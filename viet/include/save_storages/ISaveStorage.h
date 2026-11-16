@@ -18,6 +18,8 @@ public:
 
   virtual ~ISaveStorage() = default;
 
+  virtual bool SupportsAtomicBatches() const noexcept { return false; }
+
   virtual void IterateSync(const IterateSyncCallback& cb) = 0;
   virtual void Upsert(std::vector<std::optional<T>>&& changeForms,
                       const UpsertCallback& cb) = 0;

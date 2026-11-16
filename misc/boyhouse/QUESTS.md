@@ -29,7 +29,7 @@ The runner now implements:
 - `GetVMQuestVariable` (index 629) reads the owned CIS2 variable name from the active campaign's conditional quest script. Int/Float/Bool declarations, case-insensitive names, inherited variables, PEX defaults and persisted values are supported. Conditional flags come from each PEX's own user-flag table. The target must be running and adapter-enabled; missing/ambiguous scripts, nonconditional variables, type mismatches and nonfinite values fail the transaction. This does not initialize a quest or run property getters.
 - Stage conditions may compare against a GLOB (`UseGlobal`). The comparison is resolved in the same campaign immediately before each log, so earlier fragments' uncommitted writes affect later branches. Other special condition flags remain unsupported. Regressions use MQ101's original faction-path conditions and CWObj's original cross-quest/global comparisons with controlled fragment bodies, including character reload, guest isolation and rollback. They are condition tests, not playthroughs of those quests.
 - Nested `SetStage`/`SetCurrentStageID` calls execute target fragments in the same VM, campaign, instruction budget and transaction. Cross-quest calls require the target quest's own adapter opt-in. Visited stages break cycles; invalid targets and failures roll back every affected quest. `Start`, `Stop` and `Reset` execution still require lifecycle/event support.
-- One commit for journal changes and script variables. Unsupported natives, missing bindings, stale contexts, invalid property targets, invalid array access, runaway execution, and latent calls throw and discard the transaction. A VM-wide instruction budget also covers nested calls. World/inventory effect natives are deliberately absent from this runner until those effects can participate in the transaction.
+- One in-memory commit for journal changes, script variables and the supported inventory natives described below. Unsupported natives, missing bindings, stale contexts, invalid property targets, invalid array access, runaway execution, and latent calls throw and discard the transaction. A VM-wide instruction budget also covers nested calls and synchronous inventory handlers. Other world-effect natives remain absent until their effects can participate in the transaction.
 
 Original MQ102 stage 100 and DA04 stage 5 are execution fixtures. The DA04 fragment displays objective 5; a guest's execution changes only the host's journal. MQ102 stage 100 has no visible objective effect from a fresh journal. Other stages reach cross-quest adapter gates, map-marker effects, alias operations and nested lifecycle execution. Their first failure can move as earlier dependencies are implemented. Those operations fail rather than being omitted. These fixtures do not start or play the quests: no initialization events, complete alias filling/effects, dialogue, scene execution, rewards, or world overlays are supplied. Repeated stages are currently idempotent, even for quests that eventually need repeatable-stage semantics.
 
@@ -79,7 +79,36 @@ For an adapter-enabled running quest, target getters can resolve forced referenc
 
 The bounded metadata parser reads every owned quest alias, including signed creation descriptors, reference/location distinctions, optional legacy inventory counts, conditions and unknown fields. The owned catalog contains 14,514 reference aliases and 1,237 location aliases. This is format coverage, not playable quest coverage.
 
-Alias bindings, alias-script variables, globals and journal changes commit together. Failure after a binding or script mutation rolls back the whole transaction. Character reload retains bindings; quest reset removes that quest's bindings and script roots while preserving other quests and campaign globals. Live world state and inventory transactions remain future work.
+Alias bindings, alias-script variables, globals and journal changes commit together with supported inventory effects. Failure after a binding, script or inventory mutation rolls back the whole transaction. Character reload retains bindings; quest reset removes that quest's bindings and script roots while preserving other quests and campaign globals. General live world-state transactions remain future work.
+
+### Inventory effects and explicit private references
+
+The isolated runner implements partial `ObjectReference.GetItemCount`, `AddItem`
+and `RemoveItem` for concrete base items. Reads see staged changes; transfers
+preserve the inventory model's extra data. PlayerRef means the campaign owner,
+including when a guest triggers the fragment. Other references must have an
+explicit, validated `CampaignReferenceBinding` to a dynamic copy in the owner's
+current private phase. Shared originals and other players cannot be targets.
+Bindings persist with a random character identity to prevent a reused character
+FormID from resolving old copies. This does not allocate copies automatically or
+solve orphan visibility and instance naming after character-ID reuse.
+Binding refuses a copy with existing shared-VM script instances. Bound copies
+reject ordinary script initialization and shared-VM event entry; unsupported
+external events cannot silently run their scripts in the global VM.
+
+Transaction-generated `OnItemAdded`/`OnItemRemoved` events run on the logical
+reference's script attachments and matching scripted aliases of running,
+adapter-enabled quests. Active-state and inherited handlers execute independently
+for each attachment. Events share the stage's transaction and execution budget;
+unsupported alias fills, missing natives, latent handlers and unbounded event
+generation roll back inventory, journal and script state together. Ordinary
+player/world inventory events do not yet enter this dispatcher.
+
+FormLists, leveled items, item-reference arguments, transactional unequip,
+inventory-event filters, pickup UI messages and the full quest-item/ownership
+model are unsupported. Commit requires atomic persistence when storage is
+attached; notifications currently precede asynchronous disk commit. See the
+[storage contract](STORAGE.md). No adapter is enabled by this inventory subset.
 
 Scene and TopicInfo `GetOwningQuest` now return a quest object in the active campaign. Topic ownership follows its winning DIAL record; scene package-action PNAM fields are distinguished from the parent QUST. The regression invokes objective changes through those returned objects during guest play and checks personal-history isolation and rollback. Dialogue selection, scene actions and their event dispatch are not implemented by these getters.
 
@@ -109,7 +138,7 @@ Scene and TopicInfo `GetOwningQuest` now return a quest object in the active cam
 
 Mutations require the owner's private `private.boyhouse.questAdapters` array to contain the quest's stable key. This is a trusted adapter opt-in, **not automatic evidence that an adapter is correct**. No production vanilla adapter is supplied or enabled. The fixtures explicitly opt in selected quests to validate plumbing, conditional selection, and an original fragment; they do not play or certify Before the Storm.
 
-The persisted field is `private.boyhouse.questJournal`. Unknown save versions are refused rather than reset. The implementation validates before writing and uses the existing character save path. The optional [SQLite driver](STORAGE.md) now commits each complete save batch atomically across change forms. That does not yet provide transactional staging of quest state, inventory rewards and live world overlays, or wait for disk commit before notifying clients. The ledger limit is 8 MiB. The diagnostic feed currently sends full snapshots, capped at 1 MiB; exceeding that limit returns unavailable rather than truncating progress. Delta/chunk transport is required before full campaign rollout. VM epochs are process-local guards, not network transition acknowledgements or VM persistence.
+The persisted field is `private.boyhouse.questJournal`. Unknown save versions are refused rather than reset. The implementation validates before writing and uses the existing character save path. The optional [SQLite driver](STORAGE.md) commits each complete save batch atomically across change forms. The supported inventory subset stages rewards with journal/VM state, but general world overlays and acknowledgements after disk commit remain unfinished. The ledger limit is 8 MiB. The diagnostic feed currently sends full snapshots, capped at 1 MiB; exceeding that limit returns unavailable rather than truncating progress. Delta/chunk transport is required before full campaign rollout. VM epochs are process-local guards, not network transition acknowledgements or VM persistence.
 
 ## Catalog-wide automation
 

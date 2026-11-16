@@ -1,4 +1,5 @@
 #include "WorldState.h"
+#include "CampaignReferenceBinding.h"
 #include "EvaluateTemplate.h"
 #include "FormCallbacks.h"
 #include "LeveledListUtils.h"
@@ -6,6 +7,7 @@
 #include "MpActor.h"
 #include "MpChangeForms.h"
 #include "MpObjectReference.h"
+#include "QuestJournal.h"
 #include "libespm/GroupUtils.h"
 #include "papyrus-vm/Reader.h"
 #include "papyrus-vm/Utils.h"
@@ -305,6 +307,85 @@ void WorldState::RequestSave(MpObjectReference& ref)
 
   pImpl->changesByIdx[idx] = ref.GetChangeForm();
   pImpl->changesByIdxEmpty = false;
+}
+
+void WorldState::CommitCampaignInventory(
+  MpActor& owner, const std::string& journal,
+  const std::vector<CampaignInventoryChange>& changes)
+{
+  if (pImpl->formLoadingInProgress)
+    throw std::runtime_error("Campaign commit during world loading");
+  if (pImpl->saveStorage && !pImpl->saveStorage->SupportsAtomicBatches())
+    throw std::runtime_error(
+      "Campaign inventory requires atomic save storage");
+  struct Prepared
+  {
+    MpObjectReference* reference;
+    MpChangeForm live;
+    bool inventoryChanged = false;
+  };
+  std::map<uint32_t, Prepared> prepared;
+  auto prepare = [&](MpObjectReference& reference) -> Prepared& {
+    const auto id = reference.GetFormId();
+    if (reference.GetParent() != this ||
+        LookupFormByIdNoLoad(id).get() != &reference ||
+        reference.GetIdx() == FormIndex::g_invalidIdx)
+      throw std::runtime_error("Unregistered campaign inventory participant");
+    auto found = prepared.find(id);
+    if (found != prepared.end())
+      return found->second;
+    return prepared
+      .emplace(id, Prepared{ &reference, reference.GetChangeForm() })
+      .first->second;
+  };
+  auto& ownerChange = prepare(owner);
+  ownerChange.live.dynamicFields.SetValueDump(QuestJournal::kProperty,
+                                              journal);
+  std::set<uint32_t> unique;
+  for (const auto& change : changes) {
+    if (!change.reference ||
+        !unique.insert(change.reference->GetFormId()).second)
+      throw std::runtime_error(
+        "Invalid or duplicate campaign inventory participant");
+    auto& entry = prepare(*change.reference);
+    entry.inventoryChanged = entry.live.inv != change.inventory;
+    entry.live.inv = change.inventory;
+    entry.live.baseContainerAdded = true;
+  }
+  size_t size = pImpl->changesByIdx.size();
+  for (auto& [id, entry] : prepared) {
+    // All serialization and allocation failures occur before publication.
+    MpChangeForm::ToJson(entry.live).dump();
+    size = std::max(size, static_cast<size_t>(entry.reference->GetIdx()) + 1);
+  }
+  // A whole change form is not nothrow-movable on every standard library
+  // (MSVC's associative containers can allocate during a move). Prepare the
+  // complete pending save buffer, then publish it through vector::swap.
+  auto saveBatch = pImpl->changesByIdx;
+  saveBatch.resize(size);
+  for (const auto& [id, entry] : prepared)
+    saveBatch[entry.reference->GetIdx()] = entry.live;
+  static_assert(noexcept(pImpl->changesByIdx.swap(saveBatch)));
+  for (auto& [id, entry] : prepared) {
+    entry.reference->CommitPreparedCampaignChange(entry.live);
+  }
+  pImpl->changesByIdx.swap(saveBatch);
+  pImpl->changesByIdxEmpty = false;
+  // Publication has succeeded. A notification failure must not pretend the
+  // committed quest was rolled back, or allow its rewards to be run twice.
+  for (const auto& [id, entry] : prepared) {
+    if (!entry.inventoryChanged)
+      continue;
+    try {
+      entry.reference->SendInventoryUpdate();
+    } catch (...) {
+      try {
+        spdlog::error(
+          "Campaign inventory notification {:x} could not be queued", id);
+      } catch (...) {
+      } // State is already committed, even if logging fails.
+    }
+  }
 }
 
 const std::shared_ptr<MpForm>& WorldState::LookupFormById(
@@ -803,6 +884,12 @@ void WorldState::SendPapyrusEvent(MpForm* form, const char* eventName,
                                   const VarValue* arguments,
                                   size_t argumentsCount)
 {
+  if (const auto* reference = form ? form->AsObjectReference() : nullptr;
+      reference &&
+      reference->GetDynamicFields().GetValueDump(
+        CampaignReferenceBinding::kProperty) != "null")
+    throw std::runtime_error(
+      "Private references require the campaign event dispatcher");
   std::vector<VarValue> args = { arguments, arguments + argumentsCount };
 
   if (spdlog::should_log(spdlog::level::trace)) {

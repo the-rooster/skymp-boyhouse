@@ -36,6 +36,17 @@ public:
 
   const MpChangeForm& ChangeForm() const noexcept { return changeForm; }
 
+  // The world transaction has already prepared its save-buffer copy. No
+  // allocation, callback, event or save request may interrupt publication.
+  void SwapPreparedCampaignFields(MpChangeForm& prepared) noexcept
+  {
+    static_assert(noexcept(changeForm.inv.entries.swap(prepared.inv.entries)));
+    changeForm.inv.entries.swap(prepared.inv.entries);
+    changeForm.dynamicFields.Swap(prepared.dynamicFields);
+    changeForm.baseContainerAdded = prepared.baseContainerAdded;
+    lastSaveRequest = std::chrono::system_clock::now();
+  }
+
   auto GetLastSaveRequestMoment() const { return lastSaveRequest; }
 
   bool blockSaving = false;

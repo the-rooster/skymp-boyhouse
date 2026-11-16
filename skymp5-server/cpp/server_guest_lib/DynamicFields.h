@@ -14,6 +14,14 @@ public:
   const nlohmann::json& GetAsJson() const;
   static DynamicFields FromJson(const nlohmann::json& j);
 
+  void Swap(DynamicFields& other) noexcept
+  {
+    static_assert(noexcept(propDumps.swap(other.propDumps)));
+    static_assert(noexcept(jsonCache.swap(other.jsonCache)));
+    propDumps.swap(other.propDumps);
+    jsonCache.swap(other.jsonCache);
+  }
+
   template <class F>
   void ForEachValueDump(const F& f) const
   {

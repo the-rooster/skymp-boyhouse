@@ -1,4 +1,5 @@
 #include "QuestScriptRuntime.h"
+#include "CampaignInventoryApi.h"
 #include "CampaignReferenceScripts.h"
 #include "ConditionsEvaluator.h"
 #include "MpActor.h"
@@ -770,6 +771,13 @@ bool QuestScriptRuntime::ExecuteStage(
     vm.RegisterFunction("Actor", "GetActorBase", FunctionType::Method,
                         baseObject);
 
+    std::vector<CampaignInventoryApi::Event> inventoryEvents;
+    CampaignInventoryApi::Register(vm, actor, formId, [&](auto event) {
+      if (inventoryEvents.size() >= 4096)
+        throw std::runtime_error("Campaign inventory event limit exceeded");
+      inventoryEvents.push_back(event);
+    });
+
     for (const auto& [cls, type] :
          std::vector<std::pair<std::string, std::string>>{
            { "Scene", "SCEN" }, { "TopicInfo", "INFO" } }) {
@@ -1207,6 +1215,55 @@ bool QuestScriptRuntime::ExecuteStage(
     changed = execute(questId, stage);
     if (!changed)
       return;
+    for (size_t eventIndex = 0; eventIndex < inventoryEvents.size();
+         ++eventIndex) {
+      vm.CheckExecutionBudget();
+      // Copy before dispatch: handlers may append more inventory events.
+      const auto event = inventoryEvents[eventIndex];
+      const auto* name = event.added ? "OnItemAdded" : "OnItemRemoved";
+      const std::vector<VarValue> args{
+        VarValue(resolve(event.item).get()),
+        VarValue(static_cast<int32_t>(event.count)), VarValue::None(),
+        event.container ? VarValue(resolve(event.container).get())
+                        : VarValue::None()
+      };
+      std::vector<std::shared_ptr<IGameObject>> recipients{ resolve(
+        event.target) };
+      // Only aliases with attached scripts need event delivery. Unsupported
+      // alias filling must fail the transaction rather than omit a handler.
+      const auto eventJournal = QuestJournal::Snapshot(actor);
+      for (const auto& [key, progress] : eventJournal.at("quests").items()) {
+        if (progress.at("running") != true)
+          continue;
+        const auto id = FormDesc::FromString(key).ToFormId(world.espmFiles);
+        QuestJournal::RequireAdapter(actor, id);
+        const auto record = world.GetEspm().GetBrowser().LookupById(id);
+        const auto data = id == questId
+          ? metadata
+          : espm::QuestScriptData::Read(record.rec, world.GetEspmCache());
+        std::set<uint32_t> seen;
+        for (const auto& binding : data.aliases) {
+          if (std::none_of(
+                binding.scripts.begin(), binding.scripts.end(),
+                [](const auto& script) { return !(script.status & 2); }) ||
+              !seen.insert(binding.object.alias).second)
+            continue;
+          const auto* definition = definitions(id).Find(binding.object.alias);
+          if (!definition)
+            throw std::runtime_error("Inventory event alias does not exist");
+          if (definition->kind != espm::QuestAliasDefinition::Kind::Reference)
+            continue;
+          auto alias = std::dynamic_pointer_cast<CampaignAliasObject>(
+            resolveAlias(id, binding.object.alias));
+          const auto target = aliasTarget(*alias);
+          if (static_cast<IGameObject*>(target) &&
+              formId(target) == event.target)
+            recipients.push_back(alias);
+        }
+      }
+      for (const auto& recipient : recipients)
+        vm.SendEventSynchronous(recipient, name, args, stack);
+    }
     for (const auto& [key, holder] : variables)
       state.SetScript(key, holder->Save());
     QuestJournal::SetScriptState(actor, state.Save());

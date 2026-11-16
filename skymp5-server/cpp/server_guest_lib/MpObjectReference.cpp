@@ -1,4 +1,5 @@
 #include "MpObjectReference.h"
+#include "CampaignReferenceBinding.h"
 #include "ChangeFormGuard.h"
 #include "EvaluateTemplate.h"
 #include "FormCallbacks.h"
@@ -1227,6 +1228,13 @@ MpChangeForm MpObjectReference::GetChangeForm() const
   return res;
 }
 
+void MpObjectReference::CommitPreparedCampaignChange(
+  MpChangeForm& prepared) noexcept
+{
+  SwapPreparedCampaignFields(prepared);
+  pImpl->setPropertyCalled = true;
+}
+
 void MpObjectReference::ApplyChangeForm(const MpChangeForm& changeForm)
 {
   ANTIGO_CONTEXT_INIT(ctx);
@@ -1360,6 +1368,10 @@ void MpObjectReference::SendPapyrusEvent(const char* eventName,
                                          const VarValue* arguments,
                                          size_t argumentsCount)
 {
+  if (GetDynamicFields().GetValueDump(CampaignReferenceBinding::kProperty) !=
+      "null")
+    throw std::runtime_error(
+      "Private references require the campaign event dispatcher");
   if (!pImpl->scriptsInited) {
     InitScripts();
     pImpl->scriptsInited = true;
@@ -1773,6 +1785,10 @@ void MpObjectReference::UnsubscribeFromAll()
 
 void MpObjectReference::InitScripts()
 {
+  if (GetDynamicFields().GetValueDump(CampaignReferenceBinding::kProperty) !=
+      "null")
+    throw std::runtime_error(
+      "Private references require the campaign event dispatcher");
   auto baseId = GetBaseId();
   if (!baseId || !GetParent()->espm) {
     return;

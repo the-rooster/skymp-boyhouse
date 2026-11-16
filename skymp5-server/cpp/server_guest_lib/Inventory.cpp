@@ -3,6 +3,7 @@
 #include "archives/JsonOutputArchive.h"
 #include "archives/SimdJsonInputArchive.h"
 #include <fmt/format.h>
+#include <limits>
 #include <spdlog/spdlog.h>
 #include <tuple>
 
@@ -91,15 +92,27 @@ Inventory& Inventory::AddItem(uint32_t baseId, uint32_t count)
 
 Inventory& Inventory::AddItems(const std::vector<Entry>& toAdd)
 {
-  for (auto& entryToAdd : toAdd) {
-    for (auto& entry : entries) {
+  // Prepare the whole batch before changing the inventory. This also permits
+  // AddItems(entries): the input remains valid until the final swap.
+  auto result = entries;
+  for (const auto& entryToAdd : toAdd) {
+    if (!entryToAdd.count)
+      continue;
+    bool merged = false;
+    for (auto& entry : result) {
       if (entry.EqualExceptCount(entryToAdd)) {
+        if (entryToAdd.count >
+            std::numeric_limits<uint32_t>::max() - entry.count)
+          throw std::overflow_error("Inventory stack count overflow");
         entry.count += entryToAdd.count;
-        return *this; // TODO: It seems there is a bug
+        merged = true;
+        break;
       }
     }
-    entries.push_back(entryToAdd);
+    if (!merged)
+      result.push_back(entryToAdd);
   }
+  entries.swap(result);
   return *this;
 }
 

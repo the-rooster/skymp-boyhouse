@@ -14,10 +14,61 @@ using Json = nlohmann::json;
 constexpr uint64_t kMaxRevision = 9007199254740991ULL;
 struct Transaction
 {
+  struct InventoryEdit
+  {
+    std::shared_ptr<MpForm> lifetime;
+    MpObjectReference* reference;
+    Inventory initial, current;
+    uint64_t epoch;
+    bool baseContainerAdded;
+  };
   MpActor* owner;
   Json ledger;
+  std::map<uint32_t, InventoryEdit> inventories;
 };
 thread_local Transaction* transaction = nullptr;
+
+Transaction::InventoryEdit& InventoryTarget(MpActor& actor,
+                                            MpObjectReference& target)
+{
+  if (!actor.GetParent())
+    throw std::runtime_error("Unregistered quest transaction participant");
+  auto& owner = QuestJournal::Owner(actor);
+  if (!transaction || transaction->owner != &owner)
+    throw std::runtime_error("Inventory requires an owning quest transaction");
+  auto& world = *owner.GetParent();
+  const auto lifetime = world.LookupFormByIdNoLoad(target.GetFormId());
+  if (target.GetParent() != &world || lifetime.get() != &target ||
+      target.IsDeleted())
+    throw std::runtime_error("Unregistered campaign inventory target");
+  const auto& instance = owner.GetWorldInstance();
+  if (&target != &owner) {
+    const auto prefix = "campaign:" + std::to_string(owner.GetFormId()) + ":";
+    if (!instance.starts_with(prefix) || !target.SharesWorldInstance(owner) ||
+        target.GetFormId() < 0xff000000)
+      throw std::runtime_error(
+        "Inventory target is not in the owner's private instance");
+    const auto form = target.GetChangeForm();
+    if (target.AsActor() && (form.profileId >= 0 || target.GetBaseId() == 7))
+      throw std::runtime_error("Quest inventory cannot target another player");
+    if (!form.baseContainerAdded)
+      throw std::runtime_error("Campaign target inventory is not initialized");
+  }
+  const auto id = target.GetFormId();
+  if (auto found = transaction->inventories.find(id);
+      found != transaction->inventories.end()) {
+    if (found->second.lifetime != lifetime)
+      throw std::runtime_error("Campaign inventory identity was replaced");
+    return found->second;
+  }
+  return transaction->inventories
+    .emplace(id,
+             Transaction::InventoryEdit{
+               lifetime, &target, target.GetInventory(), target.GetInventory(),
+               target.GetWorldInstanceEpoch(),
+               target.GetChangeForm().baseContainerAdded })
+    .first->second;
+}
 
 uint32_t Integer(const Json& value, uint32_t limit, const char* name)
 {
@@ -292,6 +343,8 @@ void QuestJournal::Atomic(MpActor& actor, const std::function<void()>& execute)
 {
   if (transaction)
     throw std::runtime_error("Nested quest transaction");
+  if (!actor.GetParent())
+    throw std::runtime_error("Unregistered quest transaction participant");
   auto& owner = Owner(actor);
   auto& world = *actor.GetParent();
   const auto actorId = actor.GetFormId(), ownerId = owner.GetFormId();
@@ -304,7 +357,8 @@ void QuestJournal::Atomic(MpActor& actor, const std::function<void()>& execute)
   const auto actorEpoch = actor.GetWorldInstanceEpoch();
   const auto ownerEpoch = owner.GetWorldInstanceEpoch();
   const auto initial = Read(owner);
-  Transaction local{ &owner, initial };
+  const auto initialJournal = owner.GetDynamicFields().GetValueDump(kProperty);
+  Transaction local{ &owner, initial, {} };
   transaction = &local;
   try {
     execute();
@@ -318,13 +372,46 @@ void QuestJournal::Atomic(MpActor& actor, const std::function<void()>& execute)
     const auto dump = local.ledger.dump();
     if (dump.size() > 8 * 1024 * 1024)
       throw std::runtime_error("Campaign journal too large");
+    if (owner.GetDynamicFields().GetValueDump(kProperty) != initialJournal)
+      throw std::runtime_error(
+        "Campaign journal changed outside its transaction");
+    std::vector<WorldState::CampaignInventoryChange> changes;
+    for (const auto& [id, edit] : local.inventories) {
+      if (world.LookupFormByIdNoLoad(id) != edit.lifetime ||
+          edit.reference->GetWorldInstanceEpoch() != edit.epoch ||
+          edit.reference->GetInventory() != edit.initial ||
+          edit.reference->GetChangeForm().baseContainerAdded !=
+            edit.baseContainerAdded)
+        throw std::runtime_error(
+          "Campaign inventory changed during execution");
+      InventoryTarget(actor, *edit.reference);
+      if (edit.initial != edit.current)
+        changes.push_back({ edit.reference, edit.current });
+    }
     transaction = nullptr;
-    if (local.ledger != initial)
+    if (!changes.empty())
+      world.CommitCampaignInventory(owner, dump, changes);
+    else if (local.ledger != initial)
       owner.SetPropertyValueDump(kProperty, dump, false, false);
   } catch (...) {
     transaction = nullptr;
     throw;
   }
+}
+
+const Inventory& QuestJournal::ReadInventory(MpActor& actor,
+                                             MpObjectReference& target)
+{
+  return InventoryTarget(actor, target).current;
+}
+
+void QuestJournal::EditInventory(MpActor& actor, MpObjectReference& target,
+                                 const std::function<void(Inventory&)>& edit)
+{
+  auto& staged = InventoryTarget(actor, target);
+  auto prepared = staged.current;
+  edit(prepared);
+  staged.current = std::move(prepared);
 }
 
 nlohmann::json QuestJournal::ScriptState(MpActor& actor)

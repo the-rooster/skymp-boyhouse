@@ -37,12 +37,16 @@ settings explicitly choose SQLite. Initialization never replaces existing settin
   throw; they are not skipped. Each serialized change form is limited to 32 MiB.
 - `AsyncSaveStorage` serializes calls to one driver. Independent reader connections
   are supported. A single driver object is not a public concurrent/reentrant API.
-- This is atomic **disk batching**, not a complete campaign action transaction.
-  The world currently captures a batch on a save tick. In-memory rollback across
-  NPC/inventory effects, persistent event execution, ordering of projected effects
-  and acknowledgements after disk commit still need implementation. A crash can
-  lose changes not yet submitted and committed. Switching drivers alone does not
-  make world-effect natives safe to enable.
+- The scoped fragment runner stages journal/VM state and supported inventory
+  changes together. It validates every participant, prepares the complete pending
+  save buffer, then publishes live inventory/journal fields with non-allocating
+  swaps. An attached storage backend must advertise atomic batches; SQLite does,
+  legacy drivers do not. Inventory notifications follow this in-memory commit.
+- A world save tick still submits the batch asynchronously. Client notifications
+  do **not** wait for disk commit, so a crash can lose a recently acknowledged
+  change. Persistent execution of external events, complete world-effect staging
+  and durable acknowledgements remain required. Switching drivers alone does not
+  make arbitrary world-effect natives safe to enable.
 
 ## Existing saves and backups
 
@@ -72,6 +76,13 @@ middle-row rollback, retries, duplicate identities, concurrent snapshots,
 foreign/versioned databases, corrupt payloads and the asynchronous world save
 path. Linux tests kill child processes before and after commit and reopen through
 the driver. Abrupt process death is tested; hardware power-loss testing is not.
+
+The campaign transaction regression transfers inventory between a character and
+an explicitly bound private NPC, changes the journal/VM state, waits for the real
+asynchronous SQLite save, then loads a fresh server and checks all participants
+and the persisted reference binding. Separate transaction tests check stale
+identities, phase changes, conflicting writes, failed handlers and non-atomic
+storage. This does not certify general world effects or native-client behavior.
 
 `node misc/boyhouse/storage-smoke.cjs` uses the native addon and owned masters.
 It waits for 32 character saves to be visible in the database, kills the writer,

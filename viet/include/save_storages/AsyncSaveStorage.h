@@ -145,6 +145,11 @@ public:
 
   const std::string& GetName() const override { return pImpl->name; }
 
+  bool SupportsAtomicBatches() const noexcept override
+  {
+    return pImpl->share.dbImpl->SupportsAtomicBatches();
+  }
+
 private:
   enum class CallbackGarbageMark
   {

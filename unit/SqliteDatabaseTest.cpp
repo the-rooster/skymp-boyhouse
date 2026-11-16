@@ -1,4 +1,6 @@
 #include "database_drivers/SqliteDatabase.h"
+#include "CampaignReferenceBinding.h"
+#include "QuestJournal.h"
 #include "TestUtils.hpp"
 #include "database_drivers/DatabaseFactory.h"
 #include "save_storages/AsyncSaveStorage.h"
@@ -14,6 +16,8 @@
 #  include <sys/wait.h>
 #  include <unistd.h>
 #endif
+
+extern espm::Loader& GetEspmLoader();
 
 namespace {
 using Storage =
@@ -315,6 +319,70 @@ TEST_CASE(
   REQUIRE(rows.size() == 1);
   REQUIRE(rows.begin()->second.at("position") ==
           nlohmann::json::array({ 1, 2, 3 }));
+}
+
+TEST_CASE("Campaign reward transactions reload journals and bound inventories "
+          "together",
+          "[SQLite][Quest][CampaignInventory]")
+{
+  SqliteFiles files;
+  constexpr uint32_t ownerId = 0xff002001, npcId = 0xff002010;
+  {
+    auto storage =
+      std::make_shared<Storage>(std::make_shared<SqliteDatabase>(files.File()),
+                                spdlog::default_logger(), "sqlite", 1);
+    REQUIRE(storage->SupportsAtomicBatches());
+    PartOne server;
+    server.AttachEspm(&GetEspmLoader());
+    server.AttachSaveStorage(storage);
+    server.CreateActor(ownerId, { 1, 2, 3 }, 0, 0x3c);
+    auto& owner = server.worldState.GetFormAt<MpActor>(ownerId);
+    owner.SetPropertyValueDump(QuestJournal::kEnabled,
+                               "[\"4e50d:Skyrim.esm\"]", false, false);
+    const auto instance = "campaign:" + std::to_string(ownerId) + ":fixture";
+    owner.SetWorldInstance(instance);
+    owner.SetInventory(Inventory().AddItem(0xf, 10));
+    server.worldState.AddForm(
+      std::make_unique<MpActor>(
+        LocationalData{ { 1, 2, 3 }, { 0, 0, 0 }, FormDesc::Tamriel() },
+        FormCallbacks::DoNothing(), 0x13bbd),
+      npcId);
+    auto& npc = server.worldState.GetFormAt<MpActor>(npcId);
+    npc.SetWorldInstance(instance);
+    npc.SetInventory(Inventory().AddItem(0xf, 20));
+    CampaignReferenceBinding::Bind(owner, 0x1a677, npc);
+    QuestJournal::Atomic(owner, [&] {
+      QuestJournal::Apply(
+        owner,
+        { { "quest", 0x4e50d }, { "op", "setStage" }, { "index", 10 } });
+      QuestJournal::SetScriptState(owner, { { "fixture", 42 } });
+      QuestJournal::EditInventory(owner, owner,
+                                  [](Inventory& inv) { inv.AddItem(0xf, 6); });
+      QuestJournal::EditInventory(
+        owner, npc, [](Inventory& inv) { inv.RemoveItems({ { 0xf, 6 } }); });
+    });
+    const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (storage->GetNumFinishedUpserts() == 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+      server.worldState.Tick();
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(storage->GetNumFinishedUpserts() > 0);
+  }
+  auto storage =
+    std::make_shared<Storage>(std::make_shared<SqliteDatabase>(files.File()),
+                              spdlog::default_logger(), "sqlite", 1);
+  PartOne restarted;
+  restarted.AttachEspm(&GetEspmLoader());
+  restarted.AttachSaveStorage(storage);
+  auto& owner = restarted.worldState.GetFormAt<MpActor>(ownerId);
+  auto& npc = restarted.worldState.GetFormAt<MpActor>(npcId);
+  REQUIRE(owner.GetInventory().GetItemCount(0xf) == 16);
+  REQUIRE(npc.GetInventory().GetItemCount(0xf) == 14);
+  REQUIRE(QuestJournal::Get(owner, 0x4e50d).at("stage") == 10);
+  REQUIRE(QuestJournal::ScriptState(owner).at("fixture") == 42);
+  REQUIRE(&CampaignReferenceBinding::Resolve(owner, 0x1a677) == &npc);
 }
 
 #if defined(__linux__)

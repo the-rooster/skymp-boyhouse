@@ -12,6 +12,7 @@ class SqliteDatabase
 public:
   explicit SqliteDatabase(const std::string& file);
   ~SqliteDatabase() override;
+  bool SupportsAtomicBatches() const noexcept override { return true; }
   void Iterate(const IterateCallback& callback,
                std::optional<std::vector<FormDesc>> filter) override;
 

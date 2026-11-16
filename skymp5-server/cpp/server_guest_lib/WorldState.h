@@ -84,6 +84,22 @@ public:
                      std::chrono::system_clock::duration time);
 
   void RequestSave(MpObjectReference& ref);
+
+  struct CampaignInventoryChange
+  {
+    MpObjectReference* reference;
+    Inventory inventory;
+  };
+
+private:
+  friend class QuestJournal;
+  // Internal campaign commit: prepare every live/save copy before publishing
+  // any of them. Only inventory and the owner's private journal may change.
+  void CommitCampaignInventory(
+    MpActor& owner, const std::string& journal,
+    const std::vector<CampaignInventoryChange>& changes);
+
+public:
   bool HasEspmFile(std::string_view filename) const noexcept;
 
   template <typename T>

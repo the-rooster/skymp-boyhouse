@@ -13,6 +13,9 @@ public:
 
   virtual ~IDatabase() = default;
 
+  // True only when one successful Upsert commits its entire batch atomically.
+  virtual bool SupportsAtomicBatches() const noexcept { return false; }
+
   // Returns numbers of change forms inserted or updated successfully (Suitable
   // for logging). In practice, it should be equal to `changeForms.size()` when
   // saving succeed.

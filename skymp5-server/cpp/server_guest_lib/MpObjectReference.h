@@ -82,6 +82,7 @@ class MpObjectReference
 {
   friend class OccupantDestroyEventSink;
   friend class OccupantDisableEventSink;
+  friend class WorldState;
 
 public:
   static const char* Type() { return "ObjectReference"; }
@@ -225,6 +226,7 @@ protected:
                                    bool reliable) const;
 
 private:
+  void CommitPreparedCampaignChange(MpChangeForm& prepared) noexcept;
   void AddContainerObject(const espm::CONT::ContainerObject& containerObject,
                           std::map<uint32_t, uint32_t>* itemsToAdd);
   void InitScripts();

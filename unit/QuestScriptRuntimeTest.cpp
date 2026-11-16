@@ -1,4 +1,5 @@
 #include "QuestScriptRuntime.h"
+#include "CampaignReferenceBinding.h"
 #include "CampaignReferenceScripts.h"
 #include "QuestJournal.h"
 #include "QuestVmState.h"
@@ -2271,4 +2272,298 @@ TEST_CASE(
   REQUIRE_FALSE(
     state["scripts"]["4e50d:Skyrim.esm/otherbinding"]["values"].contains(
       "otherbinding/counter"));
+}
+
+namespace {
+void InventoryFragment(Fixture& f, uint32_t target = 0x14)
+{
+  BaseScripts(f);
+  f.Fragment().locals.push_back({ "target", "ObjectReference" });
+  f.Fragment().locals.push_back({ "gold", "Form" });
+  f.Fragment().code.instructions = {
+    { FunctionCode::kOp_CallStatic,
+      { VarValue("Game"), VarValue("GetForm"), Id("target"), VarValue(1),
+        VarValue(static_cast<int32_t>(target)) } },
+    { FunctionCode::kOp_CallStatic,
+      { VarValue("Game"), VarValue("GetForm"), Id("gold"), VarValue(1),
+        VarValue(0xf) } },
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("AddItem"), Id("target"), Id("temp"), VarValue(3), Id("gold"),
+        VarValue(5), VarValue(true) } },
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("GetItemCount"), Id("target"), Id("counter"), VarValue(1),
+        Id("gold") } },
+    { FunctionCode::kOp_Return, { VarValue::None() } }
+  };
+}
+
+MpActor& BoundBalgruuf(Fixture& f, MpActor& owner, uint32_t id = 0xff002010)
+{
+  f.server.worldState.AddForm(
+    std::make_unique<MpActor>(
+      LocationalData{ { 1, 2, 3 }, { 0, 0, 0 }, FormDesc::Tamriel() },
+      FormCallbacks::DoNothing(), 0x13bbd),
+    id);
+  auto& copy = f.server.worldState.GetFormAt<MpActor>(id);
+  copy.SetWorldInstance(owner.GetWorldInstance());
+  copy.SetInventory(Inventory().AddItem(0xf, 3));
+  CampaignReferenceBinding::Bind(owner, 0x1a677, copy);
+  return copy;
+}
+
+void InventoryAlias(Fixture& f, bool fail = false)
+{
+  espm::QuestScriptData::Alias binding;
+  binding.object.type = 1;
+  binding.object.formId = kQuest;
+  binding.object.alias = 4;
+  binding.version = 5;
+  binding.objectFormat = 2;
+  binding.scripts.push_back({ "InventoryAliasFixture", 0, {} });
+  f.metadata.aliases.push_back(binding);
+  auto script = std::make_shared<PexScript>();
+  script->source = "InventoryAliasFixture";
+  Object object;
+  object.NameIndex = script->source;
+  object.parentClassName = "ReferenceAlias";
+  object.variables.push_back({ "received", "Int", 0, VarValue(0) });
+  FunctionInfo event;
+  event.valid = true;
+  event.returnType = "None";
+  event.params = { { "item", "Form" },
+                   { "count", "Int" },
+                   { "reference", "ObjectReference" },
+                   { "source", "ObjectReference" } };
+  event.locals.push_back({ "temp", "None" });
+  event.code.instructions = {
+    { FunctionCode::kOp_IAdd,
+      { Id("received"), Id("received"), Id("count") } },
+    { FunctionCode::kOp_Return, { VarValue::None() } }
+  };
+  if (fail)
+    event.code.instructions.insert(
+      event.code.instructions.end() - 1,
+      { FunctionCode::kOp_CallMethod,
+        { VarValue("UnsupportedInventoryEvent"), Id("self"), Id("temp"),
+          VarValue(0) } });
+  object.states.push_back({ "", { { "OnItemAdded", event } } });
+  script->objectTable.push_back(object);
+  f.extraScripts.push_back(script);
+}
+}
+
+TEST_CASE("Campaign inventory natives stage rewards with the host journal",
+          "[Quest][CampaignInventory]")
+{
+  Fixture f;
+  InventoryFragment(f);
+  auto& owner = f.Add(0xff002001);
+  auto& guest = f.Add(0xff002002);
+  owner.SetInventory(Inventory().AddItem(0xf, 10));
+  guest.SetInventory(Inventory().AddItem(0xf, 30));
+  const auto instance =
+    "campaign:" + std::to_string(owner.GetFormId()) + ":fixture";
+  owner.SetWorldInstance(instance);
+  guest.SetWorldInstance(instance);
+  REQUIRE(f.Run(guest));
+  REQUIRE(owner.GetInventory().GetItemCount(0xf) == 15);
+  REQUIRE(guest.GetInventory().GetItemCount(0xf) == 30);
+  REQUIRE(Counter(owner) == 15);
+  REQUIRE_FALSE(f.Run(guest));
+  REQUIRE(owner.GetInventory().GetItemCount(0xf) == 15);
+  f.Fragment().code.instructions.insert(
+    f.Fragment().code.instructions.end() - 1,
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("MissingAfterReward"), Id("self"), Id("temp"),
+        VarValue(0) } });
+  const auto before = QuestJournal::ScriptState(owner);
+  REQUIRE_THROWS(f.Run(guest, 20));
+  REQUIRE(owner.GetInventory().GetItemCount(0xf) == 15);
+  REQUIRE(QuestJournal::Get(owner, kQuest).at("stage") == 10);
+  REQUIRE(QuestJournal::ScriptState(owner) == before);
+}
+
+TEST_CASE("NPC inventory events update the bound campaign alias atomically",
+          "[Quest][CampaignInventory]")
+{
+  Fixture f;
+  InventoryFragment(f, 0x1a677);
+  const bool fail = GENERATE(false, true);
+  InventoryAlias(f, fail);
+  auto& owner = f.Add(0xff002001);
+  owner.SetWorldInstance("campaign:" + std::to_string(owner.GetFormId()) +
+                         ":fixture");
+  auto& npc = BoundBalgruuf(f, owner);
+  if (fail) {
+    REQUIRE_THROWS_WITH(
+      f.Run(owner),
+      Catch::Matchers::ContainsSubstring("UnsupportedInventoryEvent"));
+    REQUIRE(npc.GetInventory().GetItemCount(0xf) == 3);
+    REQUIRE(QuestJournal::Get(owner, kQuest).at("stage") == 0);
+    REQUIRE(QuestJournal::ScriptState(owner).empty());
+  } else {
+    REQUIRE(f.Run(owner));
+    REQUIRE(npc.GetInventory().GetItemCount(0xf) == 8);
+    REQUIRE(Counter(owner) == 8);
+    const auto saved = QuestJournal::ScriptState(owner);
+    REQUIRE(saved["scripts"]["4e50d:Skyrim.esm/alias:4/inventoryaliasfixture"]
+                 ["values"]["inventoryaliasfixture/received"]["value"] == 5);
+  }
+  REQUIRE_FALSE(f.server.worldState.LookupFormByIdNoLoad(0x1a677));
+}
+
+TEST_CASE(
+  "Inventory transfers retain extra data and never cross campaign copies",
+  "[Quest][CampaignInventory]")
+{
+  Fixture f;
+  InventoryFragment(f);
+  auto& owner = f.Add(0xff002001);
+  owner.SetWorldInstance("campaign:" + std::to_string(owner.GetFormId()) +
+                         ":fixture");
+  auto& npc = BoundBalgruuf(f, owner);
+  Inventory::Entry named(0xf, 7);
+  named.name = "Marked gold";
+  named.health = 0.5f;
+  Inventory inventory;
+  inventory.AddItems({ { 0xf, 2 }, named });
+  owner.SetInventory(inventory);
+  f.Fragment().locals.push_back({ "destination", "ObjectReference" });
+  auto& code = f.Fragment().code.instructions;
+  code.erase(code.begin() + 2, code.end());
+  code.push_back({ FunctionCode::kOp_CallStatic,
+                   { VarValue("Game"), VarValue("GetForm"), Id("destination"),
+                     VarValue(1), VarValue(0x1a677) } });
+  code.push_back(
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("RemoveItem"), Id("target"), Id("temp"), VarValue(4),
+        Id("gold"), VarValue(20), VarValue(true), Id("destination") } });
+  code.push_back({ FunctionCode::kOp_Return, { VarValue::None() } });
+  REQUIRE(f.Run(owner));
+  REQUIRE(owner.GetInventory().IsEmpty());
+  REQUIRE(npc.GetInventory().GetItemCount(0xf) == 12);
+  REQUIRE(npc.GetInventory().entries.size() == 2);
+  REQUIRE(npc.GetInventory().entries[1] == named);
+  npc.SetWorldInstance("");
+  const auto before = QuestJournal::Snapshot(owner);
+  REQUIRE_THROWS_WITH(f.Run(owner, 20),
+                      Catch::Matchers::ContainsSubstring("not materialized"));
+  REQUIRE(QuestJournal::Snapshot(owner) == before);
+  REQUIRE(npc.GetInventory().GetItemCount(0xf) == 12);
+}
+
+TEST_CASE("Campaign reference bindings reject collisions and survive reload",
+          "[Quest][CampaignInventory]")
+{
+  Fixture f;
+  auto& owner = f.Add(0xff002001);
+  auto& stranger = f.Add(0xff002002);
+  owner.SetWorldInstance("campaign:" + std::to_string(owner.GetFormId()) +
+                         ":fixture");
+  auto& copy = BoundBalgruuf(f, owner);
+  REQUIRE(&CampaignReferenceBinding::Resolve(owner, 0x1a677) == &copy);
+  REQUIRE_THROWS_WITH(
+    copy.SendPapyrusEvent("OnInit"),
+    Catch::Matchers::ContainsSubstring("campaign event dispatcher"));
+  REQUIRE_THROWS_WITH(
+    f.server.worldState.SendPapyrusEvent(&copy, "OnInit", nullptr, 0),
+    Catch::Matchers::ContainsSubstring("campaign event dispatcher"));
+  REQUIRE_THROWS(CampaignReferenceBinding::Resolve(stranger, 0x1a677));
+  REQUIRE_THROWS(BoundBalgruuf(f, owner, 0xff002011));
+  REQUIRE_THROWS(CampaignReferenceBinding::Bind(owner, 0x14, copy));
+  REQUIRE_THROWS(CampaignReferenceBinding::Bind(owner, 0x1a677, owner));
+  Fixture restarted;
+  auto& restored = restarted.Add(owner.GetFormId());
+  RestoreCharacter(owner, restored);
+  restarted.server.worldState.AddForm(
+    std::make_unique<MpActor>(
+      LocationalData{ { 1, 2, 3 }, { 0, 0, 0 }, FormDesc::Tamriel() },
+      FormCallbacks::DoNothing(), 0x13bbd),
+    copy.GetFormId());
+  auto& reloaded =
+    restarted.server.worldState.GetFormAt<MpActor>(copy.GetFormId());
+  RestoreCharacter(copy, reloaded);
+  REQUIRE(&CampaignReferenceBinding::Resolve(restored, 0x1a677) == &reloaded);
+}
+
+TEST_CASE("Reusing a character form ID cannot inherit its old campaign copies",
+          "[Quest][CampaignInventory]")
+{
+  Fixture f;
+  auto& owner = f.Add(0xff002001);
+  const auto id = owner.GetFormId();
+  const auto instance = "campaign:" + std::to_string(id) + ":fixture";
+  owner.SetWorldInstance(instance);
+  BoundBalgruuf(f, owner);
+  f.server.worldState.DestroyForm(id);
+  auto& replacement = f.Add(id);
+  replacement.SetWorldInstance(instance);
+  REQUIRE_THROWS_WITH(CampaignReferenceBinding::Resolve(replacement, 0x1a677),
+                      Catch::Matchers::ContainsSubstring("not materialized"));
+}
+
+TEST_CASE("Inventory events inherit active-state handlers independently per "
+          "attachment",
+          "[Quest][CampaignInventory]")
+{
+  Fixture f;
+  InventoryFragment(f, 0x1a677);
+  InventoryAlias(f);
+  auto parent = f.extraScripts.back();
+  parent->source = "InventoryEventBase";
+  auto& object = parent->objectTable[0];
+  object.NameIndex = parent->source;
+  auto active = object.states[0].functions[0].function;
+  active.code.instructions[0].args[2] = VarValue(50);
+  object.states.push_back({ "busy", { { "OnItemAdded", active } } });
+  for (const std::string name :
+       { "InventoryAliasFixture", "OtherInventoryAlias" }) {
+    auto child = std::make_shared<PexScript>();
+    child->source = name;
+    Object definition;
+    definition.NameIndex = name;
+    definition.parentClassName = parent->source;
+    definition.autoStateName = "BUSY";
+    child->objectTable.push_back(definition);
+    f.extraScripts.push_back(child);
+  }
+  f.metadata.aliases[0].scripts.push_back({ "OtherInventoryAlias", 0, {} });
+  auto& owner = f.Add(0xff002001);
+  owner.SetWorldInstance("campaign:" + std::to_string(owner.GetFormId()) +
+                         ":fixture");
+  auto& npc = BoundBalgruuf(f, owner);
+  REQUIRE(f.Run(owner));
+  REQUIRE(npc.GetInventory().GetItemCount(0xf) == 8);
+  const auto state = QuestJournal::ScriptState(owner);
+  for (const std::string name :
+       { "inventoryaliasfixture", "otherinventoryalias" })
+    REQUIRE(state["scripts"]["4e50d:Skyrim.esm/alias:4/" + name]["values"]
+                 ["inventoryeventbase/received"]["value"] == 50);
+}
+
+TEST_CASE(
+  "Self-generating inventory events cannot publish an unbounded reward",
+  "[Quest][CampaignInventory]")
+{
+  Fixture f;
+  InventoryFragment(f, 0x1a677);
+  InventoryAlias(f);
+  auto& event =
+    f.extraScripts.back()->objectTable[0].states[0].functions[0].function;
+  event.locals.push_back({ "target", "ObjectReference" });
+  event.code.instructions.insert(
+    event.code.instructions.end() - 1,
+    { { FunctionCode::kOp_CallMethod,
+        { VarValue("GetReference"), Id("self"), Id("target"), VarValue(0) } },
+      { FunctionCode::kOp_CallMethod,
+        { VarValue("AddItem"), Id("target"), Id("temp"), VarValue(3),
+          Id("item"), VarValue(1), VarValue(true) } } });
+  auto& owner = f.Add(0xff002001);
+  owner.SetWorldInstance("campaign:" + std::to_string(owner.GetFormId()) +
+                         ":fixture");
+  auto& npc = BoundBalgruuf(f, owner);
+  REQUIRE_THROWS(f.Run(owner));
+  REQUIRE(npc.GetInventory().GetItemCount(0xf) == 3);
+  REQUIRE(QuestJournal::Get(owner, kQuest).at("stage") == 0);
+  REQUIRE(QuestJournal::ScriptState(owner).empty());
 }

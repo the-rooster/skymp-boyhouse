@@ -19,7 +19,15 @@ The [catalog analyzer](misc/boyhouse/DEPENDENCIES.md) scans all five owned maste
 
 Persistent personal/host journals, 23 Papyrus Quest state methods, four quest condition predicates, expired-context guards, and a read-only client journal feed are implemented. The new `questExecuteStage` trusted server API loads original PEX fragments into a campaign-scoped VM and commits journal changes and script variables together. It remains gated by experimental per-quest adapters; no complete vanilla quest is enabled. `mp "bh journal"` displays the diagnostic projection. See [the implementation contract and remaining gates](misc/boyhouse/QUESTS.md).
 
-## Transactional save verification on 2026-11-16 UTC
+## Campaign inventory verification on 2026-11-16 UTC
+
+- Scoped `GetItemCount`, `AddItem` and `RemoveItem` now stage supported inventory changes with quest journals and VM state. Host rewards, private NPC transfers and transaction-generated inventory handlers commit together; errors discard them together. Equipped removal and other unsupported item/event semantics fail explicitly.
+- Explicit private-copy bindings preserve original form identity and a saved character identity, reject shared/player/cross-phase targets, and prevent fallback into the shared script VM. Automatic NPC/object allocation and general world-event routing remain unfinished.
+- Fixed an upstream inventory batching error that stopped after merging the first item, dropping later entries. Batches now retain all entries and roll back on stack overflow.
+- Linux Release server/addon build and full native suite passed: **377 cases, 566,918 assertions**. Focused inventory checks passed **19 cases, 117 assertions**, including failed handlers, inherited active states, unbounded event generation, stale/colliding identities, host/guest separation, item extra data and real SQLite reload of a journal plus both transfer participants. The Windows Release `MpClientPlugin` build passed.
+- All **25 JavaScript/TypeScript tests**, **39 Python tests** and **three server smoke tests** passed, including forced-stop recovery of 32 disposable characters. These are engine/server checks, not Skyrim-client playthroughs. No vanilla adapter is enabled; **zero quests are certified playable**. General world effects, durable client acknowledgements and native-client compatibility remain open gates.
+
+## Earlier transactional save verification on 2026-11-16 UTC
 
 - Added the opt-in SQLite driver: one save batch commits all change forms together, or rolls them all back. Failed writes retain the batch for the existing retry path. Reads use a consistent snapshot; invalid saves and unknown database formats fail explicitly.
 - Linux Release build and full native suite passed: **363 cases, 565,640 assertions**; the focused database suite passed **8 cases, 86 assertions**. Tests cover a failed middle write, retry, concurrent reads, uncommitted crash recovery and committed recovery after `SIGKILL`.
@@ -100,7 +108,7 @@ Persistent personal/host journals, 23 Papyrus Quest state methods, four quest co
 
 ## What this does not implement yet
 
-This is not full campaign multiplayer or a finished instancing engine. Vanilla static references are not cloned per campaign. General quest execution, complete alias filling/effects, dialogue scenes, story events, native client journals, branch ownership, world overlays, transactions spanning inventory/world effects, transition acknowledgements, automatic boundary crossing, guest progression rules, and client reset/rebinding remain to be built and tested. Entering an experimental instance can hide shared NPCs and interactive references until overlays exist. Use the empty boundary laboratory only.
+This is not full campaign multiplayer or a finished instancing engine. Vanilla static references are not automatically cloned per campaign. The scoped runner can bind explicitly created private copies and stage supported inventory effects with quest state. General quest execution, complete alias filling/effects, dialogue scenes, story events, native client journals, branch ownership, world overlays, transactions spanning other world effects, durable acknowledgements, automatic boundary crossing, guest progression rules, and client reset/rebinding remain to be built and tested. Entering an experimental instance can hide shared NPCs and interactive references until overlays exist. Use the empty boundary laboratory only.
 
 The full-release target is every quest in Skyrim, Update, Dawnguard, HearthFires, and Dragonborn. Completion requires evidence per quest and important branch; it is not guaranteed by adding synchronization primitives. The local owned files contain 2,274 distinct QUST records including internal helper quests. **Zero quests have been certified for this fork.** Creation Club and arbitrary quest mods are separate compatibility packs.
 

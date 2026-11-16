@@ -96,6 +96,13 @@ public:
   void SendEvent(ActivePexInstance* instance, const char* eventName,
                  const std::vector<VarValue>& arguments);
 
+  // Campaign transactions share one stack context/budget and must complete
+  // every handler synchronously before publishing any external effect.
+  void SendEventSynchronous(std::shared_ptr<IGameObject> self,
+                            const char* eventName,
+                            const std::vector<VarValue>& arguments,
+                            std::shared_ptr<StackData> stackData);
+
   VarValue CallMethod(IGameObject* self, const char* methodName,
                       std::vector<VarValue>& arguments,
                       std::shared_ptr<StackData> stackData = nullptr,

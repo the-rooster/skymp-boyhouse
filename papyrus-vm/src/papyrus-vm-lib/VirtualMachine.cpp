@@ -223,6 +223,45 @@ void VirtualMachine::SendEvent(ActivePexInstance* instance,
   }
 }
 
+void VirtualMachine::SendEventSynchronous(
+  std::shared_ptr<IGameObject> self, const char* eventName,
+  const std::vector<VarValue>& arguments, std::shared_ptr<StackData> stackData)
+{
+  if (!strictExecution || !self || !stackData || !eventName || !*eventName)
+    throw std::invalid_argument("Invalid synchronous campaign event context");
+  // Copy the attachment list: a handler may resolve another object, but it
+  // must not invalidate iteration or steal a sibling attachment's event.
+  const auto roots = self->ListActivePexInstances();
+  for (const auto& root : roots) {
+    if (!root || !root->IsValid())
+      throw std::runtime_error("Invalid campaign event script instance");
+    const auto state = root->GetActiveStateName();
+    size_t depth = 0;
+    for (auto implementation = root;
+         implementation && implementation->IsValid();
+         implementation = implementation->GetParentInstance()) {
+      CheckExecutionBudget();
+      if (++depth > 128)
+        throw std::runtime_error("Campaign event inheritance depth exceeded");
+      auto function = implementation->GetFunctionByName(eventName, state);
+      if (!function.valid && !state.empty())
+        function = implementation->GetFunctionByName(eventName, "");
+      if (!function.valid)
+        continue;
+      if (function.IsNative() || function.IsGlobal())
+        throw std::runtime_error(
+          "Campaign event requires a non-native method body");
+      auto copiedArguments = arguments;
+      auto result =
+        implementation->StartFunction(function, copiedArguments, stackData);
+      if (result.promise)
+        throw std::runtime_error(
+          "Latent campaign event requires durable continuations");
+      break;
+    }
+  }
+}
+
 StackIdHolder::StackIdHolder(VirtualMachine& vm_)
   : makeId(vm_.stackIdMaker)
 {
