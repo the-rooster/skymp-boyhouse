@@ -173,25 +173,30 @@ void DX11RenderHandler::Create()
   if (!m_pTexture)
     CreateRenderTexture();
 
-  for (const auto& entry :
-       std::filesystem::directory_iterator("Data/Platform/Fonts/")) {
-    std::filesystem::path path = entry.path();
-
-    if (path.extension().string() != ".spritefont")
-      continue;
-
-    spdlog::info("Font has been added - " + entry.path().stem().string());
-
-    std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> converter;
-
-    auto widestrFontPath =
-      converter.from_bytes(static_cast<std::string>(path.string()));
-
-    const wchar_t* fontPath = widestrFontPath.c_str();
-
-    m_pFonts[entry.path().stem().string()] =
-      std::make_unique<DirectX::SpriteFont>(m_pDevice.Get(), fontPath);
+  // Font assets are optional. This runs inside the render hook; filesystem
+  // exceptions here used to terminate a fresh install before scripts loaded.
+  const std::filesystem::path fontDirectory("Data/Platform/Fonts");
+  std::error_code fontError;
+  auto fonts = std::filesystem::directory_iterator(fontDirectory, fontError);
+  const auto end = std::filesystem::directory_iterator();
+  while (!fontError && fonts != end) {
+    const auto path = fonts->path();
+    if (path.extension() == ".spritefont") {
+      try {
+        auto font =
+          std::make_unique<DirectX::SpriteFont>(m_pDevice.Get(), path.c_str());
+        m_pFonts[path.stem().string()] = std::move(font);
+        spdlog::info("Font has been added - {}", path.stem().string());
+      } catch (const std::exception& error) {
+        spdlog::warn("Unable to load font {}: {}", path.string(),
+                     error.what());
+      }
+    }
+    fonts.increment(fontError);
   }
+  if (fontError)
+    spdlog::warn("Unable to enumerate optional fonts in {}: {}",
+                 fontDirectory.string(), fontError.message());
 }
 
 void DX11RenderHandler::GetViewRect(CefRefPtr<CefBrowser> browser,
