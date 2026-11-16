@@ -48,6 +48,7 @@ const observer = String.raw`
       if (!coordinator) return;
       const status = coordinator.status;
       const view = sp.storage.view, model = sp.storage.worldModel;
+      const loadout = sp.storage.playerLoadoutState;
       const projection = coordinator.replica.snapshot();
       if (Date.now() >= nextSample) {
         nextSample = Date.now() + 1000;
@@ -56,6 +57,10 @@ const observer = String.raw`
           position: player && [player.getPositionX(), player.getPositionY(), player.getPositionZ()],
           world: player && (player.getWorldSpace() || player.getParentCell()).getFormID(),
           controls: flags(), view: view && model && view.getSpawnReadiness(model),
+          loadout: loadout && { ready: loadout.ready, creation: loadout.creation,
+            initialApplied: loadout.initialApplied, inventoryPending: loadout.inventoryPending,
+            equipmentPending: loadout.equipmentPending,
+            creationCompletionPending: loadout.creationCompletionPending, error: loadout.error },
           owned: Array.from(sp.storage.boyhouseOwnedReferences.references.values()).map(r => ({
             id: r.id, retired: r.retired, error: r.error, work: r.work.length, operation: !!r.operation })),
           operations: { errors: sp.storage.boyhouseNativeReferenceOperations.errors,
@@ -69,6 +74,10 @@ const observer = String.raw`
       if (status.phase !== 'ready' || !projection || Date.now() < waitUntil) return;
       assert(!sp.Ui.isMenuOpen('RaceSex Menu'), 'Precreated test profile unexpectedly needs character creation');
       if (phase === 'login') {
+        assert(loadout && loadout.ready && loadout.initialApplied && loadout.creation === 'idle' &&
+          !loadout.inventoryPending && !loadout.equipmentPending &&
+          !loadout.creationCompletionPending && !loadout.error,
+          'Projection became ready before the player loadout settled');
         assert(projection.instance === '', 'Initial world is not shared');
         original = inspect(1080569); controls = flags();
         assert(original && !original.disabled && !original.dead, 'Fixture original is unavailable before entry');

@@ -23,9 +23,10 @@ public:
   template <IntegralConstant T>
   BitStreamInputArchive& Serialize(const char* key, T&)
   {
-    // Compile time constant. Do nothing
-    // Maybe worth adding equality check
-    bs.IgnoreBytes(sizeof(typename T::value_type));
+    typename T::value_type actual{};
+    SerializationUtil::ReadFromBitStream(bs, actual);
+    if (actual != T::value)
+      throw std::runtime_error("Invalid binary constant");
     // spdlog::info("!!! deserialized integral constant {}", key);
     return *this;
   }
@@ -38,9 +39,10 @@ public:
     uint32_t n = 0;
     Serialize("size", n);
 
-    // TODO: check n before resizing, so that we don't allocate a huge vector
+    if (n > bs.GetNumberOfUnreadBits() / (sizeof(typename T::value_type) * 8))
+      throw std::runtime_error("Truncated binary string");
     for (size_t i = 0; i < n; ++i) {
-      typename T::value_type element;
+      typename T::value_type element{};
       Serialize("element", element);
       value.push_back(element);
     }
@@ -65,9 +67,19 @@ public:
     uint32_t n = 0;
     Serialize("size", n);
 
-    // TODO: check n before resizing, so that we don't allocate a huge vector
+    // Arithmetic elements have a fixed width; every compound wire element
+    // must consume at least one bit. Reject impossible counts before looping.
+    constexpr size_t minimumBits = [] {
+      using Element = typename T::value_type;
+      if constexpr (Arithmetic<Element> && !std::is_same_v<Element, bool>)
+        return sizeof(Element) * 8;
+      else
+        return size_t{ 1 };
+    }();
+    if (n > bs.GetNumberOfUnreadBits() / minimumBits)
+      throw std::runtime_error("Truncated binary container");
     for (size_t i = 0; i < n; ++i) {
-      typename T::value_type element;
+      typename T::value_type element{};
       Serialize("element", element);
       value.push_back(element);
     }
@@ -80,7 +92,7 @@ public:
     bool hasValue = false;
     Serialize("hasValue", hasValue);
     if (hasValue) {
-      typename T::value_type actualValue;
+      typename T::value_type actualValue{};
       Serialize("value", actualValue);
       value = actualValue;
     } else {
@@ -116,7 +128,7 @@ public:
       using SelectedType =
         typename std::variant_alternative<decltype(indexTag)::value,
                                           std::variant<Types...>>::type;
-      SelectedType value;
+      SelectedType value{};
       Serialize("value", value);
       variant = std::move(value);
     };

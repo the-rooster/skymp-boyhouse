@@ -17,6 +17,7 @@
 namespace prometheus {
 class Registry;
 }
+class CampaignVisibilityBarrier;
 
 class ScampServer : public Napi::ObjectWrap<ScampServer>
 {
@@ -56,6 +57,7 @@ public:
   Napi::Value BeginPacketEpoch(const Napi::CallbackInfo& info);
   Napi::Value GetPacketEpoch(const Napi::CallbackInfo& info);
   Napi::Value GetWorldBaseline(const Napi::CallbackInfo& info);
+  Napi::Value SetCampaignVisibilityCallbacks(const Napi::CallbackInfo& info);
 
   Napi::Value GetLocalizedString(const Napi::CallbackInfo& info);
   Napi::Value GetServerSettings(const Napi::CallbackInfo& info);
@@ -106,6 +108,7 @@ public:
 
 private:
   std::shared_ptr<PartOne> partOne;
+  std::shared_ptr<CampaignVisibilityBarrier> campaignVisibilityBarrier;
   std::shared_ptr<Networking::IServer> server;
   std::shared_ptr<Networking::MockServer> serverMock;
   std::shared_ptr<ScampServerListener> listener;

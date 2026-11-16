@@ -19,6 +19,52 @@ The [catalog analyzer](misc/boyhouse/DEPENDENCIES.md) scans all five owned maste
 
 Persistent personal/host journals, 23 Papyrus Quest state methods, four quest condition predicates, expired-context guards, and a read-only client journal feed are implemented. The new `questExecuteStage` trusted server API loads original PEX fragments into a campaign-scoped VM and commits journal changes and script variables together. It remains gated by experimental per-quest adapters; no complete vanilla quest is enabled. `mp "bh journal"` displays the diagnostic projection. See [the implementation contract and remaining gates](misc/boyhouse/QUESTS.md).
 
+## Reference queries and guarded world changes
+
+- The isolated runtime now exposes ten partial physical queries and five partial
+  visibility methods. All physical reads resolve the campaign owner or an
+  explicit private copy and validate saved state, binding identity and lifetime
+  at transaction commit. The capability registry contains **59 partial native
+  methods**, not 59 completed quest systems.
+- Supported enable/disable changes stage with journal, VM and inventory state.
+  A native/JS barrier gates every connected observer in the private phase,
+  advances packet epochs, then publishes fresh manifests and baselines after
+  subscription reconciliation. Failed preparation rolls back staged effects;
+  postcommit delivery failure quarantines observers without undoing committed
+  rewards. Reconnect identities and delayed acknowledgements are guarded.
+- New-character input is gated until the server accepts the assigned actor's
+  appearance. The client preserves a draft across same-character projection
+  refreshes and waits for an authoritative echo; binary decoding rejects
+  truncated values/containers and mismatched constants. Native creation
+  completion and settled engine loadout restoration still need acceptance.
+- Combined automated verification passed on 2026-11-16 UTC: **478 native cases,
+  374,719 assertions; 284 JavaScript tests; 39 Python tests**. The fresh-player
+  nested `OnLoad` regression and saved-dead-copy integration fixtures pass.
+  The full owned scan covered **2,274 quests and 14,026 PEX objects**; native
+  addon, full server protocol and projection smokes passed, along with SQLite
+  restart recovery of **32 disposable characters**. Evidence is in ignored
+  `artifacts/parallel-runtime-verify-2.log` (terminal exit 0). This is automated
+  coverage, not a completed native character-creation flow or a multiplayer
+  quest playthrough.
+- The fresh-character Skyrim run opened the creator after projection became
+  ready and held it for **45 seconds / 2,673 observations**, with no worn gear
+  or equipped weapons and gameplay still gated. The first native
+  `Ui.invokeIntA` call to `...onDoneClicked` with an empty argument array failed:
+  `_skyrimPlatform_indexInPool` was 0, outside `[34438, 34441)`. Completion,
+  appearance echo, loadout restoration and a phase round trip were not reached.
+  All original INIs were restored byte-for-byte, personal save hashes were
+  unchanged, no new saves remained and Skyrim closed. See
+  [the acceptance evidence](misc/boyhouse/CLIENT_RUNTIME.md#fresh-character-native-acceptance-on-2026-11-16-utc).
+  A separate projection rerun never launched: automatic approval review rejected
+  the combined prepare/launch action as "blocked by policy" without a reason;
+  its server and relay were closed. The passing automated results above remain
+  valid.
+- Fade, enable-parent propagation, latent execution and complete lifecycle remain
+  unsupported. A fresh `OnLoad` that performs nested visibility work is refused
+  while the outer barrier is active; the committed outer state is quarantined.
+  See [the precise transaction limits](misc/boyhouse/QUESTS.md#physical-reference-queries-and-visibility-mutations).
+  No vanilla adapters are enabled and **zero quests are certified playable**.
+
 ## Private reference load/recovery verification on 2026-11-16 UTC
 
 - The first player subscription to an explicit private copy now runs scoped `OnInit`, `OnCellLoad` and `OnLoad` handlers with supported inventory events, rewards and VM state in one transaction. A saved initialization marker prevents repeated `OnInit` rewards; failed handlers leave initialization retryable.

@@ -47,6 +47,8 @@ type EventTypes = {
     'worldModelReset': [],
     'campaignProjectionPending': [],
     'campaignProjectionReady': [],
+    'playerCreationComplete': [],
+    'playerLoadoutFailed': [{ generation: number; error: string }],
 
     'sendMessage': [SendMessageEvent<AnyMessage>],
     'sendRawMessage': [SendRawMessageEvent],

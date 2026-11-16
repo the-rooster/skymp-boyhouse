@@ -9,6 +9,7 @@ import { ReferenceSuppressionService } from './referenceSuppressionService';
 import { WorldCleanerService } from './worldCleanerService';
 import { RemoteServer } from './remoteServer';
 import { PlayerSpawnService } from './playerSpawnService';
+import { PlayerLoadoutService } from './playerLoadoutService';
 import { NetworkingService } from './networkingService';
 
 interface ControlLease { version: 1; enabled?: boolean[]; }
@@ -42,6 +43,7 @@ export class NativeWorldProjectionService extends ClientListener implements Proj
     private get suppression() { return this.controller.lookupListener(ReferenceSuppressionService).references; }
     private get owned() { return this.controller.lookupListener(OwnedReferenceService).references; }
     private get operations() { return this.controller.lookupListener(NativeReferenceOperationService).operations; }
+    private get loadout() { return this.controller.lookupListener(PlayerLoadoutService); }
 
     cancel(): void {
         this.blocked = true; this.target = undefined; this.references = []; this.acquired = 0; this.installed = false;
@@ -100,6 +102,8 @@ export class NativeWorldProjectionService extends ClientListener implements Proj
         const player = this.controller.lookupListener(PlayerSpawnService);
         if (player.status?.phase === 'failed') return { ready: false, error: player.status.error || 'Player spawn failed' };
         if (!player.isReady(this.spawnGeneration)) return { ready: false };
+        const loadout = this.loadout.projectionReadiness;
+        if (!loadout.ready) return loadout;
         const originals = this.controller.lookupListener(RemoteServer).getOriginalApplicationProgress();
         if (!originals.ready) return originals;
         const ids = this.references.map(reference => reference.original);
@@ -123,7 +127,7 @@ export class NativeWorldProjectionService extends ClientListener implements Proj
     }
 
     private update(): void {
-        if (this.loading || (!this.blocked && !this.controls.enabled && !this.target)) return;
+        if (this.loading || (!this.blocked && !this.controls.enabled && !this.target && !this.loadout.blocksGameplayInput)) return;
         try {
             this.reconcileControls();
             const target = this.target;
@@ -150,7 +154,10 @@ export class NativeWorldProjectionService extends ClientListener implements Proj
             this.view.setProjectionReferences(this.references);
             this.view.setFormViewUpdateAllowed(true);
             this.installed = true;
-        } catch (error) { this.error = String(error); logError(this, 'Applying campaign world failed', error); }
+        } catch (error) {
+            this.error = String(error); logError(this, 'Applying campaign world failed', error);
+            if (this.loadout.blocksGameplayInput) this.loadout.failCreation(this.error);
+        }
     }
 
     private controlFlags(): boolean[] {
@@ -163,22 +170,33 @@ export class NativeWorldProjectionService extends ClientListener implements Proj
 
     private reconcileControls(): void {
         if (!this.sp.Game.getPlayer()) return;
-        if (this.blocked && !this.controls.enabled) {
+        const creationBlocked = this.loadout.blocksGameplayInput;
+        const blocking = this.blocked || creationBlocked;
+        if (blocking && !this.controls.enabled) {
             const flags = this.controlFlags();
             // Camera/looking remain available. Only flags changed by this lease
             // are restored; controls already disabled by the game stay disabled.
             this.controls.enabled = flags.map((enabled, index) => enabled && index !== 2 && index !== 3);
-            const mask = this.controls.enabled;
-            this.sp.Game.disablePlayerControls(mask[0], mask[1], false, false, mask[4], mask[5], mask[6], mask[7], 0);
-            if (this.controlFlags().some((enabled, index) => mask[index] && enabled))
-                throw Error('Native player controls did not become blocked');
-        } else if (!this.blocked && this.controls.enabled) {
-            const current = this.controlFlags();
-            const mask = this.controls.enabled.map((owned, index) => owned && !current[index]);
-            this.sp.Game.enablePlayerControls(mask[0], mask[1], false, false, mask[4], mask[5], mask[6], mask[7], 0);
-            if (this.controlFlags().some((enabled, index) => mask[index] && !enabled))
-                throw Error('Native player controls did not restore');
-            this.controls.enabled = undefined;
         }
+        const owned = this.controls.enabled;
+        if (!owned) return;
+        // Keep the movement/action lease continuously through projection ->
+        // creation. The creator needs menu/camera controls even during a later
+        // same-actor projection, but ordinary gameplay stays disabled.
+        const desired = [blocking, blocking, false, false, blocking,
+            blocking && !this.loadout.creationMenuActive, blocking, blocking];
+        const current = this.controlFlags();
+        const disable = desired.map((hold, index) => hold && current[index]);
+        const enable = owned.map((held, index) => held && !desired[index] && !current[index]);
+        if (disable.some(Boolean))
+            this.sp.Game.disablePlayerControls(disable[0], disable[1], false, false, disable[4], disable[5], disable[6], disable[7], 0);
+        if (enable.some(Boolean))
+            this.sp.Game.enablePlayerControls(enable[0], enable[1], false, false, enable[4], enable[5], enable[6], enable[7], 0);
+        const observed = this.controlFlags();
+        if (observed.some((enabled, index) => desired[index] && enabled))
+            throw Error('Native player controls did not become blocked');
+        if (observed.some((enabled, index) => enable[index] && !enabled))
+            throw Error('Native player controls did not restore');
+        if (!blocking) this.controls.enabled = undefined;
     }
 }

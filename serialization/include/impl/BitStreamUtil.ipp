@@ -39,14 +39,14 @@ template <class T, size_t N>
 void ReadFromBitStream(SLNet::BitStream& stream, std::array<T, N>& arr)
 {
   for (size_t i = 0; i < N; ++i) {
-    stream.Read(arr[i]);
+    ReadFromBitStream(stream, arr[i]);
   }
 }
 
 template <class T>
 T ReadFromBitStream(SLNet::BitStream& stream)
 {
-  T value;
+  T value{};
   ReadFromBitStream(stream, value);
   return value;
 }

@@ -9,6 +9,7 @@
 #include "MpObjectReference.h"
 #include "QuestJournal.h"
 #include "libespm/GroupUtils.h"
+#include "libespm/RecordHeaderAccess.h"
 #include "papyrus-vm/Reader.h"
 #include "papyrus-vm/Utils.h"
 #include "script_classes/PapyrusClassesFactory.h"
@@ -18,6 +19,7 @@
 #include <Timer.h>
 #include <algorithm>
 #include <antigo/Context.h>
+#include <cstring>
 #include <deque>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -26,6 +28,7 @@
 #include <save_storages/AsyncSaveStorage.h> // UpsertFailedException
 #include <save_storages/ISaveStorage.h>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace {
 
@@ -60,6 +63,10 @@ struct WorldState::Impl
   std::array<std::shared_ptr<std::vector<uint32_t>>, 0x100>
     allFormsByModIndexCache;
   std::vector<uint32_t> attachEspmRecordFailures;
+  std::function<void(MpActor&)> beforeCampaignVisibility;
+  std::function<void(MpActor&, bool)> afterCampaignVisibility;
+  bool campaignVisibilityCommitting = false;
+  std::optional<std::unordered_set<uint32_t>> campaignEnableLinks;
 };
 
 WorldState::WorldState()
@@ -86,6 +93,7 @@ const std::chrono::steady_clock::time_point& WorldState::GetStartPoint() const
 void WorldState::AttachEspm(espm::Loader* espm_,
                             const FormCallbacksFactory& formCallbacksFactory_)
 {
+  pImpl->campaignEnableLinks.reset();
   espm = espm_;
   formCallbacksFactory = formCallbacksFactory_;
   espmCache.reset(new espm::CompressedFieldsCache);
@@ -363,9 +371,60 @@ void WorldState::RequestSave(MpObjectReference& ref)
   pImpl->changesByIdxEmpty = false;
 }
 
+void WorldState::SetCampaignVisibilityCallbacks(
+  std::function<void(MpActor&)> beforeCommit,
+  std::function<void(MpActor&, bool)> afterCommit)
+{
+  if (pImpl->campaignVisibilityCommitting)
+    throw std::runtime_error(
+      "Cannot replace an active campaign visibility barrier");
+  if (bool(beforeCommit) != bool(afterCommit))
+    throw std::invalid_argument(
+      "Both campaign visibility callbacks are required");
+  pImpl->beforeCampaignVisibility = std::move(beforeCommit);
+  pImpl->afterCampaignVisibility = std::move(afterCommit);
+}
+
+bool WorldState::HasCampaignEnableLinks(uint32_t original)
+{
+  if (!pImpl->campaignEnableLinks) {
+    std::unordered_set<uint32_t> linked;
+    const auto& browser = GetEspm().GetBrowser();
+    // Browser's REFR collection contains both placed REFR and ACHR records;
+    // ACHR is not a separate GetRecordsByType query. Distinct resolves winning
+    // overrides for both kinds before their enable links are indexed.
+    for (const auto& record : browser.GetDistinctRecordsByType("REFR")) {
+      if (record.rec->IsDeleted())
+        continue;
+      bool seen = false;
+      espm::RecordHeaderAccess::IterateFields(
+        record.rec,
+        [&](const char* tag, uint32_t size, const char* data) {
+          if (std::memcmp(tag, "XESP", 4))
+            return;
+          if (seen || size != 8)
+            throw std::runtime_error(
+              "Invalid campaign enable-parent metadata");
+          seen = true;
+          uint32_t parent;
+          std::memcpy(&parent, data, sizeof(parent));
+          if (parent) {
+            linked.insert(record.ToGlobalId(record.rec->GetId()));
+            linked.insert(record.ToGlobalId(parent));
+          }
+        },
+        GetEspmCache());
+    }
+    pImpl->campaignEnableLinks.emplace(std::move(linked));
+  }
+  return pImpl->campaignEnableLinks->contains(original);
+}
+
 void WorldState::CommitCampaignInventory(
   MpActor& owner, const std::string& journal,
-  const std::vector<CampaignInventoryChange>& changes)
+  const std::vector<CampaignInventoryChange>& changes,
+  const std::vector<CampaignVisibilityChange>& visibility,
+  const std::function<void()>& validateReads)
 {
   if (pImpl->formLoadingInProgress)
     throw std::runtime_error("Campaign commit during world loading");
@@ -375,8 +434,12 @@ void WorldState::CommitCampaignInventory(
   struct Prepared
   {
     MpObjectReference* reference;
+    std::shared_ptr<MpForm> lifetime;
+    nlohmann::json initial;
+    uint64_t epoch;
     MpChangeForm live;
     bool inventoryChanged = false;
+    bool visibilityChanged = false;
   };
   std::map<uint32_t, Prepared> prepared;
   auto prepare = [&](MpObjectReference& reference) -> Prepared& {
@@ -388,8 +451,12 @@ void WorldState::CommitCampaignInventory(
     auto found = prepared.find(id);
     if (found != prepared.end())
       return found->second;
+    const auto saved = reference.GetChangeForm();
     return prepared
-      .emplace(id, Prepared{ &reference, reference.GetChangeForm() })
+      .emplace(id,
+               Prepared{ &reference, LookupFormByIdNoLoad(id),
+                         MpChangeForm::ToJson(saved),
+                         reference.GetWorldInstanceEpoch(), saved })
       .first->second;
   };
   auto& ownerChange = prepare(owner);
@@ -406,6 +473,93 @@ void WorldState::CommitCampaignInventory(
     entry.live.inv = change.inventory;
     entry.live.baseContainerAdded = true;
   }
+  std::set<uint32_t> visibilityIds;
+  for (const auto& change : visibility) {
+    if (!change.reference ||
+        !visibilityIds.insert(change.reference->GetFormId()).second ||
+        CampaignReferenceBinding::Context(*change.reference).first != &owner)
+      throw std::runtime_error("Invalid campaign visibility participant");
+    change.reference->ValidateCampaignVisibilityChange();
+    auto& entry = prepare(*change.reference);
+    entry.visibilityChanged = entry.live.isDisabled != change.disabled;
+    entry.live.isDisabled = change.disabled;
+  }
+  const bool changesVisibility =
+    std::any_of(prepared.begin(), prepared.end(), [](const auto& item) {
+      return item.second.visibilityChanged;
+    });
+  auto beforeVisibility = pImpl->beforeCampaignVisibility;
+  auto afterVisibility = pImpl->afterCampaignVisibility;
+  if (changesVisibility &&
+      (!beforeVisibility || !afterVisibility ||
+       pImpl->campaignVisibilityCommitting))
+    throw std::runtime_error(
+      "Campaign visibility requires an available projection barrier");
+  struct VisibilityGuard
+  {
+    bool& active;
+    bool owns;
+    MpActor& owner;
+    const std::function<void(MpActor&, bool)>& finish;
+    bool pendingCleanup = false;
+    ~VisibilityGuard()
+    {
+      if (!owns)
+        return;
+      if (pendingCleanup) {
+        try {
+          finish(owner, false);
+        } catch (...) {
+        } // Preserve the failure which prevented publication.
+      }
+      active = false;
+    }
+  } guard{ pImpl->campaignVisibilityCommitting, changesVisibility, owner,
+           afterVisibility };
+  if (changesVisibility) {
+    pImpl->campaignVisibilityCommitting = true;
+    guard.pendingCleanup = true;
+    beforeVisibility(owner);
+  }
+  validateReads();
+  for (const auto& [id, entry] : prepared) {
+    if (LookupFormByIdNoLoad(id) != entry.lifetime ||
+        entry.reference->GetWorldInstanceEpoch() != entry.epoch ||
+        MpChangeForm::ToJson(entry.reference->GetChangeForm()) !=
+          entry.initial)
+      throw std::runtime_error(
+        "Campaign commit context changed at its projection barrier");
+    if (entry.visibilityChanged)
+      entry.reference->ValidateCampaignVisibilityChange();
+  }
+
+  // Clone grids and the current save buffer after the barrier callback, so
+  // unrelated callback work is not overwritten by an older world snapshot.
+  std::optional<decltype(grids)> nextGrids;
+  std::optional<decltype(hosters)> nextHosters;
+  if (changesVisibility) {
+    nextGrids.emplace(grids);
+    nextHosters.emplace(hosters);
+  }
+  std::set<uint32_t> clonedGrids;
+  for (const auto& [id, entry] : prepared) {
+    if (!entry.visibilityChanged)
+      continue;
+    const auto cell = entry.live.worldOrCellDesc.ToFormId(espmFiles);
+    auto& grid = nextGrids->operator[](cell).grid;
+    if (clonedGrids.insert(cell).second)
+      grid = std::make_shared<GridImpl<MpObjectReference*>>(*grid);
+    if (entry.live.isDisabled) {
+      grid->Forget(entry.reference);
+      for (auto lease = nextHosters->begin(); lease != nextHosters->end();) {
+        if (lease->first == id || lease->second == id)
+          lease = nextHosters->erase(lease);
+        else
+          ++lease;
+      }
+    } else
+      entry.reference->MoveOnGrid(*grid);
+  }
   size_t size = pImpl->changesByIdx.size();
   for (auto& [id, entry] : prepared) {
     // All serialization and allocation failures occur before publication.
@@ -420,24 +574,60 @@ void WorldState::CommitCampaignInventory(
   for (const auto& [id, entry] : prepared)
     saveBatch[entry.reference->GetIdx()] = entry.live;
   static_assert(noexcept(pImpl->changesByIdx.swap(saveBatch)));
+  static_assert(noexcept(grids.swap(*nextGrids)));
+  static_assert(noexcept(hosters.swap(*nextHosters)));
   for (auto& [id, entry] : prepared) {
     entry.reference->CommitPreparedCampaignChange(entry.live);
+  }
+  if (nextGrids) {
+    grids.swap(*nextGrids);
+    hosters.swap(*nextHosters);
   }
   pImpl->changesByIdx.swap(saveBatch);
   pImpl->changesByIdxEmpty = false;
   // Publication has succeeded. A notification failure must not pretend the
   // committed quest was rolled back, or allow its rewards to be run twice.
+  bool synchronized = true;
+  for (const auto& [id, entry] : prepared) {
+    if (!entry.visibilityChanged)
+      continue;
+    try {
+      if (LookupFormByIdNoLoad(id) != entry.lifetime ||
+          entry.reference->GetWorldInstanceEpoch() != entry.epoch)
+        throw std::runtime_error(
+          "Committed campaign reference is no longer available");
+      entry.reference->ReconcileCampaignVisibility();
+    } catch (...) {
+      synchronized = false;
+    }
+  }
   for (const auto& [id, entry] : prepared) {
     if (!entry.inventoryChanged)
       continue;
     try {
       entry.reference->SendInventoryUpdate();
     } catch (...) {
+      synchronized = false;
       try {
         spdlog::error(
           "Campaign inventory notification {:x} could not be queued", id);
       } catch (...) {
       } // State is already committed, even if logging fails.
+    }
+  }
+  if (changesVisibility) {
+    if (LookupFormByIdNoLoad(owner.GetFormId()) != ownerChange.lifetime ||
+        owner.GetWorldInstanceEpoch() != ownerChange.epoch)
+      synchronized = false;
+    guard.pendingCleanup = false;
+    try {
+      afterVisibility(owner, synchronized);
+    } catch (...) {
+      // The barrier remains closed; committed rewards must not be retried.
+      try {
+        spdlog::error("Campaign visibility completion could not be delivered");
+      } catch (...) {
+      }
     }
   }
 }

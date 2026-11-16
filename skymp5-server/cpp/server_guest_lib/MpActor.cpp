@@ -410,6 +410,15 @@ void MpActor::Disable()
   RejectAllSnippets("Client effect actor was disabled");
 }
 
+void MpActor::ValidateCampaignVisibilityChange() const
+{
+  MpObjectReference::ValidateCampaignVisibilityChange();
+  if (!pImpl->disableEventSinks.empty() || !pImpl->snippetPromises.empty() ||
+      pImpl->isRespawning)
+    throw std::runtime_error("Actor visibility requires transactional "
+                             "occupation, effects or respawn handling");
+}
+
 void MpActor::SendToUser(const IMessageBase& message, bool reliable)
 {
   if (callbacks->sendToUser) {

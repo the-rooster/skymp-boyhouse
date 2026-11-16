@@ -29,7 +29,7 @@ The runner now implements:
 - `GetVMQuestVariable` (index 629) reads the owned CIS2 variable name from the active campaign's conditional quest script. Int/Float/Bool declarations, case-insensitive names, inherited variables, PEX defaults and persisted values are supported. Conditional flags come from each PEX's own user-flag table. The target must be running and adapter-enabled; missing/ambiguous scripts, nonconditional variables, type mismatches and nonfinite values fail the transaction. This does not initialize a quest or run property getters.
 - Stage conditions may compare against a GLOB (`UseGlobal`). The comparison is resolved in the same campaign immediately before each log, so earlier fragments' uncommitted writes affect later branches. Other special condition flags remain unsupported. Regressions use MQ101's original faction-path conditions and CWObj's original cross-quest/global comparisons with controlled fragment bodies, including character reload, guest isolation and rollback. They are condition tests, not playthroughs of those quests.
 - Nested `SetStage`/`SetCurrentStageID` calls execute target fragments in the same VM, campaign, instruction budget and transaction. Cross-quest calls require the target quest's own adapter opt-in. Visited stages break cycles; invalid targets and failures roll back every affected quest. `Start`, `Stop` and `Reset` execution still require lifecycle/event support.
-- One in-memory commit for journal changes, script variables and the supported inventory natives described below. Unsupported natives, missing bindings, stale contexts, invalid property targets, invalid array access, runaway execution, and latent calls throw and discard the transaction. A VM-wide instruction budget also covers nested calls and synchronous inventory handlers. Other world-effect natives remain absent until their effects can participate in the transaction.
+- One in-memory commit for journal changes, script variables, supported inventory effects and the private-copy visibility subset described below. Unsupported natives, missing bindings, stale contexts, invalid property targets, invalid array access, runaway execution, and latent calls throw before publication and discard the transaction. A VM-wide instruction budget also covers nested calls and synchronous inventory handlers. Postcommit replication failures quarantine observers; they do not undo an already published reward or visibility change.
 
 Original MQ102 stage 100 and DA04 stage 5 are execution fixtures. The DA04 fragment displays objective 5; a guest's execution changes only the host's journal. MQ102 stage 100 has no visible objective effect from a fresh journal. Other stages reach cross-quest adapter gates, map-marker effects, alias operations and nested lifecycle execution. Their first failure can move as earlier dependencies are implemented. Those operations fail rather than being omitted. These fixtures do not start or play the quests: no initialization events, complete alias filling/effects, dialogue, scene execution, rewards, or world overlays are supplied. Repeated stages are currently idempotent, even for quests that eventually need repeatable-stage semantics.
 
@@ -81,7 +81,7 @@ For an adapter-enabled running quest, target getters can resolve forced referenc
 
 The bounded metadata parser reads every owned quest alias, including signed creation descriptors, reference/location distinctions, optional legacy inventory counts, conditions and unknown fields. The owned catalog contains 14,514 reference aliases and 1,237 location aliases. This is format coverage, not playable quest coverage.
 
-Alias bindings, alias-script variables, globals and journal changes commit together with supported inventory effects. Failure after a binding, script or inventory mutation rolls back the whole transaction. Character reload retains bindings; quest reset removes that quest's bindings and script roots while preserving other quests and campaign globals. General live world-state transactions remain future work.
+Alias bindings, alias-script variables, globals and journal changes commit together with supported inventory and visibility effects. Failure before publication discards the staged effects together. Character reload retains bindings; quest reset removes that quest's bindings and script roots while preserving other quests and campaign globals. Broader live world-state transactions remain future work.
 
 ### Inventory effects and explicit private references
 
@@ -97,6 +97,60 @@ solve orphan visibility and instance naming after character-ID reuse.
 Binding refuses a copy with existing shared-VM script instances. Bound copies
 reject ordinary script initialization and shared-VM event entry; unsupported
 external events cannot silently run their scripts in the global VM.
+
+### Physical reference queries and visibility mutations
+
+The isolated runner adds ten partial queries: `GetPositionX/Y/Z`,
+`GetAngleX/Y/Z`, `Actor.IsDead`, `GetDistance`, `GetParentCell`, and
+`GetWorldSpace`. Coordinates and angles come from authoritative server snapshots
+(angles are degrees), not a client engine read. PlayerRef resolves to the
+campaign owner; other physical references require an explicit private-copy
+binding. Reads participate in the journal transaction and validate registered
+lifetimes, phase epochs, saved state and binding identity before commit, even
+when only the quest journal changes. They see staged inventory/visibility writes.
+
+Distance requires the same interior or worldspace and finite, representable
+coordinates. `GetParentCell` accepts a stored CELL; a WRLD-only exterior location
+is refused until there is a campaign cell index. `GetWorldSpace` resolves a WRLD
+or an exterior CELL's owned parent, and returns None for an interior. These are
+native-method subsets; the corresponding condition functions, general spatial
+queries, movement and AI behavior remain separate work.
+
+`IsDisabled`, `Enable`, `Disable`, `EnableNoWait`, and `DisableNoWait` form the
+five-method visibility subset. Mutations require a bound non-player copy in the
+owner's private phase and `fade=false`. Enable-parent children and parents are
+both rejected; propagation is not implemented. Occupied references and actors
+with disable callbacks, pending snippets or respawn work are also rejected.
+Supported calls stage state until commit; they do not invoke the ordinary
+shared-reference Enable/Disable path or allow latent execution.
+
+A net visibility change requires atomic storage and an installed projection
+barrier. The native barrier captures every connected assigned actor in the
+private phase, rejects legacy clients without packet epochs, and closes all
+gameplay gates before calling the projection preparation hook. Every observer
+must advance its token while connection identity, actor lifetime and phase epoch
+remain unchanged. The journal, VM, inventory, visibility, grid membership, host
+leases and pending save batch then publish together; subscription reconciliation
+and fresh manifests/baselines follow while gameplay remains blocked. Publication
+may rotate tokens again, or defer until client hello. Only a valid current-token
+projection acknowledgement releases gameplay.
+
+Every entered preparation has paired cleanup, including preparation exceptions.
+An abort, reconciliation failure or failed publication receipt quarantines the
+captured connections and attempts to close them. Delayed acknowledgements cannot
+reopen a quarantined native gate; cleanup does not close a replacement connection
+that reused a numeric user slot. After publication, failure is reported as
+desynchronization rather than pretending committed state rolled back. Save ticks
+still run asynchronously: these acknowledgements do not establish disk durability
+(see [storage limits](STORAGE.md)).
+
+A fresh enable can trigger first-subscription `OnLoad` while the outer visibility
+barrier is still active. A visibility mutation in that nested load is refused;
+the outer change has already committed and observers are quarantined. Deferring
+or queuing that lifecycle work remains unimplemented. Fade, enable-parent
+propagation, latent continuations, full event lifecycle and native multi-client
+quest acceptance remain open. These partial methods enable no quest adapters and
+certify no quests.
 
 ### Private reference loading and recovery
 
@@ -409,7 +463,7 @@ Scene and TopicInfo `GetOwningQuest` now return a quest object in the active cam
 
 Mutations require the owner's private `private.boyhouse.questAdapters` array to contain the quest's stable key. This is a trusted adapter opt-in, **not automatic evidence that an adapter is correct**. No production vanilla adapter is supplied or enabled. The fixtures explicitly opt in selected quests to validate plumbing, conditional selection, and an original fragment; they do not play or certify Before the Storm.
 
-The persisted field is `private.boyhouse.questJournal`. Unknown save versions are refused rather than reset. The implementation validates before writing and uses the existing character save path. The optional [SQLite driver](STORAGE.md) commits each complete save batch atomically across change forms. The supported inventory subset stages rewards with journal/VM state, but general world overlays and acknowledgements after disk commit remain unfinished. The ledger limit is 8 MiB. The diagnostic feed currently sends full snapshots, capped at 1 MiB; exceeding that limit returns unavailable rather than truncating progress. Delta/chunk transport is required before full campaign rollout. VM epochs are process-local guards, not network transition acknowledgements or VM persistence.
+The persisted field is `private.boyhouse.questJournal`. Unknown save versions are refused rather than reset. The implementation validates before writing and uses the existing character save path. The optional [SQLite driver](STORAGE.md) commits each complete save batch atomically across change forms. Supported inventory and visibility effects stage with journal/VM state, but broader world mutations and acknowledgements after disk commit remain unfinished. The ledger limit is 8 MiB. The diagnostic feed currently sends full snapshots, capped at 1 MiB; exceeding that limit returns unavailable rather than truncating progress. Delta/chunk transport is required before full campaign rollout. VM epochs are process-local guards, not network transition acknowledgements or VM persistence.
 
 ## Catalog-wide automation
 
@@ -421,9 +475,9 @@ The [dependency analyzer](DEPENDENCIES.md) discovers shared work across the full
 | --- | --- |
 | Original quest execution | Extend the implemented scoped fragment runner with startup/stop events, alias filling and alias scripts, nested quest lifecycle transitions, repeatable stages, and the remaining condition/native semantics. The existing global VM must not become an alternate campaign-effect path. |
 | VM persistence | Shared arrays, variables, globals and alias bindings now persist; add alias lifecycle, timers, latent continuations, content hashes and content migrations. Restart during a stage/reward must neither lose nor duplicate effects. |
-| World overlays | Explicit entry/recovery prepares private references; add automatic area entry and client projection, then extend isolated death/enable state, inventories, globals, factions, locations, doors, and encounters with their full mutation/event semantics. Filtering alone hides shared references. |
+| World overlays | Explicit entry/recovery prepares private references and experimental projection replaces originals. Extend the transactional visibility subset with enable-parent propagation and lifecycle, plus death, inventory, globals, factions, locations, doors and encounters with their complete mutation/event semantics. Add automatic area entry and broader native acceptance. |
 | Dialogue and story | Implement topic/response selection, conditions, aliases, scenes, packages, story-manager events, radiants, followers, and quest item/reward behavior. Every mutating effect must carry campaign context. |
-| Client engine | Port/audit Skyrim Platform for installed runtime 1.7.104; reset/rebind local world state when changing phases; integrate journal/objective markers without rerunning client fragments; acknowledge transitions. See [the native runtime audit](CLIENT_RUNTIME.md). Current native build is not proven compatible with that runtime. |
+| Client engine | Expand the experimental Skyrim Platform 1.7.104 port and the single-client projection round-trip evidence to new-character completion, general world restoration, multiple real clients and journal/objective markers without rerunning client fragments. See [the native runtime audit](CLIENT_RUNTIME.md). |
 | In-game quest coverage | For every quest and relevant branch, exercise solo and guest play, divergent histories, late joins, party removal, disconnects and restart mid-scene/mid-reward on actual Skyrim clients. Individual quests are integration tests; the completion target is the full five-master campaign. |
 | Full content | Cover main quest, guilds, civil war, side/radiant quests, and DLC. Track branches and inter-quest dependencies rather than assuming successful SetStage equals support. |
 | Community release | Test 16/32 real or representative clients, load/recovery, reward idempotency, content-version agreement, authentication, and packaging. |

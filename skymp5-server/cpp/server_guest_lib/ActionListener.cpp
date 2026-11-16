@@ -17,6 +17,8 @@
 #include "gamemode_events/UpdateAppearanceAttemptEvent.h"
 #include "gamemode_events/UpdateEquipmentAttemptEvent.h"
 #include "script_objects/EspmGameObject.h"
+#include <algorithm>
+#include <cmath>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 #include <spdlog/spdlog.h>
@@ -114,9 +116,14 @@ bool ActionListener::IsMessageAllowed(Networking::UserId userId, MsgType type,
   const auto& users = partOne.serverState.userInfo;
   if (userId >= users.size() || !users[userId])
     return true;
-  return type == MsgType::CustomPacket ||
-    (!users[userId]->gameplayBlocked &&
-     (users[userId]->packetEpoch.empty() || hasVerifiedEpoch));
+  if (type == MsgType::CustomPacket)
+    return true; // The control-channel allowlist is checked below.
+  if (users[userId]->gameplayBlocked ||
+      (!users[userId]->packetEpoch.empty() && !hasVerifiedEpoch))
+    return false;
+  const auto* actor = partOne.serverState.ActorByUser(userId);
+  return !actor || !actor->IsRaceMenuOpen() ||
+    type == MsgType::UpdateAppearance;
 }
 
 bool ActionListener::IsPacketEpochCurrent(Networking::UserId userId,
@@ -134,15 +141,21 @@ void ActionListener::OnCustomPacket(const RawMessageData& rawMsgData,
   simdjson::dom::parser parser;
   auto content = parser.parse(msg.contentJsonDump).value();
   const auto& users = partOne.serverState.userInfo;
+  const auto* actor =
+    rawMsgData.userId < users.size() && users[rawMsgData.userId]
+    ? partOne.serverState.ActorByUser(rawMsgData.userId)
+    : nullptr;
   if (rawMsgData.userId < users.size() && users[rawMsgData.userId] &&
       (users[rawMsgData.userId]->gameplayBlocked ||
+       (actor && actor->IsRaceMenuOpen()) ||
        (!users[rawMsgData.userId]->packetEpoch.empty() &&
         !rawMsgData.hasVerifiedEpoch))) {
     std::string_view type;
+    // Creation retains the projection handshake, but neither a second login
+    // nor custom gameplay may bypass the new-character gate.
     if (content["customPacketType"].get(type) != simdjson::SUCCESS ||
         (type != "boyhouse.projection" &&
-         (type != "loginWithSkympIo" ||
-          partOne.serverState.ActorByUser(rawMsgData.userId))))
+         (type != "loginWithSkympIo" || actor)))
       return;
   }
   for (auto& listener : partOne.GetListeners()) {
@@ -247,15 +260,23 @@ void ActionListener::OnUpdateAppearance(const RawMessageData& rawMsgData,
                                         const UpdateAppearanceMessage& msg)
 {
   MpActor* actor = partOne.serverState.ActorByUser(rawMsgData.userId);
-  if (!actor || !msg.data.has_value()) {
+  if (!actor || !msg.data.has_value() || msg.idx != actor->GetIdx()) {
     return;
   }
+  const auto finite = [](float value) { return std::isfinite(value); };
+  if (!finite(msg.data->weight) ||
+      !std::all_of(msg.data->options.begin(), msg.data->options.end(),
+                   finite) ||
+      !std::all_of(msg.data->presets.begin(), msg.data->presets.end(), finite))
+    return;
 
   const bool isAllowed = actor->IsRaceMenuOpen();
 
   if (isAllowed) {
-    actor->SetRaceMenuOpen(false);
+    // Store the accepted snapshot before opening gameplay. The reliable echo
+    // includes the owner and is wrapped once with each recipient's epoch.
     actor->SetAppearance(&msg.data.value());
+    actor->SetRaceMenuOpen(false);
     SendToNeighbours(msg.idx, rawMsgData, true);
   }
 

@@ -51,9 +51,7 @@ Generated static analysis. Counts include internal/helper quests and potential d
 | --- | ---: |
 | quest.stop | 877 |
 | utility.wait | 444 |
-| objectreference.disable | 441 |
 | actor.isinfaction | 386 |
-| objectreference.enable | 385 |
 | actor.setfactionrank | 332 |
 | actor.removefromfaction | 301 |
 | actor.setactorvalue | 283 |
@@ -66,8 +64,6 @@ Generated static analysis. Counts include internal/helper quests and potential d
 | actor.kill | 210 |
 | referencealias.forcerefto | 210 |
 | actor.setrelationshiprank | 205 |
-| objectreference.getparentcell | 203 |
-| objectreference.getdistance | 200 |
 | objectreference.delete | 199 |
 | actor.stopcombat | 198 |
 | game.addachievement | 192 |
@@ -77,8 +73,12 @@ Generated static analysis. Counts include internal/helper quests and potential d
 | cell.isattached | 163 |
 | alias.registerforsingleupdate | 160 |
 | actor.attachashpile | 146 |
-| actor.isdead | 146 |
 | actor.setcriticalstage | 146 |
+| game.incrementstat | 146 |
+| alias.registerforsinglelosgain | 145 |
+| keyword.sendstoryevent | 133 |
+| form.unregisterforupdate | 124 |
+| scene.stop | 119 |
 
 ## Most widely referenced missing condition functions
 
@@ -118,7 +118,7 @@ Implement shared capabilities, then rerun this report and the regression suites.
 
 ## Reproducibility
 
-Capability registry SHA-256: dbe7c4dc4998264bc1ff9616288efc694f554647c4466c2f9537aaa4cabbafb4
+Capability registry SHA-256: f29140fb8e2dee8ad75c11973cda315c3de2dc10e540eecea1436188f0ca79ef
 
 - Skyrim.esm: e198c3b85e5e48e0c92a6580d8f66e644256b68d812ee32b61735cf9b753df73
 - Update.esm: b298b0f65fa0127fd13c1f5ef6bb30eaf9d21fd19f5e6f8f91f829c9007d3280

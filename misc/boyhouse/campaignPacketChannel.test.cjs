@@ -154,9 +154,13 @@ function harness(version = '2.1.0') {
   const packets = [], sent = [], errors = [];
   let destroyed = 0, created = 0;
   const model = { forms: [{ idx: 42, refrId: 0xff000001 }], playerCharacterFormIdx: 0 };
-  class RemoteServer {}
+  class RemoteServer {} class PlayerLoadoutService {}
+  const loadout = { blocksGameplayInput: false, generation: 1, projectionReadiness: { ready: true } };
   const controller = { on: (...args) => native.on(...args), once: (...args) => native.once(...args), emitter,
-    lookupListener: type => { assert.equal(type, RemoteServer); return { getWorldModel: () => model }; } };
+    lookupListener: type => {
+      if (type === PlayerLoadoutService) return loadout;
+      assert.equal(type, RemoteServer); return { getWorldModel: () => model };
+    } };
   const sp = { storage: {}, decodeUtf8: bytes => new TextDecoder().decode(bytes), mpClientPlugin: {
     getVersion: () => version, send: (message, reliable) => sent.push({ message: JSON.parse(message), reliable }),
     sendRaw: (bytes, length, reliable) => sent.push({ raw: Array.from(new Uint8Array(bytes)), length, reliable }),
@@ -167,10 +171,11 @@ function harness(version = '2.1.0') {
     '../../logging': { logTrace() {}, logError: (...args) => errors.push(args) },
     '../../lib/errors': { NeverError: Error }, '../../messages': load('messages.ts', {}),
     './clientListener': { ClientListener: class {} }, './remoteServer': { RemoteServer },
+    './playerLoadoutService': { PlayerLoadoutService },
     '../../campaign/campaignPacketChannel': { CampaignPacketChannel },
   });
   const service = new NetworkingService(sp, controller);
-  return { service, emitter, sent, errors, packets, native,
+  return { service, emitter, sent, errors, packets, native, loadout,
     get destroyed() { return destroyed; }, get created() { return created; },
     message: message => packets.push(['message', new TextEncoder().encode(JSON.stringify(message)).buffer, '']),
     tick: () => native.emit('tick'),
@@ -270,4 +275,39 @@ test('NetworkingService closes epoch-aware input when native JSON is malformed',
   assert.equal(h.destroyed, 0);
   h.tick();
   assert.equal(h.destroyed, 1);
+});
+
+test('creation blocks every gameplay output while permitting only the retained appearance and projection control', () => {
+  const h = harness(); h.service.selectPacketEpoch(a); h.service.releasePacketEpoch(a);
+  h.loadout.blocksGameplayInput = true;
+  const pending = { generation: 1, actorIdx: 42, data: { name: 'Finished character' } };
+  h.loadout.pendingAppearance = pending;
+  for (const message of [move, { t: 4, idx: 43, data: pending.data },
+    { t: 4, idx: 42, data: { ...pending.data } },
+    { t: 1, contentJsonDump: JSON.stringify({ customPacketType: 'boyhouse.questJournal', action: 'subscribe' }) }])
+    h.emitter.emit('sendMessage', { message, reliability: 'reliable' });
+  h.emitter.emit('sendMessageWithRefrId', { message: { t: 2, _refrId: 0xff000001 }, reliability: 'unreliable' });
+  h.emitter.emit('sendRawMessage', { rawMessage: Uint8Array.from([134, 2, 5]).buffer, reliability: 'unreliable' });
+  assert.equal(h.sent.length, 0);
+  h.emitter.emit('sendMessageWithRefrId', { message: { t: 4, data: pending.data }, reliability: 'reliable' });
+  assert.equal(h.sent.length, 1); assert.equal(h.sent[0].message.message.idx, 42);
+  h.emitter.emit('sendMessage', { message: { t: 1,
+    contentJsonDump: JSON.stringify({ customPacketType: 'boyhouse.projection', action: 'hello' }) }, reliability: 'reliable' });
+  assert.equal(h.sent[1].message.t, 1);
+  h.service.selectPacketEpoch(b);
+  h.emitter.emit('sendMessageWithRefrId', { message: { t: 4, data: pending.data }, reliability: 'reliable' });
+  assert.equal(h.sent.length, 2, 'Even final appearance waits for the replacement epoch to release');
+  h.service.releasePacketEpoch(b);
+  h.emitter.emit('sendMessageWithRefrId', { message: { t: 4, data: pending.data }, reliability: 'reliable' });
+  assert.equal(h.sent[2].message.epoch, b);
+});
+
+test('creation failure cleanup is deferred and cannot close a newer loadout', () => {
+  for (const replaced of [false, true]) {
+    const h = harness(); h.loadout.projectionReadiness = { ready: false, error: 'Creator failed' };
+    h.emitter.emit('playerLoadoutFailed', { generation: 1, error: 'Creator failed' });
+    assert.equal(h.destroyed, 0);
+    if (replaced) ++h.loadout.generation;
+    h.tick(); assert.equal(h.destroyed, replaced ? 0 : 1);
+  }
 });

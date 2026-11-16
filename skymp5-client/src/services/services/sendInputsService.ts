@@ -9,7 +9,6 @@ import * as worldViewMisc from "../../view/worldViewMisc";
 
 import { Animation, AnimationSource } from "../../sync/animation";
 import { Actor, EquipEvent, FormType } from "skyrimPlatform";
-import { getAppearance } from "../../sync/appearance";
 import { ActorValues, getActorValues } from "../../sync/actorvalues";
 import { getEquipment } from "../../sync/equipment";
 import { nextHostAttempt } from "../../view/hostAttempts";
@@ -23,7 +22,7 @@ import { UpdateAppearanceMessage } from "../messages/updateAppearanceMessage";
 import { RemoteServer } from "./remoteServer";
 import { DeathService } from "./deathService";
 import { logTrace } from "../../logging";
-import { PlayerLoadoutService } from "./playerLoadoutService";
+import { PendingPlayerAppearance, PlayerLoadoutService } from "./playerLoadoutService";
 
 const playerFormId = 0x14;
 
@@ -94,6 +93,8 @@ export class SendInputsService extends ClientListener {
     }
 
     private sendInputs() {
+        this.sendAppearance();
+        if (this.controller.lookupListener(PlayerLoadoutService).blocksGameplayInput) return;
         const hosted =
             typeof this.sp.storage['hosted'] === typeof [] ? this.sp.storage['hosted'] : [];
         const targets = [undefined].concat(hosted as any);
@@ -106,7 +107,6 @@ export class SendInputsService extends ClientListener {
             const targetFormModel = target ? this.getForm(target, world) : this.getForm(undefined, world);
             this.sendMovement(target, targetFormModel);
             this.sendAnimation(target);
-            this.sendAppearance(target);
             this.sendEquipment(target);
             this.sendActorValuePercentage(target, targetFormModel);
         });
@@ -237,28 +237,17 @@ export class SendInputsService extends ClientListener {
     }
 
     private sendAppearance(_refrId?: number) {
-        if (_refrId) {
-          return;
-        }
-        const shown = this.sp.Ui.isMenuOpen('RaceSex Menu');
-        if (shown != this.isRaceSexMenuShown) {
-            this.isRaceSexMenuShown = shown;
-            if (!shown) {
-                this.sp.printConsole('Exited from race menu');
-
-                const appearance = getAppearance(this.sp.Game.getPlayer() as Actor);
-                // TODO: log appearance contents to debug appearance issues?
-                const message: MessageWithRefrId<UpdateAppearanceMessage> = {
-                    t: MsgType.UpdateAppearance,
-                    data: appearance,
-                    _refrId
-                };
-                this.controller.emitter.emit("sendMessageWithRefrId", {
-                    message,
-                    reliability: "reliable"
-                });
-            }
-        }
+        if (_refrId) return;
+        const pending = this.controller.lookupListener(PlayerLoadoutService).pendingAppearance;
+        if (!pending) { this.lastAppearance = undefined; return; }
+        if (pending === this.lastAppearance && Date.now() - this.lastAppearanceAttempt < 1000) return;
+        const message: MessageWithRefrId<UpdateAppearanceMessage> = {
+            t: MsgType.UpdateAppearance, data: pending.data, _refrId,
+        };
+        this.controller.emitter.emit('sendMessageWithRefrId', { message, reliability: 'reliable' });
+        // An attempted send is not completion. The loadout retains this exact
+        // snapshot until the matching current-epoch self echo arrives.
+        this.lastAppearance = pending; this.lastAppearanceAttempt = Date.now();
     }
 
     private sendEquipment(_refrId?: number) {
@@ -344,7 +333,8 @@ export class SendInputsService extends ClientListener {
     private playerAnimSource = new Map<string, AnimationSource>(); // TODO: make service
     private lastAnimationSent = new Map<string, Animation>();
     private actorValuesNeedUpdate = false;
-    private isRaceSexMenuShown = false;
+    private lastAppearance?: PendingPlayerAppearance;
+    private lastAppearanceAttempt = 0;
     private equipmentChanged = false;
     private numEquipmentChanges = 0;
     private prevValues: ActorValues = { health: 0, stamina: 0, magicka: 0 };

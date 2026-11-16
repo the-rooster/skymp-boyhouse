@@ -44,6 +44,7 @@ public:
     changeForm.inv.entries.swap(prepared.inv.entries);
     changeForm.dynamicFields.Swap(prepared.dynamicFields);
     changeForm.baseContainerAdded = prepared.baseContainerAdded;
+    changeForm.isDisabled = prepared.isDisabled;
     lastSaveRequest = std::chrono::system_clock::now();
   }
 

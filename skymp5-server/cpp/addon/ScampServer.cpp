@@ -1,6 +1,7 @@
 #include "ScampServer.h"
 
 #include "Bot.h"
+#include "CampaignVisibilityBarrier.h"
 #include "ConditionsEvaluator.h"
 #include "FormCallbacks.h"
 #include "FormDesc.h"
@@ -73,6 +74,32 @@ bool StartsWith(const std::string& str, const char* prefix)
   return str.compare(0, strlen(prefix), prefix) == 0;
 }
 
+bool CallCampaignVisibilityHook(
+  const Napi::FunctionReference& callback, uint32_t owner,
+  const CampaignVisibilityBarrier::UserIds& users,
+  std::optional<bool> synchronized = std::nullopt)
+{
+  auto env = callback.Env();
+  Napi::HandleScope scope(env);
+  try {
+    auto ids = Napi::Array::New(env, users.size());
+    for (size_t i = 0; i < users.size(); ++i)
+      ids.Set(i, Napi::Number::New(env, users[i]));
+    auto result = synchronized
+      ? callback.Call({ Napi::Number::New(env, owner), ids,
+                        Napi::Boolean::New(env, *synchronized) })
+      : callback.Call({ Napi::Number::New(env, owner), ids });
+    return result.IsBoolean() && result.As<Napi::Boolean>().Value();
+  } catch (const Napi::Error& error) {
+    // WorldState must be able to call the paired abort hook even when the
+    // preparation hook throws JavaScript. Do not retain a pending JS exception
+    // across that cleanup or across a committed mutation's notification.
+    if (env.IsExceptionPending())
+      env.GetAndClearPendingException();
+    throw std::runtime_error(error.Message());
+  }
+}
+
 }
 
 Napi::FunctionReference ScampServer::constructor;
@@ -107,6 +134,8 @@ Napi::Object ScampServer::Init(Napi::Env env, Napi::Object exports)
       InstanceMethod("beginPacketEpoch", &ScampServer::BeginPacketEpoch),
       InstanceMethod("getPacketEpoch", &ScampServer::GetPacketEpoch),
       InstanceMethod("getWorldBaseline", &ScampServer::GetWorldBaseline),
+      InstanceMethod("setCampaignVisibilityCallbacks",
+                     &ScampServer::SetCampaignVisibilityCallbacks),
 
       InstanceMethod("getLocalizedString", &ScampServer::GetLocalizedString),
       InstanceMethod("getServerSettings", &ScampServer::GetServerSettings),
@@ -816,6 +845,14 @@ Napi::Value ScampServer::SetGameplayBlocked(const Napi::CallbackInfo& info)
     if (id >= partOne->serverState.userInfo.size() ||
         !partOne->serverState.userInfo[id] || !info[1].IsBoolean())
       throw std::invalid_argument("Invalid gameplay gate request");
+    if (!info[1].As<Napi::Boolean>().Value() &&
+        partOne->serverState.userInfo[id]->campaignVisibilityFailed)
+      throw std::runtime_error(
+        "Campaign visibility failed; this connection must reconnect");
+    if (!info[1].As<Napi::Boolean>().Value() && campaignVisibilityBarrier &&
+        campaignVisibilityBarrier->HoldsGate(id))
+      throw std::runtime_error(
+        "Cannot release gameplay during a campaign visibility commit");
     partOne->serverState.userInfo[id]->gameplayBlocked =
       info[1].As<Napi::Boolean>().Value();
   } catch (const std::exception& error) {
@@ -875,6 +912,51 @@ Napi::Value ScampServer::GetWorldBaseline(const Napi::CallbackInfo& info)
   } catch (const std::exception& error) {
     throw Napi::Error::New(info.Env(), error.what());
   }
+}
+
+Napi::Value ScampServer::SetCampaignVisibilityCallbacks(
+  const Napi::CallbackInfo& info)
+{
+  try {
+    if (info.Length() != 2)
+      throw std::invalid_argument(
+        "Expected two campaign visibility callbacks");
+    if (campaignVisibilityBarrier && campaignVisibilityBarrier->IsActive())
+      throw std::runtime_error(
+        "Cannot replace an active campaign visibility barrier");
+    if (info[0].IsNull() && info[1].IsNull()) {
+      partOne->worldState.SetCampaignVisibilityCallbacks({}, {});
+      campaignVisibilityBarrier.reset();
+      return info.Env().Undefined();
+    }
+    if (!info[0].IsFunction() || !info[1].IsFunction())
+      throw std::invalid_argument(
+        "Campaign visibility callbacks must both be functions or null");
+    auto before = std::make_shared<Napi::FunctionReference>(
+      Napi::Persistent(info[0].As<Napi::Function>()));
+    auto after = std::make_shared<Napi::FunctionReference>(
+      Napi::Persistent(info[1].As<Napi::Function>()));
+    auto bridge = std::make_shared<CampaignVisibilityBarrier>(
+      *partOne,
+      [before](uint32_t owner, const auto& users) {
+        return CallCampaignVisibilityHook(*before, owner, users);
+      },
+      [after](uint32_t owner, const auto& users, bool synchronized) {
+        return CallCampaignVisibilityHook(*after, owner, users, synchronized);
+      },
+      [transport = server](Networking::UserId user) {
+        transport->CloseConnection(user);
+      });
+    partOne->worldState.SetCampaignVisibilityCallbacks(
+      [bridge](MpActor& owner) { bridge->BeforeCommit(owner); },
+      [bridge](MpActor& owner, bool synchronized) {
+        bridge->AfterCommit(owner, synchronized);
+      });
+    campaignVisibilityBarrier = std::move(bridge);
+  } catch (const std::exception& error) {
+    throw Napi::Error::New(info.Env(), error.what());
+  }
+  return info.Env().Undefined();
 }
 
 Napi::Value ScampServer::Kick(const Napi::CallbackInfo& info)

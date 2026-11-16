@@ -47,11 +47,18 @@ struct DeferredMessage
 
 struct UserInfo
 {
+  // A held token identifies this connection even when its slot, GUID, and
+  // allocator address are reused by a reconnect.
+  std::shared_ptr<const uint8_t> connectionIdentity =
+    std::make_shared<const uint8_t>(0);
   bool isDisconnecting = false;
   // Connection-local handshake gate. Never persisted or inherited by a reused
   // user slot. Trusted server code releases it after projection
   // acknowledgement.
   bool gameplayBlocked = false;
+  // Projection failure is terminal for this connection; a delayed ack must
+  // not reopen its gameplay gate while transport disconnection is pending.
+  bool campaignVisibilityFailed = false;
   // Empty retains the legacy transport. Once enabled, gameplay requires this
   // connection's current epoch even after its application gate opens.
   std::string packetEpoch;

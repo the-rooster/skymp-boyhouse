@@ -124,6 +124,10 @@ public:
                         bool defaultProcessingOnly = false,
                         bool isSecondActivation = false);
   virtual void Disable();
+  // Campaign publication changes data atomically, then reconciles spatial
+  // subscriptions. Occupancy needs a wider transaction and is refused first.
+  virtual void ValidateCampaignVisibilityChange() const;
+  void ReconcileCampaignVisibility();
   virtual void Enable();
 
   void SetPos(const NiPoint3& newPos,

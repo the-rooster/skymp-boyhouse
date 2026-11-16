@@ -169,7 +169,9 @@ export class PlayerSpawnService extends ClientListener {
             }
             if (++state.stableSamples < 2) return;
             if (!state.presentationApplied) {
-                if (state.message.appearance) applyAppearanceToPlayer(state.message.appearance, () => this.current(state));
+                if (state.message.appearance && this.controller.lookupListener(PlayerLoadoutService)
+                    .shouldApplySpawnAppearance(state.loadoutGeneration))
+                    applyAppearanceToPlayer(state.message.appearance, () => this.current(state));
                 if (!this.current(state)) return;
                 const props = state.message.props;
                 if (props?.learnedSpells) {

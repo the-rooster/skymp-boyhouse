@@ -53,6 +53,7 @@ import { logTrace, logError } from '../../logging';
 import { SpellCastMessage } from '../messages/spellCastMessage';
 import { UpdateAnimVariablesMessage } from '../messages/updateAnimVariablesMessage';
 import { PlayerSpawnService } from './playerSpawnService';
+import { PlayerLoadoutService } from './playerLoadoutService';
 import { LoadGameService } from './loadGameService';
 
 export const getPcInventory = (): Inventory | undefined => {
@@ -525,6 +526,10 @@ export class RemoteServer extends ClientListener {
     const newAppearance = msg.data;
 
     if (i === this.getMyActorIndex() && newAppearance) {
+        // The creator already owns the displayed face. The loadout service
+        // consumes its matching server echo as confirmation; reapplying that
+        // echo would queue another 3D rebuild after creation controls release.
+        if (this.controller.lookupListener(PlayerLoadoutService).preservesCreationAppearance) return;
       const current = this.captureActor(msg.idx);
       this.defer(() => {
         applyAppearanceToPlayer(newAppearance, current);

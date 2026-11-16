@@ -128,6 +128,16 @@ const extrasEqual = (a: Entry, b: Entry, ignoreWorn = false) => {
   );
 };
 
+// Equipment must identify the actual worn variant, not just its base form.
+// Inventory replication intentionally ignores charge/name differences, so
+// its looser comparison is insufficient to certify an equipped instance.
+export const equipmentEntryExtrasEqual = (a: Entry, b: Entry): boolean => {
+  const actualName = (entry: Entry) => entry.name || Game.getFormEx(entry.baseId)?.getName() || '';
+  return extrasEqual(a, b, true) &&
+    ((a.name || '') === (b.name || '') || actualName(a) === actualName(b)) &&
+    Math.fround(a.chargePercent || 0) === Math.fround(b.chargePercent || 0);
+};
+
 export const hasExtras = (e: Entry): boolean => {
   return !extrasEqual(e, { baseId: 0, count: 0 });
 };
@@ -189,10 +199,11 @@ const extractExtraData = (
   });
 };
 
-const squash = (inv: Inventory): Inventory => {
+const squash = (inv: Inventory, preserveEquipmentIdentity = false): Inventory => {
   const res = new Array<Entry>();
   inv.entries.forEach((e) => {
-    const same = res.find((x) => e.baseId === x.baseId && extrasEqual(x, e));
+    const same = res.find((x) => e.baseId === x.baseId && extrasEqual(x, e) &&
+      (!preserveEquipmentIdentity || equipmentEntryExtrasEqual(x, e)));
     if (same) {
       same.count += e.count;
     } else {
@@ -203,7 +214,8 @@ const squash = (inv: Inventory): Inventory => {
 };
 
 const getExtraContainerChangesAsInventory = (
-  refr: ObjectReference
+  refr: ObjectReference,
+  preserveEquipmentIdentity = false,
 ): Inventory => {
   const extraContainerChanges = getExtraContainerChanges(refr.getFormID());
   const entries = new Array<Entry>();
@@ -230,7 +242,7 @@ const getExtraContainerChangesAsInventory = (
   });
 
   let res: Inventory = { entries };
-  res = squash(res);
+  res = squash(res, preserveEquipmentIdentity);
   return res;
 };
 
@@ -240,11 +252,13 @@ const getBaseContainerAsInventory = (refr: ObjectReference): Inventory => {
   };
 };
 
-export const sumInventories = (lhs: Inventory, rhs: Inventory): Inventory => {
-  const leftEntriesWithExtras = lhs.entries.filter((e) => hasExtras(e));
-  const rightEntriesWithExtras = rhs.entries.filter((e) => hasExtras(e));
-  const leftEntriesSimple = lhs.entries.filter((e) => !hasExtras(e));
-  const rightEntriesSimple = rhs.entries.filter((e) => !hasExtras(e));
+export const sumInventories = (lhs: Inventory, rhs: Inventory, preserveEquipmentIdentity = false): Inventory => {
+  const detailed = (entry: Entry) => hasExtras(entry) || (preserveEquipmentIdentity &&
+    !equipmentEntryExtrasEqual(entry, { baseId: entry.baseId, count: 0 }));
+  const leftEntriesWithExtras = lhs.entries.filter(detailed);
+  const rightEntriesWithExtras = rhs.entries.filter(detailed);
+  const leftEntriesSimple = lhs.entries.filter(e => !detailed(e));
+  const rightEntriesSimple = rhs.entries.filter(e => !detailed(e));
 
   leftEntriesSimple.forEach((e) => {
     const matching = rightEntriesSimple.find((x) => x.baseId === e.baseId);
@@ -311,6 +325,19 @@ export const getInventory = (refr: ObjectReference): Inventory => {
     )
   );
 };
+
+// Equipment selection must retain variants that normal inventory sync merges
+// (particularly display names and charges). Preserve identity at every merge,
+// not just when comparing the already-squashed final array.
+export const getEquipmentInventory = (refr: ObjectReference): Inventory =>
+  squash(sumInventories(getBaseContainerAsInventory(refr),
+    getExtraContainerChangesAsInventory(refr, true), true), true);
+
+// Read back native state; applyInventory's boolean only reports dispatch.
+// Use the same normalized item comparison as replication (worn state belongs
+// to the separate equipment snapshot).
+export const isInventorySettled = (refr: ObjectReference, expected: Inventory): boolean =>
+  getDiff(expected, getInventory(refr), true).entries.length === 0;
 
 const basesReset = (): Set<number> => {
   if (storage["basesResetExists"] !== true) {

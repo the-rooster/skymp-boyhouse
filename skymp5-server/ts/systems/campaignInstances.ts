@@ -68,6 +68,13 @@ export class CampaignInstances implements System {
         } else ctx.svr.kick(user);
       },
     });
+    if (this.projection) {
+      const projection = this.projection;
+      ctx.svr.setCampaignVisibilityCallbacks(
+        (_owner, users) => projection.prepareVisibility(users),
+        (_owner, users, synchronized) => projection.completeVisibility(users, synchronized)
+      );
+    }
     // Spawn emits this before enabling or subscribing a saved character.
     ctx.gm.on("beforeSpawn", (actor: number) => this.authority?.recover(actor));
   }

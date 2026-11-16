@@ -1,4 +1,5 @@
 #include "QuestJournal.h"
+#include "CampaignReferenceBinding.h"
 #include "MpActor.h"
 #include "QuestVmState.h"
 #include "WorldState.h"
@@ -22,11 +23,59 @@ struct Transaction
     uint64_t epoch;
     bool baseContainerAdded;
   };
+  struct ReferenceEdit
+  {
+    std::shared_ptr<MpForm> lifetime;
+    MpObjectReference* reference;
+    MpChangeForm initial, current;
+    Json serializedInitial;
+    uint64_t epoch;
+  };
   MpActor* owner;
   Json ledger;
   std::map<uint32_t, InventoryEdit> inventories;
+  std::map<uint32_t, ReferenceEdit> references;
 };
 thread_local Transaction* transaction = nullptr;
+
+Transaction::ReferenceEdit& ReferenceTarget(MpActor& actor,
+                                            MpObjectReference& target)
+{
+  if (!actor.GetParent())
+    throw std::runtime_error("Unregistered quest transaction participant");
+  auto& owner = QuestJournal::Owner(actor);
+  if (!transaction || transaction->owner != &owner)
+    throw std::runtime_error(
+      "Reference reads require an owning quest transaction");
+  auto& world = *owner.GetParent();
+  const auto lifetime = world.LookupFormByIdNoLoad(target.GetFormId());
+  if (target.GetParent() != &world || lifetime.get() != &target ||
+      target.IsDeleted())
+    throw std::runtime_error("Unregistered campaign reference target");
+  if (&target != &owner &&
+      CampaignReferenceBinding::Context(target).first != &owner)
+    throw std::runtime_error("Reference belongs to another campaign");
+  const auto id = target.GetFormId();
+  if (auto found = transaction->references.find(id);
+      found != transaction->references.end()) {
+    if (found->second.lifetime != lifetime)
+      throw std::runtime_error("Campaign reference identity was replaced");
+    return found->second;
+  }
+  if (transaction->references.size() >= 4096)
+    throw std::runtime_error("Campaign reference read limit exceeded");
+  const auto saved = target.GetChangeForm();
+  auto current = saved;
+  if (const auto inventory = transaction->inventories.find(id);
+      inventory != transaction->inventories.end())
+    current.inv = inventory->second.current;
+  return transaction->references
+    .emplace(id,
+             Transaction::ReferenceEdit{
+               lifetime, &target, saved, std::move(current),
+               MpChangeForm::ToJson(saved), target.GetWorldInstanceEpoch() })
+    .first->second;
+}
 
 Transaction::InventoryEdit& InventoryTarget(MpActor& actor,
                                             MpObjectReference& target)
@@ -371,39 +420,61 @@ void QuestJournal::Atomic(MpActor& actor, const std::function<void()>& execute)
   const auto ownerEpoch = owner.GetWorldInstanceEpoch();
   const auto initial = Read(owner);
   const auto initialJournal = owner.GetDynamicFields().GetValueDump(kProperty);
-  Transaction local{ &owner, initial, {} };
+  Transaction local{ &owner, initial, {}, {} };
   transaction = &local;
   try {
     execute();
-    if (world.LookupFormByIdNoLoad(actorId) != actorLifetime ||
-        world.LookupFormByIdNoLoad(ownerId) != ownerLifetime ||
-        &Owner(actor) != &owner ||
-        actor.GetWorldInstanceEpoch() != actorEpoch ||
-        owner.GetWorldInstanceEpoch() != ownerEpoch)
-      throw std::runtime_error("Quest context changed during execution");
+    const auto validateReads = [&] {
+      if (world.LookupFormByIdNoLoad(actorId) != actorLifetime ||
+          world.LookupFormByIdNoLoad(ownerId) != ownerLifetime ||
+          &Owner(actor) != &owner ||
+          actor.GetWorldInstanceEpoch() != actorEpoch ||
+          owner.GetWorldInstanceEpoch() != ownerEpoch)
+        throw std::runtime_error("Quest context changed during execution");
+      if (owner.GetDynamicFields().GetValueDump(kProperty) != initialJournal)
+        throw std::runtime_error(
+          "Campaign journal changed outside its transaction");
+      for (const auto& [id, edit] : local.inventories) {
+        if (world.LookupFormByIdNoLoad(id) != edit.lifetime ||
+            edit.reference->IsDeleted() ||
+            edit.reference->GetWorldInstanceEpoch() != edit.epoch ||
+            edit.reference->GetInventory() != edit.initial ||
+            edit.reference->GetChangeForm().baseContainerAdded !=
+              edit.baseContainerAdded)
+          throw std::runtime_error(
+            "Campaign inventory changed during execution");
+      }
+      for (const auto& [id, edit] : local.references) {
+        if (world.LookupFormByIdNoLoad(id) != edit.lifetime ||
+            edit.reference->GetWorldInstanceEpoch() != edit.epoch ||
+            MpChangeForm::ToJson(edit.reference->GetChangeForm()) !=
+              edit.serializedInitial ||
+            (edit.reference != &owner &&
+             CampaignReferenceBinding::Context(*edit.reference).first !=
+               &owner))
+          throw std::runtime_error(
+            "Campaign reference changed during execution");
+      }
+    };
+    validateReads();
     Validate(local.ledger);
     const auto dump = local.ledger.dump();
     if (dump.size() > 8 * 1024 * 1024)
       throw std::runtime_error("Campaign journal too large");
-    if (owner.GetDynamicFields().GetValueDump(kProperty) != initialJournal)
-      throw std::runtime_error(
-        "Campaign journal changed outside its transaction");
     std::vector<WorldState::CampaignInventoryChange> changes;
     for (const auto& [id, edit] : local.inventories) {
-      if (world.LookupFormByIdNoLoad(id) != edit.lifetime ||
-          edit.reference->GetWorldInstanceEpoch() != edit.epoch ||
-          edit.reference->GetInventory() != edit.initial ||
-          edit.reference->GetChangeForm().baseContainerAdded !=
-            edit.baseContainerAdded)
-        throw std::runtime_error(
-          "Campaign inventory changed during execution");
       InventoryTarget(actor, *edit.reference);
       if (edit.initial != edit.current)
         changes.push_back({ edit.reference, edit.current });
     }
+    std::vector<WorldState::CampaignVisibilityChange> visibility;
+    for (const auto& [id, edit] : local.references)
+      if (edit.initial.isDisabled != edit.current.isDisabled)
+        visibility.push_back({ edit.reference, edit.current.isDisabled });
     transaction = nullptr;
-    if (!changes.empty())
-      world.CommitCampaignInventory(owner, dump, changes);
+    if (!changes.empty() || !visibility.empty())
+      world.CommitCampaignInventory(owner, dump, changes, visibility,
+                                    validateReads);
     else if (local.ledger != initial)
       owner.SetPropertyValueDump(kProperty, dump, false, false);
   } catch (...) {
@@ -430,6 +501,30 @@ void QuestJournal::EditInventory(MpActor& actor, MpObjectReference& target,
   auto prepared = staged.current;
   edit(prepared);
   staged.current = std::move(prepared);
+  if (const auto found = transaction->references.find(target.GetFormId());
+      found != transaction->references.end())
+    found->second.current.inv = staged.current;
+}
+
+const MpChangeFormREFR& QuestJournal::ReadReference(MpActor& actor,
+                                                    MpObjectReference& target)
+{
+  return ReferenceTarget(actor, target).current;
+}
+
+void QuestJournal::SetReferenceDisabled(MpActor& actor,
+                                        MpObjectReference& target,
+                                        bool disabled)
+{
+  if (&target == &Owner(actor))
+    throw std::runtime_error("Campaign visibility cannot disable a player");
+  auto& staged = ReferenceTarget(actor, target);
+  const auto original = CampaignReferenceBinding::Context(target).second;
+  if (actor.GetParent()->HasCampaignEnableLinks(original))
+    throw std::runtime_error(
+      "Campaign visibility requires enable-parent propagation");
+  target.ValidateCampaignVisibilityChange();
+  staged.current.isDisabled = disabled;
 }
 
 nlohmann::json QuestJournal::ScriptState(MpActor& actor)

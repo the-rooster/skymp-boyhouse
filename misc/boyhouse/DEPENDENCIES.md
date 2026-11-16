@@ -78,6 +78,22 @@ when the implementation changes. Condition names are identifiers extracted from
 [xEdit's definitions](https://github.com/TES5Edit/TES5Edit/blob/dev-4.1.6/Core/wbDefinitionsTES5.pas);
 their source hash is recorded in the registry.
 
+The current registry contains **59 partial native methods**, including ten
+physical-reference queries and five private-copy visibility methods. Queries
+require tracked owner/private-copy snapshots; visibility additionally requires
+transactional staging and a complete observer projection barrier. The same-named
+condition functions are not enabled by these native registrations. Source guards
+include the barrier bridge, projection feed, character-creation gate and binary
+decoder used by this path. These guards detect source changes; they do not prove
+behavior or expand the analyzer's graph coverage. The generated backlog must be
+regenerated against the updated registry before its capability counts are used.
+
+The [runtime contract](QUESTS.md#physical-reference-queries-and-visibility-mutations)
+lists the limits: no fade, enable-parent propagation or latent support; a fresh
+`OnLoad` that attempts another visibility mutation is refused while the outer
+barrier is active. No adapters are enabled and the certified quest count remains
+zero.
+
 ## Limits
 
 This is a conservative *potential-dependency* inventory within its documented

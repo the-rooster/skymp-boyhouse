@@ -53,6 +53,10 @@ export interface ScampServer {
     schemaVersion: 1; actor: number; packetEpoch: string;
     messages: Record<string, unknown>[];
   };
+  setCampaignVisibilityCallbacks(
+    before: ((owner: number, users: number[]) => boolean) | null,
+    after: ((owner: number, users: number[], synchronized: boolean) => boolean) | null
+  ): void;
 
   executeJavaScriptOnChakra(src: string): void;
   clear(): void;

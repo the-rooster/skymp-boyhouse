@@ -10,6 +10,7 @@ import { SendRawMessageEvent } from "../events/sendRawMessageEvent";
 
 import { CampaignPacketChannel } from "../../campaign/campaignPacketChannel";
 import { WorldBaseline } from '../../campaign/worldProjection';
+import { PlayerLoadoutService } from './playerLoadoutService';
 
 export class NetworkingService extends ClientListener {
   private campaignPackets = new CampaignPacketChannel();
@@ -74,16 +75,40 @@ export class NetworkingService extends ClientListener {
     this.controller.emitter.on("sendMessage", (e) => this.onSendMessage(e));
     this.controller.emitter.on("sendRawMessage", (e) => this.onSendRawMessage(e));
     this.controller.emitter.on("sendMessageWithRefrId", (e) => this.onSendMessageWithRefrId(e));
+    this.controller.emitter.on('playerLoadoutFailed', failure => {
+      logError(this, 'Player loadout failed', failure.error);
+      const generation = this.connectionGeneration;
+      this.controller.once('tick', () => {
+        const loadout = this.controller.lookupListener(PlayerLoadoutService);
+        if (generation === this.connectionGeneration && failure.generation === loadout.generation &&
+            loadout.projectionReadiness.error) this.close();
+      });
+    });
+  }
+
+  private creationAllows(message: any): boolean {
+    const loadout = this.controller.lookupListener(PlayerLoadoutService);
+    if (!loadout.blocksGameplayInput) return true;
+    const pending = loadout.pendingAppearance;
+    if (message?.t === MsgType.UpdateAppearance)
+      return !!pending && message.idx === pending.actorIdx && message.data === pending.data;
+    if (message?.t !== MsgType.CustomPacket || typeof message.contentJsonDump !== 'string') return false;
+    try {
+      const type = JSON.parse(message.contentJsonDump)?.customPacketType;
+      return type === 'boyhouse.projection' || type === 'loginWithSkympIo';
+    } catch { return false; }
   }
 
   private onSendMessage(e: SendMessageEvent<unknown>) {
     try {
+      if (!this.creationAllows(e.message)) return;
       const message = this.campaignPackets.outgoing(e.message);
       if (message) this.sp.mpClientPlugin.send(JSON.stringify(message), this.isReliable(e.reliability));
     } catch (error) { this.failCampaignTransport(error); }
   }
 
   private onSendRawMessage(e: SendRawMessageEvent) {
+    if (this.controller.lookupListener(PlayerLoadoutService).blocksGameplayInput) return;
     if (!this.campaignPackets.enabled) {
       // @ts-expect-error
       this.sp.mpClientPlugin.sendRaw(e.rawMessage, e.rawMessage.byteLength, this.isReliable(e.reliability));

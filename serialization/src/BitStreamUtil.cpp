@@ -12,14 +12,13 @@ void SerializationUtil::ReadFromBitStream(SLNet::BitStream& stream,
                                           std::string& str)
 {
   uint32_t size = 0;
-  if (stream.Read(size)) {
-    std::string tmp;
-    tmp.resize(size);
-    stream.Read(tmp.data(), tmp.size());
-    str = std::move(tmp);
-  } else {
-    str.clear();
-  }
+  ReadFromBitStream(stream, size);
+  if (size > stream.GetNumberOfUnreadBits() / 8)
+    throw std::runtime_error("Truncated binary string");
+  std::string tmp(size, '\0');
+  if (size && !stream.Read(tmp.data(), size))
+    throw std::runtime_error("Truncated binary string");
+  str = std::move(tmp);
 }
 
 void SerializationUtil::WriteToBitStream(SLNet::BitStream& stream,

@@ -1,10 +1,12 @@
 #include "QuestScriptRuntime.h"
 #include "CampaignReferenceBinding.h"
 #include "CampaignReferenceScripts.h"
+#include "CampaignVisibilityBarrier.h"
 #include "QuestJournal.h"
 #include "QuestVmState.h"
 #include "TestUtils.hpp"
 #include "papyrus-vm/Reader.h"
+#include "save_storages/ISaveStorage.h"
 #include "script_objects/CampaignAliasObject.h"
 #include "script_objects/CampaignFormObject.h"
 #include "script_objects/CampaignQuestObject.h"
@@ -12,6 +14,7 @@
 #include "script_storages/BsaArchiveScriptStorage.h"
 #include <fstream>
 #include <limits>
+#include <tuple>
 
 extern espm::Loader& GetEspmLoader();
 
@@ -415,15 +418,15 @@ TEST_CASE("Reusing a character ID cannot receive an old quest transaction",
   Fixture f;
   const uint32_t id = 0xff000001;
   auto& actor = f.Add(id);
-  REQUIRE_THROWS_WITH(QuestJournal::Atomic(
-                        actor,
-                        [&] {
-                          QuestJournal::Apply(
-                            actor, { { "quest", kQuest }, { "op", "start" } });
-                          f.server.worldState.DestroyForm(id);
-                          f.Add(id);
-                        }),
-                      Catch::Matchers::ContainsSubstring("context changed"));
+  REQUIRE_THROWS_WITH(
+    QuestJournal::Atomic(
+      actor,
+      [&] {
+        QuestJournal::Apply(actor, { { "quest", kQuest }, { "op", "start" } });
+        f.server.worldState.DestroyForm(id);
+        f.Add(id);
+      }),
+    Catch::Matchers::ContainsSubstring("context changed"));
   REQUIRE(QuestJournal::Snapshot(
             f.server.worldState.GetFormAt<MpActor>(id))["quests"]
             .empty());
@@ -3050,4 +3053,567 @@ TEST_CASE(
   REQUIRE_NOTHROW(MpObjectReference::Subscribe(&npc, &owner));
   REQUIRE(owner.GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
           saved);
+}
+
+namespace {
+struct RuntimeIntegrationStorage
+  : Viet::ISaveStorage<MpChangeForm, FormDesc, std::vector<FormDesc>>
+{
+  std::vector<std::vector<std::optional<MpChangeForm>>> batches;
+  bool SupportsAtomicBatches() const noexcept override { return true; }
+  void IterateSync(const IterateSyncCallback&) override {}
+  void Upsert(std::vector<std::optional<MpChangeForm>>&& forms,
+              const UpsertCallback& callback) override
+  {
+    batches.push_back(std::move(forms));
+    callback();
+  }
+  void Iterate(const IterateCallback& callback,
+               const std::optional<std::vector<FormDesc>>&) override
+  {
+    callback({});
+  }
+  uint32_t GetNumFinishedUpserts() const override { return batches.size(); }
+  uint32_t GetNumFinishedIterates() const override { return 0; }
+  void Tick() override {}
+  bool GetRecycledChangeFormsBuffer(
+    std::vector<std::optional<MpChangeForm>>&) override
+  {
+    return false;
+  }
+  const std::string& GetName() const override
+  {
+    static const std::string name = "quest-runtime-integration";
+    return name;
+  }
+};
+
+FunctionInfo RuntimeWorldHandler(bool disabled)
+{
+  auto handler = InteractionHandler();
+  handler.locals.insert(
+    handler.locals.end(),
+    { { "player", "Actor" }, { "npc", "Actor" }, { "quest", "Quest" } });
+  auto& code = handler.code.instructions;
+  code.insert(code.end() - 1,
+              { { FunctionCode::kOp_CallStatic,
+                  { VarValue("Game"), VarValue("GetPlayer"), Id("player"),
+                    VarValue(0) } },
+                { FunctionCode::kOp_CallStatic,
+                  { VarValue("Game"), VarValue("GetForm"), Id("npc"),
+                    VarValue(1), VarValue(0x1a677) } } });
+  for (const auto& [method, target, destination] :
+       std::vector<std::tuple<const char*, const char*, const char*>>{
+         { "GetPositionX", "player", "playerX" },
+         { "GetPositionY", "player", "playerY" },
+         { "GetPositionZ", "player", "playerZ" },
+         { "IsDead", "player", "playerDead" },
+         { "GetPositionX", "npc", "npcX" },
+         { "GetPositionY", "npc", "npcY" },
+         { "GetPositionZ", "npc", "npcZ" },
+         { "IsDead", "npc", "npcDead" } }) {
+    code.insert(
+      code.end() - 1,
+      { FunctionCode::kOp_CallMethod,
+        { VarValue(method), Id(target), Id(destination), VarValue(0) } });
+  }
+  code.insert(code.end() - 1,
+              { { FunctionCode::kOp_CallMethod,
+                  { VarValue("IsDisabled"), Id("npc"), Id("wasDisabled"),
+                    VarValue(0) } },
+                { FunctionCode::kOp_CallMethod,
+                  { VarValue(disabled ? "Disable" : "Enable"), Id("npc"),
+                    Id("temp"), VarValue(1), VarValue(false) } },
+                { FunctionCode::kOp_CallMethod,
+                  { VarValue("IsDisabled"), Id("npc"), Id("nowDisabled"),
+                    VarValue(0) } },
+                { FunctionCode::kOp_CallStatic,
+                  { VarValue("Game"), VarValue("GetForm"), Id("quest"),
+                    VarValue(1), VarValue(static_cast<int32_t>(kQuest)) } },
+                { FunctionCode::kOp_CallMethod,
+                  { VarValue("SetObjectiveDisplayed"), Id("quest"), Id("temp"),
+                    VarValue(2), VarValue(10), VarValue(disabled) } } });
+  return handler;
+}
+
+// These controlled PEX programs deliberately use the production runtime's
+// native registrations, logical PlayerRef, bound private NPC and event path.
+// They establish transaction behavior, not support for any original quest.
+struct RuntimeWorldFixture : Fixture
+{
+  std::shared_ptr<RuntimeIntegrationStorage> storage =
+    std::make_shared<RuntimeIntegrationStorage>();
+  MpActor *owner, *guest, *npc;
+  MpObjectReference* trigger;
+
+  RuntimeWorldFixture()
+  {
+    InteractionFixture(*this);
+    auto& object = extraScripts.back()->objectTable[0];
+    for (const auto* target : { "player", "npc" }) {
+      for (const auto* axis : { "X", "Y", "Z" })
+        object.variables.push_back(
+          { std::string(target) + axis, "Float", 0, VarValue(0.f) });
+      object.variables.push_back(
+        { std::string(target) + "Dead", "Bool", 0, VarValue(false) });
+    }
+    for (const auto* name : { "wasDisabled", "nowDisabled" })
+      object.variables.push_back({ name, "Bool", 0, VarValue(false) });
+    for (auto& function : object.states[0].functions) {
+      if (function.name == "OnActivate")
+        function.function = RuntimeWorldHandler(true);
+      if (function.name == "OnTriggerEnter")
+        function.function = RuntimeWorldHandler(false);
+    }
+    // Game.GetForm resolves the owned QUST's VMAD bindings. Supply controlled
+    // empty subclasses for those names; only the registered Quest natives
+    // are exercised here, never the original quest's fragments.
+    const auto record =
+      server.worldState.GetEspm().GetBrowser().LookupById(kQuest);
+    const auto questData = espm::QuestScriptData::Read(
+      record.rec, server.worldState.GetEspmCache());
+    for (const auto& binding : questData.scripts) {
+      if (binding.status & 2)
+        continue;
+      auto script = std::make_shared<PexScript>();
+      script->source = binding.name;
+      Object questObject;
+      questObject.NameIndex = script->source;
+      questObject.parentClassName = "Quest";
+      script->objectTable.push_back(questObject);
+      extraScripts.push_back(script);
+    }
+    server.AttachSaveStorage(storage);
+    owner = &Add(0xff002001);
+    guest = &Add(0xff002002);
+    owner->SetWorldInstance("campaign:" + std::to_string(owner->GetFormId()) +
+                            ":fixture");
+    guest->SetWorldInstance(owner->GetWorldInstance());
+    guest->SetPosAndAngleSilent({ 1000, 2000, 3000 }, {});
+    owner->SetInventory(Inventory());
+    guest->SetInventory(Inventory());
+    trigger = &BoundTrigger(*this, *owner);
+    npc = &BoundBalgruuf(*this, *owner);
+    npc->SetPosAndAngleSilent({ 4, 6, 15 }, {});
+    // Model a saved campaign corpse. SetIsDead invokes the ordinary death
+    // event and schedules a respawn, which visibility correctly refuses to
+    // mutate until transactional respawn handling exists. Restore through the
+    // same private AddForm path used by WorldState::LoadChangeForm instead.
+    auto savedNpc = npc->GetChangeForm();
+    savedNpc.isDead = true;
+    savedNpc.actorValues.healthPercentage = 0;
+    const auto npcId = npc->GetFormId();
+    server.DestroyActor(npcId);
+    server.worldState.AddForm(
+      std::make_unique<MpActor>(LocationalData(), FormCallbacks::DoNothing(),
+                                0x13bbd),
+      npcId, false, &savedNpc);
+    npc = &server.worldState.GetFormAt<MpActor>(npcId);
+    REQUIRE(npc->IsDead());
+    REQUIRE_FALSE(npc->IsRespawning());
+    REQUIRE_NOTHROW(npc->ValidateCampaignVisibilityChange());
+    npc->SetInventory(Inventory().AddItem(0xf, 3));
+    QuestScriptRuntime::ExecuteReferenceLoad(*guest, kScriptedReference,
+                                             Scripts());
+    server.worldState.Tick();
+    storage->batches.clear();
+  }
+
+  void RunEvent(const char* name = "OnActivate")
+  {
+    auto source = guest->ToVarValue();
+    QuestScriptRuntime::ExecuteReferenceEvent(*trigger, name, &source, 1,
+                                              Scripts());
+  }
+
+  FunctionInfo& Activate()
+  {
+    for (const auto& script : extraScripts)
+      if (script->source == "defaultSetStageTRIGScript")
+        for (auto& function : script->objectTable[0].states[0].functions)
+          if (function.name == "OnActivate")
+            return function.function;
+    throw std::runtime_error("Missing runtime integration handler");
+  }
+
+  void AddAliases(bool fail)
+  {
+    auto alias = std::make_shared<PexScript>();
+    alias->source = "defaultsetstagealiasscript";
+    Object object;
+    object.NameIndex = alias->source;
+    object.parentClassName = "ReferenceAlias";
+    object.variables = { { "counter", "Int", 0, VarValue(0) },
+                         { "sourceId", "Int", 0, VarValue(0) },
+                         { "lastSource", "ObjectReference", 0,
+                           VarValue::None() } };
+    auto handler = InteractionHandler(false);
+    if (fail)
+      handler.code.instructions.insert(
+        handler.code.instructions.end() - 1,
+        { FunctionCode::kOp_CallMethod,
+          { VarValue("UnsupportedWorldAliasEffect"), Id("self"), Id("temp"),
+            VarValue(0) } });
+    object.states.push_back(
+      { "", { { "OnActivate", handler }, { "OnTriggerEnter", handler } } });
+    alias->objectTable.push_back(object);
+    extraScripts.push_back(alias);
+    REQUIRE(
+      QuestJournal::Apply(*owner, { { "quest", kQuest }, { "op", "start" } }));
+    QuestJournal::Atomic(*owner, [&] {
+      QuestVmState state(QuestJournal::ScriptState(*owner), {}, {});
+      state.SetAliasBinding("4e50d:Skyrim.esm/alias:1", "6debb:Skyrim.esm");
+      state.SetAliasBinding("4e50d:Skyrim.esm/alias:3", "14:Skyrim.esm");
+      QuestJournal::SetScriptState(*owner, state.Save());
+    });
+    server.worldState.Tick();
+    storage->batches.clear();
+  }
+};
+}
+
+TEST_CASE("Production quest VM publishes reference queries visibility rewards "
+          "and matching running aliases together",
+          "[Quest][QuestVM][CampaignRuntimeIntegration]")
+{
+  RuntimeWorldFixture f;
+  f.AddAliases(false);
+  const auto before = QuestJournal::ScriptState(*f.owner);
+  int prepared = 0, published = 0;
+  bool disabling = true;
+  f.server.worldState.SetCampaignVisibilityCallbacks(
+    [&](MpActor& owner) {
+      REQUIRE(&owner == f.owner);
+      REQUIRE(f.npc->IsDisabled() == !disabling);
+      REQUIRE(owner.GetInventory().GetItemCount(0xf) == (disabling ? 5 : 7));
+      REQUIRE(SavedReferenceCounter(owner) == (disabling ? 111 : 112));
+      if (disabling) {
+        REQUIRE(QuestJournal::ScriptState(owner) == before);
+        REQUIRE(QuestJournal::Get(owner, kQuest).at("objectives").empty());
+      } else {
+        REQUIRE(QuestJournal::Get(
+                  owner, kQuest)["objectives"]["10"]["displayed"] == true);
+      }
+      ++prepared;
+    },
+    [&](MpActor& owner, bool success) {
+      REQUIRE(&owner == f.owner);
+      REQUIRE(success);
+      REQUIRE(prepared == published + 1);
+      REQUIRE(f.npc->IsDisabled() == disabling);
+      REQUIRE(owner.GetInventory().GetItemCount(0xf) == (disabling ? 7 : 9));
+      REQUIRE(SavedReferenceCounter(owner) == (disabling ? 112 : 113));
+      REQUIRE(QuestJournal::Get(
+                owner, kQuest)["objectives"]["10"]["displayed"] == disabling);
+      REQUIRE(
+        QuestJournal::ScriptState(
+          owner)["scripts"]
+                ["4e50d:Skyrim.esm/alias:1/defaultsetstagealiasscript"]
+                ["values"]["defaultsetstagealiasscript/counter"]["value"] ==
+        1);
+      ++published;
+    });
+  f.RunEvent();
+  REQUIRE(prepared == 1);
+  REQUIRE(published == 1);
+  REQUIRE(f.guest->GetInventory().GetItemCount(0xf) == 0);
+  REQUIRE(f.npc->GetInventory().GetItemCount(0xf) == 3);
+  const auto saved = QuestJournal::ScriptState(*f.owner);
+  const auto& values = saved.at("scripts").at(kReferenceState).at("values");
+  for (const auto& [name, value] :
+       std::vector<std::pair<std::string, int>>{ { "playerx", 1 },
+                                                 { "playery", 2 },
+                                                 { "playerz", 3 },
+                                                 { "npcx", 4 },
+                                                 { "npcy", 6 },
+                                                 { "npcz", 15 } })
+    REQUIRE(values.at("defaultsetstagetrigscript/" + name).at("value") ==
+            value);
+  REQUIRE(values.at("defaultsetstagetrigscript/playerdead").at("value") ==
+          false);
+  REQUIRE(values.at("defaultsetstagetrigscript/npcdead").at("value") == true);
+  REQUIRE(values.at("defaultsetstagetrigscript/wasdisabled").at("value") ==
+          false);
+  REQUIRE(values.at("defaultsetstagetrigscript/nowdisabled").at("value") ==
+          true);
+  const auto aliasKey = "4e50d:Skyrim.esm/alias:1/defaultsetstagealiasscript";
+  REQUIRE(saved["scripts"][aliasKey]["values"]
+               ["defaultsetstagealiasscript/counter"]["value"] == 1);
+  REQUIRE_FALSE(
+    saved["scripts"]["4e50d:Skyrim.esm/alias:3/defaultsetstagealiasscript"]
+         ["values"]
+           .contains("defaultsetstagealiasscript/counter"));
+  f.server.worldState.Tick();
+  REQUIRE(f.storage->batches.size() == 1);
+  const auto& batch = f.storage->batches.front();
+  REQUIRE(batch.at(f.npc->GetIdx())->isDisabled);
+  REQUIRE(batch.at(f.owner->GetIdx())->inv.GetItemCount(0xf) == 7);
+  REQUIRE(batch.at(f.owner->GetIdx())
+            ->dynamicFields.GetValueDump(QuestJournal::kProperty) ==
+          f.owner->GetDynamicFields().GetValueDump(QuestJournal::kProperty));
+
+  // A stopped quest's alias does not run, while the private reference still
+  // enables its copy and restores an objective in the same production path.
+  REQUIRE(
+    QuestJournal::Apply(*f.owner, { { "quest", kQuest }, { "op", "stop" } }));
+  disabling = false;
+  f.RunEvent("OnTriggerEnter");
+  REQUIRE(prepared == 2);
+  REQUIRE(published == 2);
+  const auto enabled = QuestJournal::ScriptState(*f.owner);
+  REQUIRE(enabled["scripts"][aliasKey] == saved["scripts"][aliasKey]);
+  REQUIRE(enabled["scripts"][kReferenceState]["values"]
+                 ["defaultsetstagetrigscript/wasdisabled"]["value"] == true);
+  REQUIRE(enabled["scripts"][kReferenceState]["values"]
+                 ["defaultsetstagetrigscript/nowdisabled"]["value"] == false);
+  f.server.worldState.Tick();
+  REQUIRE(f.storage->batches.size() == 2);
+  REQUIRE_FALSE(f.storage->batches.back().at(f.npc->GetIdx())->isDisabled);
+  REQUIRE(
+    f.storage->batches.back().at(f.owner->GetIdx())->inv.GetItemCount(0xf) ==
+    9);
+  REQUIRE_FALSE(f.server.worldState.LookupFormByIdNoLoad(0x1a677));
+}
+
+TEST_CASE("Production quest VM rolls back staged visibility journal rewards "
+          "and alias state when a handler or publication barrier fails",
+          "[Quest][QuestVM][CampaignRuntimeIntegration]")
+{
+  const std::string failure =
+    GENERATE("reference", "alias", "barrier", "missing barrier");
+  RuntimeWorldFixture f;
+  if (failure == "reference")
+    f.Activate().code.instructions.insert(
+      f.Activate().code.instructions.end() - 1,
+      { FunctionCode::kOp_CallMethod,
+        { VarValue("UnsupportedWorldReferenceEffect"), Id("self"), Id("temp"),
+          VarValue(0) } });
+  f.AddAliases(failure == "alias");
+  const auto before =
+    f.owner->GetDynamicFields().GetValueDump(QuestJournal::kProperty);
+  const auto initialNpc = MpChangeForm::ToJson(f.npc->GetChangeForm());
+  int prepared = 0, finished = 0;
+  if (failure != "missing barrier")
+    f.server.worldState.SetCampaignVisibilityCallbacks(
+      [&](MpActor& owner) {
+        REQUIRE(&owner == f.owner);
+        REQUIRE_FALSE(f.npc->IsDisabled());
+        REQUIRE(owner.GetInventory().GetItemCount(0xf) == 5);
+        REQUIRE(owner.GetDynamicFields().GetValueDump(
+                  QuestJournal::kProperty) == before);
+        ++prepared;
+        if (failure == "barrier")
+          throw std::runtime_error("Fixture rejected visibility publication");
+      },
+      [&](MpActor& owner, bool success) {
+        REQUIRE(&owner == f.owner);
+        REQUIRE_FALSE(success);
+        REQUIRE_FALSE(f.npc->IsDisabled());
+        REQUIRE(owner.GetInventory().GetItemCount(0xf) == 5);
+        REQUIRE(owner.GetDynamicFields().GetValueDump(
+                  QuestJournal::kProperty) == before);
+        ++finished;
+      });
+  const auto expected = failure == "reference"
+    ? "UnsupportedWorldReferenceEffect"
+    : failure == "alias"   ? "UnsupportedWorldAliasEffect"
+    : failure == "barrier" ? "Fixture rejected visibility publication"
+                           : "visibility";
+  REQUIRE_THROWS_WITH(f.RunEvent(),
+                      Catch::Matchers::ContainsSubstring(expected));
+  REQUIRE(f.owner->GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
+          before);
+  REQUIRE(MpChangeForm::ToJson(f.npc->GetChangeForm()) == initialNpc);
+  REQUIRE(f.owner->GetInventory().GetItemCount(0xf) == 5);
+  REQUIRE(f.guest->GetInventory().GetItemCount(0xf) == 0);
+  REQUIRE(prepared == (failure == "barrier" ? 1 : 0));
+  REQUIRE(finished == (failure == "barrier" ? 1 : 0));
+  f.server.worldState.Tick();
+  REQUIRE(f.storage->batches.empty());
+}
+
+namespace {
+// One authored PEX override, generated with test_quest_dependencies.make_pex.
+// It replaces only this test's reference script, not any owned game file:
+//   OnInit: counter = 100; Game.GetPlayer().AddItem(Game.GetForm(15), 5, true)
+//   OnLoad: counter = 101; self.Disable(false)
+// The unused ::stage_var accepts the placed reference's owned stage property.
+// Production Subscribe loads these bytes through the real Reader/storage path.
+class NestedVisibilityLoadStorage : public BsaArchiveScriptStorage
+{
+public:
+  NestedVisibilityLoadStorage()
+    : BsaArchiveScriptStorage(
+        (std::filesystem::path(GetDataDir()) / "Skyrim - Misc.bsa")
+          .string()
+          .c_str())
+  {
+  }
+  int reads = 0;
+  std::vector<uint8_t> GetScriptPex(const char* name) override
+  {
+    if (CIString(name) != CIString("defaultSetStageTRIGScript"))
+      return BsaArchiveScriptStorage::GetScriptPex(name);
+    ++reads;
+    return {
+      0xfa, 0x57, 0xc0, 0xde, 0x03, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x0b, 0x66, 0x69, 0x78, 0x74, 0x75, 0x72,
+      0x65, 0x2e, 0x70, 0x73, 0x63, 0x00, 0x00, 0x00, 0x00, 0x00, 0x15, 0x00,
+      0x0f, 0x4f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x52, 0x65, 0x66, 0x65, 0x72,
+      0x65, 0x6e, 0x63, 0x65, 0x00, 0x00, 0x00, 0x07, 0x63, 0x6f, 0x75, 0x6e,
+      0x74, 0x65, 0x72, 0x00, 0x03, 0x49, 0x6e, 0x74, 0x00, 0x0b, 0x3a, 0x3a,
+      0x73, 0x74, 0x61, 0x67, 0x65, 0x5f, 0x76, 0x61, 0x72, 0x00, 0x06, 0x4f,
+      0x6e, 0x49, 0x6e, 0x69, 0x74, 0x00, 0x04, 0x47, 0x61, 0x6d, 0x65, 0x00,
+      0x09, 0x47, 0x65, 0x74, 0x50, 0x6c, 0x61, 0x79, 0x65, 0x72, 0x00, 0x06,
+      0x70, 0x6c, 0x61, 0x79, 0x65, 0x72, 0x00, 0x07, 0x47, 0x65, 0x74, 0x46,
+      0x6f, 0x72, 0x6d, 0x00, 0x04, 0x67, 0x6f, 0x6c, 0x64, 0x00, 0x07, 0x41,
+      0x64, 0x64, 0x49, 0x74, 0x65, 0x6d, 0x00, 0x04, 0x74, 0x65, 0x6d, 0x70,
+      0x00, 0x04, 0x6e, 0x6f, 0x6e, 0x65, 0x00, 0x05, 0x41, 0x63, 0x74, 0x6f,
+      0x72, 0x00, 0x04, 0x46, 0x6f, 0x72, 0x6d, 0x00, 0x04, 0x4e, 0x6f, 0x6e,
+      0x65, 0x00, 0x06, 0x4f, 0x6e, 0x4c, 0x6f, 0x61, 0x64, 0x00, 0x07, 0x44,
+      0x69, 0x73, 0x61, 0x62, 0x6c, 0x65, 0x00, 0x04, 0x73, 0x65, 0x6c, 0x66,
+      0x00, 0x19, 0x64, 0x65, 0x66, 0x61, 0x75, 0x6c, 0x74, 0x53, 0x65, 0x74,
+      0x53, 0x74, 0x61, 0x67, 0x65, 0x54, 0x52, 0x49, 0x47, 0x53, 0x63, 0x72,
+      0x69, 0x70, 0x74, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x14, 0x00, 0x00,
+      0x00, 0xc7, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+      0x00, 0x02, 0x00, 0x02, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x04, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+      0x00, 0x01, 0x00, 0x02, 0x00, 0x05, 0x00, 0x0d, 0x00, 0x01, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x08, 0x00, 0x0e, 0x00,
+      0x0a, 0x00, 0x0f, 0x00, 0x0c, 0x00, 0x10, 0x00, 0x05, 0x0d, 0x01, 0x00,
+      0x02, 0x03, 0x00, 0x00, 0x00, 0x64, 0x19, 0x02, 0x00, 0x06, 0x02, 0x00,
+      0x07, 0x01, 0x00, 0x08, 0x03, 0x00, 0x00, 0x00, 0x00, 0x19, 0x02, 0x00,
+      0x06, 0x02, 0x00, 0x09, 0x01, 0x00, 0x0a, 0x03, 0x00, 0x00, 0x00, 0x01,
+      0x03, 0x00, 0x00, 0x00, 0x0f, 0x17, 0x02, 0x00, 0x0b, 0x01, 0x00, 0x08,
+      0x01, 0x00, 0x0c, 0x03, 0x00, 0x00, 0x00, 0x03, 0x01, 0x00, 0x0a, 0x03,
+      0x00, 0x00, 0x00, 0x05, 0x05, 0x01, 0x1a, 0x00, 0x00, 0x11, 0x00, 0x0d,
+      0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00,
+      0x08, 0x00, 0x0e, 0x00, 0x0a, 0x00, 0x0f, 0x00, 0x0c, 0x00, 0x10, 0x00,
+      0x03, 0x0d, 0x01, 0x00, 0x02, 0x03, 0x00, 0x00, 0x00, 0x65, 0x17, 0x02,
+      0x00, 0x12, 0x01, 0x00, 0x13, 0x01, 0x00, 0x0c, 0x03, 0x00, 0x00, 0x00,
+      0x01, 0x05, 0x00, 0x1a, 0x00,
+    };
+  }
+};
+}
+
+TEST_CASE("Fresh player subscription rejects nested OnLoad visibility after "
+          "outer commit",
+          "[Quest][ReferenceLifecycle][CampaignVisibility]["
+          "CampaignRuntimeIntegration]")
+{
+  Fixture f;
+  auto scripts = std::make_shared<NestedVisibilityLoadStorage>();
+  f.server.worldState.AttachScriptStorage(scripts);
+  auto storage = std::make_shared<RuntimeIntegrationStorage>();
+  f.server.AttachSaveStorage(storage);
+  auto& owner = f.Add(0xff002001);
+  auto& guest = f.Add(0xff002002);
+  owner.SetWorldInstance("campaign:" + std::to_string(owner.GetFormId()) +
+                         ":fixture");
+  guest.SetWorldInstance(owner.GetWorldInstance());
+  owner.SetInventory(Inventory());
+  guest.SetInventory(Inventory());
+  auto& copy = BoundTrigger(f, owner);
+  copy.Disable();
+  // Bots with profileId=-1 never enter the first-subscription load path.
+  owner.RegisterProfileId(42);
+  guest.RegisterProfileId(43);
+  for (Networking::UserId user = 0; user < 2; ++user) {
+    DoConnect(f.server, user);
+    f.server.SetUserActor(user,
+                          user == 0 ? owner.GetFormId() : guest.GetFormId());
+    f.server.serverState.userInfo[user]->gameplayBlocked = true;
+    f.server.BeginPacketEpoch(user);
+    f.server.serverState.userInfo[user]->gameplayBlocked = false;
+  }
+  REQUIRE_FALSE(QuestJournal::ReferenceInitialized(owner, kScriptedReference));
+  REQUIRE(copy.IsDisabled());
+  f.server.worldState.Tick();
+  storage->batches.clear();
+
+  SECTION(
+    "The authored load program completes without a nested visibility change")
+  {
+    // Disable(false) is a no-op on the already-disabled copy. This proves the
+    // real PEX, owned base scripts, property binding and OnInit reward work;
+    // the failure section must not pass because storage or bytecode is
+    // invalid.
+    REQUIRE_NOTHROW(
+      QuestScriptRuntime::ExecuteReferenceLoad(owner, kScriptedReference));
+    REQUIRE(scripts->reads == 1);
+    REQUIRE(SavedReferenceCounter(owner) == 101);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 5);
+    REQUIRE(QuestJournal::ReferenceInitialized(owner, kScriptedReference));
+    REQUIRE(copy.IsDisabled());
+  }
+  SECTION(
+    "An outer enable commits once and quarantines the failed nested load")
+  {
+    CampaignVisibilityBarrier::UserIds closed;
+    int prepared = 0, finished = 0;
+    bool synchronized = true;
+    CampaignVisibilityBarrier barrier(
+      f.server,
+      [&](auto id, const auto& users) {
+        REQUIRE(id == owner.GetFormId());
+        REQUIRE(copy.IsDisabled());
+        REQUIRE(owner.GetInventory().GetItemCount(0xf) == 0);
+        REQUIRE(users == CampaignVisibilityBarrier::UserIds{ 0, 1 });
+        for (auto user : users)
+          f.server.BeginPacketEpoch(user);
+        ++prepared;
+        return true;
+      },
+      [&](auto, const auto& users, bool success) {
+        REQUIRE(users == CampaignVisibilityBarrier::UserIds{ 0, 1 });
+        synchronized = success;
+        ++finished;
+        return true;
+      },
+      [&](auto user) { closed.push_back(user); });
+    f.server.worldState.SetCampaignVisibilityCallbacks(
+      [&](auto& actor) { barrier.BeforeCommit(actor); },
+      [&](auto& actor, bool success) { barrier.AfterCommit(actor, success); });
+    REQUIRE_NOTHROW(QuestJournal::Atomic(guest, [&] {
+      REQUIRE(QuestJournal::Apply(
+        guest,
+        { { "quest", kQuest }, { "op", "setStage" }, { "index", 10 } }));
+      QuestJournal::EditInventory(
+        guest, owner, [](auto& inventory) { inventory.AddItem(0xf, 7); });
+      QuestJournal::SetReferenceDisabled(guest, copy, false);
+    }));
+    REQUIRE(scripts->reads >= 1);
+    REQUIRE(prepared == 1);
+    REQUIRE(finished == 1);
+    REQUIRE_FALSE(synchronized);
+    REQUIRE_FALSE(barrier.IsActive());
+    REQUIRE(closed == CampaignVisibilityBarrier::UserIds{ 0, 1 });
+    for (auto user : closed) {
+      REQUIRE(f.server.serverState.userInfo[user]->gameplayBlocked);
+      REQUIRE(f.server.serverState.userInfo[user]->campaignVisibilityFailed);
+    }
+    // The outer enable/stage/reward published; nested OnInit and OnLoad did
+    // not persist their five gold, initialization marker, variables or
+    // Disable.
+    REQUIRE_FALSE(copy.IsDisabled());
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 7);
+    REQUIRE(guest.GetInventory().GetItemCount(0xf) == 0);
+    REQUIRE(QuestJournal::Get(owner, kQuest).at("stage") == 10);
+    REQUIRE_FALSE(
+      QuestJournal::ReferenceInitialized(owner, kScriptedReference));
+    REQUIRE(QuestJournal::ScriptState(owner).empty());
+    const auto committed = QuestJournal::Snapshot(owner);
+    REQUIRE_FALSE(
+      f.Run(guest)); // A committed stage is not replayed as rollback.
+    REQUIRE(QuestJournal::Snapshot(owner) == committed);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 7);
+    REQUIRE(prepared == 1);
+    f.server.worldState.Tick();
+    REQUIRE(storage->batches.size() == 1);
+    REQUIRE_FALSE(storage->batches[0].at(copy.GetIdx())->isDisabled);
+    REQUIRE(storage->batches[0].at(owner.GetIdx())->inv.GetItemCount(0xf) ==
+            7);
+    f.server.worldState.SetCampaignVisibilityCallbacks({}, {});
+  }
 }

@@ -3,6 +3,7 @@
 #include <nlohmann/json_fwd.hpp>
 #include <optional>
 #include <slikenet/BitStream.h>
+#include <stdexcept>
 #include <string>
 
 namespace SerializationUtil {
@@ -14,7 +15,8 @@ namespace SerializationUtil {
   }                                                                           \
   inline void ReadFromBitStream(SLNet::BitStream& stream, type& data)         \
   {                                                                           \
-    stream.Read(data);                                                        \
+    if (!stream.Read(data))                                                  \
+      throw std::runtime_error("Truncated binary value");                    \
   }
 
 DECLARE_RAKNET_SAFETY_WRAPPERS(uint64_t)

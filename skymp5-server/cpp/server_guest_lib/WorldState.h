@@ -90,6 +90,21 @@ public:
     MpObjectReference* reference;
     Inventory inventory;
   };
+  struct CampaignVisibilityChange
+  {
+    MpObjectReference* reference;
+    bool disabled;
+  };
+  // A visibility commit requires a projection barrier. BeforeCommit must
+  // close gameplay for every participant in the owner's private phase and
+  // invalidate its packet epoch. Every BeforeCommit invocation is paired with
+  // AfterCommit. True permits a fresh manifest; false means aborted or failed
+  // synchronization, and must retain gates/quarantine (not a commit receipt).
+  void SetCampaignVisibilityCallbacks(
+    std::function<void(MpActor&)> beforeCommit,
+    std::function<void(MpActor&, bool synchronized)> afterCommit);
+  // Metadata-only index, cached for the attached immutable plugin set.
+  bool HasCampaignEnableLinks(uint32_t original);
 
 private:
   friend class QuestJournal;
@@ -97,10 +112,12 @@ private:
   void CommitCampaignReferences(MpActor& owner, MpChangeForm ownerState,
                                 const std::vector<MpChangeForm>& copies);
   // Internal campaign commit: prepare every live/save copy before publishing
-  // any of them. Only inventory and the owner's private journal may change.
+  // any of them. Visibility additionally requires a projection barrier.
   void CommitCampaignInventory(
     MpActor& owner, const std::string& journal,
-    const std::vector<CampaignInventoryChange>& changes);
+    const std::vector<CampaignInventoryChange>& changes,
+    const std::vector<CampaignVisibilityChange>& visibility,
+    const std::function<void()>& validateReads);
 
 public:
   bool HasEspmFile(std::string_view filename) const noexcept;

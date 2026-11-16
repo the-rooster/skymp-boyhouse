@@ -13,6 +13,9 @@ export class CampaignQuestService extends ClientListener {
         });
         controller.emitter.on('campaignProjectionPending', () => this.replica.clear());
         controller.emitter.on('campaignProjectionReady', () => this.subscribe());
+        // A creation gate may have refused the first subscription. Establish a
+        // fresh nonce once the server accepts appearance and loadout is settled.
+        controller.emitter.on('playerCreationComplete', () => this.subscribe());
         for (const event of ["connectionDisconnect", "connectionDenied", "connectionFailed"] as const)
             controller.emitter.on(event, () => this.replica.clear());
         controller.emitter.on("customPacketMessage", event => {

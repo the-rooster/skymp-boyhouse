@@ -15,6 +15,17 @@ async function login(profileId) {
   await sleep(250);
   const actor = server.getUserActor(bot.getUserId());
   assert.ok(actor, "Full Login/Spawn pipeline must assign a character");
+  if (!server.get(actor, "appearance")) {
+    const data = {
+      isFemale: false, raceId: 0x13746, weight: 50, skinColor: 0, hairColor: 0,
+      headpartIds: [], headTextureSetId: 0, options: Array(19).fill(0),
+      presets: Array(4).fill(0), tints: [], name: `Protocol ${profileId}`,
+    };
+    bot.send({ t: 4, idx: server.get(actor, "idx"), data });
+    await sleep(100);
+    assert.deepEqual(server.get(actor, "appearance"), data,
+      "The bot must finish character creation through the normal packet gate");
+  }
   return { bot, actor };
 }
 (async () => {

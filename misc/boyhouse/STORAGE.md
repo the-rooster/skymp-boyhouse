@@ -37,11 +37,15 @@ settings explicitly choose SQLite. Initialization never replaces existing settin
   throw; they are not skipped. Each serialized change form is limited to 32 MiB.
 - `AsyncSaveStorage` serializes calls to one driver. Independent reader connections
   are supported. A single driver object is not a public concurrent/reentrant API.
-- The scoped fragment runner stages journal/VM state and supported inventory
-  changes together. It validates every participant, prepares the complete pending
-  save buffer, then publishes live inventory/journal fields with non-allocating
-  swaps. An attached storage backend must advertise atomic batches; SQLite does,
-  legacy drivers do not. Inventory notifications follow this in-memory commit.
+- The scoped fragment runner stages journal/VM state, supported inventory and
+  private-copy visibility changes together. It validates participants and read
+  snapshots, prepares the pending save buffer and affected grid/host state, then
+  publishes with non-allocating swaps. An attached storage backend must advertise
+  atomic batches; SQLite does, legacy drivers do not. Visibility also requires
+  native observer gates and fresh packet epochs before publication. Subscription
+  reconciliation, inventory notifications and replacement projections follow
+  the in-memory commit; failed delivery quarantines observers without retrying
+  the committed rewards as though the transaction had rolled back.
 - A world save tick still submits the batch asynchronously. Client notifications
   do **not** wait for disk commit, so a crash can lose a recently acknowledged
   change. Persistent execution of external events, complete world-effect staging

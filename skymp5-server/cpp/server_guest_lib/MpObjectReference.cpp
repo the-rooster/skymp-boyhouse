@@ -539,6 +539,23 @@ void MpObjectReference::Enable()
   }
 }
 
+void MpObjectReference::ValidateCampaignVisibilityChange() const
+{
+  if (occupant)
+    throw std::runtime_error(
+      "Occupied references require transactional occupancy changes");
+}
+
+void MpObjectReference::ReconcileCampaignVisibility()
+{
+  if (IsDisabled()) {
+    RemoveFromGridAndUnsubscribeAll();
+    UnsubscribeFromAll();
+  } else {
+    ForceSubscriptionsUpdate();
+  }
+}
+
 void MpObjectReference::SetPos(const NiPoint3& newPos, SetPosMode setPosMode)
 {
   auto oldGridPos = GetGridPos(ChangeForm().position);

@@ -78,6 +78,7 @@ public:
   void VisitProperties(CreateActorMessage& message,
                        VisitPropertiesMode mode) override;
   void Disable() override;
+  void ValidateCampaignVisibilityChange() const override;
 
   void SendToUser(const IMessageBase& message, bool reliable);
   void SendToUserDeferred(const IMessageBase& message, bool reliable,

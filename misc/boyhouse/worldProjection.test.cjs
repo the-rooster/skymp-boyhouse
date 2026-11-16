@@ -134,6 +134,214 @@ test("idle sessions do not repeatedly parse whole campaign ledgers", () => {
   assert.equal(f.closed.length, 0);
 });
 
+test("visibility commits gate every participant and publish only the committed view", () => {
+  const f = fixture(2);
+  const guest = new WorldProjectionReplica(); guest.begin("guest");
+  f.data.get(1).instance = f.data.get(0).instance;
+  f.data.get(1).campaignOwner = actor;
+  const deliver = () => {
+    while (f.packets.length) {
+      const { user, packet } = f.packets.shift();
+      assert.equal((user === 0 ? f.replica : guest).accept(packet), true);
+    }
+  };
+  f.hello(); f.feed.connect(1);
+  f.feed.packet(1, { action: "hello", protocolVersion: 2, sessionId: "guest" });
+  deliver();
+  const previous = [f.replica.applied(f.replica.version), guest.applied(guest.version)];
+  for (const user of [0, 1]) f.feed.packet(user, previous[user]);
+  deliver();
+  const reads = f.reads();
+  const send = f.adapter.send;
+  f.adapter.send = (user, packet) => {
+    send(user, packet);
+    if (packet.kind === "pause") {
+      // Reentry before the second pause must not release the second player.
+      f.feed.packet(1, previous[1]);
+      f.feed.poll();
+      assert.equal(f.blocked.get(1), true);
+    }
+  };
+  assert.equal(f.feed.prepareVisibility([0, 1]), true);
+  assert.equal(f.reads(), reads);
+  assert.ok(f.packets.every(({ packet }) => packet.kind === "pause"));
+  deliver();
+  for (const data of f.data.values()) data.references[1].disabled = true;
+  assert.equal(f.feed.completeVisibility([0, 1], true), true);
+  deliver();
+  assert.equal(f.replica.prepared().references[1].disabled, true);
+  assert.equal(guest.prepared().references[1].disabled, true);
+  for (const user of [0, 1]) {
+    f.feed.packet(user, previous[user]);
+    assert.equal(f.blocked.get(user), true);
+  }
+  f.feed.packet(0, f.replica.applied(f.replica.version)); deliver();
+  assert.equal(f.blocked.get(0), false);
+  assert.equal(f.blocked.get(1), true);
+  f.feed.packet(1, guest.applied(guest.version)); deliver();
+  assert.equal(f.blocked.get(1), false);
+});
+
+test("visibility preparation refuses missing or duplicate participants before pausing", () => {
+  for (const users of [[0, 0], [0, 1], [0, -1], [0, 0.5], [0, 0x100000000]]) {
+    const f = fixture(); f.hello(); f.deliver();
+    f.feed.packet(0, f.replica.applied(f.replica.version)); f.deliver();
+    const epoch = f.adapter.epoch(0);
+    assert.throws(() => f.feed.prepareVisibility(users));
+    assert.equal(f.adapter.epoch(0), epoch);
+    assert.equal(f.blocked.get(0), false);
+    assert.equal(f.packets.length, 0);
+  }
+});
+
+test("hello during a visibility hold waits for publication without extending timeout", () => {
+  const f = fixture();
+  f.feed.prepareVisibility([0]);
+  f.advance(29000); f.hello(); f.feed.poll();
+  assert.equal(f.packets.length, 0);
+  assert.equal(f.reads(), 0);
+  f.feed.completeVisibility([0], true); f.deliver();
+  assert.ok(f.replica.prepared());
+  f.advance(1001); f.feed.poll();
+  assert.equal(f.closed.length, 1);
+  assert.equal(f.blocked.get(0), true);
+});
+
+test("visibility abort or publication failure retains every participant's gate", () => {
+  for (const mode of ["abort", "publish", "closeFailure"]) {
+    const f = fixture(); f.hello(); f.feed.connect(1);
+    f.feed.packet(1, { action: "hello", protocolVersion: 2, sessionId: "guest" });
+    f.feed.prepareVisibility([0, 1]);
+    if (mode === "publish") f.adapter.baseline = () => { throw Error("baseline failed"); };
+    if (mode === "closeFailure") {
+      const close = f.adapter.close;
+      f.adapter.close = (user, error) => {
+        if (user === 0) throw Error("native fallback must close this socket");
+        close(user, error);
+      };
+    }
+    if (mode === "abort") assert.equal(f.feed.completeVisibility([0, 1], false), true);
+    else assert.throws(() => f.feed.completeVisibility([0, 1], mode !== "closeFailure"));
+    for (const user of [0, 1]) assert.equal(f.blocked.get(user), true);
+    assert.equal(f.feed.users.size, 0);
+    assert.ok(f.closed.some(({ user }) => user === 1), "cleanup must continue after the first failure");
+  }
+});
+
+test("stale visibility cleanup preserves a replacement connection in the same slot", () => {
+  for (const synchronized of [false, true]) for (const differentActor of [false, true]) {
+    const f = fixture(); f.hello(); f.feed.connect(1);
+    f.feed.packet(1, { action: "hello", protocolVersion: 2, sessionId: "guest" });
+    f.feed.prepareVisibility([0, 1]);
+    f.feed.disconnect(1);
+    if (differentActor) f.data.get(1).actor += 1;
+    f.feed.connect(1);
+    const replacement = f.feed.users.get(1), epoch = f.adapter.epoch(1);
+    f.blocked.set(1, false);
+    f.packets.length = 0;
+    if (synchronized) assert.throws(() => f.feed.completeVisibility([0, 1], true));
+    else assert.equal(f.feed.completeVisibility([0, 1], false), true);
+    assert.deepEqual(f.closed.map(({ user }) => user), [0]);
+    assert.equal(f.feed.users.get(1), replacement);
+    assert.equal(f.connected.has(1), true);
+    assert.equal(f.blocked.get(1), false);
+    assert.equal(f.adapter.epoch(1), epoch);
+    assert.equal(f.packets.length, 0);
+    assert.equal(f.feed.visibilityParticipants.size, 0);
+
+    // The replacement's own projection handshake still works after cleanup.
+    const replica = new WorldProjectionReplica(); replica.begin("replacement");
+    f.feed.packet(1, { action: "hello", protocolVersion: 2, sessionId: "replacement" });
+    while (f.packets.length) assert.equal(replica.accept(f.packets.shift().packet), true);
+    f.feed.packet(1, replica.applied(replica.version));
+    while (f.packets.length) assert.equal(replica.accept(f.packets.shift().packet), true);
+    assert.equal(replica.ready, true);
+    assert.equal(f.blocked.get(1), false);
+  }
+});
+
+test("visibility cleanup preserves a new actor assignment on the existing connection", () => {
+  for (const synchronized of [false, true]) {
+    const f = fixture(); f.hello(); f.feed.connect(1);
+    f.feed.packet(1, { action: "hello", protocolVersion: 2, sessionId: "guest" });
+    f.feed.prepareVisibility([0, 1]);
+    const state = f.feed.users.get(1);
+    f.data.get(1).actor += 1;
+    f.packets.length = 0;
+    if (synchronized) assert.throws(() => f.feed.completeVisibility([0, 1], true));
+    else assert.equal(f.feed.completeVisibility([0, 1], false), true);
+    assert.deepEqual(f.closed.map(({ user }) => user), [0]);
+    assert.equal(f.feed.users.get(1), state);
+    assert.equal(state.visibilityHeld, false);
+    assert.equal(f.feed.visibilityParticipants.size, 0);
+    f.feed.poll();
+    assert.equal(state.pending.actor, f.data.get(1).actor);
+    assert.equal(f.blocked.get(1), true, "The replacement actor still needs its own acknowledgement");
+  }
+});
+
+test("visibility cleanup rechecks each captured participant after reentrant callbacks", () => {
+  for (const phase of ["prepare", "publish", "close"]) {
+    const f = fixture(); f.hello(); f.feed.connect(1);
+    f.feed.packet(1, { action: "hello", protocolVersion: 2, sessionId: "guest" });
+    let replacement;
+    const replaceGuest = () => {
+      f.feed.disconnect(1); f.feed.connect(1);
+      replacement = f.feed.users.get(1);
+      f.blocked.set(1, false);
+    };
+    if (phase === "prepare") {
+      const send = f.adapter.send;
+      f.adapter.send = (user, packet) => {
+        if (user === 0 && packet.kind === "pause") {
+          replaceGuest(); throw Error("Preparation failed after slot reuse");
+        }
+        send(user, packet);
+      };
+      assert.throws(() => f.feed.prepareVisibility([0, 1]));
+      assert.equal(f.feed.completeVisibility([0, 1], false), true);
+    } else {
+      f.feed.prepareVisibility([0, 1]);
+      if (phase === "publish") {
+        f.adapter.baseline = () => {
+          replaceGuest(); throw Error("Publication failed after slot reuse");
+        };
+        assert.throws(() => f.feed.completeVisibility([0, 1], true));
+      } else {
+        const close = f.adapter.close;
+        f.adapter.close = (user, error) => {
+          close(user, error);
+          if (user === 0) replaceGuest();
+        };
+        assert.equal(f.feed.completeVisibility([0, 1], false), true);
+      }
+    }
+    assert.deepEqual(f.closed.map(({ user }) => user), [0], phase);
+    assert.equal(f.feed.users.get(1), replacement, phase);
+    assert.equal(f.connected.has(1), true, phase);
+    assert.equal(f.blocked.get(1), false, phase);
+    assert.equal(f.feed.visibilityParticipants.size, 0, phase);
+  }
+});
+
+test("a failed pause cannot close the replacement of the connection being paused", () => {
+  const f = fixture(); f.hello();
+  let replacement;
+  f.adapter.send = (_user, packet) => {
+    if (packet.kind === "pause") {
+      f.feed.disconnect(0); f.feed.connect(0);
+      replacement = f.feed.users.get(0);
+      throw Error("Pause failed after its own slot was reused");
+    }
+  };
+  assert.throws(() => f.feed.prepareVisibility([0]));
+  assert.equal(f.feed.completeVisibility([0], false), true);
+  assert.equal(f.feed.users.get(0), replacement);
+  assert.equal(f.connected.has(0), true);
+  assert.equal(f.closed.length, 0);
+  assert.equal(f.feed.visibilityParticipants.size, 0);
+});
+
 test("repeated hello, invalid ack and changed manifests cannot keep a transition alive forever", () => {
   const f = fixture(); f.hello(); f.deliver();
   const ack = f.replica.applied(f.replica.version);

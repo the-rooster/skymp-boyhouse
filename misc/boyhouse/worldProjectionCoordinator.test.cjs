@@ -124,6 +124,14 @@ test('disabled projection preserves legacy login and hot reload reconnects an en
   assert.deepEqual(reload.calls, ['close', 'reconnect']);
 });
 
+test('confirmed character creation establishes a fresh journal subscription after its input gate', () => {
+  const f = bindingFixture(); f.events.emit('tick'); f.connect(); f.release();
+  const first = f.sent.at(-1);
+  f.emitter.emit('playerCreationComplete');
+  const second = f.sent.at(-1);
+  assert.equal(second.action, 'subscribe'); assert.notEqual(first.subscriptionId, second.subscriptionId);
+});
+
 function fixture() {
   const channel = new CampaignPacketChannel(), packets = [], sent = [], calls = [], closed = [], delivered = [];
   let now = 0, nonce = 0, epoch = '', blocked = true, connected = true, data = manifest();
@@ -268,7 +276,9 @@ function engineFixture(options = {}) {
   ['Movement', 'Fighting', 'CamSwitch', 'Looking', 'Sneaking', 'Menu', 'Activate', 'Journal'].forEach((name, i) => {
     sp.Game[`is${name}ControlsEnabled`] = () => flags[i];
   });
-  class OwnedToken {} class WorldCleanerService {} class WorldView {} class RemoteServer {} class PlayerSpawnService {} class NetworkingService {}
+  class OwnedToken {} class WorldCleanerService {} class WorldView {} class RemoteServer {} class PlayerSpawnService {} class NetworkingService {} class PlayerLoadoutService {}
+  const loadout = { blocksGameplayInput: false, creationMenuActive: false, projectionReadiness: { ready: true },
+    failCreation(error) { this.projectionReadiness = { ready: false, error }; } };
   const dependencies = {
     './clientListener': { ClientListener: class {} }, '../../logging': { logError: (...args) => errors.push(args) },
     '../../campaign/nativeReferenceOperations': { NativeReferenceOperations },
@@ -276,6 +286,7 @@ function engineFixture(options = {}) {
     '../../campaign/referenceSuppression': { ReferenceSuppression }, './ownedReferenceService': { OwnedReferenceService: OwnedToken },
     './worldCleanerService': { WorldCleanerService }, '../../view/worldView': { WorldView },
     './remoteServer': { RemoteServer }, './playerSpawnService': { PlayerSpawnService }, './networkingService': { NetworkingService },
+    './playerLoadoutService': { PlayerLoadoutService },
   };
   const { NativeReferenceOperationService } = load('services/services/nativeReferenceOperationService.ts', dependencies);
   dependencies['./nativeReferenceOperationService'] = { NativeReferenceOperationService };
@@ -299,6 +310,7 @@ function engineFixture(options = {}) {
     if (type === WorldView) return view;
     if (type === RemoteServer) return remote;
     if (type === NetworkingService) return network;
+    if (type === PlayerLoadoutService) return loadout;
     if (type === PlayerSpawnService) return { get status() { return spawn; }, isReady: generation => playerReady && spawn?.generation === generation };
     if (type === WorldCleanerService) return { modWcProtection() {}, setProjectionMode(value) { calls.push(['cleaner', value]); } };
     throw Error('Unexpected service');
@@ -309,7 +321,7 @@ function engineFixture(options = {}) {
   suppression = new ReferenceSuppressionService(sp, controller);
   const projection = { ...manifest(), instance: `campaign:${actor}:room`, identity: 'a'.repeat(32),
     references: [{ original: 0x100, copy: 0xff001000, baseId: 123, kind: 'actor', disabled: false, deleted: false }] };
-  return { engine, native, owned, suppression, view, projection, pending, forms, flags, errors, calls, sp,
+  return { engine, native, owned, suppression, view, projection, pending, forms, flags, errors, calls, sp, loadout,
     update() { ++frame; events.emit('update'); },
     async drain(limit = 24) { for (let i = 0; i < limit; ++i) {
       if (pending.length) pending.shift().finish(); await Promise.resolve(); await Promise.resolve(); this.update();
@@ -368,4 +380,32 @@ test('a reloaded engine adapter restores its retained control lease before doing
     boyhouseProjectionControls: { version: 1, enabled: [true, true, false, false, false, true, true, false] },
   } });
   f.update(); assert.deepEqual(f.flags, [true, true, true, true, false, true, true, false]);
+});
+
+test('projection hands its control lease to character creation without opening movement or activation', async () => {
+  const f = engineFixture(), before = [...f.flags];
+  f.loadout.blocksGameplayInput = true;
+  f.begin(); f.playerReady(); f.viewsReady(); await f.drain();
+  assert.equal(f.engine.observe().ready, true);
+  f.engine.release();
+  assert.equal(f.flags[0], false); assert.equal(f.flags[6], false);
+  f.loadout.creationMenuActive = true; f.update();
+  assert.equal(f.flags[5], true); assert.equal(f.flags[0], false); assert.equal(f.flags[6], false);
+  f.engine.cancel(); await f.drain();
+  assert.equal(f.flags[5], true, 'Reprojection does not disable the active creator menu');
+  assert.equal(f.flags[0], false);
+  f.engine.apply(f.projection, baseline('b'.repeat(32))); await f.drain(); f.engine.release();
+  f.loadout.creationMenuActive = false; f.update();
+  assert.equal(f.flags[5], false, 'Confirmation keeps ordinary menus closed');
+  f.loadout.blocksGameplayInput = false; f.update();
+  assert.deepEqual(f.flags, before);
+});
+
+test('projection waits for loadout application and creation control failures remain closed', async () => {
+  const f = engineFixture(); f.begin(); f.playerReady(); f.viewsReady(); await f.drain();
+  f.loadout.projectionReadiness = { ready: false };
+  assert.equal(f.engine.observe().ready, false);
+  f.loadout.projectionReadiness = { ready: true }; f.engine.release();
+  f.loadout.blocksGameplayInput = true; f.noOpControls(true); f.update();
+  assert.match(f.loadout.projectionReadiness.error, /controls did not become blocked/);
 });

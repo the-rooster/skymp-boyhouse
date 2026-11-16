@@ -14,6 +14,14 @@ const server = new ScampServer(JSON.stringify({
   npcEnabled: false, offlineMode: true, logLevel: "error",
 }));
 server._setSelf(server);
+// The addon must expose the paired hook contract used by the production feed.
+// Runtime tests exercise real commit/rejection semantics beneath this bridge.
+for (const args of [[], [null], [null, () => true], [() => true, null],
+                    [true, true], [null, null, null]]) {
+  assert.throws(() => server.setCampaignVisibilityCallbacks(...args));
+}
+assert.doesNotThrow(() => server.setCampaignVisibilityCallbacks(() => true, () => true));
+assert.doesNotThrow(() => server.setCampaignVisibilityCallbacks(null, null));
 const ids = [0xff000a01, 0xff000a02, 0xff000a03];
 for (const id of ids) server.createActor(id, [10000, 10000, 10000], 0, 0x3c);
 const authority = new PartyInstances({

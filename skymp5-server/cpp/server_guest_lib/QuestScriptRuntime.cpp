@@ -1,7 +1,9 @@
 #include "QuestScriptRuntime.h"
 #include "CampaignInventoryApi.h"
 #include "CampaignReferenceBinding.h"
+#include "CampaignReferenceQueryApi.h"
 #include "CampaignReferenceScripts.h"
+#include "CampaignWorldStateApi.h"
 #include "ConditionsEvaluator.h"
 #include "MpActor.h"
 #include "QuestJournal.h"
@@ -856,6 +858,8 @@ bool QuestScriptRuntime::Execute(MpActor& actor, uint32_t questId,
           "Form belongs to another campaign or is an alias");
       return result->record.ToGlobalId(result->record.rec->GetId());
     };
+    CampaignReferenceQueryApi::Register(vm, actor, formId, resolve);
+    CampaignWorldStateApi::Register(vm, actor, formId);
     vm.RegisterFunction("Form", "GetFormID", FunctionType::Method,
                         [&](VarValue self, std::vector<VarValue> args) {
                           if (!args.empty())

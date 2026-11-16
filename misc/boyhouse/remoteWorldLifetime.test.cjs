@@ -47,7 +47,8 @@ function fixture(storage = {}) {
       setDisplayName() {}, getFurnitureReference: () => null,
     };
   };
-  class PlayerSpawnService {} class LoadGameService {} class RagdollService {}
+  class PlayerSpawnService {} class PlayerLoadoutService {} class LoadGameService {} class RagdollService {}
+  const loadout = { preservesCreationAppearance: false };
   class RespawnNeededError extends Error {}
   const view = { syncFormArray() {}, getFormViews: () => ({ destroyForm: id => calls.push(['destroy-view', id]) }) };
   const sp = { storage, mpClientPlugin: { isConnected: () => connected },
@@ -79,18 +80,20 @@ function fixture(storage = {}) {
       getObjectReference: () => reference(0xff001000), remoteIdToLocalId: id => id },
     '../../logging': { logTrace() {}, logError() {} }, './playerSpawnService': { PlayerSpawnService },
     './loadGameService': { LoadGameService },
+    './playerLoadoutService': { PlayerLoadoutService },
   };
   const { RemoteServer } = load('services/services/remoteServer.ts', dependencies, { Date: { now: () => now } });
   const server = new RemoteServer(sp, { on: (...args) => events.on(...args), once: (...args) => events.once(...args), emitter,
     lookupListener(type) {
       if (type === PlayerSpawnService) return { request: m => calls.push(['spawn', m.idx]), cancel: () => calls.push(['cancel-spawn']) };
       if (type === LoadGameService) return { get isLoadingPlatformSave() { return platformLoad; } };
+      if (type === PlayerLoadoutService) return loadout;
       if (type === RagdollService) return { safeRemoveRagdollFromWorld: (_actor, callback) => ragdolls.push(callback) };
       throw Error('Unexpected service');
     },
   });
   const event = (name, message) => emitter.emit(name, { message });
-  return { server, emitter, events, calls, guards, ragdolls, forms, storage, RespawnNeededError,
+  return { server, emitter, events, calls, guards, ragdolls, forms, storage, RespawnNeededError, loadout,
     event, create: message => event('createActorMessage', message || create()),
     update(ms = 0) { now += ms; ++frame; events.emit('update'); },
     tick: () => events.emit('tick'), native: (...args) => events.emit(...args),
@@ -164,6 +167,16 @@ test('generated-world loading suspends initial native effects until its load eve
   f.emitter.emit('gameLoad', { isCausedBySkyrimPlatform: true }); f.update();
   assert.equal(f.calls.filter(c => c[0] === 'appearance').length, 1);
   assert.equal(f.guards[0](), true); f.server.resetWorldModel(); assert.equal(f.guards[0](), false);
+});
+
+test('creation preserves its face and accepted echo without queuing another native rebuild', () => {
+  const f = fixture(); f.create(); f.loadout.preservesCreationAppearance = true;
+  f.event('updateAppearanceMessage', { idx: 1, data: { name: 'Creator face' } }); f.update();
+  assert.equal(f.calls.some(c => c[0] === 'appearance'), false);
+  assert.equal(f.server.getWorldModel().forms[0].appearance.name, 'Creator face');
+  f.loadout.preservesCreationAppearance = false;
+  f.event('updateAppearanceMessage', { idx: 1, data: { name: 'Later server edit' } }); f.update();
+  assert.equal(f.calls.filter(c => c[0] === 'appearance').length, 1);
 });
 
 for (const changed of ['none', 'epoch', 'handle']) test(`late ragdoll completion checks ${changed} before teleporting`, () => {

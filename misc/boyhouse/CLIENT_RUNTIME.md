@@ -1,12 +1,14 @@
 ﻿# Native client runtime audit
 
-Updated 2026-11-16 UTC. **Experimental port; multiplayer gameplay is unverified.**
+Updated 2026-11-16 UTC. **Experimental port; full multiplayer gameplay is unverified.**
 The installed Steam runtime is 1.7.104.0. The locally built SKSE 2.3.1 and
 Skyrim Platform implementation now load a generated test world and execute native
 JavaScript/Papyrus bridge calls. A clean restart reproduced this result. No
 personal save was loaded or changed. The full multiplayer client has now logged
-into the private staging server and loaded its generated character. Movement,
-multiple real players, campaign projection and quest playthroughs remain unverified.
+into the private staging server and loaded its generated character. The
+single-client shared/private/shared projection round trip described below has
+passed on a disposable server. New-character completion, multiple real players,
+general movement/world behavior and quest playthroughs remain unverified.
 
 ## Implemented port
 
@@ -640,6 +642,93 @@ remain unfinished. The adapter's readiness checks cover spawn/lifetime work;
 they do not certify every inventory, equipment, animation, or arbitrary
 gamemode effect. Staging projection remains disabled and **zero quests are
 certified playable**.
+
+## Character creation and visibility refresh guards
+
+`PlayerLoadoutService` now owns the character-creation preview and draft. It
+waits for projection readiness before opening RaceSexMenu and keeps the gameplay
+input/control lease throughout editing. Closing the menu captures one immutable
+appearance snapshot; reliable retries continue until the assigned actor's
+matching server echo or same-actor replacement baseline acknowledges it. A
+projection refresh preserves the active menu/draft for that same character;
+replacing the character during editing is refused. Human editing has no deadline,
+while missing menu opening, capture, acknowledgement or restoration fails closed
+after 30 seconds of active processing. Projection pauses suspend those deadlines.
+
+The native server separately permits only appearance updates while its assigned
+actor's race menu is open (plus the projection control channel). It checks the
+actor index and finite appearance values, stores the accepted appearance, then
+closes the creation flag and sends the reliable echo. Client outbound gating also
+blocks raw and ordinary gameplay messages during creation. Stale generations
+cannot close a replacement connection after a loadout failure.
+
+The visibility commit barrier is separate from character creation. Before a
+private copy changes enabled state, every connected assigned observer in its
+phase is gated and advances its native packet epoch. Fresh projections follow
+the committed change; the native gate cannot open inside the barrier or after a
+terminal visibility failure. Client hello can defer publication while the gate
+remains closed. A failed update quarantines captured connections; reconnecting
+into a reused user slot does not inherit another connection's cleanup.
+
+Binary decoding now checks primitive reads, constants and string/container
+lengths before accepting values. Truncation and impossible lengths fail instead
+of becoming partial appearance or gameplay state. These checks complement the
+epoch and actor-identity guards; they are not gameplay certification.
+
+Self loadout restoration now observes normalized full inventory equality on two
+updates before handling equipment. It equips existing inventory items without
+queuing the older additive equipment-inventory task, then observes worn variants,
+hands and spells on two updates before releasing the creation gate. No-op native
+calls cannot satisfy that check. Retries are spaced at least 250 ms apart; paused
+menus and unloaded actors wait. Ordinary play retains its five-second inventory
+checks without taking the creation input lease. The inventory comparer retains
+its existing normalization; equipment preserves names and charges through native
+extra-data parsing and every merge, then compares explicit names exactly (only
+absent/empty names normalize to the base form name). When selection is required,
+differing variants of one base ID are
+refused before changing gear because `equipItemEx` cannot select a specific item
+instance.
+
+Controlled service tests now cover these observations and failed/no-op native
+calls; **284 JavaScript tests and the client webpack build passed**, including six
+regressions through the real native-extra-data parser. Evidence is
+in ignored `artifacts/client-loadout-settlement-tests.log` and
+`artifacts/client-loadout-settlement-build.log`. The native attempt below reached
+the creator but did not complete it. Actual creation-to-gameplay
+behavior, ambiguous item-instance selection, visibility refreshes on multiple
+real clients and the full quest lifecycle still require acceptance. A first
+`OnLoad` that requests another visibility mutation is refused while its outer
+barrier is active. No quest adapters are enabled and **zero quests are certified
+playable**.
+
+## Fresh-character native acceptance on 2026-11-16 UTC
+
+A fresh character opened RaceSexMenu after projection reached ready. The
+observer recorded **45 seconds of editing across 2,673 samples**, with no worn
+gear or equipped weapons and gameplay input still gated. This establishes the
+creation preview and its extended editing gate in that run.
+
+The first native `Ui.invokeIntA` call to `...onDoneClicked`, using an empty
+argument array, failed in `SP3NativeValueCasts::JsObjectToNativeObject`:
+`_skyrimPlatform_indexInPool` was 0, but the valid range was `[34438, 34441)`.
+The fixture ended with `passed: false` and `accepted: false` while still editing.
+It did not establish menu completion, accepted appearance echo, final loadout
+restoration, gameplay release or the planned phase round trip. This binding
+failure remains the immediate blocker for completing the scripted creator run;
+the automated native/JavaScript/Python suites and server smokes remain green.
+
+Evidence is in ignored
+`artifacts/creation-runtime-runtime/boyhouseCharacterCreationRuntimeTest-logs.txt`.
+The backup manifest is
+`artifacts/game-backups/20261116T220543Z/creation-runtime/`. After the attempt,
+all original INIs were restored byte-for-byte, personal save hashes were
+unchanged, no new saves remained and Skyrim was closed.
+
+A separate projection rerun never launched. Automatic approval review rejected
+the combined preparation/launch action with "blocked by policy" and supplied no
+specific reason. Its server and relay were closed; this attempt contributes no
+new projection acceptance evidence. Earlier recorded projection evidence is
+unchanged. **Zero quests are certified playable.**
 
 ## Remaining acceptance
 

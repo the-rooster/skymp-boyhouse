@@ -61,6 +61,20 @@ async function command(p, body) {
     t: 1, contentJsonDump: JSON.stringify({ customPacketType: "boyhouse.instance", ...body }),
   } }); await sleep(250);
 }
+async function finishCreation(p) {
+  if (server.get(p.actor, "appearance")) return;
+  const data = {
+    isFemale: false, raceId: 0x13746, weight: 50, skinColor: 0, hairColor: 0,
+    headpartIds: [], headTextureSetId: 0, options: Array(19).fill(0),
+    presets: Array(4).fill(0), tints: [], name: `Projection ${p.actor}`,
+  };
+  p.bot.send({ t: 34, epoch: p.replica.packetEpoch, message: {
+    t: 4, idx: server.get(p.actor, "idx"), data,
+  } });
+  await sleep(100);
+  assert.deepEqual(server.get(p.actor, "appearance"), data,
+    "Character creation must complete in the released projection epoch");
+}
 
 (async () => {
   const owner = await login(2001, "owner");
@@ -69,11 +83,14 @@ async function command(p, body) {
   await command(owner, { action: "enter", area: "fixture" });
   assert.equal(scope(owner), "", "Custom gameplay commands are blocked before acknowledgement");
   await acknowledge(owner);
+  await command(owner, { action: "enter", area: "fixture" });
+  assert.equal(scope(owner), "", "Character creation still blocks gameplay after projection release");
+  await finishCreation(owner);
   packet(owner.bot, { customPacketType: "boyhouse.instance", action: "enter", area: "fixture" });
   await sleep(250);
   assert.equal(scope(owner), "", "Untagged input cannot bypass the released epoch");
-  const guest = await login(2002, "guest"); await acknowledge(guest);
-  const stranger = await login(2003, "stranger"); await acknowledge(stranger);
+  const guest = await login(2002, "guest"); await acknowledge(guest); await finishCreation(guest);
+  const stranger = await login(2003, "stranger"); await acknowledge(stranger); await finishCreation(stranger);
   const key = "4e50d:Skyrim.esm";
   for (const [p, index] of [[owner, 10], [guest, 5]]) {
     server.set(p.actor, "private.boyhouse.questAdapters", [key]);

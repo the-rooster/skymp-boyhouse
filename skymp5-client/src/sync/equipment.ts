@@ -8,7 +8,7 @@ import {
   setInventory,
 } from 'skyrimPlatform';
 
-import { Entry, Inventory, getInventory } from './inventory';
+import { Entry, Inventory, getInventory, getEquipmentInventory, equipmentEntryExtrasEqual } from './inventory';
 
 export const enum SpellType {
   Left,
@@ -123,6 +123,56 @@ export const applyEquipment = (ac: Actor, eq: Equipment): boolean => {
   syncSpellEquipment(ac, eq.instantSpell, SpellType.Instant);
 
   return true;
+};
+
+const wornSlots = (inventory: Inventory): { item: Entry; left: boolean }[] => {
+  const slots: { item: Entry; left: boolean }[] = [];
+  for (const entry of inventory.entries) {
+    if (entry.count <= 0) continue;
+    if (entry.worn) slots.push({ item: entry, left: false });
+    if (entry.wornLeft) slots.push({ item: entry, left: true });
+  }
+  return slots;
+};
+
+export const isPlayerEquipmentSettled = (ac: Actor, eq: Equipment): boolean => {
+  const actual = wornSlots(getEquipmentInventory(ac)), expected = wornSlots(eq.inv);
+  if (actual.length !== expected.length) return false;
+  for (const wanted of expected) {
+    const index = actual.findIndex(slot => slot.left === wanted.left &&
+      slot.item.baseId === wanted.item.baseId && equipmentEntryExtrasEqual(slot.item, wanted.item));
+    if (index < 0) return false;
+    actual.splice(index, 1);
+  }
+  return [eq.leftSpell, eq.rightSpell, eq.voiceSpell, eq.instantSpell].every((spell, slot) =>
+    getEquipedSpell(ac, slot) === (spell || 0));
+};
+
+// Self restoration follows an observed full-inventory restore. Never queue
+// setInventory here: its additive game-thread task can race the inventory
+// reconciler and duplicate items. Re-equipping existing items is retryable.
+export const applyPlayerEquipment = (ac: Actor, eq: Equipment): void => {
+  if (ac.getFormID() !== 0x14) throw Error('Player equipment requires the local player');
+  const inventory = getEquipmentInventory(ac);
+  for (const entry of filterWorn(eq.inv).entries) {
+    const form = Game.getFormEx(entry.baseId);
+    if (!form || ac.getItemCount(form) <= 0) throw Error('Equipped item is absent from the authoritative inventory');
+    // EquipItemEx selects by base ID. With differing variants it can pick the
+    // wrong enchanted/tempered/named item; refuse before changing any gear.
+    const variants = inventory.entries.filter(item => item.baseId === entry.baseId && item.count > 0);
+    if (!variants.length || variants.some(item => !equipmentEntryExtrasEqual(item, entry)))
+      throw Error('Ambiguous equipment requires item-instance selection');
+  }
+  ac.unequipAll();
+  for (const entry of filterWorn(eq.inv).entries) {
+    const form = Game.getFormEx(entry.baseId);
+    if (entry.worn) ac.equipItemEx(form, 1, false, false);
+    if (entry.wornLeft) ac.equipItemEx(form, 2, false, false);
+  }
+  syncSpellEquipment(ac, eq.leftSpell, SpellType.Left);
+  syncSpellEquipment(ac, eq.rightSpell, SpellType.Right);
+  syncSpellEquipment(ac, eq.voiceSpell, SpellType.Voice);
+  syncSpellEquipment(ac, eq.instantSpell, SpellType.Instant);
 };
 
 export const isBadMenuShown = (): boolean => {

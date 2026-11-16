@@ -46,6 +46,7 @@ function fixture(storage = {}) {
     assert.ok(name in dependencies, `Unexpected dependency ${name}`); return dependencies[name];
   } });
   const loadout = {
+    shouldApplySpawnAppearance: () => true,
     beginSpawn(message) { calls.push(['begin', message.idx]); return ++loadoutGeneration; },
     cancelSpawn(generation) { calls.push(['cancel', generation]); if (generation === loadoutGeneration) ++loadoutGeneration; },
     markSpawnReady(generation) { assert.equal(generation, loadoutGeneration); ready.push(generation); },
@@ -70,7 +71,7 @@ function fixture(storage = {}) {
       throw Error('Unexpected service lookup');
     },
   });
-  return { service, calls, loads, errors, ready, guards, storage, emitter,
+  return { service, calls, loads, errors, ready, guards, storage, emitter, loadout,
     update(ms = 0) { now += ms; ++frame; events.emit('update'); },
     tick(ms = 0) { now += ms; inTick = true; try { events.emit('tick'); } finally { inTick = false; } },
     native: (...args) => events.emit(...args), message: (...args) => emitter.emit(...args),
@@ -118,6 +119,15 @@ test('a superseding self snapshot owns positioning, spells, appearance and loado
   assert.deepEqual(f.calls.filter(c => c[0] === 'appearance'), [['appearance', 'Player 2']]);
   assert.deepEqual(f.calls.filter(c => c[0] === 'spells'), [['spells', [2]]]);
   assert.equal(f.ready.length, 1);
+});
+
+test('a same-player creation draft prevents baseline presentation from overwriting its face', () => {
+  const f = fixture(); f.loadout.shouldApplySpawnAppearance = () => false;
+  const message = spawn(); const generation = f.service.request(message);
+  f.arrive(message);
+  assert.equal(f.service.isReady(generation), true);
+  assert.equal(f.calls.some(call => call[0] === 'appearance'), false);
+  assert.ok(f.calls.some(call => call[0] === 'spells'));
 });
 
 for (const during of ['appearance', 'removeSpells']) test(`a replacement during ${during} prevents later old-snapshot effects`, () => {

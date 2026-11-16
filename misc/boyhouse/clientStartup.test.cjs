@@ -24,7 +24,7 @@ function equipmentHarness() {
   const events = new EventEmitter(), emitter = new EventEmitter();
   const player = { getFormID: () => 0x14 };
   let count = -1;
-  let blocked = false, menuOpen = false;
+  let blocked = false, menuOpen = false, pending;
   const dependencies = {
     './clientListener': { ClientListener: class {} },
     './singlePlayerService': {}, './playerLoadoutService': {},
@@ -44,11 +44,12 @@ function equipmentHarness() {
     Game: { getPlayer: () => player }, Ui: { isMenuOpen: () => menuOpen }, printConsole() {},
   }, {
     on: (...args) => events.on(...args), emitter,
-    lookupListener: () => ({ blocksEquipmentInput: blocked }),
+    lookupListener: () => ({ blocksEquipmentInput: blocked, pendingAppearance: pending }),
   });
   const changed = () => events.emit('equip', { actor: player, baseObj: { getType: () => 26, getFormID: () => 0x12e46 } });
   return { service, emitter, changed, setCount(value) { count = value; },
     setBlocked(value) { blocked = value; }, setMenuOpen(value) { menuOpen = value; },
+    setPending(value) { pending = value; },
     send: () => service.sendEquipment(), appearance: () => service.sendAppearance() };
 }
 
@@ -60,7 +61,8 @@ test('character preview suppresses equipment and item scripts but still submits 
   h.appearance(); h.changed(); h.send();
   assert.equal(sent.length, 0);
   assert.equal(itemEvents.length, 0);
-  h.setMenuOpen(false); h.appearance(); h.send();
+  h.setMenuOpen(false); h.setPending({ generation: 1, actorIdx: 1, data: { name: 'Finished character' } });
+  h.appearance(); h.send();
   assert.deepEqual(sent.map(m => m.t), [4]);
   h.setBlocked(false); h.send(); h.send();
   assert.deepEqual(sent.map(m => m.t), [4, 5]);
@@ -78,6 +80,27 @@ test('equipment waits for a valid inventory and retries without another equip ev
   assert.equal(sent.length, 1);
   assert.equal(sent[0].data.numChanges, 1);
   assert.equal(sent[0].data.inv.entries[0].count, 1);
+});
+
+test('the final appearance is retried until loadout confirmation and never re-read from the preview', () => {
+  const h = equipmentHarness(), sent = [];
+  const pending = { generation: 1, actorIdx: 1, data: { name: 'Finished character' } };
+  h.setPending(pending);
+  h.emitter.on('sendMessageWithRefrId', e => sent.push(e.message));
+  h.appearance(); h.appearance(); assert.equal(sent.length, 1);
+  h.service.lastAppearanceAttempt -= 1000; h.appearance();
+  assert.equal(sent.length, 2); assert.equal(sent[1].data, pending.data);
+  h.setPending(undefined); h.appearance(); assert.equal(sent.length, 2);
+  h.setPending({ ...pending, generation: 2 }); h.appearance(); assert.equal(sent.length, 3);
+});
+
+test('an appearance send exception does not consume the pending submission', () => {
+  const h = equipmentHarness(), sent = [];
+  h.setPending({ generation: 1, actorIdx: 1, data: { name: 'Finished character' } });
+  h.emitter.once('sendMessageWithRefrId', () => { throw Error('send failed'); });
+  assert.throws(h.appearance, /send failed/);
+  h.emitter.on('sendMessageWithRefrId', e => sent.push(e.message));
+  h.appearance(); assert.equal(sent.length, 1);
 });
 
 test('native send failure retains the equipment change and sequence for retry', () => {
