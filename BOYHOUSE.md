@@ -76,7 +76,7 @@ This is not full campaign multiplayer or a finished instancing engine. Vanilla s
 
 The full-release target is every quest in Skyrim, Update, Dawnguard, HearthFires, and Dragonborn. Completion requires evidence per quest and important branch; it is not guaranteed by adding synchronization primitives. The local owned files contain 2,274 distinct QUST records including internal helper quests. **Zero quests have been certified for this fork.** Creation Club and arbitrary quest mods are separate compatibility packs.
 
-The installed Skyrim runtime is 1.7.104. Upstream Skyrim Platform documentation lists older runtimes through 1.6.1170. Native plugin compatibility with 1.7.104 must be established before an in-game test; the existing game installation has not been modified. Building a client bundle is not evidence of engine compatibility.
+The installed Skyrim runtime is 1.7.104. The experimental native port builds, and vanilla Skyrim plus a locally built SKSE 2.3.1 have reached the main menu. Saves/settings were backed up before installing SKSE. The complete Address Library is still missing; the multiplayer implementation DLL and actual gameplay remain unverified. See the [runtime audit](misc/boyhouse/CLIENT_RUNTIME.md).
 
 ## Build and verify
 
@@ -119,6 +119,4 @@ Once a compatible fork client is installed, open the Skyrim console and use `mp 
 
 ## Windows runtime compatibility investigation
 
-The client TypeScript bundle builds using the upstream Yarn lockfile. Windows CMake configuration and all 60 native dependency installations also completed. The native plugin uses a 2024 CommonLib pin whose address database reader rejects unexpected format versions, and `Hooks.cpp` explicitly looks for `skse64_1_6_1170.dll`. These are concrete porting targets, not proof that every hook will work after an upgrade.
-
-SKSE's official site supplies 2.3.1 for 1.7.104: https://skse.silverlock.org/. A current CommonLib candidate is https://github.com/alandtse/CommonLibSSE-NG; migration must preserve SkyMP's four local access/layout patches and audit runtime-dependent hooks. A similar format-5 failure is documented at https://github.com/maglarnet/Dynamic_Terrain_Deformation_Skse/issues/4. Do not install the current build into a 1.7.104 game and label it compatible based only on compilation.
+The native port pins a 1.7-aware CommonLib source and preserves the four SkyMP patches. It adds format-5 plugin metadata, a runtime-derived SKSE module name, the VM runtime-data accessor, early executable/dependency checks, and a checked console hook. Both DLLs and the CEF process build in Release. The support-script builder produced 63 strictly parsed Skyrim PEX files and passed five focused tests. These are build/source checks and a dependency-only game launch, not proof of multiplayer compatibility; remaining gates and exact source pins are in the [runtime audit](misc/boyhouse/CLIENT_RUNTIME.md).

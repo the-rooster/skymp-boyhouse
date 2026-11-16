@@ -127,10 +127,9 @@ if(NOT "${SKIP_SKYRIM_PLATFORM_BUILDING}")
       set_target_properties(CommonLibSSE::CommonLibSSE PROPERTIES INTERFACE_COMPILE_DEFINITIONS "${_commonlib_defs}")
     endif()
 
-    target_commonlibsse_properties(skyrim_platform_entry
-      NAME "SkyrimPlatform"
-      AUTHOR "SkyMP Team and Contributors"
-    )
+    # Explicit metadata is required for Address Library format 5. The upstream
+    # metadata generator currently omits its SKSE compatibility flag.
+    target_link_libraries(skyrim_platform_entry PRIVATE CommonLibSSE::CommonLibSSE)
 
     target_precompile_headers(skyrim_platform_entry	PRIVATE	skyrim_platform_entry/PCH.h)
     apply_default_settings(TARGETS skyrim_platform_entry)

@@ -1,7 +1,7 @@
-diff --git a/include/RE/E/ExtraDataList.h b/include/RE/E/ExtraDataList.h
+diff --git a/extern/CommonLibSSE/include/RE/E/ExtraDataList.h b/extern/CommonLibSSE/include/RE/E/ExtraDataList.h
 index dde093b5..8c1ee92f 100644
---- a/include/RE/E/ExtraDataList.h
-+++ b/include/RE/E/ExtraDataList.h
+--- a/extern/CommonLibSSE/include/RE/E/ExtraDataList.h
++++ b/extern/CommonLibSSE/include/RE/E/ExtraDataList.h
 @@ -38,7 +38,9 @@ namespace RE
  		[[nodiscard]] const PresenceBitfield*& GetPresence() const noexcept;
  

@@ -1,7 +1,7 @@
-diff --git a/include/RE/T/TESObjectREFR.h b/include/RE/T/TESObjectREFR.h
+diff --git a/extern/CommonLibSSE/include/RE/T/TESObjectREFR.h b/extern/CommonLibSSE/include/RE/T/TESObjectREFR.h
 index 4d9debf6..6aa33ce2 100644
---- a/include/RE/T/TESObjectREFR.h
-+++ b/include/RE/T/TESObjectREFR.h
+--- a/extern/CommonLibSSE/include/RE/T/TESObjectREFR.h
++++ b/extern/CommonLibSSE/include/RE/T/TESObjectREFR.h
 @@ -456,6 +456,7 @@ namespace RE
  		void                                            MoveTo(TESObjectREFR* a_target);
  		bool                                            MoveToNode(TESObjectREFR* a_target, const BSFixedString& a_nodeName);

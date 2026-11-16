@@ -52,10 +52,25 @@ struct OnConsoleVPrint
 
 void InstallOnConsoleVPrintHook()
 {
-  Hooks::write_thunk_call<OnConsoleVPrint>(Offsets::Hooks::VPrint.address());
+  const auto site = Offsets::Hooks::VPrint.address();
+  if (*reinterpret_cast<const uint8_t*>(site) != 0xE8) {
+    throw std::runtime_error("Console print hook does not point to a CALL");
+  }
+  if (REL::Module::get().version() == REL::Version{ 1, 7, 104, 0 }) {
+    // Verified on Steam PE timestamp 0x6A8C7046, image size 0x03929000.
+    // VPrint ID 51110 is RVA 0x90F1E0; +0x300 calls string append at 0x1497E0.
+    // Do not install if the site has moved or another plugin has patched it.
+    constexpr uint8_t expected[] = { 0xE8, 0xFB, 0xA2, 0x83, 0xFF };
+    if (site - REL::Module::get().base() != 0x90F4E0 ||
+        std::memcmp(reinterpret_cast<const void*>(site), expected,
+                    sizeof(expected)) != 0) {
+      throw std::runtime_error("Unexpected Skyrim 1.7.104 console print hook");
+    }
+  }
+  Hooks::write_thunk_call<OnConsoleVPrint>(site);
 }
 
-void BindNativeMethod(RE::BSScript::Internal::VirtualMachine* thisArg,
+bool BindNativeMethod(RE::BSScript::Internal::VirtualMachine* thisArg,
                       RE::BSScript::IFunction* func);
 
 decltype(&BindNativeMethod) _BindNativeMethod;
@@ -70,46 +85,32 @@ void HookVirtualMachineBind()
     Vtbl.write_vfunc(0x18, BindNativeMethod));
 }
 
-void BindNativeMethod(RE::BSScript::Internal::VirtualMachine* thisArg,
+bool BindNativeMethod(RE::BSScript::Internal::VirtualMachine* thisArg,
                       RE::BSScript::IFunction* func)
 {
-  std::stringstream memory;
-
-  for (int i = 0; i < 100; i++) {
-    uint8_t* funcPtr = reinterpret_cast<uint8_t*>(func);
-    if (i % 8 == 0) {
-      memory << std::hex << '[' << (int)i << ']' << ' ';
-    }
-    memory << std::hex << (int)funcPtr[i] << ' ';
-  }
-
-  uint8_t* raw = reinterpret_cast<uint8_t*>(func);
-  uintptr_t realFunc = *reinterpret_cast<uintptr_t*>(raw + 0x50);
-
-  uintptr_t moduleBase =
-    hook::internal::GetAllocationBase(reinterpret_cast<void*>(realFunc));
-  uintptr_t funcOffset = realFunc - moduleBase;
-
-  auto skse = (uintptr_t)GetModuleHandleA("skse64_1_6_1170.dll");
-
-  uintptr_t isLongSignature =
-    moduleBase == skse ? *reinterpret_cast<uint8_t*>(raw + 0x58) : 0;
-
-  const char* funcName = func ? func->GetName().data() : "<null func>";
-  const char* className =
-    func ? func->GetObjectTypeName().data() : "<null IFunction>";
-  spdlog::trace("VirtualMachine::Bind called {} {} {} funcOffset={:x}, "
-                "realFunc={:x}, moduleBase={:x}",
-                className, funcName, memory.str(), funcOffset, realFunc,
-                moduleBase);
-
-  if (func) {
+  // Only native functions have the callback field. SKSE 2.3.x preserves
+  // NativeFunctionBase (0x50), followed by the callback and long-signature flag.
+  if (func && func->GetIsNative()) {
+    const auto* raw = reinterpret_cast<const uint8_t*>(func);
+    const auto realFunc = *reinterpret_cast<const uintptr_t*>(raw + 0x50);
+    const auto moduleBase =
+      hook::internal::GetAllocationBase(reinterpret_cast<void*>(realFunc));
+    const auto funcOffset = realFunc - moduleBase;
+    const auto runtime = REL::Module::get().version();
+    const auto moduleName = fmt::format("skse64_{}_{}_{}.dll", runtime[0],
+                                        runtime[1], runtime[2]);
+    const auto skse = reinterpret_cast<uintptr_t>(GetModuleHandleA(moduleName.c_str()));
+    const uintptr_t isLongSignature =
+      skse && moduleBase == skse ? *(raw + 0x58) : 0;
+    const auto* funcName = func->GetName().data();
+    const auto* className = func->GetObjectTypeName().data();
+    spdlog::trace("VirtualMachine::Bind {} {} funcOffset={:x}, moduleBase={:x}",
+                  className, funcName, funcOffset, moduleBase);
     std::lock_guard<std::mutex> lock(hook::internal::g_mutex);
     hook::internal::g_boundNatives.push_back(
       { className, funcName, func, moduleBase, funcOffset, isLongSignature });
   }
-
-  _BindNativeMethod(thisArg, func);
+  return _BindNativeMethod(thisArg, func);
 }
 
 std::vector<std::tuple<std::string, std::string, RE::BSScript::IFunction*,

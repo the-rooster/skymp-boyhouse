@@ -1,7 +1,7 @@
-diff --git a/include/RE/S/StackFrame.h b/include/RE/S/StackFrame.h
+diff --git a/extern/CommonLibSSE/include/RE/S/StackFrame.h b/extern/CommonLibSSE/include/RE/S/StackFrame.h
 index 03bfc2d5..a17051dc 100644
---- a/include/RE/S/StackFrame.h
-+++ b/include/RE/S/StackFrame.h
+--- a/extern/CommonLibSSE/include/RE/S/StackFrame.h
++++ b/extern/CommonLibSSE/include/RE/S/StackFrame.h
 @@ -29,8 +29,7 @@ namespace RE
  			bool                            instructionsValid;   // 3C
  			std::uint8_t                    pad3D;               // 3D

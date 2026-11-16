@@ -1,8 +1,8 @@
 vcpkg_from_github(
     OUT_SOURCE_PATH SOURCE_PATH
-    REPO CharmedBaryon/CommonLibSSE
-    REF b93280e832f263dbef44e44cbe2936622a02f91a
-    SHA512  c98a0dde8fab45d0b5ffc8241bc6437fc1b2855e5577e9b66fe4e237c35c7111c3288f0ef7a637b2a399dd38938221619331e3b49504b76ac0e1a0a2034715a6
+    REPO Zzyxz/CommonLibSSE-NG
+    REF d4ee41104c391ac4e19093c97c3a76138bf6b55a
+    SHA512 3628aa145ed358849c10058d3bfd50a829cdc2cb85c2b789400057a5643c85a0488c4b5a78e789ed284d27334a4355bbca7a8e4b78fa875ae2540feaecaeca43
     HEAD_REF main
     PATCHES
       patches/01-objectrefr-make_moverefr_public.patch
@@ -10,6 +10,8 @@ vcpkg_from_github(
       patches/03-stackframe-uncomment_top_args.patch
       patches/04-extradatalist-make_members_public.patch
 )
+
+set(SOURCE_PATH "${SOURCE_PATH}/extern/CommonLibSSE")
 
 vcpkg_configure_cmake(
         SOURCE_PATH "${SOURCE_PATH}"
