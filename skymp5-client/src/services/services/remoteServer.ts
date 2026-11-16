@@ -22,10 +22,8 @@ import { setActorValuePercentage } from '../../sync/actorvalues';
 import { applyAppearanceToPlayer } from '../../sync/appearance';
 import { Inventory } from '../../sync/inventory';
 import { Movement } from '../../sync/movement';
-import { learnSpells, removeAllSpells } from '../../sync/spell';
 import { ModelApplyUtils } from '../../view/modelApplyUtils';
 import { FormModel, WorldModel } from '../../view/model';
-import { LoadGameService } from './loadGameService';
 import { UpdateMovementMessage } from '../messages/updateMovementMessage';
 import { ChangeValuesMessage } from '../messages/changeValuesMessage';
 import { UpdateAnimationMessage } from '../messages/updateAnimationMessage';
@@ -52,12 +50,11 @@ import {
   getViewFromStorage,
   remoteIdToLocalId,
 } from '../../view/worldViewMisc';
-import { TimeService } from './timeService';
 import { logTrace, logError } from '../../logging';
 
 import { SpellCastMessage } from '../messages/spellCastMessage';
 import { UpdateAnimVariablesMessage } from '../messages/updateAnimVariablesMessage';
-import { PlayerLoadoutService } from './playerLoadoutService';
+import { PlayerSpawnService } from './playerSpawnService';
 
 export const getPcInventory = (): Inventory | undefined => {
   const res = storage['pcInv'];
@@ -375,173 +372,7 @@ export class RemoteServer extends ClientListener {
     if (msg.props && !msg.props.isHostedByOther) {
     }
 
-    const loadout = this.controller.lookupListener(PlayerLoadoutService);
-    const spawnGeneration = msg.isMe ? loadout.beginSpawn(msg) : undefined;
-    const markLoadoutReady = () => {
-      if (spawnGeneration !== undefined) loadout.markSpawnReady(spawnGeneration);
-    };
-
-    if (msg.isMe && msg.props && msg.props.learnedSpells) {
-      const learnedSpells = msg.props.learnedSpells;
-
-      once('update', () => {
-        Utility.wait(1).then(() => {
-          const player = Game.getPlayer();
-
-          if (player) {
-            removeAllSpells(player);
-            learnSpells(player, learnedSpells);
-            logTrace(this,
-              `player learnedSpells:`, JSON.stringify(learnedSpells),
-            );
-          }
-        });
-      });
-    }
-
-    if (msg.isMe) {
-      if (msg.props?.isDead) {
-        once("update", () => {
-          this.controller.emitter.emit("applyDeathStateEvent", {
-            actor: Game.getPlayer()!,
-            isDead: true
-          });
-        });
-      }
-    }
-
-    if (msg.isMe) {
-      const spawnTask = { running: false };
-      once('update', () => {
-        // Use MoveRefrToPosition to spawn if possible (not in main menu)
-        // In case of connection lost this is essential
-        if (!spawnTask.running) {
-          spawnTask.running = true;
-          logTrace(this, 'Using moveRefrToPosition to spawn player');
-          (async () => {
-            while (true) {
-              logTrace(this, 'Spawning...');
-              TESModPlatform.moveRefrToPosition(
-                Game.getPlayer(),
-                Cell.from(Game.getFormEx(msg.transform.worldOrCell)),
-                WorldSpace.from(Game.getFormEx(msg.transform.worldOrCell)),
-                msg.transform.pos[0],
-                msg.transform.pos[1],
-                msg.transform.pos[2],
-                msg.transform.rot[0],
-                msg.transform.rot[1],
-                msg.transform.rot[2],
-              );
-              await Utility.wait(1);
-              const pl = Game.getPlayer();
-              if (!pl) {
-                break;
-              }
-              const pos = [
-                pl.getPositionX(),
-                pl.getPositionY(),
-                pl.getPositionZ(),
-              ];
-              const sqr = (x: number) => x * x;
-              const distance = Math.sqrt(
-                sqr(pos[0] - msg.transform.pos[0]) +
-                sqr(pos[1] - msg.transform.pos[1]),
-              );
-              if (distance < 256) {
-                break;
-              }
-            }
-          })();
-          // The loadout service waits for this spawn and applies only its latest snapshot.
-          Utility.wait(1).then(markLoadoutReady);
-          // Note: appearance part was copy-pasted
-          if (msg.appearance) {
-            applyAppearanceToPlayer(msg.appearance);
-          }
-        }
-
-        if (msg.props) {
-          const baseActorValues = new Map<string, unknown>([
-            ['healRate', msg.props.healRate],
-            ['healRateMult', msg.props.healRateMult],
-            ['health', msg.props.health],
-            ['magickaRate', msg.props.magickaRate],
-            ['magickaRateMult', msg.props.magickaRateMult],
-            ['magicka', msg.props.magicka],
-            ['staminaRate', msg.props.staminaRate],
-            ['staminaRateMult', msg.props.staminaRateMult],
-            ['stamina', msg.props.stamina],
-            ['healthPercentage', msg.props.healthPercentage],
-            ['staminaPercentage', msg.props.staminaPercentage],
-            ['magickaPercentage', msg.props.magickaPercentage],
-          ]);
-
-          const player = Game.getPlayer();
-          if (player) {
-            baseActorValues.forEach((value, key) => {
-              if (typeof value === 'number') {
-                if (key.includes('Percentage')) {
-                  const subKey = key.replace('Percentage', '');
-                  const subValue = baseActorValues.get(subKey);
-                  if (typeof subValue === 'number') {
-                    setActorValuePercentage(player, subKey, value);
-                  }
-                } else {
-                  player.setActorValue(key, value);
-                }
-              }
-            });
-          }
-        }
-      });
-      once('tick', () => {
-        once('tick', () => {
-          if (!spawnTask.running) {
-            spawnTask.running = true;
-
-            let loadOrder = new Array<string>();
-            for (let i = 0; i < this.sp.Game.getModCount(); ++i) {
-              loadOrder.push(this.sp.Game.getModName(i));
-            }
-
-            logTrace(this, `loading game in world/cell`, msg.transform.worldOrCell.toString(16));
-            const loadGameService = this.controller.lookupListener(LoadGameService);
-            loadGameService.loadGame(
-              msg.transform.pos,
-              msg.transform.rot,
-              msg.transform.worldOrCell,
-              msg.appearance
-                ? {
-                  name: msg.appearance.name,
-                  raceId: msg.appearance.raceId,
-
-                  // TODO: In types, isFemale is under face, but in the reality SP expects it here. Fix required.
-                  // @ts-expect-error
-                  isFemale: msg.appearance.isFemale,
-
-                  face: {
-                    hairColor: msg.appearance.hairColor,
-                    bodySkinColor: msg.appearance.skinColor,
-                    headTextureSetId: msg.appearance.headTextureSetId,
-                    headPartIds: msg.appearance.headpartIds,
-                    presets: msg.appearance.presets
-                  },
-                }
-                : undefined,
-              loadOrder,
-              { minutes: 0, seconds: 0, hours: this.controller.lookupListener(TimeService).getTime().newGameHourValue }
-            );
-            once('update', () => {
-              Utility.wait(0.3).then(markLoadoutReady);
-              // Note: appearance part was copy-pasted
-              if (msg.appearance) {
-                applyAppearanceToPlayer(msg.appearance);
-              }
-            });
-          }
-        });
-      });
-    }
+    if (msg.isMe) this.controller.lookupListener(PlayerSpawnService).request(msg);
   }
 
   private onDestroyActorMessage(event: ConnectionMessage<DestroyActorMessage>): void {

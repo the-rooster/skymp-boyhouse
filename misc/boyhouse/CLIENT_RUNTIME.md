@@ -342,6 +342,58 @@ model/remote-server mutations and original-reference restoration still need
 the same lifetime discipline. This is a prerequisite for the phase coordinator,
 not a completed engine projection or quest playthrough.
 
+## Observed player-spawn completion
+
+`PlayerSpawnService` now owns the self-create path previously implemented as
+independent timers in `RemoteServer`. It waits for the authoritative world/cell,
+full three-dimensional position within 128 units, and a loaded player model.
+It applies the current appearance, spells and actor values only after stable
+position observations, then observes the player on another update before
+releasing the matching loadout generation. A nearby player still receives the
+authoritative move/rotation. Position retries are bounded to eight attempts,
+with a 60-second overall deadline; failure cancels the pending loadout.
+
+A superseding self snapshot, disconnect, actor destruction, manual save load,
+or plugin replacement invalidates old spawn work and deferred appearance
+callbacks. One generated save can be in flight at a time; a newer snapshot
+waits for that load and positions its own player afterward. The loaded event
+prevents a second bootstrap even if a network tick precedes the first gameplay
+update. Menu events carry loading state into tick context because Papyrus UI
+queries are forbidden there. World-view connection resumption likewise starts
+its native game-time wait on an update and rechecks the gate generation.
+
+All 158 Node regressions and the client build pass. A full-client connection to
+the unchanged private staging server passed on runtime 1.7.104.0: five consecutive
+samples observed a connected, loaded, ready player at the server position, with
+the character menu open and no worn armor or equipped weapons. The final run
+finished in 10.4 seconds after the plugin observer started, with no callback
+exceptions in the native log. This tests actual client dispatch/bootstrap and
+the character-creation preview; it does not certify play after closing the menu,
+phase switching, concurrent players, or quests.
+
+Build the test bundle after building the client:
+
+```sh
+node misc/boyhouse/build-player-spawn-smoke.cjs <output.js>
+```
+
+The observer is appended to the actual client bundle so it shares that plugin's
+storage. It requires isolated offline-server settings and exits the test game
+after passing or its deadline. Installation, transport and backups are separate.
+Evidence is in ignored `artifacts/player-spawn-runtime/`; the final backup
+manifest is `artifacts/game-backups/20261116T185939Z/player-spawn/`. Skyrim exited,
+the test bundle/settings were removed, all three INIs were restored byte-for-byte,
+and all four personal save hashes were unchanged. Earlier runs exposed the tick
+context and repeated-bootstrap bugs above; a fixture log initially also rejected
+an undefined native load-event payload. These were corrected before the final run.
+
+This readiness API is a prerequisite for the projection coordinator, which is
+still unwired. Rendering/appearance completion beyond the loaded-model check,
+native hot reload during outstanding work, the other remote-server asynchronous
+mutations, original-reference restoration, and real multi-client quest play
+remain open. The staging projection flag and quest certification counts are
+unchanged.
+
 ## Remaining acceptance
 
 The packet-epoch transport adds a separate `MpClientPlugin` codec version 2.1.0.

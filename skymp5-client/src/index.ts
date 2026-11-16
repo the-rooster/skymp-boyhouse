@@ -12,6 +12,7 @@ import { EnforceLimitationsService } from './services/services/enforceLimitation
 import { LoadGameService } from './services/services/loadGameService';
 import { SendInputsService } from './services/services/sendInputsService';
 import { PlayerLoadoutService } from './services/services/playerLoadoutService';
+import { PlayerSpawnService } from './services/services/playerSpawnService';
 import { ReferenceSuppressionService } from './services/services/referenceSuppressionService';
 import { OwnedReferenceService } from './services/services/ownedReferenceService';
 import { SinglePlayerService } from './services/services/singlePlayerService';
@@ -81,6 +82,7 @@ const main = () => {
       new SendInputsService(sp, controller),
       // Observe the final appearance before restoring the preview's loadout.
       new PlayerLoadoutService(sp, controller),
+      new PlayerSpawnService(sp, controller),
       new SkympClient(sp, controller),
       new TimeService(sp, controller),
       new SpVersionCheckService(sp, controller),

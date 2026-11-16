@@ -81,6 +81,14 @@ test('creation keeps the latest loadout queued through slow opening and editing,
   assert.equal(h.applied.length, 5);
 });
 
+test('canceling an obsolete spawn cannot erase the current player loadout', () => {
+  const h = harness(), old = h.service.beginSpawn(spawn(1, false));
+  const current = h.service.beginSpawn(spawn(2, false));
+  h.service.cancelSpawn(old); h.service.markSpawnReady(current); h.update();
+  assert.ok(h.applied.some(call => Array.isArray(call) && call[0] === 'inventory' && call[1].entries[0].baseId === 2));
+  h.service.cancelSpawn(current); assert.equal(h.storage.pcInv, undefined);
+});
+
 for (const event of ['connectionAccepted', 'connectionDisconnect', 'connectionFailed', 'connectionDenied']) {
   test(`${event} discards old snapshots and delayed spawn readiness`, () => {
     const h = harness(), old = h.start();

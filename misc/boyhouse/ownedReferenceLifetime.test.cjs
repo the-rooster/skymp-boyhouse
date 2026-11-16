@@ -197,7 +197,7 @@ test('cancellation from the completion callback discards newly queued work befor
 
 function worldFixture() {
   const events = new EventEmitter(), emitter = new EventEmitter(), waits = [], arrays = [];
-  let connected = true, singlePlayer = false;
+  let connected = true, singlePlayer = false, inConnectionCallback = false;
   class FormViewArray {
     constructor() { this.resizes = []; this.updates = []; arrays.push(this); }
     resize(size) { this.resizes.push(size); }
@@ -210,7 +210,10 @@ function worldFixture() {
     '../services/services/singlePlayerService': { SinglePlayerService }, '../services/services/remoteServer': { RemoteServer },
     '../services/services/networkingService': { NetworkingService },
   });
-  const sp = { storage: {}, settings: { 'skymp5-client': {} }, Utility: { wait: () => new Promise(resolve => waits.push(resolve)) },
+  const sp = { storage: {}, settings: { 'skymp5-client': {} }, Utility: { wait: () => {
+    assert.equal(inConnectionCallback, false, 'Papyrus waits are forbidden in the connection tick');
+    return new Promise(resolve => waits.push(resolve));
+  } },
     Game: { getPlayer: () => ({ getWorldSpace: () => ({ getFormID: () => 60 }) }) } };
   const controller = { on: (...args) => events.on(...args), once: (...args) => events.once(...args), emitter,
     lookupListener(type) {
@@ -220,10 +223,22 @@ function worldFixture() {
       throw Error('Unexpected lookup');
     } };
   const view = new WorldView(sp, controller);
-  return { view, arrays, waits, sp, event: (...args) => emitter.emit(...args), native: (...args) => events.emit(...args), tick: () => events.emit('update'),
+  return { view, arrays, waits, sp, event: (...args) => {
+    inConnectionCallback = args[0] === 'connectionAccepted';
+    try { emitter.emit(...args); } finally { inConnectionCallback = false; }
+  }, native: (...args) => events.emit(...args), tick: () => events.emit('update'),
     setConnected(value) { connected = value; }, setSinglePlayer(value) { singlePlayer = value; },
     async finishWait(index = 0) { waits[index](); await Promise.resolve(); } };
 }
+
+test('connection resumption starts its native wait on update and only for the current gate', async () => {
+  const f = worldFixture(); f.event('connectionAccepted', {});
+  assert.equal(f.waits.length, 0); f.tick(); assert.equal(f.waits.length, 1);
+  await f.finishWait(); f.tick(); assert.equal(f.arrays.at(-2).updates.at(-1), 1);
+  f.event('connectionAccepted', {}); f.view.setFormViewUpdateAllowed(false); f.tick();
+  assert.equal(f.waits.length, 1, 'An intervening gate must discard the queued resume');
+  assert.equal(f.arrays.at(-2).updates.at(-1), 0);
+});
 
 test('a pending game-time wait cannot reopen views after an explicit phase gate', async () => {
   const f = worldFixture(); f.tick(); f.view.setFormViewUpdateAllowed(false);

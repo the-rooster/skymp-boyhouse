@@ -80,6 +80,10 @@ export class PlayerLoadoutService extends ClientListener {
     }
   }
 
+  cancelSpawn(generation: number): void {
+    if (generation === this.state.generation) this.reset();
+  }
+
   get blocksEquipmentInput(): boolean {
     return !this.state.ready || this.state.creation !== 'idle' ||
       this.state.equipmentPending || this.state.inventoryPending ||

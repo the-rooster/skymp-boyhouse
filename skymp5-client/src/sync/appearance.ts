@@ -159,7 +159,7 @@ export const applyAppearance = (appearance: Appearance): ActorBase => {
   return npc;
 };
 
-export const applyAppearanceToPlayer = (appearance: Appearance): void => {
+export const applyAppearanceToPlayer = (appearance: Appearance, isCurrent: () => boolean = () => true): void => {
   applyAppearanceCommon(
     appearance,
     ActorBase.from((Game.getPlayer() as Actor).getBaseObject()) as ActorBase,
@@ -168,7 +168,7 @@ export const applyAppearanceToPlayer = (appearance: Appearance): void => {
   (Game.getPlayer() as Actor).queueNiNodeUpdate();
   Utility.wait(0.0625).then(() => {
     once("update", () => {
-      Game.getPlayer()?.startDeferredKill();
+      if (isCurrent()) Game.getPlayer()?.startDeferredKill();
     });
   });
 };

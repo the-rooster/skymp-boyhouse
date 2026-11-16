@@ -30,7 +30,12 @@ export class WorldView extends ClientListener {
     });
     controller.emitter.on('connectionAccepted', () => {
       this.destroy();
-      if (!this.explicitlyBlocked) this.waitGameTimeAndAllowFormViewUpdate(1);
+      if (!this.explicitlyBlocked) {
+        const generation = this.allowUpdateGeneration;
+        // Connection delivery runs in tick context, where Papyrus waits are
+        // forbidden. A load or explicit gate can invalidate this queued resume.
+        controller.once('update', () => this.waitGameTimeAndAllowFormViewUpdate(1, generation));
+      }
     });
   }
 
