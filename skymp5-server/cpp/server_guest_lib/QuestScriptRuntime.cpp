@@ -18,6 +18,7 @@
 #include "script_objects/CampaignAliasObject.h"
 #include "script_objects/CampaignFormObject.h"
 #include "script_objects/CampaignQuestObject.h"
+#include "script_objects/MpFormGameObject.h"
 #include "script_storages/IScriptStorage.h"
 #include <cmath>
 #include <cstring>
@@ -449,6 +450,52 @@ std::vector<LogEntry> ReadLogs(const espm::LookupResult& record,
 }
 
 namespace {
+struct ReferenceEventContext
+{
+  MpActor* actor;
+  uint32_t target;
+  uint32_t source;
+};
+
+ReferenceEventContext ReadReferenceEvent(MpObjectReference& target,
+                                         const char* eventName,
+                                         const VarValue* arguments,
+                                         size_t count)
+{
+  if (!eventName ||
+      (std::strcmp(eventName, "OnActivate") &&
+       std::strcmp(eventName, "OnTriggerEnter") &&
+       std::strcmp(eventName, "OnTriggerLeave") &&
+       std::strcmp(eventName, "OnTrigger") &&
+       std::strcmp(eventName, "SkympOnActivateClose")))
+    throw std::runtime_error("Unsupported event in campaign event dispatcher");
+  if (count != 1 || !arguments || arguments[0].promise)
+    throw std::invalid_argument("Campaign interaction needs one reference");
+  const auto* object = arguments[0].GetType() == VarValue::kType_Object
+    ? dynamic_cast<MpFormGameObject*>(static_cast<IGameObject*>(arguments[0]))
+    : nullptr;
+  auto* native = object ? object->GetFormPtrNoLoad() : nullptr;
+  auto* source = native ? native->AsObjectReference() : nullptr;
+  auto* world = target.GetParent();
+  if (!world || !source || source->GetParent() != world ||
+      world->LookupFormByIdNoLoad(source->GetFormId()).get() != source ||
+      source->IsDeleted() || !target.SharesWorldInstance(*source))
+    throw std::runtime_error("Campaign interaction source is unavailable");
+  const auto [owner, original] = CampaignReferenceBinding::Context(target);
+  auto* player = source->AsActor();
+  if (player &&
+      (player->GetBaseId() == 7 || player->GetChangeForm().profileId >= 0)) {
+    if (&QuestJournal::Owner(*player) != owner)
+      throw std::runtime_error("Interaction belongs to another campaign");
+    return { player, original, 0x14 };
+  }
+  const auto [sourceOwner, sourceOriginal] =
+    CampaignReferenceBinding::Context(*source);
+  if (sourceOwner != owner)
+    throw std::runtime_error("Interaction belongs to another campaign");
+  return { owner, original, sourceOriginal };
+}
+
 std::vector<PexScript::Lazy> LoadCampaignScripts(WorldState& world)
 {
   auto* storage = world.GetScriptStorage();
@@ -523,11 +570,33 @@ void QuestScriptRuntime::ExecuteReferenceLoad(
   Execute(actor, 0, 0, {}, scripts, original);
 }
 
+void QuestScriptRuntime::ExecuteReferenceEvent(MpObjectReference& target,
+                                               const char* eventName,
+                                               const VarValue* arguments,
+                                               size_t count)
+{
+  // Validate ingress before loading scripts, including for unsupported events.
+  ReadReferenceEvent(target, eventName, arguments, count);
+  ExecuteReferenceEvent(target, eventName, arguments, count,
+                        LoadCampaignScripts(*target.GetParent()));
+}
+
+void QuestScriptRuntime::ExecuteReferenceEvent(
+  MpObjectReference& target, const char* eventName, const VarValue* arguments,
+  size_t count, const std::vector<PexScript::Lazy>& scripts)
+{
+  const auto context = ReadReferenceEvent(target, eventName, arguments, count);
+  Execute(*context.actor, 0, 0, {}, scripts, context.target, eventName,
+          context.source);
+}
+
 bool QuestScriptRuntime::Execute(MpActor& actor, uint32_t questId,
                                  uint16_t stage,
                                  const espm::QuestScriptData& metadata,
                                  const std::vector<PexScript::Lazy>& scripts,
-                                 uint32_t loadedReference)
+                                 uint32_t loadedReference,
+                                 const char* referenceEvent,
+                                 uint32_t eventSource)
 {
   if (!actor.GetParent())
     throw std::runtime_error("Unregistered campaign actor");
@@ -543,6 +612,13 @@ bool QuestScriptRuntime::Execute(MpActor& actor, uint32_t questId,
       // Read tracking guards the physical copy's lifetime and phase even
       // when a load handler only changes script variables.
       QuestJournal::ReadInventory(actor, *loaded);
+      if (referenceEvent) {
+        if (!QuestJournal::ReferenceInitialized(actor, loadedReference))
+          throw std::runtime_error(
+            "Campaign interaction requires reference initialization");
+        auto& source = CampaignReferenceBinding::Resolve(actor, eventSource);
+        QuestJournal::ReadInventory(actor, source);
+      }
     }
     VirtualMachine vm(scripts);
     vm.SetStrictExecution(true);
@@ -1303,7 +1379,11 @@ bool QuestScriptRuntime::Execute(MpActor& actor, uint32_t questId,
       for (const auto& recipient : recipients)
         vm.SendEventSynchronous(recipient, name, args, stack);
     };
-    if (loadedReference) {
+    if (referenceEvent) {
+      dispatchReferenceEvent(loadedReference, referenceEvent,
+                             { VarValue(resolve(eventSource).get()) }, true);
+      changed = true;
+    } else if (loadedReference) {
       if (!QuestJournal::ReferenceInitialized(actor, loadedReference)) {
         // An alias's OnInit belongs to quest startup, not its target's load.
         dispatchReferenceEvent(loadedReference, "OnInit", {}, false);

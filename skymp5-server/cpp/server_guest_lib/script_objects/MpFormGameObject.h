@@ -7,6 +7,8 @@ class MpFormGameObject : public IGameObject
 public:
   MpFormGameObject(MpForm* form_);
   MpForm* GetFormPtr() const noexcept;
+  // Event ingress must not materialize a shared original for a stale handle.
+  MpForm* GetFormPtrNoLoad() const noexcept;
 
   const char* GetParentNativeScript() override;
   bool EqualsByValue(const IGameObject& obj) const override;

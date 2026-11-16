@@ -122,8 +122,34 @@ subscription. Bound placed-item copies are retained by database loading too.
 Recovery validates the original record, base, copy kind, owner identity and
 private phase. Pending loot timers and active magic effects fail explicitly
 until campaign timer recovery is implemented. Automatic area-entry integration,
-complete quest startup, trigger/activation/combat events and ordinary player inventory
-events still need implementation; no vanilla adapter is enabled.
+complete quest startup, combat events and ordinary player inventory events still
+need implementation; no vanilla adapter is enabled.
+
+### Private reference interaction events
+
+Bound copies route native `OnActivate`, `OnTriggerEnter`, `OnTriggerLeave`,
+`OnTrigger` and `SkympOnActivateClose` through the isolated campaign runtime.
+The copy must already have completed reference initialization. Each event takes
+one live native reference from the same private instance: a player participant
+maps to the campaign's PlayerRef; a bound NPC or object maps to its original
+form identity. Shared references, unbound objects, foreign phases, logical VM
+objects supplied as native arguments, and unsupported event shapes are refused.
+
+Attached reference scripts and matching scripted reference aliases of running,
+adapter-enabled quests receive the event. Script variables, journal changes and
+supported inventory effects (including resulting inventory-event handlers)
+share one bounded transaction. A handler failure rolls those effects back.
+The global VM remains inaccessible to bound copies. Queued trigger enter/leave
+events retain both native lifetimes and instance epochs, so leaving and returning
+or reusing an object ID cannot deliver a previous phase's event.
+
+This is synchronous event ingress, not durable delivery or complete activation
+semantics. Existing default activation processing, door teleports, activation
+parents, container UI and other spatial effects are outside this transaction;
+they still need campaign-specific integration. Movement is also outside the
+script transaction. Automatic alias fills, remaining natives and latent handlers
+remain restricted. Controlled script tests do not certify any vanilla quest or
+establish throughput for 16–32 players.
 
 ### Creating private reference copies
 

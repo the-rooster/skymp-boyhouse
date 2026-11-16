@@ -4,6 +4,7 @@
 #include <nlohmann/json.hpp>
 
 class MpActor;
+class MpObjectReference;
 
 class QuestScriptRuntime
 {
@@ -27,9 +28,22 @@ public:
     MpActor& actor, uint32_t original,
     const std::vector<PexScript::Lazy>& scripts);
 
+  // Synchronous native interaction ingress. Only supported one-reference
+  // events are accepted; native objects never enter the isolated VM. Guests
+  // act as PlayerRef in the owner's history, just like Game.GetPlayer().
+  static void ExecuteReferenceEvent(MpObjectReference& target,
+                                    const char* eventName,
+                                    const VarValue* arguments, size_t count);
+  static void ExecuteReferenceEvent(
+    MpObjectReference& target, const char* eventName,
+    const VarValue* arguments, size_t count,
+    const std::vector<PexScript::Lazy>& scripts);
+
 private:
   static bool Execute(MpActor& actor, uint32_t questId, uint16_t stage,
                       const espm::QuestScriptData& metadata,
                       const std::vector<PexScript::Lazy>& scripts,
-                      uint32_t loadedReference = 0);
+                      uint32_t loadedReference = 0,
+                      const char* referenceEvent = nullptr,
+                      uint32_t eventSource = 0);
 };

@@ -8,6 +8,7 @@
 #include "script_objects/CampaignAliasObject.h"
 #include "script_objects/CampaignFormObject.h"
 #include "script_objects/CampaignQuestObject.h"
+#include "script_objects/MpFormGameObject.h"
 #include "script_storages/BsaArchiveScriptStorage.h"
 #include <fstream>
 #include <limits>
@@ -2722,6 +2723,305 @@ TEST_CASE("Failed campaign load rolls back initialization and permits retry",
                                            f.Scripts());
   REQUIRE(SavedReferenceCounter(owner) == 111);
   REQUIRE(owner.GetInventory().GetItemCount(0xf) == 5);
+}
+
+namespace {
+FunctionInfo InteractionHandler(bool reward = true)
+{
+  FunctionInfo handler;
+  handler.valid = true;
+  handler.returnType = "None";
+  handler.params = { { "source", "ObjectReference" } };
+  handler.locals = { { "gold", "Form" }, { "temp", "None" } };
+  handler.code.instructions = {
+    { FunctionCode::kOp_IAdd, { Id("counter"), Id("counter"), VarValue(1) } },
+    { FunctionCode::kOp_Assign, { Id("lastSource"), Id("source") } },
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("GetFormID"), Id("source"), Id("sourceId"), VarValue(0) } },
+    { FunctionCode::kOp_Return, { VarValue::None() } }
+  };
+  if (reward)
+    handler.code.instructions.insert(
+      handler.code.instructions.end() - 1,
+      { { FunctionCode::kOp_CallStatic,
+          { VarValue("Game"), VarValue("GetForm"), Id("gold"), VarValue(1),
+            VarValue(0xf) } },
+        { FunctionCode::kOp_CallMethod,
+          { VarValue("AddItem"), Id("source"), Id("temp"), VarValue(3),
+            Id("gold"), VarValue(2), VarValue(true) } } });
+  return handler;
+}
+
+void InteractionFixture(Fixture& f)
+{
+  ReferenceLoadFixture(f);
+  auto& object = f.extraScripts.back()->objectTable[0];
+  object.variables.push_back({ "sourceId", "Int", 0, VarValue(0) });
+  object.variables.push_back(
+    { "lastSource", "ObjectReference", 0, VarValue::None() });
+  for (const auto* name : { "OnActivate", "OnTriggerEnter", "OnTriggerLeave",
+                            "OnTrigger", "SkympOnActivateClose" })
+    object.states[0].functions.push_back({ name, InteractionHandler() });
+}
+}
+
+TEST_CASE("Private interactions use the host PlayerRef for party guests",
+          "[Quest][ReferenceEvents]")
+{
+  const auto* name = GENERATE("OnActivate", "OnTriggerEnter", "OnTriggerLeave",
+                              "OnTrigger", "SkympOnActivateClose");
+  Fixture f;
+  InteractionFixture(f);
+  auto& owner = f.Add(0xff002001);
+  auto& guest = f.Add(0xff002002);
+  owner.SetWorldInstance("campaign:" + std::to_string(owner.GetFormId()) +
+                         ":fixture");
+  guest.SetWorldInstance(owner.GetWorldInstance());
+  owner.SetInventory(Inventory());
+  guest.SetInventory(Inventory());
+  auto& copy = BoundTrigger(f, owner);
+  auto source = guest.ToVarValue();
+  REQUIRE_THROWS_WITH(QuestScriptRuntime::ExecuteReferenceEvent(
+                        copy, name, &source, 1, f.Scripts()),
+                      Catch::Matchers::ContainsSubstring("initialization"));
+  QuestScriptRuntime::ExecuteReferenceLoad(owner, kScriptedReference,
+                                           f.Scripts());
+  QuestScriptRuntime::ExecuteReferenceEvent(copy, name, &source, 1,
+                                            f.Scripts());
+  REQUIRE(SavedReferenceCounter(owner) == 112);
+  REQUIRE(owner.GetInventory().GetItemCount(0xf) == 7);
+  REQUIRE(guest.GetInventory().GetItemCount(0xf) == 0);
+  const auto values =
+    QuestJournal::ScriptState(owner)["scripts"][kReferenceState]["values"];
+  REQUIRE(values["defaultsetstagetrigscript/sourceid"]["value"] == 0x14);
+  REQUIRE(values["defaultsetstagetrigscript/lastsource"]["value"] ==
+          "14:Skyrim.esm");
+  REQUIRE(MpFormGameObject(&copy).ListActivePexInstances().empty());
+  guest.SetWorldInstance("");
+  REQUIRE(QuestJournal::ScriptState(guest).empty());
+  REQUIRE_THROWS(QuestScriptRuntime::ExecuteReferenceEvent(copy, name, &source,
+                                                           1, f.Scripts()));
+  REQUIRE(SavedReferenceCounter(owner) == 112);
+}
+
+TEST_CASE("Private interaction sources resolve to their original NPC identity",
+          "[Quest][ReferenceEvents]")
+{
+  Fixture f;
+  InteractionFixture(f);
+  auto& owner = f.Add(0xff002001);
+  owner.SetWorldInstance("campaign:" + std::to_string(owner.GetFormId()) +
+                         ":fixture");
+  owner.SetInventory(Inventory());
+  auto& copy = BoundTrigger(f, owner);
+  auto& npc = BoundBalgruuf(f, owner);
+  QuestScriptRuntime::ExecuteReferenceLoad(owner, kScriptedReference,
+                                           f.Scripts());
+  auto source = npc.ToVarValue();
+  QuestScriptRuntime::ExecuteReferenceEvent(copy, "OnTriggerEnter", &source, 1,
+                                            f.Scripts());
+  REQUIRE(SavedReferenceCounter(owner) == 112);
+  REQUIRE(npc.GetInventory().GetItemCount(0xf) == 5);
+  REQUIRE(owner.GetInventory().GetItemCount(0xf) == 5);
+  const auto values =
+    QuestJournal::ScriptState(owner)["scripts"][kReferenceState]["values"];
+  REQUIRE(values["defaultsetstagetrigscript/sourceid"]["value"] == 0x1a677);
+  REQUIRE(values["defaultsetstagetrigscript/lastsource"]["value"] ==
+          "1a677:Skyrim.esm");
+  REQUIRE_FALSE(f.server.worldState.LookupFormByIdNoLoad(0x1a677));
+}
+
+TEST_CASE("Failed interaction handlers roll back state and inventory rewards",
+          "[Quest][ReferenceEvents]")
+{
+  Fixture f;
+  InteractionFixture(f);
+  auto& owner = f.Add(0xff002001);
+  owner.SetWorldInstance("campaign:" + std::to_string(owner.GetFormId()) +
+                         ":fixture");
+  owner.SetInventory(Inventory());
+  auto& copy = BoundTrigger(f, owner);
+  QuestScriptRuntime::ExecuteReferenceLoad(owner, kScriptedReference,
+                                           f.Scripts());
+  auto& handler =
+    f.extraScripts.back()->objectTable[0].states[0].functions.back().function;
+  handler.code.instructions.insert(
+    handler.code.instructions.end() - 1,
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("UnsupportedInteractionEffect"), Id("self"), Id("temp"),
+        VarValue(0) } });
+  const auto before =
+    owner.GetDynamicFields().GetValueDump(QuestJournal::kProperty);
+  auto source = owner.ToVarValue();
+  REQUIRE_THROWS_WITH(
+    QuestScriptRuntime::ExecuteReferenceEvent(copy, "SkympOnActivateClose",
+                                              &source, 1, f.Scripts()),
+    Catch::Matchers::ContainsSubstring("UnsupportedInteractionEffect"));
+  REQUIRE(owner.GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
+          before);
+  REQUIRE(owner.GetInventory().GetItemCount(0xf) == 5);
+  handler.code.instructions.erase(handler.code.instructions.end() - 2);
+  QuestScriptRuntime::ExecuteReferenceEvent(copy, "SkympOnActivateClose",
+                                            &source, 1, f.Scripts());
+  REQUIRE(SavedReferenceCounter(owner) == 112);
+  REQUIRE(owner.GetInventory().GetItemCount(0xf) == 7);
+}
+
+TEST_CASE("Campaign event ingress rejects unsupported and foreign arguments",
+          "[Quest][ReferenceEvents]")
+{
+  Fixture f;
+  InteractionFixture(f);
+  auto& owner = f.Add(0xff002001);
+  auto& stranger = f.Add(0xff002002);
+  owner.SetWorldInstance("campaign:" + std::to_string(owner.GetFormId()) +
+                         ":fixture");
+  stranger.SetWorldInstance(
+    "campaign:" + std::to_string(stranger.GetFormId()) + ":fixture");
+  auto& copy = BoundTrigger(f, owner);
+  auto source = owner.ToVarValue();
+  REQUIRE_THROWS(QuestScriptRuntime::ExecuteReferenceEvent(
+    copy, "OnDeath", &source, 1, f.Scripts()));
+  REQUIRE_THROWS(QuestScriptRuntime::ExecuteReferenceEvent(
+    copy, nullptr, &source, 1, f.Scripts()));
+  REQUIRE_THROWS(QuestScriptRuntime::ExecuteReferenceEvent(
+    copy, "OnActivate", nullptr, 1, f.Scripts()));
+  REQUIRE_THROWS(QuestScriptRuntime::ExecuteReferenceEvent(
+    copy, "OnActivate", &source, 2, f.Scripts()));
+  const auto logical = std::make_shared<CampaignFormObject>(
+    espm::LookupResult{}, owner.GetFormId(), 0x14);
+  for (auto argument : { VarValue::None(), VarValue(0x14),
+                         stranger.ToVarValue(), VarValue(logical.get()) }) {
+    REQUIRE_THROWS(QuestScriptRuntime::ExecuteReferenceEvent(
+      copy, "OnActivate", &argument, 1, f.Scripts()));
+  }
+  // An unbound NPC in the same instance is not a campaign reference.
+  f.server.worldState.AddForm(
+    std::make_unique<MpActor>(
+      LocationalData{ { 1, 2, 3 }, { 0, 0, 0 }, FormDesc::Tamriel() },
+      FormCallbacks::DoNothing(), 0x13bbd),
+    0xff002030);
+  auto& unbound = f.server.worldState.GetFormAt<MpActor>(0xff002030);
+  unbound.SetWorldInstance(owner.GetWorldInstance());
+  auto argument = unbound.ToVarValue();
+  REQUIRE_THROWS(QuestScriptRuntime::ExecuteReferenceEvent(
+    copy, "OnActivate", &argument, 1, f.Scripts()));
+  // An ordinarily loadable door, unlike protected/unique vanilla NPCs.
+  constexpr uint32_t staleSource = 87048;
+  const auto shared = f.server.worldState.LookupFormById(staleSource);
+  REQUIRE(shared);
+  auto expired = shared->ToVarValue();
+  f.server.worldState.DestroyForm(staleSource);
+  REQUIRE_FALSE(f.server.worldState.LookupFormByIdNoLoad(staleSource));
+  REQUIRE_THROWS(QuestScriptRuntime::ExecuteReferenceEvent(
+    copy, "OnActivate", &expired, 1, f.Scripts()));
+  REQUIRE_FALSE(f.server.worldState.LookupFormByIdNoLoad(staleSource));
+  REQUIRE(QuestJournal::ScriptState(owner).empty());
+}
+
+TEST_CASE("Private interactions dispatch to matching running quest aliases",
+          "[Quest][ReferenceEvents]")
+{
+  Fixture f;
+  InteractionFixture(f);
+  auto alias = std::make_shared<PexScript>();
+  alias->source = "defaultsetstagealiasscript";
+  Object object;
+  object.NameIndex = alias->source;
+  object.parentClassName = "ReferenceAlias";
+  object.variables = { { "counter", "Int", 0, VarValue(0) },
+                       { "sourceId", "Int", 0, VarValue(0) },
+                       { "lastSource", "ObjectReference", 0,
+                         VarValue::None() } };
+  auto handler = InteractionHandler(false);
+  const bool fail = GENERATE(false, true);
+  if (fail)
+    handler.code.instructions.insert(
+      handler.code.instructions.end() - 1,
+      { FunctionCode::kOp_CallMethod,
+        { VarValue("UnsupportedAliasInteraction"), Id("self"), Id("temp"),
+          VarValue(0) } });
+  object.states.push_back({ "", { { "OnActivate", handler } } });
+  alias->objectTable.push_back(object);
+  f.extraScripts.push_back(alias);
+  auto& owner = f.Add(0xff002001);
+  owner.SetWorldInstance("campaign:" + std::to_string(owner.GetFormId()) +
+                         ":fixture");
+  owner.SetInventory(Inventory());
+  auto& copy = BoundTrigger(f, owner);
+  QuestScriptRuntime::ExecuteReferenceLoad(owner, kScriptedReference,
+                                           f.Scripts());
+  REQUIRE(
+    QuestJournal::Apply(owner, { { "quest", kQuest }, { "op", "start" } }));
+  // Controlled saved fills for the two scripted aliases in the owned QUST.
+  // Filling these world-query aliases automatically remains unsupported.
+  QuestJournal::Atomic(owner, [&] {
+    QuestVmState state(QuestJournal::ScriptState(owner), {}, {});
+    state.SetAliasBinding("4e50d:Skyrim.esm/alias:1", "6debb:Skyrim.esm");
+    state.SetAliasBinding("4e50d:Skyrim.esm/alias:3", "14:Skyrim.esm");
+    QuestJournal::SetScriptState(owner, state.Save());
+  });
+  const auto before =
+    owner.GetDynamicFields().GetValueDump(QuestJournal::kProperty);
+  auto source = owner.ToVarValue();
+  if (fail) {
+    REQUIRE_THROWS_WITH(
+      QuestScriptRuntime::ExecuteReferenceEvent(copy, "OnActivate", &source, 1,
+                                                f.Scripts()),
+      Catch::Matchers::ContainsSubstring("UnsupportedAliasInteraction"));
+    REQUIRE(owner.GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
+            before);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 5);
+  } else {
+    QuestScriptRuntime::ExecuteReferenceEvent(copy, "OnActivate", &source, 1,
+                                              f.Scripts());
+    const auto saved = QuestJournal::ScriptState(owner);
+    for (const auto id : { 1, 3 }) {
+      const auto key = "4e50d:Skyrim.esm/alias:" + std::to_string(id) +
+        "/defaultsetstagealiasscript";
+      const auto& values = saved.at("scripts").at(key).at("values");
+      if (id == 1)
+        REQUIRE(values.at("defaultsetstagealiasscript/counter").at("value") ==
+                1);
+      else
+        REQUIRE_FALSE(values.contains("defaultsetstagealiasscript/counter"));
+    }
+    REQUIRE(SavedReferenceCounter(owner) == 112);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 7);
+    REQUIRE(
+      QuestJournal::Apply(owner, { { "quest", kQuest }, { "op", "stop" } }));
+    QuestScriptRuntime::ExecuteReferenceEvent(copy, "OnActivate", &source, 1,
+                                              f.Scripts());
+    REQUIRE(
+      QuestJournal::ScriptState(
+        owner)["scripts"]
+              ["4e50d:Skyrim.esm/alias:1/defaultsetstagealiasscript"] ==
+      saved["scripts"]["4e50d:Skyrim.esm/alias:1/defaultsetstagealiasscript"]);
+    REQUIRE(SavedReferenceCounter(owner) == 113);
+  }
+}
+
+TEST_CASE("Private native event entry never initializes the shared VM",
+          "[Quest][ReferenceEvents]")
+{
+  Fixture f;
+  auto& owner = f.Add(0xff002001);
+  owner.SetWorldInstance("campaign:" + std::to_string(owner.GetFormId()) +
+                         ":fixture");
+  auto& npc = BoundBalgruuf(f, owner);
+  f.server.worldState.AttachScriptStorage(
+    std::make_shared<BsaArchiveScriptStorage>(
+      (std::filesystem::path(GetDataDir()) / "Skyrim - Misc.bsa")
+        .string()
+        .c_str()));
+  QuestScriptRuntime::ExecuteReferenceLoad(owner, 0x1a677);
+  auto source = owner.ToVarValue();
+  REQUIRE_NOTHROW(npc.SendPapyrusEvent("OnActivate", &source, 1));
+  REQUIRE(MpFormGameObject(&npc).ListActivePexInstances().empty());
+  // Direct global-VM entry remains forbidden, even for supported events.
+  REQUIRE_THROWS_WITH(
+    f.server.worldState.SendPapyrusEvent(&npc, "OnActivate", &source, 1),
+    Catch::Matchers::ContainsSubstring("campaign event dispatcher"));
 }
 
 TEST_CASE(

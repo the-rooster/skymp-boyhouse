@@ -27,6 +27,13 @@ MpForm* MpFormGameObject::GetFormPtr() const noexcept
   return form;
 }
 
+MpForm* MpFormGameObject::GetFormPtrNoLoad() const noexcept
+{
+  return parent && parent->LookupFormByIdNoLoad(formId).get() == form
+    ? form
+    : nullptr;
+}
+
 const char* MpFormGameObject::GetParentNativeScript()
 {
   if (auto form = GetFormPtr()) {

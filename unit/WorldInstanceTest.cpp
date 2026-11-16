@@ -7,6 +7,26 @@
 #include <slikenet/BitStream.h>
 
 namespace {
+class EventCountingTrigger : public MpObjectReference
+{
+public:
+  EventCountingTrigger()
+    : MpObjectReference(
+        LocationalData{ { 100, 100, 100 }, {}, FormDesc::Tamriel() },
+        FormCallbacks::DoNothing(), 0, "ACTI", NiPoint3{ 10, 10, 10 })
+  {
+  }
+  void SendPapyrusEvent(const char* name, const VarValue*, size_t) override
+  {
+    if (std::string(name) == "OnTriggerEnter")
+      ++enters;
+    if (std::string(name) == "OnTrigger")
+      ++inside;
+  }
+  int enters = 0;
+  int inside = 0;
+};
+
 MpActor& AddPlayer(PartOne& server, uint32_t id, Networking::UserId user)
 {
   DoConnect(server, user);
@@ -14,6 +34,41 @@ MpActor& AddPlayer(PartOne& server, uint32_t id, Networking::UserId user)
   server.SetUserActor(user, id);
   return server.worldState.GetFormAt<MpActor>(id);
 }
+}
+
+TEST_CASE("Queued trigger events retain both native identities and phases",
+          "[Instance]")
+{
+  const std::string transition =
+    GENERATE("none", "source", "emitter", "reuse");
+  PartOne server;
+  auto& actor = AddPlayer(server, 0xff000001, 0);
+  constexpr uint32_t triggerId = 0xff000002;
+  server.worldState.AddForm(std::make_unique<EventCountingTrigger>(),
+                            triggerId);
+  const auto lifetime = server.worldState.LookupFormByIdNoLoad(triggerId);
+  auto& trigger = static_cast<EventCountingTrigger&>(*lifetime);
+  trigger.ForceSubscriptionsUpdate();
+  actor.SetPos({ 100, 100, 100 });
+  REQUIRE(trigger.inside == 1);
+  REQUIRE(trigger.enters == 0);
+  if (transition == "source") {
+    actor.SetWorldInstance("other");
+    actor.SetWorldInstance("");
+  } else if (transition == "emitter") {
+    trigger.SetWorldInstance("other");
+    trigger.SetWorldInstance("");
+  } else if (transition == "reuse") {
+    server.worldState.DestroyForm(triggerId);
+    server.worldState.AddForm(std::make_unique<EventCountingTrigger>(),
+                              triggerId);
+  }
+  server.worldState.Tick();
+  REQUIRE(trigger.enters == (transition == "none" ? 1 : 0));
+  if (transition == "reuse") {
+    const auto replacement = server.worldState.LookupFormByIdNoLoad(triggerId);
+    REQUIRE(static_cast<EventCountingTrigger&>(*replacement).enters == 0);
+  }
 }
 
 TEST_CASE("Private instances remove observers and restore shared visibility",

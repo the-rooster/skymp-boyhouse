@@ -566,17 +566,23 @@ void MpObjectReference::SetPos(const NiPoint3& newPos, SetPosMode setPosMode)
           auto wst = GetParent();
           auto id = emitterRefr->GetFormId();
           auto myId = GetFormId();
+          const auto sourceLifetime = wst->LookupFormByIdNoLoad(myId);
+          const auto emitterLifetime = wst->LookupFormByIdNoLoad(id);
+          const auto sourceEpoch = GetWorldInstanceEpoch();
+          const auto emitterEpoch = emitterRefr->GetWorldInstanceEpoch();
           wst->SetTimer(std::chrono::seconds(0))
-            .Then([wst, id, inside, me, myId, this](Viet::Void) {
-              if (wst->LookupFormById(myId).get() != this) {
-                wst->logger->error("Refr pointer expired", id);
-                return;
-              }
-              auto& emitter = wst->LookupFormById(id);
+            .Then([wst, id, inside, me, myId, this, sourceLifetime,
+                   emitterLifetime, sourceEpoch, emitterEpoch](Viet::Void) {
+              auto& emitter = wst->LookupFormByIdNoLoad(id);
               MpObjectReference* emitterRefr =
                 emitter ? emitter->AsObjectReference() : nullptr;
-              if (!emitterRefr) {
-                wst->logger->error("Emitter not found in timer ({0:x})", id);
+              // Delayed movement events must not cross a phase transition or
+              // target a replacement which reused either native form ID.
+              if (wst->LookupFormByIdNoLoad(myId) != sourceLifetime ||
+                  emitter != emitterLifetime || !emitterRefr ||
+                  GetWorldInstanceEpoch() != sourceEpoch ||
+                  emitterRefr->GetWorldInstanceEpoch() != emitterEpoch ||
+                  !SharesWorldInstance(*emitterRefr)) {
                 return;
               }
               emitterRefr->SendPapyrusEvent(
@@ -1381,8 +1387,8 @@ void MpObjectReference::SendPapyrusEvent(const char* eventName,
 {
   if (GetDynamicFields().GetValueDump(CampaignReferenceBinding::kProperty) !=
       "null")
-    throw std::runtime_error(
-      "Private references require the campaign event dispatcher");
+    return QuestScriptRuntime::ExecuteReferenceEvent(
+      *this, eventName, arguments, argumentsCount);
   if (!pImpl->scriptsInited) {
     InitScripts();
     pImpl->scriptsInited = true;
