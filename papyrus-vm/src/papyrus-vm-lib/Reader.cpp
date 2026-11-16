@@ -49,6 +49,8 @@ Reader::Reader(const std::vector<std::vector<uint8_t>>& pexVector)
 
 void Reader::CreateScriptStructure(const std::vector<uint8_t>& arrayBytes)
 {
+  if (arrayBytes.size() > 64 * 1024 * 1024)
+    throw std::runtime_error("PEX exceeds supported size");
   this->arrayBytes = arrayBytes;
   currentReadPositionInFile = 0;
 
@@ -73,6 +75,10 @@ void Reader::FillHeader(ScriptHeader& scriptHeader)
   scriptHeader.VerMajor = Read8_bit();   // 04	03
   scriptHeader.VerMinor = Read8_bit();   // 05	01
   scriptHeader.GameID = Read16_bit();    // 06	0001
+  if (scriptHeader.Signature != ScriptHeader::kSignature ||
+      scriptHeader.VerMajor != 3 || scriptHeader.VerMinor > 2 ||
+      scriptHeader.GameID != 1)
+    throw std::runtime_error("Unsupported or malformed Skyrim PEX header");
   scriptHeader.BuildTime = Read64_bit(); // 08	time_t
 }
 
@@ -80,6 +86,8 @@ void Reader::FillSource(std::string& str)
 {
   int sizeString = Read16_bit();
   str = ReadString(sizeString);
+  if (str.size() < 4)
+    throw std::runtime_error("Invalid PEX source filename");
 
   for (int i = 0; i < 4; ++i) {
     str.pop_back();
@@ -116,6 +124,10 @@ void Reader::FillStringTable(StringTable& strTable)
 void Reader::FillDebugInfo(DebugInfo& debugInfo)
 {
   debugInfo.m_flags = Read8_bit();
+  if (!debugInfo.m_flags)
+    return;
+  if (debugInfo.m_flags != 1)
+    throw std::runtime_error("Invalid PEX debug-info flag");
   debugInfo.m_sourceModificationTime = Read64_bit();
 
   int functionCount = Read16_bit();
@@ -130,9 +142,10 @@ DebugInfo::DebugFunction Reader::FillDebugFunction()
 {
   DebugInfo::DebugFunction Fdebug;
 
-  Fdebug.objName = this->structure->stringTable.GetStorage()[Read16_bit()];
-  Fdebug.stateName = this->structure->stringTable.GetStorage()[Read16_bit()];
-  Fdebug.fnName = this->structure->stringTable.GetStorage()[Read16_bit()];
+  Fdebug.objName = this->structure->stringTable.GetStorage().at(Read16_bit());
+  Fdebug.stateName =
+    this->structure->stringTable.GetStorage().at(Read16_bit());
+  Fdebug.fnName = this->structure->stringTable.GetStorage().at(Read16_bit());
   Fdebug.type = Read8_bit();
 
   int instrunctionCount = Read16_bit();
@@ -156,7 +169,7 @@ UserFlag Reader::FillUserFlag()
 {
   UserFlag flag;
 
-  flag.name = this->structure->stringTable.GetStorage()[Read16_bit()];
+  flag.name = this->structure->stringTable.GetStorage().at(Read16_bit());
   flag.idx = Read8_bit();
 
   return flag;
@@ -176,17 +189,19 @@ Object Reader::FillObject()
 {
   Object object;
 
-  object.NameIndex = this->structure->stringTable.GetStorage()[Read16_bit()];
+  object.NameIndex =
+    this->structure->stringTable.GetStorage().at(Read16_bit());
 
   Read32_bit(); //	Dont remove!   size includes itself for some reason,
                 // hence size-4
 
   object.parentClassName =
-    this->structure->stringTable.GetStorage()[Read16_bit()];
-  object.docstring = this->structure->stringTable.GetStorage()[Read16_bit()];
+    this->structure->stringTable.GetStorage().at(Read16_bit());
+  object.docstring =
+    this->structure->stringTable.GetStorage().at(Read16_bit());
   object.userFlags = Read32_bit();
   object.autoStateName =
-    this->structure->stringTable.GetStorage()[Read16_bit()];
+    this->structure->stringTable.GetStorage().at(Read16_bit());
 
   int numVariables = Read16_bit();
   object.variables.reserve(numVariables);
@@ -215,8 +230,8 @@ Object::VarInfo Reader::FillVariable()
 {
   Object::VarInfo Var;
 
-  Var.name = this->structure->stringTable.GetStorage()[Read16_bit()];
-  Var.typeName = this->structure->stringTable.GetStorage()[Read16_bit()];
+  Var.name = this->structure->stringTable.GetStorage().at(Read16_bit());
+  Var.typeName = this->structure->stringTable.GetStorage().at(Read16_bit());
   Var.userFlags = Read32_bit();
   Var.value = FillVariableData();
 
@@ -236,11 +251,11 @@ VarValue Reader::FillVariableData()
     case Data.kType_Identifier:
       Data = VarValue(
         Data.kType_Identifier,
-        this->structure->stringTable.GetStorage()[Read16_bit()].data());
+        this->structure->stringTable.GetStorage().at(Read16_bit()).data());
       break;
     case Data.kType_String:
       Data = VarValue(
-        this->structure->stringTable.GetStorage()[Read16_bit()].data());
+        this->structure->stringTable.GetStorage().at(Read16_bit()).data());
       break;
     case Data.kType_Integer:
       Data = VarValue((int32_t)Read32_bit());
@@ -280,8 +295,8 @@ FunctionInfo Reader::FillFuncInfo()
 {
   FunctionInfo info;
 
-  info.returnType = this->structure->stringTable.GetStorage()[Read16_bit()];
-  info.docstring = this->structure->stringTable.GetStorage()[Read16_bit()];
+  info.returnType = this->structure->stringTable.GetStorage().at(Read16_bit());
+  info.docstring = this->structure->stringTable.GetStorage().at(Read16_bit());
   info.userFlags = Read32_bit();
   info.flags = Read8_bit();
 
@@ -290,19 +305,19 @@ FunctionInfo Reader::FillFuncInfo()
 
   for (int i = 0; i < countParams; i++) {
     FunctionInfo::ParamInfo temp;
-    temp.name = this->structure->stringTable.GetStorage()[Read16_bit()];
-    temp.type = this->structure->stringTable.GetStorage()[Read16_bit()];
+    temp.name = this->structure->stringTable.GetStorage().at(Read16_bit());
+    temp.type = this->structure->stringTable.GetStorage().at(Read16_bit());
     info.params.push_back(temp);
   }
 
   int countLocals = Read16_bit();
-  info.params.reserve(countLocals);
+  info.locals.reserve(countLocals);
 
   for (int i = 0; i < countLocals; i++) {
     FunctionInfo::ParamInfo temp;
-    temp.name = this->structure->stringTable.GetStorage()[Read16_bit()];
-    temp.type = this->structure->stringTable.GetStorage()[Read16_bit()];
-    info.params.push_back(temp);
+    temp.name = this->structure->stringTable.GetStorage().at(Read16_bit());
+    temp.type = this->structure->stringTable.GetStorage().at(Read16_bit());
+    info.locals.push_back(temp);
   }
 
   int countInstructions = Read16_bit();
@@ -331,6 +346,9 @@ FunctionCode Reader::FillFunctionCode(int countInstructions)
       if (i == numArguments - 1) {
         if (additionalArguments) {
           int numAdditionalArgs = (int)item.args[i];
+          if (item.args[i].GetType() != VarValue::kType_Integer ||
+              numAdditionalArgs < 0 || numAdditionalArgs > 128)
+            throw std::runtime_error("Invalid PEX call argument count");
           for (int i = 0; i < numAdditionalArgs; ++i) {
             item.args.push_back(FillVariableData());
           }
@@ -347,7 +365,7 @@ FunctionCode Reader::FillFunctionCode(int countInstructions)
 uint8_t Reader::GetCountArguments(uint8_t opcode)
 {
 
-  int count = numArgumentsForOpcodes[opcode];
+  int count = numArgumentsForOpcodes.at(opcode);
 
   if (count < 0) {
     additionalArguments = true;
@@ -361,14 +379,15 @@ Object::PropInfo Reader::FillProperty()
 {
   Object::PropInfo prop;
 
-  prop.name = this->structure->stringTable.GetStorage()[Read16_bit()];
-  prop.type = this->structure->stringTable.GetStorage()[Read16_bit()];
-  prop.docstring = this->structure->stringTable.GetStorage()[Read16_bit()];
+  prop.name = this->structure->stringTable.GetStorage().at(Read16_bit());
+  prop.type = this->structure->stringTable.GetStorage().at(Read16_bit());
+  prop.docstring = this->structure->stringTable.GetStorage().at(Read16_bit());
   prop.userFlags = Read32_bit();
   prop.flags = Read8_bit();
 
   if ((prop.flags & 4) == prop.kFlags_AutoVar) { // it exists??
-    prop.autoVarName = this->structure->stringTable.GetStorage()[Read16_bit()];
+    prop.autoVarName =
+      this->structure->stringTable.GetStorage().at(Read16_bit());
   }
 
   if ((prop.flags & 5) == prop.kFlags_Read) {
@@ -386,7 +405,7 @@ Object::StateInfo Reader::FillState()
 {
   Object::StateInfo stateinfo;
 
-  stateinfo.name = this->structure->stringTable.GetStorage()[Read16_bit()];
+  stateinfo.name = this->structure->stringTable.GetStorage().at(Read16_bit());
 
   int numFunctions = Read16_bit();
 
@@ -401,7 +420,7 @@ Object::StateInfo::StateFunction Reader::FillStateFunction()
 {
   Object::StateInfo::StateFunction temp;
 
-  temp.name = this->structure->stringTable.GetStorage()[Read16_bit()];
+  temp.name = this->structure->stringTable.GetStorage().at(Read16_bit());
   temp.function = FillFuncInfo();
 
   return temp;
@@ -411,6 +430,9 @@ uint8_t Reader::Read8_bit()
 {
   uint8_t temp;
 
+  if (currentReadPositionInFile < 0 ||
+      static_cast<size_t>(currentReadPositionInFile) >= arrayBytes.size())
+    throw std::runtime_error("Truncated PEX data");
   temp = arrayBytes[currentReadPositionInFile];
   currentReadPositionInFile++;
 
@@ -422,8 +444,7 @@ uint16_t Reader::Read16_bit()
   uint16_t temp = 0;
 
   for (int i = 0; i < 2; i++) {
-    temp = temp * 256 + arrayBytes[currentReadPositionInFile];
-    currentReadPositionInFile++;
+    temp = temp * 256 + Read8_bit();
   }
 
   return temp;
@@ -434,8 +455,7 @@ uint32_t Reader::Read32_bit()
   uint32_t temp = 0;
 
   for (int i = 0; i < 4; i++) {
-    temp = temp * 256 + arrayBytes[currentReadPositionInFile];
-    currentReadPositionInFile++;
+    temp = temp * 256 + Read8_bit();
   }
   return temp;
 }
@@ -445,14 +465,17 @@ uint64_t Reader::Read64_bit()
   uint64_t temp = 0;
 
   for (int i = 0; i < 8; i++) {
-    temp = temp * 256 + arrayBytes[currentReadPositionInFile];
-    currentReadPositionInFile++;
+    temp = temp * 256 + Read8_bit();
   }
   return temp;
 }
 
 std::string Reader::ReadString(int size)
 {
+  if (size < 0 ||
+      static_cast<size_t>(size) >
+        arrayBytes.size() - static_cast<size_t>(currentReadPositionInFile))
+    throw std::runtime_error("Truncated PEX string");
   std::string temp;
   temp.reserve(size);
 

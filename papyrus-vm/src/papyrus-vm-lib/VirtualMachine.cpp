@@ -10,6 +10,12 @@ namespace {
 constexpr uint32_t g_maxStackId = 100'000;
 }
 
+void VirtualMachine::CheckExecutionBudget()
+{
+  if (strictExecution && ++executedInstructions > 100000)
+    throw std::runtime_error("Papyrus transaction instruction quota exceeded");
+}
+
 VirtualMachine::VirtualMachine(
   const std::vector<PexScript::Lazy>& loadedScripts)
 {
@@ -264,6 +270,8 @@ VarValue VirtualMachine::CallMethod(
   }
 
   if (!selfObj) {
+    if (strictExecution)
+      throw std::runtime_error("Method called on None");
     return VarValue::None();
   }
 
@@ -303,6 +311,8 @@ VarValue VirtualMachine::CallMethod(
       try {
         return f(self, arguments);
       } catch (std::exception& e) {
+        if (strictExecution)
+          throw;
         std::string methodNameFull;
         methodNameFull += base;
         methodNameFull += (base[0] ? "." : "") + std::string(methodName) + "'";
@@ -310,6 +320,8 @@ VarValue VirtualMachine::CallMethod(
                       methodNameFull, e.what());
         return VarValue::None();
       } catch (...) {
+        if (strictExecution)
+          throw;
         std::string methodNameFull;
         methodNameFull += base;
         methodNameFull += (base[0] ? "." : "") + std::string(methodName) + "'";
@@ -332,6 +344,8 @@ VarValue VirtualMachine::CallMethod(
   e += base;
   e += (base[0] ? "." : "") + std::string(methodName) + "'";
 
+  if (strictExecution)
+    throw std::runtime_error(e);
   spdlog::error("VirtualMachine::CallMethod - {}", e);
 
   return VarValue::None();
@@ -358,11 +372,15 @@ VarValue VirtualMachine::CallStatic(const std::string& className,
     try {
       return f(self, arguments);
     } catch (std::exception& e) {
+      if (strictExecution)
+        throw;
       std::string functionNameFull = className + "." + functionName;
       spdlog::error("VirtualMachine::CallStatic - Native {} errored with {}",
                     functionNameFull, e.what());
       return VarValue::None();
     } catch (...) {
+      if (strictExecution)
+        throw;
       std::string functionNameFull = className + "." + functionName;
       spdlog::critical(
         "VirtualMachine::CallStatic - Native {} errored with unknown error",
@@ -397,6 +415,9 @@ VarValue VirtualMachine::CallStatic(const std::string& className,
 
   if (function.valid) {
     if (function.IsNative()) {
+      if (strictExecution)
+        throw std::runtime_error("Unimplemented native: " + className + "." +
+                                 functionName);
       spdlog::error("VirtualMachine::CallStatic - Function not found - '{}'",
                     functionName);
       return VarValue::None();
@@ -405,6 +426,9 @@ VarValue VirtualMachine::CallStatic(const std::string& className,
     result = instance->StartFunction(function, arguments, stackData);
   }
   if (!function.valid) {
+    if (strictExecution)
+      throw std::runtime_error("Missing static function: " + className + "." +
+                               functionName);
     spdlog::error("VirtualMachine::CallStatic - Function is not valid - '{}'",
                   functionName);
     return VarValue::None();

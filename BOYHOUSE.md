@@ -11,11 +11,21 @@ Experimental work on personal campaigns in a shared Skyrim world. Upstream basel
 - Development console commands in the forked client; no polished party UI yet.
 - Owned-master quest inventory scanner with overrides, compressed records, source hashes, and an explicit untested status.
 
-## Quest journal foundation
+## Quest journal and fragment runtime
 
-Persistent personal/host journals, 23 Papyrus Quest state methods, four quest condition predicates, expired-context guards, and a read-only client journal feed are now implemented. `mp "bh journal"` displays the diagnostic projection. Vanilla quest execution remains disabled until an execution adapter exists. See [the implementation contract and remaining gates](misc/boyhouse/QUESTS.md).
+Persistent personal/host journals, 23 Papyrus Quest state methods, four quest condition predicates, expired-context guards, and a read-only client journal feed are implemented. The new `questExecuteStage` trusted server API loads original PEX fragments into a campaign-scoped VM and commits journal changes and script variables together. It remains gated by experimental per-quest adapters; no complete vanilla quest is enabled. `mp "bh journal"` displays the diagnostic projection. See [the implementation contract and remaining gates](misc/boyhouse/QUESTS.md).
 
-## Quest milestone verification on 2026-11-16 UTC
+## Fragment milestone verification on 2026-11-16 UTC
+
+- Linux Release server/addon build passed. Full native suite: **290 cases, 518,484 assertions passed**.
+- Tests parse every QUST VMAD in the five owned masters and every PEX in the owned vanilla script archive.
+- Original MQ102 stage 100 and DA04 stage 5 execute. DA04's original fragment displays objective 5 in the host's journal when invoked by a guest; leaving restores the guest's personal history. Unsupported map-marker/alias/lifecycle operations roll back.
+- Persistent variables, arrays, quest reset, conditional log entries, stale identities, property targets, instruction quotas and transaction rollback have regression coverage. Shared array identities and latent continuations remain unsupported and fail explicitly.
+- 25 JavaScript/TypeScript tests and 4 Python catalog tests passed. No client code changed in this milestone.
+- The focused instance/quest suite passed 36 cases and 41,857 assertions. Native addon/party/original-fragment integration and full-server protocol smoke passed, including rejected client writes, host-only effects, guest removal and reconnect.
+- These are server execution fixtures, not completed quests. **Zero quests have certified multiplayer playthroughs.** See the [native client runtime audit](misc/boyhouse/CLIENT_RUNTIME.md) for concrete 1.7.104 port requirements.
+
+## Earlier journal milestone verification on 2026-11-16 UTC
 
 - Linux Release server/addon and server TypeScript build passed; the client webpack/typecheck also passed.
 - Full native suite: 271 cases and 476,285 assertions passed. The focused instance/quest suite passed 17 cases and 115 assertions, including 8 new quest cases.
@@ -35,7 +45,7 @@ Persistent personal/host journals, 23 Papyrus Quest state methods, four quest co
 
 ## What this does not implement yet
 
-This is not full campaign multiplayer or a finished instancing engine. Vanilla static references are not cloned per campaign. Quest VM isolation, aliases, dialogue scenes, story events, native client journals, branch ownership, world overlays, scoped persistence transactions, transition acknowledgements/epochs, automatic boundary crossing, guest progression rules, and client reset/rebinding remain to be built and tested. Entering an experimental instance can hide shared NPCs and interactive references until overlays exist. Use the empty boundary laboratory only.
+This is not full campaign multiplayer or a finished instancing engine. Vanilla static references are not cloned per campaign. General quest execution, aliases, dialogue scenes, story events, native client journals, branch ownership, world overlays, transactions spanning inventory/world effects, transition acknowledgements, automatic boundary crossing, guest progression rules, and client reset/rebinding remain to be built and tested. Entering an experimental instance can hide shared NPCs and interactive references until overlays exist. Use the empty boundary laboratory only.
 
 The full-release target is every quest in Skyrim, Update, Dawnguard, HearthFires, and Dragonborn. Completion requires evidence per quest and important branch; it is not guaranteed by adding synchronization primitives. The local owned files contain 2,274 distinct QUST records including internal helper quests. **Zero quests have been certified for this fork.** Creation Club and arbitrary quest mods are separate compatibility packs.
 

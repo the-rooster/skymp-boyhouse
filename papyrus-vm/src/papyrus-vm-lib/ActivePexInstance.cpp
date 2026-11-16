@@ -83,11 +83,15 @@ std::string ActivePexInstance::GetActiveStateName() const
   try {
     var = variables->GetVariableByName("::State", *sourcePex.fn());
   } catch (std::exception& e) {
+    if (parentVM->IsStrictExecution())
+      throw;
     spdlog::error("ActivePexInstance::GetActiveStateName - "
                   "GetVariableByName(::State) unexpectedly errored: '{}'",
                   e.what());
     return "";
   } catch (...) {
+    if (parentVM->IsStrictExecution())
+      throw;
     spdlog::critical(
       "ActivePexInstance::GetActiveStateName - GetVariableByName(::State) "
       "unexpectedly errored: unknown error");
@@ -180,6 +184,9 @@ std::vector<VarValue> GetArgsForCall(uint8_t op,
 bool ActivePexInstance::EnsureCallResultIsSynchronous(
   const VarValue& callResult, ExecutionContext* ctx)
 {
+  if (parentVM->IsStrictExecution() && callResult.promise)
+    throw std::runtime_error(
+      "Latent call requires a durable continuation adapter");
   if (!callResult.promise) {
     return true;
   }
@@ -203,11 +210,110 @@ bool ActivePexInstance::EnsureCallResultIsSynchronous(
   return false;
 }
 
-void ActivePexInstance::ExecuteOpCode(
-  ExecutionContext* ctx, uint8_t op,
-  const std::vector<VarValue*>& args) noexcept
+void ActivePexInstance::ExecuteStrictProperty(
+  ExecutionContext* ctx, uint8_t op, const std::vector<VarValue*>& args)
 {
+  const bool write = op == OpcodesImplementation::Opcodes::op_PropSet;
+  const bool self = IsSelfStr(*args.at(1));
+  const auto& target = self ? activeInstanceOwner : *args.at(1);
+  auto* object = static_cast<IGameObject*>(target);
+  const char* name = static_cast<const char*>(*args.at(0));
+  if (!object || !name)
+    throw std::runtime_error("Invalid Papyrus property target or name");
+  ActivePexInstance* selected = nullptr;
+  Object::PropInfo* property = nullptr;
+  std::vector<ActivePexInstance*> roots;
+  if (self)
+    roots.push_back(this);
+  else
+    for (const auto& attached : object->ListActivePexInstances())
+      roots.push_back(attached.get());
+  for (auto* attached : roots) {
+    bool matchesType = target.objectType.empty();
+    for (auto* instance = attached; instance && instance->IsValid();
+         instance = instance->parentInstance.get())
+      matchesType |= !Utils::stricmp(instance->GetSourcePexName().c_str(),
+                                     target.objectType.c_str());
+    if (!self && !matchesType)
+      continue;
+    for (auto* instance = attached; instance && instance->IsValid();
+         instance = instance->parentInstance.get()) {
+      auto& properties =
+        instance->sourcePex.fn()->objectTable.at(0).properties;
+      auto found =
+        std::find_if(properties.begin(), properties.end(), [&](const auto& p) {
+          return !Utils::stricmp(p.name.c_str(), name);
+        });
+      if (found == properties.end())
+        continue;
+      if (selected)
+        throw std::runtime_error("Ambiguous Papyrus property binding");
+      selected = instance;
+      property = &*found;
+      break;
+    }
+  }
+  const auto access =
+    write ? Object::PropInfo::kFlags_Write : Object::PropInfo::kFlags_Read;
+  if (!selected || !(property->flags & access))
+    throw std::runtime_error(std::string("Unavailable Papyrus property: ") +
+                             name);
+  if (property->flags & Object::PropInfo::kFlags_AutoVar) {
+    auto* value = selected->variables->GetVariableByName(
+      property->autoVarName.c_str(), *selected->sourcePex.fn());
+    if (!value)
+      throw std::runtime_error("Missing Papyrus property variable");
+    if (write)
+      *value = *args.at(2);
+    else
+      *args.at(2) = *value;
+  } else {
+    auto function = write ? property->writeHandler : property->readHandler;
+    if (function.IsNative())
+      throw std::runtime_error("Native property handler requires an adapter");
+    std::vector<VarValue> arguments;
+    if (write)
+      arguments.push_back(*args.at(2));
+    auto result = selected->StartFunction(function, arguments, ctx->stackData);
+    EnsureCallResultIsSynchronous(result, ctx);
+    if (!write)
+      *args.at(2) = result;
+  }
+}
+
+void ActivePexInstance::ExecuteOpCode(ExecutionContext* ctx, uint8_t op,
+                                      const std::vector<VarValue*>& args)
+{
+  if (parentVM->IsStrictExecution() &&
+      (op == OpcodesImplementation::Opcodes::op_PropGet ||
+       op == OpcodesImplementation::Opcodes::op_PropSet)) {
+    ExecuteStrictProperty(ctx, op, args);
+    return;
+  }
   auto argsForCall = GetArgsForCall(op, args);
+
+  if (parentVM->IsStrictExecution()) {
+    if (op == OpcodesImplementation::Opcodes::op_Array_GetElement ||
+        op == OpcodesImplementation::Opcodes::op_Array_SetElement) {
+      const bool get =
+        op == OpcodesImplementation::Opcodes::op_Array_GetElement;
+      const auto& array = *args.at(get ? 1 : 0);
+      const auto& index = *args.at(get ? 2 : 1);
+      if (!array.pArray || index.GetType() != VarValue::kType_Integer ||
+          static_cast<int32_t>(index) < 0 ||
+          static_cast<uint32_t>(static_cast<int32_t>(index)) >=
+            array.pArray->size())
+        throw std::runtime_error("Invalid Papyrus array access");
+    }
+    if (op == OpcodesImplementation::Opcodes::op_iDiv ||
+        op == OpcodesImplementation::Opcodes::op_iMod) {
+      const auto denominator = static_cast<int32_t>(*args.at(2));
+      if (!denominator ||
+          (denominator == -1 &&
+           static_cast<int32_t>(*args.at(1)) == INT32_MIN))
+        throw std::runtime_error("Invalid Papyrus integer division");
+    }
+  }
 
   switch (op) {
     case OpcodesImplementation::Opcodes::op_Nop:
@@ -343,6 +449,8 @@ void ActivePexInstance::ExecuteOpCode(
       // BYOHRelationshipAdoptionPetDoorTrigger in Skyrim Legendary Edition
       if (args[0]->GetType() != VarValue::kType_String &&
           args[0]->GetType() != VarValue::kType_Identifier) {
+        if (parentVM->IsStrictExecution())
+          throw std::runtime_error("Invalid Papyrus method name");
         *args[2] = VarValue::None();
         spdlog::error("OpcodesImplementation::Opcodes::op_CallMethod - "
                       "anomaly, string expected");
@@ -354,6 +462,13 @@ void ActivePexInstance::ExecuteOpCode(
       static const std::string nameOnEndState = "onEndState";
 
       if (functionName == nameOnBeginState || functionName == nameOnEndState) {
+        if (parentVM->IsStrictExecution()) {
+          const auto event =
+            GetFunctionByName(functionName.c_str(), GetActiveStateName());
+          if (event.valid)
+            StartFunction(event, argsForCall, ctx->stackData);
+          break;
+        }
         // TODO: consider using CallMethod here. I'm afraid that this event
         // will pollute other scripts attached to an object
         parentVM->SendEvent(this, functionName.c_str(), argsForCall);
@@ -452,6 +567,9 @@ void ActivePexInstance::ExecuteOpCode(
                                                     propertyName.data());
                            });
             if (it == instProps.end()) {
+              if (parentVM->IsStrictExecution())
+                throw std::runtime_error("Unknown Papyrus property: " +
+                                         propertyName);
               spdlog::trace("propget do nothing: prop {} not found",
                             propertyName);
             } else {
@@ -463,11 +581,15 @@ void ActivePexInstance::ExecuteOpCode(
                   it->autoVarName.data(), *inst->sourcePex.fn());
 
               } catch (std::exception& e) {
+                if (parentVM->IsStrictExecution())
+                  throw;
                 spdlog::error("OpcodesImplementation::Opcodes::op_PropGet - "
                               "GetVariableByName errored with '{}'",
                               e.what());
                 var = nullptr;
               } catch (...) {
+                if (parentVM->IsStrictExecution())
+                  throw;
                 spdlog::critical(
                   "OpcodesImplementation::Opcodes::op_PropGet - "
                   "GetVariableByName errored with unknown error");
@@ -478,6 +600,9 @@ void ActivePexInstance::ExecuteOpCode(
               if (var) {
                 *args[2] = *var;
               } else {
+                if (parentVM->IsStrictExecution())
+                  throw std::runtime_error(
+                    "Unknown Papyrus property variable");
                 spdlog::trace("propget do nothing: variable {} not found",
                               it->autoVarName);
               }
@@ -556,6 +681,9 @@ void ActivePexInstance::ExecuteOpCode(
                                                     propertyName.data());
                            });
             if (it == instProps.end()) {
+              if (parentVM->IsStrictExecution())
+                throw std::runtime_error("Unknown Papyrus property: " +
+                                         propertyName);
               spdlog::trace("propset do nothing: prop {} not found",
                             propertyName);
             } else {
@@ -565,11 +693,15 @@ void ActivePexInstance::ExecuteOpCode(
                 var = inst->variables->GetVariableByName(
                   it->autoVarName.data(), *inst->sourcePex.fn());
               } catch (std::exception& e) {
+                if (parentVM->IsStrictExecution())
+                  throw;
                 spdlog::error("OpcodesImplementation::Opcodes::op_PropSet - "
                               "GetVariableByName errored with '{}'",
                               e.what());
                 var = nullptr;
               } catch (...) {
+                if (parentVM->IsStrictExecution())
+                  throw;
                 spdlog::critical(
                   "OpcodesImplementation::Opcodes::op_PropSet - "
                   "GetVariableByName errored with unknown error");
@@ -580,6 +712,9 @@ void ActivePexInstance::ExecuteOpCode(
               if (var) {
                 *var = *args[2];
               } else {
+                if (parentVM->IsStrictExecution())
+                  throw std::runtime_error(
+                    "Unknown Papyrus property variable");
                 spdlog::trace("propset do nothing: variable {} not found",
                               it->autoVarName);
               }
@@ -592,6 +727,10 @@ void ActivePexInstance::ExecuteOpCode(
       }
       break;
     case OpcodesImplementation::Opcodes::op_Array_Create:
+      if (parentVM->IsStrictExecution() &&
+          (static_cast<int32_t>(*args[1]) < 0 ||
+           static_cast<int32_t>(*args[1]) > 1000000))
+        throw std::runtime_error("Invalid Papyrus array length");
       (*args[0]).pArray = std::make_shared<std::vector<VarValue>>();
       if ((int32_t)(*args[1]) > 0) {
         (*args[0]).pArray->resize((int32_t)(*args[1]));
@@ -658,6 +797,8 @@ void ActivePexInstance::ExecuteOpCode(
                                                *args[3]);
       break;
     default:
+      if (parentVM->IsStrictExecution())
+        throw std::runtime_error("Unsupported Papyrus opcode");
       assert(0);
   }
 }
@@ -755,7 +896,7 @@ ActivePexInstance::TransformInstructions(
 }
 
 VarValue ActivePexInstance::ExecuteAll(
-  ExecutionContext& ctx, std::optional<VarValue> previousCallResult) noexcept
+  ExecutionContext& ctx, std::optional<VarValue> previousCallResult)
 {
   auto pipex = sourcePex.fn();
 
@@ -777,8 +918,11 @@ VarValue ActivePexInstance::ExecuteAll(
   size_t opCodeExecutions = 0;
 
   for (; ctx.line < opCode.size(); ++ctx.line) {
+    parentVM->CheckExecutionBudget();
 
     if (opCodeExecutions >= kOpCodeExecutionsQuota) {
+      if (parentVM->IsStrictExecution())
+        throw std::runtime_error("Papyrus instruction quota exceeded");
       spdlog::error("ActivePexInstance::ExecuteAll - Quota exceeded in script "
                     "{}, returning None",
                     sourcePex.fn()->source);
@@ -797,6 +941,10 @@ VarValue ActivePexInstance::ExecuteAll(
 
     if (ctx.needJump) {
       ctx.needJump = false;
+      const auto next = static_cast<int64_t>(ctx.line) + ctx.jumpStep + 1;
+      if (parentVM->IsStrictExecution() &&
+          (next < 0 || next > static_cast<int64_t>(opCode.size())))
+        throw std::runtime_error("Papyrus jump is outside function");
       ctx.line += ctx.jumpStep;
     }
   }
@@ -808,12 +956,17 @@ VarValue ActivePexInstance::StartFunction(const FunctionInfo& function,
                                           std::shared_ptr<StackData> stackData)
 {
   if (!stackData) {
+    if (parentVM->IsStrictExecution())
+      throw std::runtime_error("Missing Papyrus stack context");
     spdlog::error("ActivePexInstance::StartFunction - An empty stackData "
                   "passed to StartFunction");
     return VarValue::None();
   }
 
   thread_local StackDepthHolder g_stackDepthHolder;
+  if (parentVM->IsStrictExecution() &&
+      arguments.size() != function.params.size())
+    throw std::runtime_error("Papyrus argument count mismatch");
 
   g_stackDepthHolder.IncreaseStackDepth();
 
@@ -826,6 +979,8 @@ VarValue ActivePexInstance::StartFunction(const FunctionInfo& function,
   constexpr size_t kMaxStackDepth = 128;
 
   if (g_stackDepthHolder.GetStackDepth() >= kMaxStackDepth) {
+    if (parentVM->IsStrictExecution())
+      throw std::runtime_error("Papyrus stack depth exceeded");
     spdlog::error("ActivePexInstance::StartFunction - Stack overflow in "
                   "script {}, returning None",
                   sourcePex.fn()->source);
@@ -1149,17 +1304,23 @@ VarValue& ActivePexInstance::GetVariableValueByName(std::vector<Local>* locals,
             variables->GetVariableByName(name.data(), *sourcePex.fn()))
         return *var;
   } catch (std::exception& e) {
+    if (parentVM->IsStrictExecution())
+      throw;
     spdlog::error("ActivePexInstance::GetVariableValueByName - "
                   "GetVariableByName errored with '{}'",
                   e.what());
     return ResetNoneVarAndReturn();
   } catch (...) {
+    if (parentVM->IsStrictExecution())
+      throw;
     spdlog::critical("ActivePexInstance::GetVariableValueByName - "
                      "GetVariableByName errored with unknown error");
     std::terminate();
     return ResetNoneVarAndReturn();
   }
 
+  if (parentVM->IsStrictExecution())
+    throw std::runtime_error("Unknown script variable: " + name);
   for (auto& _name : identifiersValueNameCache) {
     if ((const char*)(*_name) == name) {
       return *_name;

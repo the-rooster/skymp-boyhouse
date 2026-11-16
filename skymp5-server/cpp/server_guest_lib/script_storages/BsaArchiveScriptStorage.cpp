@@ -37,11 +37,17 @@ const std::set<CIString>& BsaArchiveScriptStorage::ListScripts(
 #ifndef NO_BSA
   if (scripts.empty() || forceReloadScripts) {
     scripts.clear();
+    scriptPex.clear();
     bsa::tes4::archive bsa;
-    bsa.read(bsaPath);
-    auto bsaScripts = *bsa["scripts"];
+    const auto version = bsa.read(bsaPath);
+    auto folder = bsa["scripts"];
+    if (!folder)
+      throw std::runtime_error("BSA archive has no scripts folder");
+    auto bsaScripts = *folder;
     for (auto it = bsaScripts.begin(); it != bsaScripts.end(); it++) {
       auto fileName = it->first.name();
+      if (it->second.compressed())
+        it->second.decompress(version);
 
       const std::byte* data = it->second.data();
       size_t size = it->second.size();

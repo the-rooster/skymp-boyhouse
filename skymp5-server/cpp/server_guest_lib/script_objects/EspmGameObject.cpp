@@ -291,6 +291,8 @@ const char* EspmGameObject::GetParentNativeScript()
 
 bool EspmGameObject::EqualsByValue(const IGameObject& obj) const
 {
+  if (typeid(*this) != typeid(obj))
+    return false;
   if (auto espmObj = dynamic_cast<const EspmGameObject*>(&obj)) {
     return espmObj->record.rec == record.rec;
   }

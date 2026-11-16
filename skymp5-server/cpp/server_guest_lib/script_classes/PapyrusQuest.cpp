@@ -1,5 +1,7 @@
 #include "PapyrusQuest.h"
+#include "MpActor.h"
 #include "QuestJournal.h"
+#include "script_objects/CampaignQuestObject.h"
 #include "script_objects/EspmGameObject.h"
 #include <algorithm>
 
@@ -10,6 +12,13 @@ MpActor& PapyrusQuest::Actor(const VarValue& self) const
   auto actor = compatibilityPolicy->GetQuestActor(self.GetMetaStackId());
   if (!actor)
     throw std::runtime_error("Missing quest campaign actor");
+  if (self.GetType() == VarValue::kType_Object) {
+    if (auto scoped = dynamic_cast<CampaignQuestObject*>(
+          static_cast<IGameObject*>(self))) {
+      if (scoped->OwnerId() != QuestJournal::Owner(*actor).GetFormId())
+        throw std::runtime_error("Quest object belongs to another campaign");
+    }
+  }
   return *actor;
 }
 

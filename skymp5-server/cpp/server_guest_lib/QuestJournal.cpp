@@ -11,6 +11,12 @@
 namespace {
 using Json = nlohmann::json;
 constexpr uint64_t kMaxRevision = 9007199254740991ULL;
+struct Transaction
+{
+  MpActor* owner;
+  Json ledger;
+};
+thread_local Transaction* transaction = nullptr;
 
 uint32_t Integer(const Json& value, uint32_t limit, const char* name)
 {
@@ -85,6 +91,11 @@ void Validate(const Json& ledger)
 
 Json Read(MpActor& owner)
 {
+  if (transaction) {
+    if (transaction->owner != &owner)
+      throw std::runtime_error("Cross-campaign quest transaction");
+    return transaction->ledger;
+  }
   const auto& dump =
     owner.GetDynamicFields().GetValueDump(QuestJournal::kProperty);
   if (dump == "null") {
@@ -161,6 +172,7 @@ nlohmann::json QuestJournal::Snapshot(MpActor& actor)
 {
   auto& owner = Owner(actor);
   auto result = Read(owner);
+  result.erase("vm"); // Script variables are private server state.
   result["campaignOwner"] = owner.GetFormId();
   result["instance"] = actor.GetWorldInstance();
   result["actor"] = actor.GetFormId();
@@ -212,6 +224,16 @@ bool QuestJournal::Apply(MpActor& actor, const nlohmann::json& command)
     quest["active"] = false;
   } else if (op == "reset") {
     quest = EmptyQuest();
+    if (ledger.contains("vm")) {
+      auto& vm = ledger["vm"];
+      const auto prefix = def.key + "/";
+      for (auto it = vm.begin(); it != vm.end();) {
+        if (it.key().compare(0, prefix.size(), prefix) == 0)
+          it = vm.erase(it);
+        else
+          ++it;
+      }
+    }
   } else if (op == "complete") {
     quest["completed"] = true;
     quest["active"] = false;
@@ -273,6 +295,71 @@ bool QuestJournal::Apply(MpActor& actor, const nlohmann::json& command)
   }
   // Single change-form update: validation failures never partially change a
   // journal; the ordinary save path persists it with the owning character.
-  owner.SetPropertyValueDump(kProperty, dump, false, false);
+  if (transaction)
+    transaction->ledger = std::move(ledger);
+  else
+    owner.SetPropertyValueDump(kProperty, dump, false, false);
   return true;
+}
+
+void QuestJournal::Atomic(MpActor& actor, const std::function<void()>& execute)
+{
+  if (transaction)
+    throw std::runtime_error("Nested quest transaction");
+  auto& owner = Owner(actor);
+  auto& world = *actor.GetParent();
+  const auto actorId = actor.GetFormId(), ownerId = owner.GetFormId();
+  // Keep both objects alive and require the same registered identities at
+  // commit.
+  const auto actorLifetime = world.LookupFormByIdNoLoad(actorId);
+  const auto ownerLifetime = world.LookupFormByIdNoLoad(ownerId);
+  if (actorLifetime.get() != &actor || ownerLifetime.get() != &owner)
+    throw std::runtime_error("Unregistered quest transaction participant");
+  const auto actorEpoch = actor.GetWorldInstanceEpoch();
+  const auto ownerEpoch = owner.GetWorldInstanceEpoch();
+  const auto initial = Read(owner);
+  Transaction local{ &owner, initial };
+  transaction = &local;
+  try {
+    execute();
+    if (world.LookupFormByIdNoLoad(actorId) != actorLifetime ||
+        world.LookupFormByIdNoLoad(ownerId) != ownerLifetime ||
+        &Owner(actor) != &owner ||
+        actor.GetWorldInstanceEpoch() != actorEpoch ||
+        owner.GetWorldInstanceEpoch() != ownerEpoch)
+      throw std::runtime_error("Quest context changed during execution");
+    Validate(local.ledger);
+    const auto dump = local.ledger.dump();
+    if (dump.size() > 8 * 1024 * 1024)
+      throw std::runtime_error("Campaign journal too large");
+    transaction = nullptr;
+    if (local.ledger != initial)
+      owner.SetPropertyValueDump(kProperty, dump, false, false);
+  } catch (...) {
+    transaction = nullptr;
+    throw;
+  }
+}
+
+nlohmann::json QuestJournal::ScriptState(MpActor& actor)
+{
+  auto value = Read(Owner(actor)).value("vm", Json::object());
+  if (!value.is_object())
+    throw std::runtime_error("Invalid saved quest VM state");
+  return value;
+}
+
+void QuestJournal::SetScriptState(MpActor& actor, const nlohmann::json& state)
+{
+  auto& owner = Owner(actor);
+  if (!transaction || transaction->owner != &owner || !state.is_object())
+    throw std::runtime_error(
+      "Script state requires an owning quest transaction");
+  if (transaction->ledger.value("vm", Json::object()) == state)
+    return;
+  const auto revision = transaction->ledger.at("revision").get<uint64_t>();
+  if (revision == kMaxRevision)
+    throw std::overflow_error("Quest revision exhausted");
+  transaction->ledger["vm"] = state;
+  transaction->ledger["revision"] = revision + 1;
 }

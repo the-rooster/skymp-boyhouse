@@ -72,6 +72,13 @@ public:
   VirtualMachine(const std::vector<std::shared_ptr<PexScript>>& loadedScripts);
 
   void SetMissingScriptHandler(const MissingScriptHandler& handler);
+  void SetStrictExecution(bool enabled)
+  {
+    strictExecution = enabled;
+    executedInstructions = 0;
+  }
+  bool IsStrictExecution() const { return strictExecution; }
+  void CheckExecutionBudget();
 
   void AddObject(std::shared_ptr<IGameObject> self,
                  const std::vector<ScriptInfo>& scripts);
@@ -119,6 +126,8 @@ public:
   bool DynamicCast(const VarValue& object, const CIString& className) const;
 
 private:
+  bool strictExecution = false;
+  size_t executedInstructions = 0;
   CIMap<PexScript::Lazy> allLoadedScripts;
 
   CIMap<CIMap<NativeFunction>> nativeFunctions, nativeStaticFunctions;

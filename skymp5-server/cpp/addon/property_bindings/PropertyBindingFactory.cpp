@@ -55,6 +55,7 @@ PropertyBindingFactory::CreateStandardPropertyBindings()
   result["worldInstance"] = std::make_shared<WorldInstanceBinding>();
   result["questJournal"] = std::make_shared<QuestJournalBinding>();
   result["questCommand"] = std::make_shared<QuestCommandBinding>();
+  result["questExecuteStage"] = std::make_shared<QuestStageExecutionBinding>();
   result["idx"] = std::make_shared<IdxBinding>();
   result["consoleCommandsAllowed"] =
     std::make_shared<ConsoleCommandsAllowedBinding>();

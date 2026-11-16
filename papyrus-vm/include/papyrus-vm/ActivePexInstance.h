@@ -73,10 +73,13 @@ private:
 
   VarValue ExecuteAll(
     ExecutionContext& ctx,
-    std::optional<VarValue> previousCallResult = std::nullopt) noexcept;
+    std::optional<VarValue> previousCallResult = std::nullopt);
 
   void ExecuteOpCode(ExecutionContext* ctx, uint8_t op,
-                     const std::vector<VarValue*>& arguments) noexcept;
+                     const std::vector<VarValue*>& arguments);
+
+  void ExecuteStrictProperty(ExecutionContext* ctx, uint8_t op,
+                             const std::vector<VarValue*>& arguments);
 
   bool EnsureCallResultIsSynchronous(const VarValue& callResult,
                                      ExecutionContext* ctx);

@@ -1,0 +1,501 @@
+#include "QuestScriptRuntime.h"
+#include "QuestJournal.h"
+#include "TestUtils.hpp"
+#include "papyrus-vm/Reader.h"
+#include "script_objects/CampaignQuestObject.h"
+#include "script_storages/BsaArchiveScriptStorage.h"
+#include <fstream>
+
+extern espm::Loader& GetEspmLoader();
+
+namespace {
+constexpr uint32_t kQuest = 0x4e50d;
+const char* kStateKey = "4e50d:Skyrim.esm/boyhousefixture";
+VarValue Id(const char* name)
+{
+  return VarValue(VarValue::kType_Identifier, name);
+}
+struct Fixture
+{
+  PartOne server;
+  espm::QuestScriptData metadata;
+  std::shared_ptr<PexScript> fixture = std::make_shared<PexScript>();
+  std::shared_ptr<PexScript> quest = std::make_shared<PexScript>();
+  Fixture()
+  {
+    server.AttachEspm(&GetEspmLoader());
+    metadata.version = 5;
+    metadata.objectFormat = 2;
+    metadata.scripts.push_back({ "BoyhouseFixture", 0, {} });
+    metadata.fragments.push_back({ 10, 0, 1, "BoyhouseFixture", "Fragment" });
+    metadata.fragments.push_back({ 20, 0, 1, "BoyhouseFixture", "Fragment" });
+    fixture->source = "BoyhouseFixture";
+    Object object;
+    object.NameIndex = fixture->source;
+    object.parentClassName = "Quest";
+    object.variables.push_back({ "counter", "Int", 0, VarValue(0) });
+    FunctionInfo fragment;
+    fragment.valid = true;
+    fragment.returnType = "None";
+    fragment.locals.push_back({ "temp", "None" });
+    fragment.code.instructions = {
+      { FunctionCode::kOp_IAdd,
+        { Id("counter"), Id("counter"), VarValue(1) } },
+      { FunctionCode::kOp_CallMethod,
+        { VarValue("SetObjectiveDisplayed"), Id("self"), Id("temp"),
+          VarValue(2), VarValue(10), VarValue(true) } },
+      { FunctionCode::kOp_Return, { VarValue::None() } }
+    };
+    object.states.push_back({ "", { { "Fragment", fragment } } });
+    fixture->objectTable.push_back(object);
+    quest->source = "Quest";
+    Object base;
+    base.NameIndex = "Quest";
+    quest->objectTable.push_back(base);
+  }
+  MpActor& Add(uint32_t id)
+  {
+    server.CreateActor(id, { 1, 2, 3 }, 0, 0x3c);
+    auto& actor = server.worldState.GetFormAt<MpActor>(id);
+    actor.SetPropertyValueDump(QuestJournal::kEnabled,
+                               "[\"4e50d:Skyrim.esm\"]", false, false);
+    return actor;
+  }
+  bool Run(MpActor& actor, uint16_t stage = 10)
+  {
+    const std::vector<PexScript::Lazy> scripts = {
+      { fixture->source, [pex = fixture] { return pex; } },
+      { quest->source, [pex = quest] { return pex; } }
+    };
+    return QuestScriptRuntime::ExecuteStage(actor, kQuest, stage, metadata,
+                                            scripts);
+  }
+  FunctionInfo& Fragment()
+  {
+    return fixture->objectTable[0].states[0].functions[0].function;
+  }
+};
+}
+
+TEST_CASE("Quest objects have symmetric campaign-specific Papyrus identities",
+          "[Quest][QuestVM]")
+{
+  const auto record = GetEspmLoader().GetBrowser().LookupById(kQuest);
+  CampaignQuestObject a(record, 1), same(record, 1), b(record, 2);
+  EspmGameObject global(record);
+  REQUIRE(a.EqualsByValue(same));
+  REQUIRE_FALSE(a.EqualsByValue(b));
+  REQUIRE_FALSE(b.EqualsByValue(a));
+  REQUIRE_FALSE(global.EqualsByValue(a));
+  REQUIRE_FALSE(a.EqualsByValue(global));
+  REQUIRE(std::string(a.GetStringID()) != b.GetStringID());
+}
+
+TEST_CASE(
+  "Fragments persist isolated variables and duplicate stages do not rerun",
+  "[Quest][QuestVM]")
+{
+  Fixture f;
+  auto& a = f.Add(0xff000001);
+  auto& b = f.Add(0xff000002);
+  REQUIRE(f.Run(a));
+  REQUIRE(QuestJournal::Get(a, kQuest)["objectives"]["10"]["displayed"] ==
+          true);
+  REQUIRE(QuestJournal::ScriptState(
+            a)[kStateKey]["values"]["boyhousefixture/counter"]["value"] == 1);
+  REQUIRE_FALSE(QuestJournal::Snapshot(a).contains("vm"));
+  const auto snapshot = QuestJournal::Snapshot(a);
+  REQUIRE_FALSE(f.Run(a));
+  REQUIRE(QuestJournal::Snapshot(a) == snapshot);
+  REQUIRE(f.Run(a, 20));
+  REQUIRE(QuestJournal::ScriptState(
+            a)[kStateKey]["values"]["boyhousefixture/counter"]["value"] == 2);
+  REQUIRE(f.Run(b));
+  REQUIRE(QuestJournal::ScriptState(
+            b)[kStateKey]["values"]["boyhousefixture/counter"]["value"] == 1);
+  Fixture restarted;
+  auto& restored = restarted.Add(a.GetFormId());
+  auto json = MpChangeForm::ToJson(a.GetChangeForm()).dump();
+  simdjson::dom::parser parser;
+  auto parsed = parser.parse(json).value();
+  restored.ApplyChangeForm(MpChangeForm::JsonToChangeForm(parsed));
+  REQUIRE(QuestJournal::ScriptState(restored) == QuestJournal::ScriptState(a));
+}
+
+TEST_CASE("Guest fragments update only the owner's script variables",
+          "[Quest][QuestVM]")
+{
+  Fixture f;
+  auto& a = f.Add(0xff000001);
+  auto& b = f.Add(0xff000002);
+  const auto instance =
+    "campaign:" + std::to_string(a.GetFormId()) + ":fixture";
+  a.SetWorldInstance(instance);
+  b.SetWorldInstance(instance);
+  REQUIRE(f.Run(b));
+  REQUIRE(QuestJournal::ScriptState(
+            a)[kStateKey]["values"]["boyhousefixture/counter"]["value"] == 1);
+  b.SetWorldInstance("");
+  REQUIRE(QuestJournal::ScriptState(b).empty());
+  REQUIRE(QuestJournal::Get(b, kQuest)["stage"] == 0);
+}
+
+TEST_CASE("Quest reset discards script variables before the next run",
+          "[Quest][QuestVM]")
+{
+  Fixture f;
+  auto& actor = f.Add(0xff000001);
+  REQUIRE(f.Run(actor));
+  REQUIRE(
+    QuestJournal::Apply(actor, { { "quest", kQuest }, { "op", "reset" } }));
+  REQUIRE(QuestJournal::ScriptState(actor).empty());
+  REQUIRE(f.Run(actor));
+  REQUIRE(QuestJournal::ScriptState(
+            actor)[kStateKey]["values"]["boyhousefixture/counter"]["value"] ==
+          1);
+}
+
+TEST_CASE(
+  "Conditional log fragments read the host history while a guest visits",
+  "[Quest][QuestVM]")
+{
+  Fixture f;
+  auto& owner = f.Add(0xff000001);
+  auto& guest = f.Add(0xff000002);
+  // MQ102 stage 10 has one unconditional entry and two GetStageDone branches.
+  f.metadata.fragments.push_back({ 10, 1, 1, "BoyhouseFixture", "Fragment" });
+  f.metadata.fragments.push_back({ 10, 2, 1, "BoyhouseFixture", "Fragment" });
+  owner.SetPropertyValueDump(QuestJournal::kEnabled,
+                             "[\"4e50d:Skyrim.esm\",\"2bf9c:Skyrim.esm\"]",
+                             false, false);
+  REQUIRE(QuestJournal::Apply(
+    owner, { { "quest", 0x2bf9c }, { "op", "setStage" }, { "index", 10 } }));
+  const auto instance =
+    "campaign:" + std::to_string(owner.GetFormId()) + ":fixture";
+  owner.SetWorldInstance(instance);
+  guest.SetWorldInstance(instance);
+  REQUIRE(f.Run(guest));
+  REQUIRE(QuestJournal::ScriptState(
+            owner)[kStateKey]["values"]["boyhousefixture/counter"]["value"] ==
+          2);
+  guest.SetWorldInstance("");
+  REQUIRE(f.Run(guest));
+  REQUIRE(QuestJournal::ScriptState(
+            guest)[kStateKey]["values"]["boyhousefixture/counter"]["value"] ==
+          1);
+}
+
+TEST_CASE("Runaway fragments roll back and do not poison later executions",
+          "[Quest][QuestVM]")
+{
+  Fixture f;
+  auto& actor = f.Add(0xff000001);
+  const auto before = QuestJournal::Snapshot(actor);
+  const auto original = f.Fragment().code.instructions.back();
+  f.Fragment().code.instructions.back() = { FunctionCode::kOp_Jump,
+                                            { VarValue(0) } };
+  REQUIRE_THROWS_WITH(f.Run(actor),
+                      Catch::Matchers::ContainsSubstring("quota exceeded"));
+  REQUIRE(QuestJournal::Snapshot(actor) == before);
+  f.Fragment().code.instructions.back() = original;
+  REQUIRE(f.Run(actor));
+}
+
+TEST_CASE(
+  "Property writes persist on the intended script and None never aliases self",
+  "[Quest][QuestVM]")
+{
+  Fixture f;
+  auto& actor = f.Add(0xff000001);
+  Object::PropInfo property;
+  property.name = "Count";
+  property.type = "Int";
+  property.flags = 7;
+  property.autoVarName = "counter";
+  f.fixture->objectTable[0].properties.push_back(property);
+  auto& code = f.Fragment().code.instructions;
+  code.insert(code.end() - 1,
+              { FunctionCode::kOp_PropSet,
+                { VarValue("Count"), Id("self"), VarValue(42) } });
+  REQUIRE(f.Run(actor));
+  REQUIRE(QuestJournal::ScriptState(
+            actor)[kStateKey]["values"]["boyhousefixture/counter"]["value"] ==
+          42);
+  const auto before = QuestJournal::Snapshot(actor);
+  f.Fragment().locals.push_back({ "target", "Quest" });
+  code[2].args[1] = Id("target");
+  REQUIRE_THROWS_WITH(f.Run(actor, 20),
+                      Catch::Matchers::ContainsSubstring("property target"));
+  REQUIRE(QuestJournal::Snapshot(actor) == before);
+}
+
+TEST_CASE(
+  "Quest arrays persist, while unrepresentable shared identities roll back",
+  "[Quest][QuestVM]")
+{
+  Fixture f;
+  auto& actor = f.Add(0xff000001);
+  auto& object = f.fixture->objectTable[0];
+  object.variables.push_back({ "a", "Int[]", 0, VarValue::None() });
+  object.variables.push_back({ "b", "Int[]", 0, VarValue::None() });
+  auto& code = f.Fragment().code.instructions;
+  code = { { FunctionCode::kOp_ArrayCreate, { Id("a"), VarValue(2) } },
+           { FunctionCode::kOp_ArraySetElement,
+             { Id("a"), VarValue(0), VarValue(7) } },
+           { FunctionCode::kOp_Assign, { Id("b"), Id("a") } },
+           { FunctionCode::kOp_Return, { VarValue::None() } } };
+  const auto before = QuestJournal::Snapshot(actor);
+  REQUIRE_THROWS_WITH(
+    f.Run(actor), Catch::Matchers::ContainsSubstring("Shared quest arrays"));
+  REQUIRE(QuestJournal::Snapshot(actor) == before);
+  code.erase(code.begin() + 2);
+  REQUIRE(f.Run(actor));
+  code = { { FunctionCode::kOp_ArrayGetElement,
+             { Id("counter"), Id("a"), VarValue(0) } },
+           { FunctionCode::kOp_IAdd,
+             { Id("counter"), Id("counter"), VarValue(1) } },
+           { FunctionCode::kOp_ArraySetElement,
+             { Id("a"), VarValue(0), Id("counter") } },
+           { FunctionCode::kOp_Return, { VarValue::None() } } };
+  REQUIRE(f.Run(actor, 20));
+  REQUIRE(
+    QuestJournal::ScriptState(
+      actor)[kStateKey]["values"]["boyhousefixture/a"]["value"][0]["value"] ==
+    8);
+}
+
+TEST_CASE(
+  "Native failure after a fragment mutation rolls back journal and variables",
+  "[Quest][QuestVM]")
+{
+  Fixture f;
+  auto& a = f.Add(0xff000001);
+  const auto before = QuestJournal::Snapshot(a);
+  auto& code = f.Fragment().code.instructions;
+  code.insert(code.end() - 1,
+              { FunctionCode::kOp_CallMethod,
+                { VarValue("UnsupportedNative"), Id("self"), Id("temp"),
+                  VarValue(0) } });
+  REQUIRE_THROWS(f.Run(a));
+  REQUIRE(QuestJournal::Snapshot(a) == before);
+  REQUIRE(QuestJournal::ScriptState(a).empty());
+  code.erase(code.end() - 2);
+  REQUIRE(f.Run(a));
+}
+
+TEST_CASE(
+  "Missing bindings and recursive stage changes cannot silently complete",
+  "[Quest][QuestVM]")
+{
+  Fixture f;
+  auto& a = f.Add(0xff000001);
+  const auto before = QuestJournal::Snapshot(a);
+  f.metadata.fragments[0].function = "MissingFragment";
+  REQUIRE_THROWS(f.Run(a));
+  REQUIRE(QuestJournal::Snapshot(a) == before);
+  f.metadata.fragments[0].function = "Fragment";
+  f.Fragment().code.instructions[1] = {
+    FunctionCode::kOp_CallMethod,
+    { VarValue("SetStage"), Id("self"), Id("temp"), VarValue(1), VarValue(20) }
+  };
+  REQUIRE_THROWS(f.Run(a));
+  REQUIRE(QuestJournal::Snapshot(a) == before);
+  f.metadata.scripts[0].name = "MissingPex";
+  REQUIRE_THROWS(f.Run(a));
+  REQUIRE(QuestJournal::Snapshot(a) == before);
+}
+
+TEST_CASE(
+  "Quest transactions reject context changes and cross-campaign writes",
+  "[Quest][QuestVM]")
+{
+  Fixture f;
+  auto& a = f.Add(0xff000001);
+  auto& b = f.Add(0xff000002);
+  const auto before = QuestJournal::Snapshot(a);
+  REQUIRE_THROWS(QuestJournal::Atomic(a, [&] {
+    QuestJournal::Apply(a, { { "quest", kQuest }, { "op", "start" } });
+    QuestJournal::Apply(b, { { "quest", kQuest }, { "op", "start" } });
+  }));
+  REQUIRE(QuestJournal::Snapshot(a) == before);
+  REQUIRE_THROWS(QuestJournal::Atomic(a, [&] {
+    QuestJournal::Apply(a, { { "quest", kQuest }, { "op", "start" } });
+    a.SetWorldInstance("campaign:4278190081:fixture");
+  }));
+  REQUIRE(QuestJournal::Get(a, kQuest)["running"] == false);
+  REQUIRE_THROWS(QuestJournal::SetScriptState(a, nlohmann::json::object()));
+}
+
+TEST_CASE(
+  "Owned original quest fragment runs through VMAD and compressed PEX storage",
+  "[Quest][QuestVM][OwnedFragment]")
+{
+  Fixture f;
+  auto& actor = f.Add(0xff000001);
+  auto storage = std::make_shared<BsaArchiveScriptStorage>(
+    (std::filesystem::path(GetDataDir()) / "Skyrim - Misc.bsa")
+      .string()
+      .c_str());
+  f.server.worldState.AttachScriptStorage(storage);
+  const auto before = QuestJournal::Snapshot(actor);
+  REQUIRE_THROWS_WITH(
+    QuestScriptRuntime::ExecuteStage(actor, kQuest, 10),
+    Catch::Matchers::ContainsSubstring("RiverwoodMapMarker"));
+  REQUIRE(QuestJournal::Snapshot(actor) == before);
+  const auto record =
+    f.server.worldState.GetEspm().GetBrowser().LookupById(kQuest);
+  const auto data = espm::QuestScriptData::Read(
+    record.rec, f.server.worldState.GetEspmCache());
+  REQUIRE(std::count_if(data.fragments.begin(), data.fragments.end(),
+                        [](const auto& f) { return f.stage == 100; }) > 0);
+  REQUIRE(QuestScriptRuntime::ExecuteStage(actor, kQuest, 100));
+  REQUIRE(QuestJournal::Get(actor, kQuest)["stage"] == 100);
+  REQUIRE_FALSE(QuestJournal::ScriptState(actor).empty());
+
+  // An original fragment with a visible journal effect, executed by a guest.
+  const uint32_t objectiveQuest = 0x2d512;
+  actor.SetPropertyValueDump(QuestJournal::kEnabled,
+                             "[\"4e50d:Skyrim.esm\",\"2d512:Skyrim.esm\"]",
+                             false, false);
+  auto& guest = f.Add(0xff000002);
+  const auto instance =
+    "campaign:" + std::to_string(actor.GetFormId()) + ":fixture";
+  actor.SetWorldInstance(instance);
+  guest.SetWorldInstance(instance);
+  REQUIRE(QuestScriptRuntime::ExecuteStage(guest, objectiveQuest, 5));
+  REQUIRE(QuestJournal::Get(
+            actor, objectiveQuest)["objectives"]["5"]["displayed"] == true);
+  const auto progress = QuestJournal::Snapshot(actor);
+  REQUIRE_FALSE(QuestScriptRuntime::ExecuteStage(guest, objectiveQuest, 5));
+  REQUIRE(QuestJournal::Snapshot(actor) == progress);
+  guest.SetWorldInstance("");
+  REQUIRE(QuestJournal::Get(guest, objectiveQuest)["objectives"].empty());
+}
+
+TEST_CASE("Reusing a character ID cannot receive an old quest transaction",
+          "[Quest][QuestVM]")
+{
+  Fixture f;
+  const uint32_t id = 0xff000001;
+  auto& actor = f.Add(id);
+  REQUIRE_THROWS_WITH(
+    QuestJournal::Atomic(
+      actor,
+      [&] {
+        QuestJournal::Apply(actor, { { "quest", kQuest }, { "op", "start" } });
+        f.server.worldState.DestroyForm(id);
+        f.Add(id);
+      }),
+    Catch::Matchers::ContainsSubstring("context changed"));
+  REQUIRE(QuestJournal::Snapshot(
+            f.server.worldState.GetFormAt<MpActor>(id))["quests"]
+            .empty());
+}
+
+TEST_CASE("PEX reader rejects truncation and malformed headers instead of "
+          "reading past input",
+          "[Quest][QuestVM]")
+{
+  std::ifstream stream(std::filesystem::path(TEST_PEX_DIR) / "quest.pex",
+                       std::ios::binary);
+  REQUIRE(stream.good());
+  const std::vector<uint8_t> bytes{ std::istreambuf_iterator<char>(stream),
+                                    std::istreambuf_iterator<char>() };
+  REQUIRE(Reader(std::vector<std::vector<uint8_t>>{ bytes })
+            .GetSourceStructures()
+            .size() == 1);
+  for (const size_t size : { size_t(0), size_t(8), size_t(16),
+                             bytes.size() / 2, bytes.size() - 1 }) {
+    std::vector<uint8_t> truncated(bytes.begin(), bytes.begin() + size);
+    REQUIRE_THROWS(Reader(std::vector<std::vector<uint8_t>>{ truncated }));
+  }
+  auto bad = bytes;
+  bad[0] = 0;
+  REQUIRE_THROWS(Reader(std::vector<std::vector<uint8_t>>{ bad }));
+}
+
+TEST_CASE("PEX without debug info keeps parameters separate from locals",
+          "[Quest][QuestVM]")
+{
+  std::vector<uint8_t> bytes;
+  auto number = [&](uint64_t value, unsigned width) {
+    for (unsigned i = width; i > 0; --i)
+      bytes.push_back(uint8_t(value >> ((i - 1) * 8)));
+  };
+  auto string = [&](const std::string& value) {
+    number(value.size(), 2);
+    bytes.insert(bytes.end(), value.begin(), value.end());
+  };
+  number(0xfa57c0de, 4);
+  number(3, 1);
+  number(2, 1);
+  number(1, 2);
+  number(0, 8);
+  string("Fixture.psc");
+  string("");
+  string("");
+  const std::vector<std::string> strings = { "Fixture", "",        "None",
+                                             "Int",     "Example", "argument",
+                                             "local" };
+  number(strings.size(), 2);
+  for (const auto& value : strings)
+    string(value);
+  number(0, 1); // no debug info, so no timestamp/function table follows
+  number(0, 2); // user flags
+  number(1, 2); // objects
+  number(0, 2); // object name
+  const auto objectSize = bytes.size();
+  number(0, 4);
+  number(1, 2);
+  number(1, 2);
+  number(0, 4);
+  number(1, 2); // parent, docs, flags, state
+  number(0, 2);
+  number(0, 2);
+  number(1, 2); // variables, properties, states
+  number(1, 2);
+  number(1, 2);
+  number(4, 2); // state name, functions, function name
+  number(2, 2);
+  number(1, 2);
+  number(0, 4);
+  number(0, 1); // return, docs, flags
+  number(1, 2);
+  number(5, 2);
+  number(3, 2); // one Int parameter
+  number(1, 2);
+  number(6, 2);
+  number(3, 2); // one Int local
+  number(1, 2);
+  number(FunctionCode::kOp_Return, 1);
+  number(0, 1);
+  const auto size = bytes.size() - objectSize;
+  for (unsigned i = 0; i < 4; ++i)
+    bytes[objectSize + i] = uint8_t(size >> ((3 - i) * 8));
+  const auto parsed = Reader(std::vector<std::vector<uint8_t>>{ bytes })
+                        .GetSourceStructures()
+                        .at(0);
+  const auto& function =
+    parsed->objectTable.at(0).states.at(0).functions.at(0).function;
+  REQUIRE(function.params.size() == 1);
+  REQUIRE(function.params.at(0).name == "argument");
+  REQUIRE(function.locals.size() == 1);
+  REQUIRE(function.locals.at(0).name == "local");
+}
+
+TEST_CASE("Owned vanilla PEX files parse after archive decompression",
+          "[Quest][QuestVM][OwnedPex]")
+{
+  const auto path = std::filesystem::path(GetDataDir()) / "Skyrim - Misc.bsa";
+  BsaArchiveScriptStorage storage(path.string().c_str());
+  const auto& names = storage.ListScripts(false);
+  REQUIRE(names.size() > 1000);
+  for (const auto& name : names) {
+    INFO("script=" << name.c_str());
+    const auto bytes = storage.GetScriptPex(name.c_str());
+    const auto parsed =
+      Reader(std::vector<std::vector<uint8_t>>{ bytes }).GetSourceStructures();
+    REQUIRE(parsed.size() == 1);
+    REQUIRE(parsed.front()->objectTable.size() == 1);
+  }
+}
