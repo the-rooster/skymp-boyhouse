@@ -675,16 +675,18 @@ lengths before accepting values. Truncation and impossible lengths fail instead
 of becoming partial appearance or gameplay state. These checks complement the
 epoch and actor-identity guards; they are not gameplay certification.
 
-Self loadout restoration now observes normalized full inventory equality on two
+Self loadout restoration now observes equality of the represented inventory fields on two
 updates before handling equipment. It equips existing inventory items without
 queuing the older additive equipment-inventory task, then observes worn variants,
 hands and spells on two updates before releasing the creation gate. No-op native
 calls cannot satisfy that check. Retries are spaced at least 250 ms apart; paused
 menus and unloaded actors wait. Ordinary play retains its five-second inventory
-checks without taking the creation input lease. The inventory comparer retains
-its existing normalization; equipment preserves names and charges through native
-extra-data parsing and every merge, then compares explicit names exactly (only
-absent/empty names normalize to the base form name). When selection is required,
+checks without taking the creation input lease. Self inventory and equipment
+preserve names, raw float32 health, charge presence and the other represented
+extra-data fields through parsing and every merge. Explicit names compare exactly
+(only absent/empty names normalize to the base form name); absent charge and
+explicit zero charge differ. General remote inventory replication retains its
+older normalization. When selection is required,
 differing variants of one base ID are
 refused before changing gear because `equipItemEx` cannot select a specific item
 instance.
@@ -700,6 +702,47 @@ real clients and the full quest lifecycle still require acceptance. A first
 `OnLoad` that requests another visibility mutation is refused while its outer
 barrier is active. No quest adapters are enabled and **zero quests are certified
 playable**.
+
+## Represented inventory fidelity and write limits
+
+The native inventory reader now exports the contained soul level (0–5), rather
+than the extra-data record's type number, and includes `removeOnUnequip` for
+enchantments even when false. Present zero charge remains distinct from absent
+charge. Strict self parsing rejects older DLL output that omits the enchantment
+flag or reports an invalid soul level. Individual expected counts are validated
+before aggregation, and finalized native counts are checked after base-container
+and change-delta cancellation. Outgoing self equipment uses the precise reader;
+ordinary remote inventory normalization is unchanged.
+
+Before resetting or changing the player's inventory, the client checks whether
+the entire desired inventory is already observed. An exact match requires no
+writer, including an existing depleted weapon. Otherwise it preflights the full
+target against the legacy writer's limits and checks that the legacy diff
+represents the required precise changes. Unsupported zero-charge/soul writes,
+health below one, truncated names, unsupported counts or ammunition metadata,
+and removal requiring an extra-bearing item instance are refused before mutation.
+Worn enchantments that disappear on unequip also block nontrivial inventory or
+equipment restoration before any unequip call.
+
+This is deliberately conservative: an unrelated gold-count change may be refused
+when an unchanged depleted weapon remains in the desired inventory, because the
+first legacy reset could erase every item. Exact item-instance updates need a
+new native writer. The reader still exposes only its listed extra-data fields;
+ownership, quest-item flags and other unexported native extras are not covered
+by the equality or preservation checks. This is not arbitrary native inventory
+fidelity.
+
+The preflight is a safety prerequisite, not a complete lossless writer. Ordinary
+legacy additions/removals and equipped-item transitions still require real native
+acceptance, even when their represented fields pass these checks.
+
+The client webpack build and **48 focused JavaScript tests** passed. The native
+reader compiled successfully, and its production field emitters passed
+**3 portable cases / 24 assertions**. Evidence is in ignored
+`artifacts/inventory-fidelity-platform-build.log` and
+`artifacts/native-inventory-tests/results.txt`. The new DLL has not been installed
+or accepted in a real Skyrim run; these results do not extend the native creation
+acceptance below.
 
 ## Fresh-character native acceptance on 2026-11-16 UTC
 

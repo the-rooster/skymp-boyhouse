@@ -32,10 +32,6 @@ Persistent personal/host journals, 23 Papyrus Quest state methods, four quest co
   initialization, staged writes and transaction conflicts are checked. The
   registry has **nine partial condition functions**; implicit physical subjects,
   general alias filling and dialogue conditions remain unfinished.
-  This batch passed 499 native cases, 284 JavaScript tests and 43 Python tests,
-  plus protocol, projection and SQLite restart checks. These are automated
-  component/integration checks; zero quests have completed native playthrough
-  certification.
 - Supported enable/disable changes stage with journal, VM and inventory state.
   A native/JS barrier gates every connected observer in the private phase,
   advances packet epochs, then publishes fresh manifests and baselines after
@@ -47,8 +43,15 @@ Persistent personal/host journals, 23 Papyrus Quest state methods, four quest co
   refreshes and waits for an authoritative echo; binary decoding rejects
   truncated values/containers and mismatched constants. Native creation
   completion and settled engine loadout restoration still need acceptance.
-- Combined automated verification passed on 2026-11-16 UTC: **478 native cases,
-  374,719 assertions; 284 JavaScript tests; 39 Python tests**. The fresh-player
+- Self inventory checks now preserve charge presence, precise health and the
+  other exported item fields. Native soul/enchantment metadata exports are
+  corrected. Unsupported legacy restores fail before inventory reset or
+  equipment removal; this may also block unrelated updates when the desired
+  inventory contains an item the writer cannot recreate. Unexported native
+  extras and exact item-instance updates remain incomplete. See
+  [the inventory limits](misc/boyhouse/CLIENT_RUNTIME.md#represented-inventory-fidelity-and-write-limits).
+- Combined automated verification passed on 2026-11-16 UTC: **502 native cases,
+  374,706 assertions; 295 JavaScript tests; 43 Python tests**. The fresh-player
   nested `OnLoad` regression and saved-dead-copy integration fixtures pass.
   The full owned scan covered **2,274 quests and 14,026 PEX objects**; native
   addon, full server protocol and projection smokes passed, along with SQLite

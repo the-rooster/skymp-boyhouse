@@ -8,7 +8,7 @@ import {
   setInventory,
 } from 'skyrimPlatform';
 
-import { Entry, Inventory, getInventory, getEquipmentInventory, equipmentEntryExtrasEqual } from './inventory';
+import { Entry, Inventory, getInventory, getEquipmentInventory, equipmentEntryExtrasEqual, assertInventoryCounts } from './inventory';
 
 export const enum SpellType {
   Left,
@@ -81,7 +81,7 @@ const removeUnnecessaryExtra = (inv: Inventory, ignoreAmmo: boolean): Inventory 
 
 export const getEquipment = (ac: Actor, numChanges: number): Equipment => {
   return {
-    inv: getInventory(ac),
+    inv: ac.getFormID() === 0x14 ? getEquipmentInventory(ac) : getInventory(ac),
     leftSpell: getEquipedSpell(ac, SpellType.Left),
     rightSpell: getEquipedSpell(ac, SpellType.Right),
     voiceSpell: getEquipedSpell(ac, SpellType.Voice),
@@ -136,6 +136,7 @@ const wornSlots = (inventory: Inventory): { item: Entry; left: boolean }[] => {
 };
 
 export const isPlayerEquipmentSettled = (ac: Actor, eq: Equipment): boolean => {
+  assertInventoryCounts(eq.inv);
   const actual = wornSlots(getEquipmentInventory(ac)), expected = wornSlots(eq.inv);
   if (actual.length !== expected.length) return false;
   for (const wanted of expected) {
@@ -153,7 +154,12 @@ export const isPlayerEquipmentSettled = (ac: Actor, eq: Equipment): boolean => {
 // reconciler and duplicate items. Re-equipping existing items is retryable.
 export const applyPlayerEquipment = (ac: Actor, eq: Equipment): void => {
   if (ac.getFormID() !== 0x14) throw Error('Player equipment requires the local player');
+  if (isPlayerEquipmentSettled(ac, eq)) return;
   const inventory = getEquipmentInventory(ac);
+  // unequipAll and even direct equip can remove another worn item's temporary
+  // enchantment. Exact instance-preserving transitions need a native API.
+  if (inventory.entries.some(item => item.count > 0 && (item.worn || item.wornLeft) && item.removeEnchantmentOnUnequip))
+    throw Error('Player equipment cannot safely remove a worn temporary enchantment');
   for (const entry of filterWorn(eq.inv).entries) {
     const form = Game.getFormEx(entry.baseId);
     if (!form || ac.getItemCount(form) <= 0) throw Error('Equipped item is absent from the authoritative inventory');

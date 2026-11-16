@@ -1,5 +1,6 @@
 #include "InventoryApi.h"
 #include "CallNativeApi.h"
+#include "NativeInventoryMetadata.h"
 #include "NullPointerException.h"
 
 extern CallNativeApi::NativeCallRequirements g_nativeCallRequirements;
@@ -25,19 +26,16 @@ Napi::Value ToJsValue(Napi::Env env, RE::ExtraCount& extra)
 Napi::Value ToJsValue(Napi::Env env, RE::ExtraEnchantment& extra)
 {
   auto res = Napi::Object::New(env);
-  res.Set("enchantmentId",
-          Napi::Number::New(
-            env, (extra.enchantment ? extra.enchantment->formID : 0)));
-  res.Set("maxCharge", extra.charge);
-  res.Set("type", Napi::String::New(env, "Enchantment"));
+  NativeInventoryMetadata::Enchantment(
+    extra, [&](const char* name, auto value) { res.Set(name, value); });
   return res;
 }
 
 Napi::Value ToJsValue(Napi::Env env, RE::ExtraCharge& extra)
 {
   auto res = Napi::Object::New(env);
-  res.Set("charge", Napi::Number::New(env, extra.charge));
-  res.Set("type", Napi::String::New(env, "Charge"));
+  NativeInventoryMetadata::Charge(
+    &extra, [&](const char* name, auto value) { res.Set(name, value); });
   return res;
 }
 
@@ -52,8 +50,8 @@ Napi::Value ToJsValue(Napi::Env env, RE::ExtraTextDisplayData& extra)
 Napi::Value ToJsValue(Napi::Env env, RE::ExtraSoul& extra)
 {
   auto res = Napi::Object::New(env);
-  res.Set("soul", Napi::Number::New(env, static_cast<int>(extra.GetType())));
-  res.Set("type", Napi::String::New(env, "Soul"));
+  NativeInventoryMetadata::Soul(
+    extra, [&](const char* name, auto value) { res.Set(name, value); });
   return res;
 }
 

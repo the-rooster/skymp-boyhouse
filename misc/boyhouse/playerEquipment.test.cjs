@@ -85,3 +85,19 @@ test('same-base variants cannot falsely settle or be selected ambiguously', () =
     h.inventory(eq.inv); assert.equal(h.api.isPlayerEquipmentSettled(h.actor, eq), true);
   }
 });
+
+test('temporary worn enchantments survive exact no-ops and block unsafe equipment transitions', () => {
+  const h = harness(), entry = { baseId: 10, count: 1, worn: true, enchantmentId: 99,
+    maxCharge: 100, removeEnchantmentOnUnequip: true };
+  h.inventory({ entries: [entry, { baseId: 20, count: 1 }] });
+  h.api.applyPlayerEquipment(h.actor, { inv: { entries: [entry] } });
+  assert.deepEqual(h.calls, []);
+  for (const eq of [
+    { inv: { entries: [] } },
+    { inv: { entries: [entry] }, leftSpell: 30 },
+    { inv: { entries: [entry, { baseId: 20, count: 1, wornLeft: true }] } },
+  ]) {
+    assert.throws(() => h.api.applyPlayerEquipment(h.actor, eq), /temporary enchantment/);
+    assert.deepEqual(h.calls, [], 'No equip, unequip, or spell mutation may precede refusal');
+  }
+});

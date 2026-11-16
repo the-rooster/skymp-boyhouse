@@ -129,13 +129,19 @@ const extrasEqual = (a: Entry, b: Entry, ignoreWorn = false) => {
 };
 
 // Equipment must identify the actual worn variant, not just its base form.
-// Inventory replication intentionally ignores charge/name differences, so
-// its looser comparison is insufficient to certify an equipped instance.
+// Legacy general inventory comparisons ignore charge/name differences, so
+// their looser comparison is insufficient to certify a self item instance.
 export const equipmentEntryExtrasEqual = (a: Entry, b: Entry): boolean => {
   const actualName = (entry: Entry) => entry.name || Game.getFormEx(entry.baseId)?.getName() || '';
-  return extrasEqual(a, b, true) &&
+  const floatEqual = (left: number, right: number) => Number.isFinite(left) && Number.isFinite(right) &&
+    Number.isFinite(Math.fround(left)) && Math.fround(left) === Math.fround(right);
+  return floatEqual(a.health === undefined ? 1 : a.health, b.health === undefined ? 1 : b.health) &&
+    a.enchantmentId === b.enchantmentId && a.maxCharge === b.maxCharge &&
+    !!a.removeEnchantmentOnUnequip === !!b.removeEnchantmentOnUnequip &&
+    a.soul === b.soul && a.poisonId === b.poisonId && a.poisonCount === b.poisonCount &&
     ((a.name || '') === (b.name || '') || actualName(a) === actualName(b)) &&
-    Math.fround(a.chargePercent || 0) === Math.fround(b.chargePercent || 0);
+    (a.chargePercent === undefined ? b.chargePercent === undefined :
+      b.chargePercent !== undefined && floatEqual(a.chargePercent, b.chargePercent));
 };
 
 export const hasExtras = (e: Entry): boolean => {
@@ -145,7 +151,8 @@ export const hasExtras = (e: Entry): boolean => {
 const extractExtraData = (
   refr: ObjectReference,
   extraList: BaseExtraList | null,
-  out: Entry
+  out: Entry,
+  preserveEquipmentIdentity = false,
 ): void => {
   // I see that ExtraWorn is not emitted for 0xFF actors when arrows are equipped. Fixing
   const item = Game.getFormEx(out.baseId);
@@ -159,9 +166,10 @@ const extractExtraData = (
   (extraList || []).forEach((extra) => {
     switch (extra.type) {
       case "Health":
-        out.health = Math.round((extra as ExtraHealth).health * 10) / 10;
+        out.health = preserveEquipmentIdentity ? Math.fround((extra as ExtraHealth).health) :
+          Math.round((extra as ExtraHealth).health * 10) / 10;
 
-        // TESModPlatform::AddItemEx makes all items at least 1.01 health
+        // No ExtraHealth means the default multiplier of exactly one.
         if (out.health === 1) {
           delete out.health;
         }
@@ -170,6 +178,8 @@ const extractExtraData = (
         out.count = (extra as ExtraCount).count;
         break;
       case "Enchantment":
+        if (preserveEquipmentIdentity && typeof (extra as ExtraEnchantment).removeOnUnequip !== 'boolean')
+          throw Error('Native inventory reader does not expose enchantment removal metadata');
         out.enchantmentId = (extra as ExtraEnchantment).enchantmentId;
         out.maxCharge = (extra as ExtraEnchantment).maxCharge;
         out.removeEnchantmentOnUnequip = (
@@ -185,6 +195,8 @@ const extractExtraData = (
         break;
       case "Soul":
         out.soul = (extra as ExtraSoul).soul;
+        if (preserveEquipmentIdentity && (!Number.isInteger(out.soul) || out.soul < 0 || out.soul > 5))
+          throw Error('Native inventory reader returned an invalid contained soul');
         break;
       case "TextDisplayData":
         out.name = (extra as ExtraTextDisplayData).name;
@@ -202,8 +214,8 @@ const extractExtraData = (
 const squash = (inv: Inventory, preserveEquipmentIdentity = false): Inventory => {
   const res = new Array<Entry>();
   inv.entries.forEach((e) => {
-    const same = res.find((x) => e.baseId === x.baseId && extrasEqual(x, e) &&
-      (!preserveEquipmentIdentity || equipmentEntryExtrasEqual(x, e)));
+    const same = res.find((x) => e.baseId === x.baseId && (preserveEquipmentIdentity ?
+      equipmentEntryExtrasEqual(x, e) && !!x.worn === !!e.worn && !!x.wornLeft === !!e.wornLeft : extrasEqual(x, e)));
     if (same) {
       same.count += e.count;
     } else {
@@ -231,7 +243,7 @@ const getExtraContainerChangesAsInventory = (
         baseId: entry.baseId,
         count: 1,
       };
-      extractExtraData(refr, extraList, e);
+      extractExtraData(refr, extraList, e, preserveEquipmentIdentity);
       entries.push(e);
       entry.count -= e.count;
     });
@@ -297,14 +309,22 @@ export const removeSimpleItemsAsManyAsPossible = (
 export const getDiff = (
   lhs: Inventory,
   rhs: Inventory,
-  ignoreWorn: boolean
+  ignoreWorn: boolean,
+  preserveEquipmentIdentity = false,
 ): Inventory => {
-  const lhsCopy: Inventory = JSON.parse(JSON.stringify(lhs));
-  const rhsCopy: Inventory = JSON.parse(JSON.stringify(rhs));
+  const copy = (inventory: Inventory): Inventory => {
+    const result: Inventory = JSON.parse(JSON.stringify(inventory));
+    if (!preserveEquipmentIdentity) return result;
+    if (ignoreWorn) result.entries.forEach(entry => { delete entry.worn; delete entry.wornLeft; });
+    return squash(result, true);
+  };
+  const lhsCopy = copy(lhs);
+  const rhsCopy = copy(rhs);
 
   rhsCopy.entries.forEach((e) => {
     const sameFromLeft = lhsCopy.entries.find(
-      (x) => x.baseId === e.baseId && extrasEqual(x, e, ignoreWorn)
+      (x) => x.baseId === e.baseId && (preserveEquipmentIdentity ? equipmentEntryExtrasEqual(x, e) &&
+        (ignoreWorn || (!!x.worn === !!e.worn && !!x.wornLeft === !!e.wornLeft)) : extrasEqual(x, e, ignoreWorn))
     );
     if (sameFromLeft) {
       sameFromLeft.count -= e.count;
@@ -329,15 +349,30 @@ export const getInventory = (refr: ObjectReference): Inventory => {
 // Equipment selection must retain variants that normal inventory sync merges
 // (particularly display names and charges). Preserve identity at every merge,
 // not just when comparing the already-squashed final array.
-export const getEquipmentInventory = (refr: ObjectReference): Inventory =>
-  squash(sumInventories(getBaseContainerAsInventory(refr),
+export const assertInventoryCounts = (inventory: Inventory): void => {
+  const totals = new Map<number, number>();
+  for (const entry of inventory.entries) {
+    const total = (totals.get(entry.baseId) || 0) + entry.count;
+    if (!Number.isInteger(entry.count) || entry.count < 0 || total > 0x7fffffff)
+      throw Error('Player inventory contains an invalid item count');
+    totals.set(entry.baseId, total);
+  }
+};
+
+export const getEquipmentInventory = (refr: ObjectReference): Inventory => {
+  const inventory = squash(sumInventories(getBaseContainerAsInventory(refr),
     getExtraContainerChangesAsInventory(refr, true), true), true);
+  assertInventoryCounts(inventory);
+  return inventory;
+};
 
 // Read back native state; applyInventory's boolean only reports dispatch.
-// Use the same normalized item comparison as replication (worn state belongs
-// to the separate equipment snapshot).
-export const isInventorySettled = (refr: ObjectReference, expected: Inventory): boolean =>
-  getDiff(expected, getInventory(refr), true).entries.length === 0;
+// Self readiness preserves represented instance metadata. Worn state belongs
+// to the separate equipment snapshot; count grouping is immaterial.
+export const isInventorySettled = (refr: ObjectReference, expected: Inventory): boolean => {
+  assertInventoryCounts(expected);
+  return getDiff(expected, getEquipmentInventory(refr), true, true).entries.length === 0;
+};
 
 const basesReset = (): Set<number> => {
   if (storage["basesResetExists"] !== true) {
@@ -358,12 +393,61 @@ const resetBase = (refr: ObjectReference): void => {
   }
 };
 
+// The legacy writer cannot select arbitrary existing item instances or encode
+// every Extra value. Refuse those restores before resetBase can erase anything.
+// An exact observation needs no writer, including an existing depleted weapon.
+const preflightPlayerInventory = (refr: ObjectReference, expected: Inventory): boolean => {
+  assertInventoryCounts(expected);
+  const actual = getEquipmentInventory(refr);
+  const strictDiff = getDiff(expected, actual, true, true);
+  if (!strictDiff.entries.length) return true;
+  const refuse = () => { throw Error('Player inventory requires unsupported native item-instance restoration'); };
+  if (actual.entries.some(entry => entry.count > 0 && (entry.worn || entry.wornLeft) && entry.removeEnchantmentOnUnequip))
+    refuse();
+  const float32 = (value: number) => Number.isFinite(value) && Number.isFinite(Math.fround(value));
+  for (const entry of expected.entries) {
+    if (!Number.isInteger(entry.count) || entry.count < 0 || entry.count > 0x7fffffff) refuse();
+    if (!entry.count) continue;
+    const form = Game.getFormEx(entry.baseId);
+    if (!form) refuse();
+    const type = form!.getType();
+    if (entry.health !== undefined && (!float32(entry.health) || Math.fround(entry.health) < 1)) refuse();
+    // Absence means full charge on an enchanted weapon. AddItemEx's zero
+    // argument omits ExtraCharge, so explicit zero cannot be written by it.
+    if (entry.chargePercent !== undefined && (!float32(entry.chargePercent) || Math.fround(entry.chargePercent) <= 0)) refuse();
+    if (entry.name !== undefined && (typeof entry.name !== 'string' || entry.name.length >= 128 || entry.name.includes('\0'))) refuse();
+    if (entry.enchantmentId !== undefined) {
+      if (!Enchantment.from(Game.getFormEx(entry.enchantmentId)) || !Number.isInteger(entry.maxCharge) ||
+          entry.maxCharge! < 0 || entry.maxCharge! > 0xffff) refuse();
+    } else if (entry.maxCharge !== undefined || entry.removeEnchantmentOnUnequip) refuse();
+    if (entry.soul !== undefined && (!Number.isInteger(entry.soul) || entry.soul < 1 || entry.soul > 5)) refuse();
+    if (entry.poisonId !== undefined) {
+      if (!Potion.from(Game.getFormEx(entry.poisonId)) || !Number.isInteger(entry.poisonCount) ||
+          entry.poisonCount! < 0 || entry.poisonCount! > 0x7fffffff) refuse();
+    } else if (entry.poisonCount !== undefined) refuse();
+    if (Ammo.from(form)) {
+      if (!equipmentEntryExtrasEqual(entry, { baseId: entry.baseId, count: entry.count })) refuse();
+    } else if (entry.count > 1000 && type !== FormType.Misc && type !== FormType.Potion && type !== FormType.Ingredient) refuse();
+  }
+  const legacyDiff = getDiff(expected, getInventory(refr), true);
+  if (getDiff(strictDiff, legacyDiff, true, true).entries.length) refuse();
+  for (const entry of strictDiff.entries.filter(entry => entry.count < 0)) {
+    const variants = actual.entries.filter(item => item.baseId === entry.baseId && item.count > 0);
+    if (variants.some(item => !equipmentEntryExtrasEqual(item, { baseId: item.baseId, count: item.count }))) refuse();
+    const form = Game.getFormEx(entry.baseId);
+    const type = form?.getType();
+    if (-entry.count > 1000 && type !== FormType.Misc && type !== FormType.Potion && type !== FormType.Ingredient) refuse();
+  }
+  return false;
+};
+
 export const applyInventory = (
   refr: ObjectReference,
   newInventory: Inventory,
   enableCrashProtection: boolean,
   ignoreWorn = false
 ): boolean => {
+  if (refr.getFormID() === 0x14 && preflightPlayerInventory(refr, newInventory)) return true;
   resetBase(refr);
   const diff = getDiff(newInventory, getInventory(refr), ignoreWorn).entries;
 
