@@ -1,4 +1,5 @@
 #include "PartOne.h"
+#include "CampaignReferenceBinding.h"
 #include <array>
 #include <cassert>
 #include <chrono>
@@ -357,7 +358,9 @@ void PartOne::AttachSaveStorage(
       auto baseId = changeForm.baseDesc.ToFormId(worldState.espmFiles);
       auto lookupRes = GetEspm().GetBrowser().LookupById(baseId);
 
-      if (lookupRes.rec && espm::utils::IsItem(lookupRes.rec->GetType())) {
+      if (lookupRes.rec && espm::utils::IsItem(lookupRes.rec->GetType()) &&
+          changeForm.dynamicFields.GetValueDump(
+            CampaignReferenceBinding::kProperty) == "null") {
         pImpl->logger->info("Skipping FF item {} (type is {}), will likely "
                             "overwrite at some point",
                             changeForm.formDesc.ToString(),

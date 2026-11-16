@@ -19,7 +19,14 @@ The [catalog analyzer](misc/boyhouse/DEPENDENCIES.md) scans all five owned maste
 
 Persistent personal/host journals, 23 Papyrus Quest state methods, four quest condition predicates, expired-context guards, and a read-only client journal feed are implemented. The new `questExecuteStage` trusted server API loads original PEX fragments into a campaign-scoped VM and commits journal changes and script variables together. It remains gated by experimental per-quest adapters; no complete vanilla quest is enabled. `mp "bh journal"` displays the diagnostic projection. See [the implementation contract and remaining gates](misc/boyhouse/QUESTS.md).
 
-## Campaign inventory verification on 2026-11-16 UTC
+## Private reference load/recovery verification on 2026-11-16 UTC
+
+- The first player subscription to an explicit private copy now runs scoped `OnInit`, `OnCellLoad` and `OnLoad` handlers with supported inventory events, rewards and VM state in one transaction. A saved initialization marker prevents repeated `OnInit` rewards; failed handlers leave initialization retryable.
+- Private NPC/item copies restore without ordinary inventory rerolls, attribute resets, character creation or automatic corpse respawns. Saves retain maximum attributes/regeneration and explicitly empty faction lists. Legacy saves still load with their prior attribute defaults.
+- Linux Release server/addon build and **383 native cases, 567,661 assertions** passed. Focused lifecycle/inventory coverage passed **18 cases, 163 assertions**; the Windows Release `MpClientPlugin` build passed. All **25 JavaScript/TypeScript tests**, **39 Python tests**, three server smokes and the full owned dependency scan passed.
+- This is first-subscription load handling, not a complete world event lifecycle. Automatic copy allocation, trigger/activation/combat dispatch and private effect/loot timer recovery remain unfinished. Pending timers are rejected explicitly on private-copy recovery. No vanilla adapter is enabled and **zero quests are certified playable**.
+
+## Earlier campaign inventory verification on 2026-11-16 UTC
 
 - Scoped `GetItemCount`, `AddItem` and `RemoveItem` now stage supported inventory changes with quest journals and VM state. Host rewards, private NPC transfers and transaction-generated inventory handlers commit together; errors discard them together. Equipped removal and other unsupported item/event semantics fail explicitly.
 - Explicit private-copy bindings preserve original form identity and a saved character identity, reject shared/player/cross-phase targets, and prevent fallback into the shared script VM. Automatic NPC/object allocation and general world-event routing remain unfinished.

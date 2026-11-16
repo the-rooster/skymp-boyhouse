@@ -29,4 +29,6 @@ public:
                             const std::function<void(Inventory&)>& edit);
   static nlohmann::json ScriptState(MpActor& actor);
   static void SetScriptState(MpActor& actor, const nlohmann::json& state);
+  static bool ReferenceInitialized(MpActor& actor, uint32_t original);
+  static void MarkReferenceInitialized(MpActor& actor, uint32_t original);
 };

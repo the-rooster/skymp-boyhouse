@@ -98,6 +98,18 @@ void Validate(const Json& ledger)
       !ledger.at("quests").is_object() || ledger.at("quests").size() > 10000) {
     throw std::runtime_error("Invalid or unsupported campaign journal");
   }
+  if (ledger.contains("referenceInit")) {
+    const auto& initialized = ledger.at("referenceInit");
+    if (!initialized.is_object() || initialized.size() > 100000)
+      throw std::runtime_error("Invalid saved reference initialization");
+    for (const auto& [key, value] : initialized.items()) {
+      if (key.empty() || key.size() > 300 || value != true)
+        throw std::runtime_error("Invalid saved reference initialization");
+      const auto form = FormDesc::FromString(key);
+      if (form.file.empty() || form.ToString() != key)
+        throw std::runtime_error("Invalid initialized reference identity");
+    }
+  }
   for (const auto& [key, quest] : ledger.at("quests").items()) {
     if (key.empty() || key.size() > 300 || !quest.is_object() ||
         !quest.at("stages").is_array() ||
@@ -225,6 +237,7 @@ nlohmann::json QuestJournal::Snapshot(MpActor& actor)
   auto& owner = Owner(actor);
   auto result = Read(owner);
   result.erase("vm"); // Script variables are private server state.
+  result.erase("referenceInit");
   result["campaignOwner"] = owner.GetFormId();
   result["instance"] = actor.GetWorldInstance();
   result["actor"] = actor.GetFormId();
@@ -435,6 +448,46 @@ void QuestJournal::SetScriptState(MpActor& actor, const nlohmann::json& state)
     throw std::overflow_error("Quest revision exhausted");
   transaction->ledger["vm"] = state;
   transaction->ledger["revision"] = revision + 1;
+}
+
+namespace {
+std::string ReferenceKey(MpActor& actor, uint32_t original)
+{
+  if (!actor.GetParent() || original == 0x14 || original >= 0xff000000)
+    throw std::invalid_argument("Expected a static campaign reference");
+  auto& world = *actor.GetParent();
+  const auto record = world.GetEspm().GetBrowser().LookupById(original);
+  if (!record.rec || record.rec->IsDeleted() ||
+      (record.rec->GetType() != "REFR" && record.rec->GetType() != "ACHR"))
+    throw std::invalid_argument("Expected a live campaign reference");
+  return FormDesc::FromFormId(original, world.espmFiles).ToString();
+}
+}
+
+bool QuestJournal::ReferenceInitialized(MpActor& actor, uint32_t original)
+{
+  const auto key = ReferenceKey(actor, original);
+  const auto ledger = Read(Owner(actor));
+  return ledger.contains("referenceInit") &&
+    ledger.at("referenceInit").contains(key);
+}
+
+void QuestJournal::MarkReferenceInitialized(MpActor& actor, uint32_t original)
+{
+  const auto key = ReferenceKey(actor, original);
+  auto& owner = Owner(actor);
+  if (!transaction || transaction->owner != &owner)
+    throw std::runtime_error(
+      "Reference initialization requires an owning quest transaction");
+  auto& ledger = transaction->ledger;
+  if (ledger.contains("referenceInit") &&
+      ledger.at("referenceInit").contains(key))
+    return;
+  const auto revision = ledger.at("revision").get<uint64_t>();
+  if (revision == kMaxRevision)
+    throw std::overflow_error("Quest revision exhausted");
+  ledger["referenceInit"][key] = true;
+  ledger["revision"] = revision + 1;
 }
 
 void QuestJournal::RequireAdapter(MpActor& actor, uint32_t questId)

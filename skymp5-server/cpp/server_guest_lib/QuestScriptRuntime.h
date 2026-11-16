@@ -19,4 +19,17 @@ public:
   static bool ExecuteStage(MpActor& actor, uint32_t questId, uint16_t stage,
                            const espm::QuestScriptData& metadata,
                            const std::vector<PexScript::Lazy>& scripts);
+
+  // One reference load transaction: OnInit once per campaign identity, then
+  // OnCellLoad/OnLoad. The reference must already have a private world copy.
+  static void ExecuteReferenceLoad(MpActor& actor, uint32_t original);
+  static void ExecuteReferenceLoad(
+    MpActor& actor, uint32_t original,
+    const std::vector<PexScript::Lazy>& scripts);
+
+private:
+  static bool Execute(MpActor& actor, uint32_t questId, uint16_t stage,
+                      const espm::QuestScriptData& metadata,
+                      const std::vector<PexScript::Lazy>& scripts,
+                      uint32_t loadedReference = 0);
 };

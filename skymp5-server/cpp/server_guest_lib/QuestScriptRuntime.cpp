@@ -1,5 +1,6 @@
 #include "QuestScriptRuntime.h"
 #include "CampaignInventoryApi.h"
+#include "CampaignReferenceBinding.h"
 #include "CampaignReferenceScripts.h"
 #include "ConditionsEvaluator.h"
 #include "MpActor.h"
@@ -447,13 +448,9 @@ std::vector<LogEntry> ReadLogs(const espm::LookupResult& record,
 
 }
 
-bool QuestScriptRuntime::ExecuteStage(MpActor& actor, uint32_t questId,
-                                      uint16_t stage)
+namespace {
+std::vector<PexScript::Lazy> LoadCampaignScripts(WorldState& world)
 {
-  auto& world = *actor.GetParent();
-  const auto record = world.GetEspm().GetBrowser().LookupById(questId);
-  auto metadata =
-    espm::QuestScriptData::Read(record.rec, world.GetEspmCache());
   auto* storage = world.GetScriptStorage();
   if (!storage)
     throw std::runtime_error("Quest execution requires owned PEX storage");
@@ -483,7 +480,21 @@ bool QuestScriptRuntime::ExecuteStage(MpActor& actor, uint32_t questId,
          return *cached;
        } });
   }
-  return ExecuteStage(actor, questId, stage, metadata, scripts);
+  return scripts;
+}
+}
+
+bool QuestScriptRuntime::ExecuteStage(MpActor& actor, uint32_t questId,
+                                      uint16_t stage)
+{
+  if (!actor.GetParent())
+    throw std::runtime_error("Unregistered campaign actor");
+  auto& world = *actor.GetParent();
+  const auto record = world.GetEspm().GetBrowser().LookupById(questId);
+  const auto metadata =
+    espm::QuestScriptData::Read(record.rec, world.GetEspmCache());
+  return ExecuteStage(actor, questId, stage, metadata,
+                      LoadCampaignScripts(world));
 }
 
 bool QuestScriptRuntime::ExecuteStage(
@@ -491,12 +502,48 @@ bool QuestScriptRuntime::ExecuteStage(
   const espm::QuestScriptData& metadata,
   const std::vector<PexScript::Lazy>& scripts)
 {
+  return Execute(actor, questId, stage, metadata, scripts);
+}
+
+void QuestScriptRuntime::ExecuteReferenceLoad(MpActor& actor,
+                                              uint32_t original)
+{
+  if (!actor.GetParent())
+    throw std::runtime_error("Unregistered campaign actor");
+  ExecuteReferenceLoad(actor, original,
+                       LoadCampaignScripts(*actor.GetParent()));
+}
+
+void QuestScriptRuntime::ExecuteReferenceLoad(
+  MpActor& actor, uint32_t original,
+  const std::vector<PexScript::Lazy>& scripts)
+{
+  if (!original || original == 0x14 || original >= 0xff000000)
+    throw std::invalid_argument("Expected a static campaign reference");
+  Execute(actor, 0, 0, {}, scripts, original);
+}
+
+bool QuestScriptRuntime::Execute(MpActor& actor, uint32_t questId,
+                                 uint16_t stage,
+                                 const espm::QuestScriptData& metadata,
+                                 const std::vector<PexScript::Lazy>& scripts,
+                                 uint32_t loadedReference)
+{
+  if (!actor.GetParent())
+    throw std::runtime_error("Unregistered campaign actor");
   auto& world = *actor.GetParent();
   const auto record = world.GetEspm().GetBrowser().LookupById(questId);
-  if (!record.rec || record.rec->GetType() != "QUST")
+  if (!loadedReference && (!record.rec || record.rec->GetType() != "QUST"))
     throw std::invalid_argument("Expected quest record");
   bool changed = false;
   QuestJournal::Atomic(actor, [&] {
+    MpObjectReference* loaded = nullptr;
+    if (loadedReference) {
+      loaded = &CampaignReferenceBinding::Resolve(actor, loadedReference);
+      // Read tracking guards the physical copy's lifetime and phase even
+      // when a load handler only changes script variables.
+      QuestJournal::ReadInventory(actor, *loaded);
+    }
     VirtualMachine vm(scripts);
     vm.SetStrictExecution(true);
     auto policy = std::make_shared<HeuristicPolicy>(&world);
@@ -1212,28 +1259,17 @@ bool QuestScriptRuntime::ExecuteStage(
       }
       return true;
     };
-    changed = execute(questId, stage);
-    if (!changed)
-      return;
-    for (size_t eventIndex = 0; eventIndex < inventoryEvents.size();
-         ++eventIndex) {
+    auto dispatchReferenceEvent = [&](uint32_t targetId, const char* name,
+                                      const std::vector<VarValue>& args,
+                                      bool includeAliases) {
       vm.CheckExecutionBudget();
-      // Copy before dispatch: handlers may append more inventory events.
-      const auto event = inventoryEvents[eventIndex];
-      const auto* name = event.added ? "OnItemAdded" : "OnItemRemoved";
-      const std::vector<VarValue> args{
-        VarValue(resolve(event.item).get()),
-        VarValue(static_cast<int32_t>(event.count)), VarValue::None(),
-        event.container ? VarValue(resolve(event.container).get())
-                        : VarValue::None()
-      };
       std::vector<std::shared_ptr<IGameObject>> recipients{ resolve(
-        event.target) };
+        targetId) };
       // Only aliases with attached scripts need event delivery. Unsupported
       // alias filling must fail the transaction rather than omit a handler.
       const auto eventJournal = QuestJournal::Snapshot(actor);
       for (const auto& [key, progress] : eventJournal.at("quests").items()) {
-        if (progress.at("running") != true)
+        if (!includeAliases || progress.at("running") != true)
           continue;
         const auto id = FormDesc::FromString(key).ToFormId(world.espmFiles);
         QuestJournal::RequireAdapter(actor, id);
@@ -1250,20 +1286,50 @@ bool QuestScriptRuntime::ExecuteStage(
             continue;
           const auto* definition = definitions(id).Find(binding.object.alias);
           if (!definition)
-            throw std::runtime_error("Inventory event alias does not exist");
+            throw std::runtime_error("Reference event alias does not exist");
           if (definition->kind != espm::QuestAliasDefinition::Kind::Reference)
             continue;
           auto alias = std::dynamic_pointer_cast<CampaignAliasObject>(
             resolveAlias(id, binding.object.alias));
           const auto target = aliasTarget(*alias);
-          if (static_cast<IGameObject*>(target) &&
-              formId(target) == event.target)
+          if (static_cast<IGameObject*>(target) && formId(target) == targetId)
             recipients.push_back(alias);
         }
       }
       for (const auto& recipient : recipients)
         vm.SendEventSynchronous(recipient, name, args, stack);
+    };
+    if (loadedReference) {
+      if (!QuestJournal::ReferenceInitialized(actor, loadedReference)) {
+        // An alias's OnInit belongs to quest startup, not its target's load.
+        dispatchReferenceEvent(loadedReference, "OnInit", {}, false);
+        QuestJournal::MarkReferenceInitialized(actor, loadedReference);
+      }
+      dispatchReferenceEvent(loadedReference, "OnCellLoad", {}, true);
+      dispatchReferenceEvent(loadedReference, "OnLoad", {}, true);
+      changed = true;
+    } else {
+      changed = execute(questId, stage);
+      if (!changed)
+        return;
     }
+    for (size_t eventIndex = 0; eventIndex < inventoryEvents.size();
+         ++eventIndex) {
+      // Copy before dispatch: handlers may append more inventory events.
+      const auto event = inventoryEvents[eventIndex];
+      const auto* name = event.added ? "OnItemAdded" : "OnItemRemoved";
+      const std::vector<VarValue> args{
+        VarValue(resolve(event.item).get()),
+        VarValue(static_cast<int32_t>(event.count)), VarValue::None(),
+        event.container ? VarValue(resolve(event.container).get())
+                        : VarValue::None()
+      };
+      dispatchReferenceEvent(event.target, name, args, true);
+    }
+    if (loadedReference &&
+        &CampaignReferenceBinding::Resolve(actor, loadedReference) != loaded)
+      throw std::runtime_error(
+        "Campaign load reference changed during execution");
     for (const auto& [key, holder] : variables)
       state.SetScript(key, holder->Save());
     QuestJournal::SetScriptState(actor, state.Save());

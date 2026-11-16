@@ -47,6 +47,17 @@ settings explicitly choose SQLite. Initialization never replaces existing settin
   change. Persistent execution of external events, complete world-effect staging
   and durable acknowledgements remain required. Switching drivers alone does not
   make arbitrary world-effect natives safe to enable.
+- Change forms now store maximum attributes and regeneration values as well as
+  percentages. Legacy saves without the optional `actorValues` object retain
+  the previous default attributes; missing members in a present object are an
+  error. Explicitly empty faction lists are saved, so removing every faction
+  remains distinct from never initializing factions. The ordinary shared-world
+  actor loader still applies its existing attribute recalculation; private
+  campaign copies use direct state restoration.
+- Private copies restore without shared-VM load events or implicit corpse
+  respawns. A persisted reference initialization marker prevents repeat `OnInit`
+  rewards. Effect and loot timer recovery is still unsupported for those copies
+  and fails explicitly. These changes do not make world timers durable.
 
 ## Existing saves and backups
 
@@ -83,6 +94,13 @@ asynchronous SQLite save, then loads a fresh server and checks all participants
 and the persisted reference binding. Separate transaction tests check stale
 identities, phase changes, conflicting writes, failed handlers and non-atomic
 storage. This does not certify general world effects or native-client behavior.
+
+The private-copy restart regression saves a dead story NPC with changed
+attributes, equipment and an empty faction list, plus a placed ammunition stack,
+then loads them through a fresh server and the actual SQLite driver. Malformed
+copy identities and unsupported pending timers are rejected before registration.
+Scoped load tests also exercise failed-handler rollback, initialization retry,
+owner/guest isolation, and loading a copy before its owner.
 
 `node misc/boyhouse/storage-smoke.cjs` uses the native addon and owned masters.
 It waits for 32 character saves to be visible in the database, kills the writer,

@@ -70,14 +70,18 @@ struct Fixture
   }
   bool Run(MpActor& actor, uint16_t stage = 10, uint32_t questId = kQuest)
   {
+    return QuestScriptRuntime::ExecuteStage(actor, questId, stage, metadata,
+                                            Scripts());
+  }
+  std::vector<PexScript::Lazy> Scripts()
+  {
     std::vector<PexScript::Lazy> scripts = {
       { fixture->source, [pex = fixture] { return pex; } },
       { quest->source, [pex = quest] { return pex; } }
     };
     for (const auto& script : extraScripts)
       scripts.push_back({ script->source, [script] { return script; } });
-    return QuestScriptRuntime::ExecuteStage(actor, questId, stage, metadata,
-                                            scripts);
+    return scripts;
   }
   FunctionInfo& Fragment()
   {
@@ -2566,4 +2570,184 @@ TEST_CASE(
   REQUIRE(npc.GetInventory().GetItemCount(0xf) == 3);
   REQUIRE(QuestJournal::Get(owner, kQuest).at("stage") == 0);
   REQUIRE(QuestJournal::ScriptState(owner).empty());
+}
+
+namespace {
+MpObjectReference& BoundTrigger(Fixture& f, MpActor& owner)
+{
+  auto& world = f.server.worldState;
+  const auto source =
+    world.GetEspm().GetBrowser().LookupById(kScriptedReference);
+  const auto data = reinterpret_cast<const espm::REFR*>(source.rec)
+                      ->GetData(world.GetEspmCache());
+  const auto base = source.ToGlobalId(data.baseId);
+  const auto type =
+    world.GetEspm().GetBrowser().LookupById(base).rec->GetType().ToString();
+  constexpr uint32_t id = 0xff002020;
+  world.AddForm(
+    std::make_unique<MpObjectReference>(
+      LocationalData{ { 1, 2, 3 }, { 0, 0, 0 }, FormDesc::Tamriel() },
+      FormCallbacks::DoNothing(), base, type.c_str()),
+    id);
+  auto& copy = world.GetFormAt<MpObjectReference>(id);
+  copy.SetWorldInstance(owner.GetWorldInstance());
+  copy.SetInventory(Inventory());
+  CampaignReferenceBinding::Bind(owner, kScriptedReference, copy);
+  return copy;
+}
+
+void ReferenceLoadFixture(Fixture& f)
+{
+  ReferenceFixture(f);
+  auto& state = f.extraScripts.back()->objectTable[0].states[0];
+  for (const auto& [name, increment] :
+       std::vector<std::pair<std::string, int>>{
+         { "OnInit", 100 }, { "OnCellLoad", 10 }, { "OnLoad", 1 } }) {
+    FunctionInfo handler;
+    handler.valid = true;
+    handler.returnType = "None";
+    handler.locals = { { "player", "Actor" },
+                       { "gold", "Form" },
+                       { "temp", "None" } };
+    handler.code.instructions = {
+      { FunctionCode::kOp_IAdd,
+        { Id("counter"), Id("counter"), VarValue(increment) } },
+      { FunctionCode::kOp_Return, { VarValue::None() } }
+    };
+    if (name == "OnInit") {
+      handler.code.instructions.insert(
+        handler.code.instructions.end() - 1,
+        { { FunctionCode::kOp_CallStatic,
+            { VarValue("Game"), VarValue("GetPlayer"), Id("player"),
+              VarValue(0) } },
+          { FunctionCode::kOp_CallStatic,
+            { VarValue("Game"), VarValue("GetForm"), Id("gold"), VarValue(1),
+              VarValue(0xf) } },
+          { FunctionCode::kOp_CallMethod,
+            { VarValue("AddItem"), Id("player"), Id("temp"), VarValue(3),
+              Id("gold"), VarValue(5), VarValue(true) } } });
+    }
+    state.functions.push_back({ name, handler });
+  }
+}
+}
+
+TEST_CASE("Campaign reference initialization rewards run once across reloads",
+          "[Quest][ReferenceLifecycle]")
+{
+  Fixture f;
+  ReferenceLoadFixture(f);
+  auto& owner = f.Add(0xff002001);
+  auto& guest = f.Add(0xff002002);
+  const auto phase =
+    "campaign:" + std::to_string(owner.GetFormId()) + ":fixture";
+  owner.SetWorldInstance(phase);
+  guest.SetWorldInstance(phase);
+  owner.SetInventory(Inventory());
+  guest.SetInventory(Inventory());
+  auto& copy = BoundTrigger(f, owner);
+  REQUIRE_FALSE(QuestJournal::ReferenceInitialized(owner, kScriptedReference));
+  REQUIRE_THROWS(
+    QuestJournal::MarkReferenceInitialized(owner, kScriptedReference));
+  QuestScriptRuntime::ExecuteReferenceLoad(guest, kScriptedReference,
+                                           f.Scripts());
+  REQUIRE(SavedReferenceCounter(owner) == 111);
+  REQUIRE(owner.GetInventory().GetItemCount(0xf) == 5);
+  REQUIRE(guest.GetInventory().GetItemCount(0xf) == 0);
+  REQUIRE(QuestJournal::ReferenceInitialized(owner, kScriptedReference));
+  REQUIRE_FALSE(QuestJournal::Snapshot(owner).contains("referenceInit"));
+  QuestScriptRuntime::ExecuteReferenceLoad(owner, kScriptedReference,
+                                           f.Scripts());
+  REQUIRE(SavedReferenceCounter(owner) == 122);
+  REQUIRE(owner.GetInventory().GetItemCount(0xf) == 5);
+
+  Fixture restarted;
+  ReferenceLoadFixture(restarted);
+  // The copy must restore before its owner without executing scripts or
+  // initializing the owner's history as a side effect of database iteration.
+  restarted.server.worldState.LoadChangeForm(copy.GetChangeForm(),
+                                             FormCallbacks::DoNothing());
+  // Match PartOne's startup path: saved players are disabled until login.
+  // Enabling inside a trigger also requires the separate trigger dispatcher.
+  auto ownerSave = owner.GetChangeForm();
+  ownerSave.profileId = 42;
+  ownerSave.isDisabled = true;
+  restarted.server.worldState.LoadChangeForm(ownerSave,
+                                             FormCallbacks::DoNothing());
+  auto& restored =
+    restarted.server.worldState.GetFormAt<MpActor>(owner.GetFormId());
+  auto& reloaded =
+    restarted.server.worldState.GetFormAt<MpObjectReference>(copy.GetFormId());
+  REQUIRE(CampaignReferenceBinding::Context(reloaded).first == &restored);
+  REQUIRE(CampaignReferenceBinding::Context(reloaded).second ==
+          kScriptedReference);
+  REQUIRE(SavedReferenceCounter(restored) == 122);
+  QuestScriptRuntime::ExecuteReferenceLoad(restored, kScriptedReference,
+                                           restarted.Scripts());
+  REQUIRE(SavedReferenceCounter(restored) == 133);
+  REQUIRE(restored.GetInventory().GetItemCount(0xf) == 5);
+  REQUIRE(QuestJournal::ReferenceInitialized(restored, kScriptedReference));
+  guest.SetWorldInstance("");
+  REQUIRE(QuestJournal::ScriptState(guest).empty());
+  REQUIRE_FALSE(QuestJournal::ReferenceInitialized(guest, kScriptedReference));
+}
+
+TEST_CASE("Failed campaign load rolls back initialization and permits retry",
+          "[Quest][ReferenceLifecycle]")
+{
+  Fixture f;
+  ReferenceLoadFixture(f);
+  auto& owner = f.Add(0xff002001);
+  owner.SetWorldInstance("campaign:" + std::to_string(owner.GetFormId()) +
+                         ":fixture");
+  owner.SetInventory(Inventory());
+  BoundTrigger(f, owner);
+  auto& load =
+    f.extraScripts.back()->objectTable[0].states[0].functions.back().function;
+  load.code.instructions.insert(load.code.instructions.end() - 1,
+                                { FunctionCode::kOp_CallMethod,
+                                  { VarValue("UnsupportedLoadEffect"),
+                                    Id("self"), Id("temp"), VarValue(0) } });
+  const auto before =
+    owner.GetDynamicFields().GetValueDump(QuestJournal::kProperty);
+  REQUIRE_THROWS(QuestScriptRuntime::ExecuteReferenceLoad(
+    owner, kScriptedReference, f.Scripts()));
+  REQUIRE(owner.GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
+          before);
+  REQUIRE_FALSE(QuestJournal::ReferenceInitialized(owner, kScriptedReference));
+  REQUIRE(QuestJournal::ScriptState(owner).empty());
+  REQUIRE(owner.GetInventory().GetItemCount(0xf) == 0);
+  load.code.instructions.erase(load.code.instructions.end() - 2);
+  QuestScriptRuntime::ExecuteReferenceLoad(owner, kScriptedReference,
+                                           f.Scripts());
+  REQUIRE(SavedReferenceCounter(owner) == 111);
+  REQUIRE(owner.GetInventory().GetItemCount(0xf) == 5);
+}
+
+TEST_CASE(
+  "Private reference subscription retries failed load before replication",
+  "[Quest][ReferenceLifecycle]")
+{
+  Fixture f;
+  auto& owner = f.Add(0xff002001);
+  owner.SetWorldInstance("campaign:" + std::to_string(owner.GetFormId()) +
+                         ":fixture");
+  auto& npc = BoundBalgruuf(f, owner);
+  owner.RegisterProfileId(42);
+  // Missing storage fails before marking the first load complete.
+  REQUIRE_THROWS_WITH(MpObjectReference::Subscribe(&npc, &owner),
+                      Catch::Matchers::ContainsSubstring("owned PEX storage"));
+  REQUIRE_FALSE(QuestJournal::ReferenceInitialized(owner, 0x1a677));
+  f.server.worldState.AttachScriptStorage(
+    std::make_shared<BsaArchiveScriptStorage>(
+      (std::filesystem::path(GetDataDir()) / "Skyrim - Misc.bsa")
+        .string()
+        .c_str()));
+  REQUIRE_NOTHROW(MpObjectReference::Subscribe(&npc, &owner));
+  REQUIRE(QuestJournal::ReferenceInitialized(owner, 0x1a677));
+  const auto saved =
+    owner.GetDynamicFields().GetValueDump(QuestJournal::kProperty);
+  REQUIRE_NOTHROW(MpObjectReference::Subscribe(&npc, &owner));
+  REQUIRE(owner.GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
+          saved);
 }

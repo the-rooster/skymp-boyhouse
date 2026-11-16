@@ -95,8 +95,7 @@ public:
 
   Equipment equipment;
 
-  // TODO: inconsistency! save not only percentages but whole structure OR
-  // have only percentages in change form struct
+  // Saved in full; older saves without actorValues retain default attributes.
   ActorValues actorValues;
 
   float healthRespawnPercentage = 1.f;

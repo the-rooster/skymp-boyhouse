@@ -116,6 +116,21 @@ void WorldState::AddForm(std::unique_ptr<MpForm> form, uint32_t formId,
     throw std::runtime_error(
       fmt::format("Form with id {:x} already exists", formId));
   }
+  uint32_t campaignOriginal = 0;
+  auto* reference = form->AsObjectReference();
+  if (optionalChangeFormToApply &&
+      optionalChangeFormToApply->dynamicFields.GetValueDump(
+        CampaignReferenceBinding::kProperty) != "null") {
+    campaignOriginal = CampaignReferenceBinding::SavedOriginal(
+      *this, *optionalChangeFormToApply);
+    if (!reference ||
+        optionalChangeFormToApply->formDesc.ToFormId(espmFiles) != formId ||
+        optionalChangeFormToApply->baseDesc.ToFormId(espmFiles) !=
+          reference->GetBaseId() ||
+        bool(reference->AsActor()) !=
+          (optionalChangeFormToApply->recType == MpChangeForm::ACHR))
+      throw std::runtime_error("Invalid saved campaign reference object");
+  }
 
   // Assign formIndex before Init
   if (auto refr = form->AsObjectReference()) {
@@ -135,7 +150,17 @@ void WorldState::AddForm(std::unique_ptr<MpForm> form, uint32_t formId,
 
   // MpObjectReference::Init requests save for newly created forms. That's why
   // we want formIndex to be assigned before init.
-  form->Init(this, formId, optionalChangeFormToApply != nullptr);
+  if (campaignOriginal) {
+    // Saved campaign copies already contain their selected template,
+    // inventory and actor state. Ordinary Init/ApplyChangeForm would reroll
+    // inventory, reset attributes and schedule corpse respawns.
+    form->MpForm::Init(this, formId, true);
+    reference->EditChangeForm(
+      [&](MpChangeForm& state) { state = *optionalChangeFormToApply; },
+      ChangeFormGuard::Mode::NoRequestSave);
+  } else {
+    form->Init(this, formId, optionalChangeFormToApply != nullptr);
+  }
 
   auto it = forms.insert({ formId, std::move(form) }).first;
 
@@ -146,7 +171,33 @@ void WorldState::AddForm(std::unique_ptr<MpForm> form, uint32_t formId,
       throw std::runtime_error(
         "Unable to apply ChangeForm, cast to ObjectReference failed");
     }
-    refr->ApplyChangeForm(*optionalChangeFormToApply);
+    if (campaignOriginal) {
+      refr->blockSaving = true;
+      Viet::ScopedTask<MpObjectReference> unblock(
+        [](MpObjectReference& value) { value.blockSaving = false; }, *refr);
+      optionalChangeFormToApply->dynamicFields.ForEachValueDump(
+        [&](const std::string& key, const std::string& value) {
+          if (key.starts_with("private.indexed."))
+            refr->RegisterPrivateIndexedProperty(key, value);
+        });
+      const auto source = GetEspm().GetBrowser().LookupById(campaignOriginal);
+      const auto data = reinterpret_cast<const espm::REFR*>(source.rec)
+                          ->GetData(GetEspmCache());
+      if (data.boundsDiv2)
+        refr->SetPrimitive(
+          { data.boundsDiv2[0], data.boundsDiv2[1], data.boundsDiv2[2] });
+      if (auto* actor = refr->AsActor())
+        actor->factionsLoaded =
+          optionalChangeFormToApply->factions.has_value();
+      // Index spatially without firing load events while the owner and other
+      // saved references may still be absent. A real subscriber loads scripts.
+      if (!refr->IsDisabled()) {
+        const auto cell = refr->GetCellOrWorld().ToFormId(espmFiles);
+        refr->MoveOnGrid(*grids[cell].grid);
+      }
+    } else {
+      refr->ApplyChangeForm(*optionalChangeFormToApply);
+    }
   }
 }
 
@@ -160,6 +211,9 @@ void WorldState::Tick()
 void WorldState::LoadChangeForm(const MpChangeForm& changeForm,
                                 const FormCallbacks& callbacks)
 {
+  if (changeForm.dynamicFields.GetValueDump(
+        CampaignReferenceBinding::kProperty) != "null")
+    CampaignReferenceBinding::SavedOriginal(*this, changeForm);
   Viet::ScopedTask<bool> task([](bool& st) { st = false; },
                               pImpl->formLoadingInProgress);
   pImpl->formLoadingInProgress = true;

@@ -1,8 +1,21 @@
 #include "MpChangeForms.h"
 #include "JsonUtils.h"
+#include <cmath>
 #include <spdlog/spdlog.h>
 
 namespace {
+// Percentages keep their existing top-level fields for older saves/readers.
+constexpr std::pair<const char*, float ActorValues::*> kActorValueFields[] = {
+  { "health", &ActorValues::health },
+  { "magicka", &ActorValues::magicka },
+  { "stamina", &ActorValues::stamina },
+  { "healRate", &ActorValues::healRate },
+  { "magickaRate", &ActorValues::magickaRate },
+  { "staminaRate", &ActorValues::staminaRate },
+  { "healRateMult", &ActorValues::healRateMult },
+  { "magickaRateMult", &ActorValues::magickaRateMult },
+  { "staminaRateMult", &ActorValues::staminaRateMult }
+};
 std::vector<std::string> ToStringArray(const std::vector<FormDesc>& formDescs)
 {
   std::vector<std::string> res(formDescs.size());
@@ -57,6 +70,12 @@ nlohmann::json MpChangeForm::ToJson(const MpChangeForm& changeForm)
   res["healthPercentage"] = changeForm.actorValues.healthPercentage;
   res["magickaPercentage"] = changeForm.actorValues.magickaPercentage;
   res["staminaPercentage"] = changeForm.actorValues.staminaPercentage;
+  for (const auto& [name, member] : kActorValueFields) {
+    const auto value = changeForm.actorValues.*member;
+    if (!std::isfinite(value))
+      throw std::runtime_error("Non-finite saved actor value");
+    res["actorValues"][name] = value;
+  }
 
   res["healthRespawnPercentage"] = changeForm.healthRespawnPercentage;
   res["magickaRespawnPercentage"] = changeForm.magickaRespawnPercentage;
@@ -99,8 +118,7 @@ nlohmann::json MpChangeForm::ToJson(const MpChangeForm& changeForm)
     res["displayName"] = *changeForm.displayName;
   }
 
-  if (changeForm.factions.has_value() &&
-      !changeForm.factions.value().empty()) {
+  if (changeForm.factions.has_value()) {
     auto factionsJson = nlohmann::json::array();
     for (int i = 0; i < static_cast<int>(changeForm.factions.value().size());
          ++i) {
@@ -258,6 +276,15 @@ MpChangeForm MpChangeForm::JsonToChangeForm(simdjson::dom::element& element)
   ReadEx(element, healthPercentage, &res.actorValues.healthPercentage);
   ReadEx(element, magickaPercentage, &res.actorValues.magickaPercentage);
   ReadEx(element, staminaPercentage, &res.actorValues.staminaPercentage);
+  auto savedValues = element["actorValues"];
+  if (savedValues.error() != simdjson::error_code::NO_SUCH_FIELD) {
+    auto values = savedValues.value();
+    for (const auto& [name, member] : kActorValueFields) {
+      ReadEx(values, JsonPointer(name), &(res.actorValues.*member));
+      if (!std::isfinite(res.actorValues.*member))
+        throw std::runtime_error("Non-finite saved actor value");
+    }
+  }
 
   if (element.at_pointer(healthRespawnPercentage.GetData()).error() ==
       simdjson::error_code::SUCCESS) {

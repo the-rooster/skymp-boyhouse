@@ -164,3 +164,93 @@ MpObjectReference& CampaignReferenceBinding::Resolve(MpActor& actor,
       "Campaign reference is not materialized in this instance");
   return *copy;
 }
+
+std::pair<MpActor*, uint32_t> CampaignReferenceBinding::Context(
+  MpObjectReference& copy)
+{
+  auto* world = copy.GetParent();
+  if (!world || world->LookupFormByIdNoLoad(copy.GetFormId()).get() != &copy)
+    throw std::runtime_error("Unregistered campaign reference copy");
+  const auto& dump = copy.GetDynamicFields().GetValueDump(kProperty);
+  const auto binding = nlohmann::json::parse(dump);
+  if (!binding.is_object() || binding.size() != 3 ||
+      !binding.at("owner").is_string() ||
+      !binding.at("original").is_string() ||
+      !binding.at("identity").is_string())
+    throw std::runtime_error("Invalid campaign reference binding");
+  const auto ownerId =
+    FormDesc::FromString(binding.at("owner").get<std::string>())
+      .ToFormId(world->espmFiles);
+  const auto original =
+    FormDesc::FromString(binding.at("original").get<std::string>())
+      .ToFormId(world->espmFiles);
+  const auto& form = world->LookupFormByIdNoLoad(ownerId);
+  auto* owner = form ? form->AsActor() : nullptr;
+  if (!owner || Key(*owner, original) != dump ||
+      &Resolve(*owner, original) != &copy)
+    throw std::runtime_error(
+      "Campaign reference owner context is unavailable");
+  return { owner, original };
+}
+
+uint32_t CampaignReferenceBinding::SavedOriginal(WorldState& world,
+                                                 const MpChangeForm& saved)
+{
+  const auto binding =
+    nlohmann::json::parse(saved.dynamicFields.GetValueDump(kProperty));
+  if (!binding.is_object() || binding.size() != 3 ||
+      !binding.at("owner").is_string() ||
+      !binding.at("original").is_string() ||
+      !binding.at("identity").is_string())
+    throw std::runtime_error("Invalid saved campaign reference binding");
+  const auto identity = binding.at("identity").get<std::string>();
+  const auto owner =
+    FormDesc::FromString(binding.at("owner").get<std::string>());
+  const auto original =
+    FormDesc::FromString(binding.at("original").get<std::string>());
+  const auto ownerId = owner.ToFormId(world.espmFiles);
+  const auto originalId = original.ToFormId(world.espmFiles);
+  const auto copyId = saved.formDesc.ToFormId(world.espmFiles);
+  const auto prefix = "campaign:" + std::to_string(ownerId) + ":";
+  // Ordinary recovery reapplies effect magnitudes and resets loot. Campaign
+  // copies need their own timer recovery before these states are supported.
+  if (!saved.activeMagicEffects.Empty() || saved.nextRelootDatetime != 0)
+    throw std::runtime_error(
+      "Campaign reference timer recovery is not implemented");
+  if (identity.size() != 32 ||
+      identity.find_first_not_of("0123456789abcdef") != std::string::npos ||
+      !owner.file.empty() || ownerId < 0xff000000 || original.file.empty() ||
+      originalId == 0x14 || originalId >= 0xff000000 ||
+      !saved.formDesc.file.empty() || copyId < 0xff000000 ||
+      copyId == ownerId || saved.profileId != -1 ||
+      saved.baseDesc.ToFormId(world.espmFiles) == 7 ||
+      !saved.worldInstance.starts_with(prefix) ||
+      saved.worldInstance.size() <= prefix.size() ||
+      saved.worldInstance.size() > 128 || !saved.baseContainerAdded ||
+      (saved.recType != MpChangeForm::REFR &&
+       saved.recType != MpChangeForm::ACHR) ||
+      owner.ToString() != binding.at("owner").get<std::string>() ||
+      original.ToString() != binding.at("original").get<std::string>())
+    throw std::runtime_error("Invalid saved campaign reference identity");
+  const auto record = world.GetEspm().GetBrowser().LookupById(originalId);
+  if (!record.rec || record.rec->IsDeleted() ||
+      (record.rec->GetType() != "REFR" && record.rec->GetType() != "ACHR") ||
+      (record.rec->GetType() == "ACHR") !=
+        (saved.recType == MpChangeForm::ACHR))
+    throw std::runtime_error("Invalid saved campaign original reference");
+  uint32_t base = 0;
+  espm::RecordHeaderAccess::IterateFields(
+    record.rec,
+    [&](const char* tag, uint32_t size, const char* data) {
+      if (!std::memcmp(tag, "NAME", 4)) {
+        if (size != 4 || base)
+          throw std::runtime_error("Malformed campaign reference base");
+        std::memcpy(&base, data, 4);
+      }
+    },
+    world.GetEspmCache());
+  if (!base ||
+      saved.baseDesc.ToFormId(world.espmFiles) != record.ToGlobalId(base))
+    throw std::runtime_error("Saved campaign reference has the wrong base");
+  return originalId;
+}

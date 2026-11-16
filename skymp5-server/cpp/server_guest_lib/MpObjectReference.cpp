@@ -12,6 +12,7 @@
 #include "MpChangeForms.h"
 #include "MsgType.h"
 #include "Primitive.h"
+#include "QuestScriptRuntime.h"
 #include "ScriptVariablesHolder.h"
 #include "UpdatePropertyMessage.h"
 #include "WorldState.h"
@@ -1036,10 +1037,18 @@ void MpObjectReference::Subscribe(MpObjectReference* emitter,
 
   if (!emitter->pImpl->onInitEventSent &&
       listener->GetChangeForm().profileId != -1) {
-    emitter->pImpl->onInitEventSent = true;
-    emitter->SendPapyrusEvent("OnInit");
-    emitter->SendPapyrusEvent("OnCellLoad");
-    emitter->SendPapyrusEvent("OnLoad");
+    if (emitter->GetDynamicFields().GetValueDump(
+          CampaignReferenceBinding::kProperty) != "null") {
+      const auto [owner, original] =
+        CampaignReferenceBinding::Context(*emitter);
+      QuestScriptRuntime::ExecuteReferenceLoad(*owner, original);
+      emitter->pImpl->onInitEventSent = true;
+    } else {
+      emitter->pImpl->onInitEventSent = true;
+      emitter->SendPapyrusEvent("OnInit");
+      emitter->SendPapyrusEvent("OnCellLoad");
+      emitter->SendPapyrusEvent("OnLoad");
+    }
   }
 
   const bool hasPrimitive = emitter->HasPrimitive();

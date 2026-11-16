@@ -139,6 +139,61 @@ TEST_CASE("SQLite saves complete change forms and reuses batches",
   REQUIRE(Read(reopened, std::vector<FormDesc>{}).empty());
 }
 
+TEST_CASE(
+  "Attribute persistence accepts legacy saves and rejects incomplete values",
+  "[save][ReferenceLifecycle]")
+{
+  auto saved = SavedForm(1);
+  saved.actorValues.health = 314;
+  saved.actorValues.magicka = 271;
+  saved.actorValues.stamina = 161;
+  saved.actorValues.healRate = 2;
+  saved.actorValues.magickaRate = 4;
+  saved.actorValues.staminaRate = 6;
+  saved.actorValues.healRateMult = 50;
+  saved.actorValues.magickaRateMult = 75;
+  saved.actorValues.staminaRateMult = 125;
+  saved.actorValues.healthPercentage = 0.25f;
+  saved.factions = std::vector<Faction>{};
+  auto json = MpChangeForm::ToJson(saved);
+  const auto decode = [](const nlohmann::json& data) {
+    simdjson::dom::parser parser;
+    const auto text = data.dump();
+    auto document = parser.parse(text).value();
+    return MpChangeForm::JsonToChangeForm(document);
+  };
+  SECTION("full round trip")
+  {
+    const auto restored = decode(json);
+    REQUIRE(restored.actorValues.ToTuple() == saved.actorValues.ToTuple());
+    REQUIRE(restored.factions.has_value());
+    REQUIRE(restored.factions->empty());
+  }
+  SECTION("legacy attributes keep their defaults and old percentages")
+  {
+    json.erase("actorValues");
+    const auto restored = decode(json);
+    auto expected = ActorValues();
+    expected.healthPercentage = 0.25f;
+    REQUIRE(restored.actorValues.ToTuple() == expected.ToTuple());
+  }
+  SECTION("missing member")
+  {
+    json["actorValues"].erase("health");
+    REQUIRE_THROWS(decode(json));
+  }
+  SECTION("invalid member")
+  {
+    json["actorValues"]["health"] = "314";
+    REQUIRE_THROWS(decode(json));
+  }
+  SECTION("null attributes")
+  {
+    json["actorValues"] = nullptr;
+    REQUIRE_THROWS(decode(json));
+  }
+}
+
 TEST_CASE("SQLite rolls back every member of a failed save batch",
           "[SQLite][save]")
 {
@@ -383,6 +438,145 @@ TEST_CASE("Campaign reward transactions reload journals and bound inventories "
   REQUIRE(QuestJournal::Get(owner, 0x4e50d).at("stage") == 10);
   REQUIRE(QuestJournal::ScriptState(owner).at("fixture") == 42);
   REQUIRE(&CampaignReferenceBinding::Resolve(owner, 0x1a677) == &npc);
+}
+
+TEST_CASE(
+  "Private campaign NPCs and placed items restore without world side effects",
+  "[SQLite][Quest][ReferenceLifecycle]")
+{
+  SqliteFiles files;
+  constexpr uint32_t ownerId = 0xff002001, npcId = 0xff002010,
+                     itemId = 0xff002011;
+  MpChangeForm savedNpc, savedItem;
+  {
+    PartOne server;
+    server.AttachEspm(&GetEspmLoader());
+    server.CreateActor(ownerId, { 1, 2, 3 }, 0, 0x3c);
+    auto& owner = server.worldState.GetFormAt<MpActor>(ownerId);
+    const auto phase = "campaign:" + std::to_string(ownerId) + ":fixture";
+    owner.SetWorldInstance(phase);
+    server.worldState.AddForm(
+      std::make_unique<MpActor>(
+        LocationalData{ { 1, 2, 3 }, { 0, 0, 0 }, FormDesc::Tamriel() },
+        FormCallbacks::DoNothing(), 0x13bbd),
+      npcId);
+    auto& npc = server.worldState.GetFormAt<MpActor>(npcId);
+    npc.SetWorldInstance(phase);
+    npc.SetInventory(Inventory().AddItem(0xf, 19));
+    CampaignReferenceBinding::Bind(owner, 0x1a677, npc);
+    savedNpc = npc.GetChangeForm();
+    savedNpc.isDead = true;
+    savedNpc.isRaceMenuOpen = false;
+    savedNpc.actorValues.health = 314;
+    savedNpc.actorValues.healthPercentage = 0;
+    savedNpc.actorValues.magicka = 271;
+    savedNpc.actorValues.magickaPercentage = 0.25f;
+    savedNpc.factions = std::vector<Faction>{};
+    savedNpc.equipment.numChanges = 31;
+    savedNpc.equipment.rightSpell = 0x12fd0;
+
+    const auto source = GetEspmLoader().GetBrowser().LookupById(0x8a986);
+    const auto data = reinterpret_cast<const espm::REFR*>(source.rec)
+                        ->GetData(server.worldState.GetEspmCache());
+    const auto base = source.ToGlobalId(data.baseId);
+    server.worldState.AddForm(
+      std::make_unique<MpObjectReference>(
+        LocationalData{ { 1, 2, 3 }, { 0, 0, 0 }, FormDesc::Tamriel() },
+        FormCallbacks::DoNothing(), base, "AMMO"),
+      itemId);
+    auto& item = server.worldState.GetFormAt<MpObjectReference>(itemId);
+    item.SetWorldInstance(phase);
+    item.SetInventory(Inventory());
+    CampaignReferenceBinding::Bind(owner, 0x8a986, item);
+    savedItem = item.GetChangeForm();
+    savedItem.count = data.count;
+    REQUIRE(savedItem.count == 15);
+    SqliteDatabase database(files.File());
+    REQUIRE(database.Upsert({ owner.GetChangeForm(), savedNpc, savedItem }) ==
+            3);
+  }
+  auto storage =
+    std::make_shared<Storage>(std::make_shared<SqliteDatabase>(files.File()),
+                              spdlog::default_logger(), "sqlite", 1);
+  PartOne restarted;
+  restarted.AttachEspm(&GetEspmLoader());
+  restarted.AttachSaveStorage(storage);
+  auto& owner = restarted.worldState.GetFormAt<MpActor>(ownerId);
+  auto& npc = restarted.worldState.GetFormAt<MpActor>(npcId);
+  auto& item = restarted.worldState.GetFormAt<MpObjectReference>(itemId);
+  REQUIRE(MpChangeForm::ToJson(npc.GetChangeForm()) ==
+          MpChangeForm::ToJson(savedNpc));
+  REQUIRE(MpChangeForm::ToJson(item.GetChangeForm()) ==
+          MpChangeForm::ToJson(savedItem));
+  REQUIRE_FALSE(npc.IsRespawning());
+  REQUIRE(npc.GetFactions(-128, 127).empty());
+  REQUIRE(npc.GetChangeForm().actorValues.health == 314);
+  REQUIRE(npc.GetInventory().GetItemCount(0xf) == 19);
+  REQUIRE(CampaignReferenceBinding::Context(npc).first == &owner);
+  REQUIRE(&CampaignReferenceBinding::Resolve(owner, 0x8a986) == &item);
+}
+
+TEST_CASE("Malformed private reference saves are rejected before registration",
+          "[SQLite][Quest][ReferenceLifecycle]")
+{
+  PartOne server;
+  server.AttachEspm(&GetEspmLoader());
+  constexpr uint32_t ownerId = 0xff002001, npcId = 0xff002010;
+  server.CreateActor(ownerId, { 1, 2, 3 }, 0, 0x3c);
+  auto& owner = server.worldState.GetFormAt<MpActor>(ownerId);
+  owner.SetWorldInstance("campaign:" + std::to_string(ownerId) + ":fixture");
+  server.worldState.AddForm(
+    std::make_unique<MpActor>(
+      LocationalData{ { 1, 2, 3 }, { 0, 0, 0 }, FormDesc::Tamriel() },
+      FormCallbacks::DoNothing(), 0x13bbd),
+    npcId);
+  auto& npc = server.worldState.GetFormAt<MpActor>(npcId);
+  npc.SetWorldInstance(owner.GetWorldInstance());
+  npc.SetInventory(Inventory());
+  CampaignReferenceBinding::Bind(owner, 0x1a677, npc);
+  auto saved = npc.GetChangeForm();
+  SECTION("wrong base")
+  {
+    saved.baseDesc = { 0x7, "Skyrim.esm" };
+  }
+  SECTION("shared world")
+  {
+    saved.worldInstance = "";
+  }
+  SECTION("player identity")
+  {
+    saved.profileId = 17;
+  }
+  SECTION("inventory not initialized")
+  {
+    saved.baseContainerAdded = false;
+  }
+  SECTION("pending loot timer")
+  {
+    saved.nextRelootDatetime = 1;
+  }
+  SECTION("active effect")
+  {
+    saved.activeMagicEffects.Add(espm::ActorValue::HealRate,
+                                 ActiveMagicEffectsMap::Entry{});
+  }
+  SECTION("wrong record kind")
+  {
+    saved.recType = MpChangeForm::REFR;
+  }
+  SECTION("invalid identity")
+  {
+    auto binding = nlohmann::json::parse(
+      saved.dynamicFields.GetValueDump(CampaignReferenceBinding::kProperty));
+    binding["identity"] = "invalid";
+    saved.dynamicFields.SetValueDump(CampaignReferenceBinding::kProperty,
+                                     binding.dump());
+  }
+  PartOne restarted;
+  restarted.AttachEspm(&GetEspmLoader());
+  REQUIRE_THROWS(
+    restarted.worldState.LoadChangeForm(saved, FormCallbacks::DoNothing()));
+  REQUIRE_FALSE(restarted.worldState.LookupFormByIdNoLoad(npcId));
 }
 
 #if defined(__linux__)

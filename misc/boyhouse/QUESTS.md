@@ -51,8 +51,9 @@ Reference script variables and arrays persist under `reference:<FormDesc>/<scrip
 roots in the same transaction as the journal. Different quests in one campaign
 share that reference's state; resetting a quest preserves it. Host/guest histories
 stay separate, character reload retains it, and fragment failure rolls it back.
-These bindings do not instantiate NPCs, dispatch initialization/world events, or
-permit ordinary global-VM world mutations. PlayerRef base bindings and
+Resolving these logical bindings does not instantiate NPCs or dispatch events.
+Explicit private copies have the limited load dispatcher described below;
+ordinary global-VM world mutations remain prohibited. PlayerRef base bindings and
 active-magic-effect instances remain unimplemented. Content migration and
 reference retirement still need explicit lifecycle handling.
 
@@ -95,6 +96,35 @@ solve orphan visibility and instance naming after character-ID reuse.
 Binding refuses a copy with existing shared-VM script instances. Bound copies
 reject ordinary script initialization and shared-VM event entry; unsupported
 external events cannot silently run their scripts in the global VM.
+
+### Private reference loading and recovery
+
+The first player subscription to an explicitly bound copy runs a scoped load
+transaction before publishing that subscription. `OnInit` runs once per original
+reference in the owner's saved campaign; `OnCellLoad` and `OnLoad` follow it.
+Reference scripts receive all three events. Matching scripted reference aliases
+of running, adapter-enabled quests receive the load events, but not the target's
+`OnInit` (alias initialization belongs to quest startup). Inventory events caused
+by these handlers drain within the same transaction and execution budget.
+
+Initialization markers, script state and supported inventory effects commit
+together. A failed handler leaves the load retryable without retaining its
+reward or initialization marker. The private `referenceInit` ledger field
+survives restart and is omitted from the client journal projection. This hook
+covers the first subscription in each server process, not a complete engine
+cell attach/detach/unload lifecycle or a durable external event queue.
+
+Saved private copies restore directly, without rerolling their inventory,
+resetting attributes, opening character creation or scheduling dead NPCs to
+respawn. Copies may load before their owner; their scripts wait for a player
+subscription. Bound placed-item copies are retained by database loading too.
+Recovery validates the original record, base, copy kind, owner identity and
+private phase. Pending loot timers and active magic effects fail explicitly
+until campaign timer recovery is implemented. Automatic reference creation,
+complete quest startup, trigger/activation/combat events and ordinary player inventory
+events still need implementation; no vanilla adapter is enabled.
+
+### Transaction-generated inventory events
 
 Transaction-generated `OnItemAdded`/`OnItemRemoved` events run on the logical
 reference's script attachments and matching scripted aliases of running,

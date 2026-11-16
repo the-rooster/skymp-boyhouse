@@ -21,6 +21,7 @@ class MpActor : public MpObjectReference
 {
 public:
   friend class RespawnEvent;
+  friend class WorldState;
 
   static const char* Type() { return "Actor"; }
   const char* GetFormType() const override { return "Actor"; }
