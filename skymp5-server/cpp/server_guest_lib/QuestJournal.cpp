@@ -434,7 +434,12 @@ void QuestJournal::EditInventory(MpActor& actor, MpObjectReference& target,
 
 nlohmann::json QuestJournal::ScriptState(MpActor& actor)
 {
-  auto value = Read(Owner(actor)).value("vm", Json::object());
+  return PersonalScriptState(Owner(actor));
+}
+
+nlohmann::json QuestJournal::PersonalScriptState(MpActor& actor)
+{
+  auto value = Read(actor).value("vm", Json::object());
   if (!value.is_object())
     throw std::runtime_error("Invalid saved quest VM state");
   return value;

@@ -4,6 +4,9 @@
 // interaction boundaries; vanilla reference overlays are a separate milestone.
 class PartyInstances {
   constructor(adapter, areas, now = () => Date.now()) {
+    if (typeof adapter.prepareInstance !== "function") {
+      throw new Error("Instance preparation is required");
+    }
     this.adapter = adapter;
     this.now = now;
     this.areas = new Map();
@@ -15,10 +18,12 @@ class PartyInstances {
       if (!area || !/^[a-zA-Z0-9_-]{1,48}$/.test(area.id) || this.areas.has(area.id)) {
         throw new Error("Invalid or duplicate instance area");
       }
-      if (!Number.isInteger(area.worldOrCell) || area.worldOrCell < 0 ||
-          area.worldOrCell > 0xffffffff || !Array.isArray(area.center) ||
+      if (!Number.isInteger(area.worldOrCell) || area.worldOrCell <= 0 ||
+          area.worldOrCell >= 0xff000000 || !Array.isArray(area.center) ||
           area.center.length !== 3 || !area.center.every(Number.isFinite) ||
-          !Number.isFinite(area.radius) || area.radius <= 0) {
+          !Number.isFinite(area.radius) || area.radius <= 0 || area.radius > 65536 ||
+          area.center.slice(0, 2).some(n => Math.abs(n) + area.radius > 60000000) ||
+          !Number.isInteger(area.encounterLevel) || area.encounterLevel < 1 || area.encounterLevel > 65535) {
         throw new Error("Invalid instance area boundary");
       }
       this.areas.set(area.id, { ...area, center: [...area.center] });
@@ -37,6 +42,35 @@ class PartyInstances {
   }
 
   key(owner, area) { return `campaign:${owner}:${area}`; }
+
+  quarantine(actor) {
+    this.visits.delete(actor);
+    this.removeMembership(actor);
+    this.adapter.disable(actor);
+  }
+
+  hostAvailable(owner, areaId) {
+    const visit = this.visits.get(owner);
+    return this.adapter.exists(owner) && visit?.owner === owner && visit.area === areaId &&
+      this.adapter.getInstance(owner) === this.key(owner, areaId) &&
+      this.adapter.isInside(owner, this.areas.get(areaId));
+  }
+
+  transition(actor, owner, areaId) {
+    // Preparation is synchronous and never changes a player's current phase.
+    // Do not publish a visit until every destination reference is available.
+    if (owner !== null) this.adapter.prepareInstance(owner, this.areas.get(areaId));
+    try {
+      this.adapter.setInstance(actor, owner === null ? "" : this.key(owner, areaId));
+    } catch (error) {
+      // Native subscription or script loading can throw after changing the
+      // phase. Quarantine this character instead of claiming the old visit.
+      this.quarantine(actor);
+      throw error;
+    }
+    if (owner === null) this.visits.delete(actor);
+    else this.visits.set(actor, { owner, area: areaId });
+  }
 
   invite(actor, target) {
     this.actor(actor);
@@ -68,6 +102,11 @@ class PartyInstances {
 
   leave(actor) {
     this.actor(actor);
+    this.removeMembership(actor);
+    this.reconcile();
+  }
+
+  removeMembership(actor) {
     const leader = this.membership.get(actor);
     if (leader === undefined) return;
     if (leader === actor) {
@@ -80,7 +119,6 @@ class PartyInstances {
       this.parties.get(leader).delete(actor);
       this.membership.delete(actor);
     }
-    this.reconcile();
   }
 
   kick(actor, target) {
@@ -97,13 +135,11 @@ class PartyInstances {
     if (!area) throw new Error("Area is not enabled for instancing");
     if (actor !== owner && !this.sameParty(actor, owner)) throw new Error("Party membership required");
     if (!this.adapter.isInside(actor, area)) throw new Error("Character is outside the instance boundary");
-    if (actor !== owner) {
-      const hostVisit = this.visits.get(owner);
-      if (!hostVisit || hostVisit.owner !== owner || hostVisit.area !== areaId ||
-          !this.adapter.isInside(owner, area)) throw new Error("Campaign owner is not in that instance");
+    if (actor !== owner && !this.hostAvailable(owner, areaId)) {
+      throw new Error("Campaign owner is not in that instance");
     }
-    this.adapter.setInstance(actor, this.key(owner, areaId));
-    this.visits.set(actor, { owner, area: areaId });
+    try { this.transition(actor, owner, areaId); }
+    finally { this.reconcile(); }
   }
 
   exit(actor) {
@@ -112,22 +148,36 @@ class PartyInstances {
     if (visit && this.adapter.isInside(actor, this.areas.get(visit.area))) {
       throw new Error("Leave the altered area before returning to shared space");
     }
-    this.adapter.setInstance(actor, "");
-    this.visits.delete(actor);
+    try { this.transition(actor, null); }
+    finally { this.reconcile(); }
   }
 
   reconcile() {
+    const changed = [];
     for (const [actor, visit] of this.visits) {
-      if (actor === visit.owner || this.sameParty(actor, visit.owner)) continue;
-      try {
-        this.adapter.setInstance(actor, this.key(actor, visit.area));
-        this.visits.set(actor, { owner: actor, area: visit.area });
-      } catch (error) {
-        // A failed native transition must not leave a revoked guest active.
-        this.adapter.disable(actor);
+      if (!this.adapter.exists(actor)) {
         this.visits.delete(actor);
+        changed.push(actor);
+        continue;
       }
+      try {
+        if (this.adapter.getInstance(actor) !== this.key(visit.owner, visit.area)) {
+          throw new Error("Instance visit disagrees with native phase");
+        }
+        if (!this.adapter.isInside(actor, this.areas.get(visit.area))) {
+          this.transition(actor, null);
+        } else if (actor !== visit.owner &&
+                   (!this.sameParty(actor, visit.owner) || !this.hostAvailable(visit.owner, visit.area))) {
+          this.transition(actor, actor, visit.area);
+        } else continue;
+      } catch (error) {
+        // In contrast to voluntary entry, a failed revocation cannot retain
+        // the old access even when preparation failed before switching.
+        this.quarantine(actor);
+      }
+      changed.push(actor);
     }
+    return changed;
   }
 
   recover(actor) {
@@ -135,14 +185,24 @@ class PartyInstances {
     const saved = this.adapter.getInstance(actor);
     if (!saved) { this.visits.delete(actor); return; }
     const match = /^campaign:([0-9]+):([a-zA-Z0-9_-]{1,48})$/.exec(saved);
-    if (!match || !this.areas.has(match[2])) {
-      this.adapter.disable(actor);
+    const owner = match ? Number(match[1]) : 0;
+    if (!match || !this.areas.has(match[2]) || !Number.isInteger(owner) ||
+        owner <= 0 || owner > 0xffffffff || String(owner) !== match[1]) {
+      this.quarantine(actor);
+      this.reconcile();
       throw new Error("Saved instance needs administrator recovery");
     }
-    const owner = Number(match[1]);
-    const authorizedOwner = owner === actor || this.sameParty(actor, owner) ? owner : actor;
-    this.adapter.setInstance(actor, this.key(authorizedOwner, match[2]));
-    this.visits.set(actor, { owner: authorizedOwner, area: match[2] });
+    const areaId = match[2];
+    const authorizedOwner = owner === actor ||
+      (this.sameParty(actor, owner) && this.hostAvailable(owner, areaId)) ? owner : actor;
+    try {
+      if (this.adapter.isInside(actor, this.areas.get(areaId))) {
+        this.transition(actor, authorizedOwner, areaId);
+      } else this.transition(actor, null);
+    } catch (error) {
+      this.quarantine(actor);
+      throw error;
+    } finally { this.reconcile(); }
   }
 
   snapshot(actor) {

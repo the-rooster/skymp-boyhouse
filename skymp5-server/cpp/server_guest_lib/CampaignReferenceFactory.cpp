@@ -22,6 +22,16 @@ namespace {
 using Json = nlohmann::json;
 constexpr auto kIdentity = "private.boyhouse.campaignIdentity";
 
+std::string Destination(MpActor& owner, const std::string& areaId)
+{
+  if (areaId.empty() || areaId.size() > 48 ||
+      areaId.find_first_not_of(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") !=
+        std::string::npos)
+    throw std::invalid_argument("Invalid campaign allocation area ID");
+  return "campaign:" + std::to_string(owner.GetFormId()) + ":" + areaId;
+}
+
 std::string Identity(const DynamicFields& fields)
 {
   const auto& dump = fields.GetValueDump(kIdentity);
@@ -46,6 +56,7 @@ struct Allocation
   WorldState& world;
   const espm::CombineBrowser& browser;
   std::string identity;
+  std::string instance;
   Json ledger;
   std::map<uint32_t, bool> preparedDisabled;
   uint32_t level;
@@ -53,13 +64,15 @@ struct Allocation
   std::mt19937 random{ std::random_device{}() };
   LeveledListUtils::Options options;
 
-  Allocation(MpActor& actor, uint32_t encounterLevel)
+  Allocation(MpActor& actor, const std::string& destination,
+             uint32_t encounterLevel)
     : owner(actor)
     , world(*actor.GetParent())
     , browser(world.GetEspm().GetBrowser())
     , identity(Identity(actor.GetDynamicFields()))
+    , instance(destination)
     , level(encounterLevel)
-    , vm(QuestJournal::ScriptState(actor), {}, {})
+    , vm(QuestJournal::PersonalScriptState(actor), {}, {})
   {
     const auto& saved = owner.GetDynamicFields().GetValueDump(
       CampaignReferenceFactory::kAllocations);
@@ -148,7 +161,7 @@ struct Allocation
         "Allocated campaign reference is missing or inconsistent");
     // Do not reroll a deleted copy or a copy already assigned to another area.
     // Cross-area reference migration must be an explicit world transaction.
-    if (requireCurrentArea && !reference->SharesWorldInstance(owner))
+    if (requireCurrentArea && reference->GetWorldInstance() != instance)
       throw std::runtime_error(
         "Allocated reference belongs to another campaign area");
     return reference;
@@ -223,7 +236,7 @@ struct Allocation
     result.baseDesc =
       FormDesc::FromFormId(source.ToGlobalId(data.baseId), world.espmFiles);
     result.worldOrCellDesc = FormDesc::FromFormId(cell, world.espmFiles);
-    result.worldInstance = owner.GetWorldInstance();
+    result.worldInstance = instance;
     result.position = LocationalDataUtils::GetPos(data.loc);
     result.angle = LocationalDataUtils::GetRot(data.loc);
     for (const auto value :
@@ -341,21 +354,36 @@ std::vector<uint32_t> CampaignReferenceFactory::Ensure(
   MpActor& owner, const std::vector<uint32_t>& originals,
   uint32_t encounterLevel)
 {
+  const auto prefix = "campaign:" + std::to_string(owner.GetFormId()) + ":";
+  if (!owner.GetWorldInstance().starts_with(prefix) ||
+      owner.GetWorldInstance().size() <= prefix.size())
+    throw std::runtime_error(
+      "Campaign allocation requires the owning private phase");
+  return EnsureForInstance(owner, owner.GetWorldInstance(), originals,
+                           encounterLevel);
+}
+
+std::vector<uint32_t> CampaignReferenceFactory::Prepare(
+  MpActor& owner, const std::string& areaId,
+  const std::vector<uint32_t>& originals, uint32_t encounterLevel)
+{
+  return EnsureForInstance(owner, Destination(owner, areaId), originals,
+                           encounterLevel);
+}
+
+std::vector<uint32_t> CampaignReferenceFactory::EnsureForInstance(
+  MpActor& owner, const std::string& instance,
+  const std::vector<uint32_t>& originals, uint32_t encounterLevel)
+{
   if (!owner.GetParent() || QuestJournal::HasActiveTransaction() ||
       owner.GetParent()->LookupFormByIdNoLoad(owner.GetFormId()).get() !=
         &owner ||
       owner.GetFormId() < 0xff000000 || owner.IsDeleted() || !encounterLevel ||
       encounterLevel > 65535 || originals.size() > 4096)
     throw std::runtime_error("Invalid campaign allocation request");
-  const auto prefix = "campaign:" + std::to_string(owner.GetFormId()) + ":";
-  if (&QuestJournal::Owner(owner) != &owner ||
-      !owner.GetWorldInstance().starts_with(prefix) ||
-      owner.GetWorldInstance().size() <= prefix.size())
-    throw std::runtime_error(
-      "Campaign allocation requires the owning private phase");
   if (originals.empty())
     return {};
-  Allocation allocation(owner, encounterLevel);
+  Allocation allocation(owner, instance, encounterLevel);
   std::map<uint32_t, uint32_t> ids;
   std::vector<MpChangeForm> copies;
   for (const auto original : originals) {
@@ -398,6 +426,27 @@ std::vector<uint32_t> CampaignReferenceFactory::Ensure(
 std::vector<uint32_t> CampaignReferenceFactory::EnsureArea(
   MpActor& owner, uint32_t worldOrCell, const NiPoint3& center, float radius,
   uint32_t encounterLevel)
+{
+  const auto prefix = "campaign:" + std::to_string(owner.GetFormId()) + ":";
+  if (!owner.GetWorldInstance().starts_with(prefix) ||
+      owner.GetWorldInstance().size() <= prefix.size())
+    throw std::runtime_error(
+      "Campaign allocation requires the owning private phase");
+  return EnsureAreaForInstance(owner, owner.GetWorldInstance(), worldOrCell,
+                               center, radius, encounterLevel);
+}
+
+std::vector<uint32_t> CampaignReferenceFactory::PrepareArea(
+  MpActor& owner, const std::string& areaId, uint32_t worldOrCell,
+  const NiPoint3& center, float radius, uint32_t encounterLevel)
+{
+  return EnsureAreaForInstance(owner, Destination(owner, areaId), worldOrCell,
+                               center, radius, encounterLevel);
+}
+
+std::vector<uint32_t> CampaignReferenceFactory::EnsureAreaForInstance(
+  MpActor& owner, const std::string& instance, uint32_t worldOrCell,
+  const NiPoint3& center, float radius, uint32_t encounterLevel)
 {
   if (!owner.GetParent() || !std::isfinite(radius) || radius <= 0 ||
       radius > 65536 || !std::isfinite(center.x) || !std::isfinite(center.y) ||
@@ -451,5 +500,6 @@ std::vector<uint32_t> CampaignReferenceFactory::EnsureArea(
       }
     }
   }
-  return Ensure(owner, { originals.begin(), originals.end() }, encounterLevel);
+  return EnsureForInstance(
+    owner, instance, { originals.begin(), originals.end() }, encounterLevel);
 }

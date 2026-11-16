@@ -11,9 +11,10 @@ fs.writeFileSync(path.join(state, "gamemode.js"), `require(${JSON.stringify(path
 fs.writeFileSync(path.join(state, "server-settings.json"), JSON.stringify({
   name: "Boyhouse protocol smoke", port: 17781, maxPlayers: 4, listenHost: "127.0.0.1", uiListenHost: "127.0.0.1",
   offlineMode: true, master: "http://127.0.0.1", dataDir: "./data", npcEnabled: false, logLevel: "error",
+  databaseDriver: "sqlite", databaseName: path.join(state, "world.sqlite3"),
   loadOrder: ["Skyrim.esm", "Update.esm", "Dawnguard.esm", "HearthFires.esm", "Dragonborn.esm"].map(name => `/game-data/${name}`),
   startPoints: [{ pos: [133857, -61130, 14662], worldOrCell: "0x3c", angleZ: 72 }],
-  boyhouseInstances: { experimental: true, areas: [{ id: "fixture", worldOrCell: 60, center: [133857, -61130, 14662], radius: 512 }] }
+  boyhouseInstances: { experimental: true, areas: [{ id: "fixture", worldOrCell: 60, center: [133857, -61130, 14662], radius: 512, encounterLevel: 5 }] }
 }));
 const result = spawnSync(process.execPath, [path.join(state, "dist_back/skymp5-server.js")], { cwd: state, stdio: "inherit", timeout: 20000 });
 if (result.error) console.error(result.error);

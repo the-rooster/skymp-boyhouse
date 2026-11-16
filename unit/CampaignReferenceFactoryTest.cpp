@@ -2,6 +2,7 @@
 #include "CampaignReferenceBinding.h"
 #include "LocationalDataUtils.h"
 #include "QuestJournal.h"
+#include "QuestVmState.h"
 #include "TestUtils.hpp"
 #include "libespm/GroupUtils.h"
 #include "save_storages/ISaveStorage.h"
@@ -279,4 +280,129 @@ TEST_CASE("Campaign copies keep initial death and enable-parent state",
   const auto changed =
     CampaignReferenceFactory::Ensure(*f.owner, { 0xe4d26 }, 5);
   REQUIRE(world.GetFormAt<MpObjectReference>(changed.front()).IsDisabled());
+}
+
+TEST_CASE("Destination preparation does not admit or change the player",
+          "[Quest][CampaignAllocation]")
+{
+  AllocationWorld f;
+  auto& world = f.server.worldState;
+  f.owner->SetWorldInstance("");
+  const auto epoch = f.owner->GetWorldInstanceEpoch();
+  const auto inventory = f.owner->GetInventory().ToJson();
+  const auto ids = CampaignReferenceFactory::Prepare(*f.owner, "fixture",
+                                                     { 0x1a677, 0x8a986 }, 5);
+  REQUIRE(f.owner->GetWorldInstance().empty());
+  REQUIRE(f.owner->GetWorldInstanceEpoch() == epoch);
+  REQUIRE(f.owner->GetInventory().ToJson() == inventory);
+  for (const auto id : ids) {
+    const auto& copy = world.GetFormAt<MpObjectReference>(id);
+    REQUIRE(copy.GetWorldInstance() == "campaign:4278198273:fixture");
+    REQUIRE_FALSE(copy.SharesWorldInstance(*f.owner));
+  }
+  REQUIRE_THROWS(CampaignReferenceBinding::Resolve(*f.owner, 0x1a677));
+  world.GetFormAt<MpActor>(ids[0]).SetInventory(Inventory().AddItem(0xf, 19));
+  REQUIRE(CampaignReferenceFactory::Prepare(*f.owner, "fixture",
+                                            { 0x1a677, 0x8a986 }, 99) == ids);
+  f.owner->SetWorldInstance("campaign:4278198273:fixture");
+  REQUIRE(CampaignReferenceBinding::Resolve(*f.owner, 0x1a677).GetFormId() ==
+          ids[0]);
+  REQUIRE(world.GetFormAt<MpActor>(ids[0]).GetInventory().GetItemCount(0xf) ==
+          19);
+}
+
+TEST_CASE(
+  "Guest recovery preparation reads personal VM state without the host",
+  "[Quest][CampaignAllocation]")
+{
+  AllocationWorld f;
+  QuestVmState personal(nlohmann::json::object(), {}, {});
+  personal.SetGlobal("73f10:Skyrim.esm", 7);
+  QuestJournal::Atomic(*f.owner, [&] {
+    QuestJournal::SetScriptState(*f.owner, personal.Save());
+  });
+  auto badHost = nlohmann::json{ { "schemaVersion", 1 },
+                                 { "revision", uint64_t(0) },
+                                 { "quests", nlohmann::json::object() },
+                                 { "vm", "invalid host VM" } };
+  f.other->SetPropertyValueDump(QuestJournal::kProperty, badHost.dump(), false,
+                                false);
+  SECTION("present host with unusable VM")
+  {
+    f.owner->SetWorldInstance(f.other->GetWorldInstance());
+  }
+  SECTION("absent host after restart")
+  {
+    f.owner->SetWorldInstance("campaign:4294967000:fixture");
+  }
+  const auto phase = f.owner->GetWorldInstance();
+  const auto epoch = f.owner->GetWorldInstanceEpoch();
+  REQUIRE_THROWS(QuestJournal::ScriptState(*f.owner));
+  const auto ids =
+    CampaignReferenceFactory::Prepare(*f.owner, "fixture", { 0x1a677 }, 5);
+  REQUIRE(ids.size() == 1);
+  REQUIRE(f.owner->GetWorldInstance() == phase);
+  REQUIRE(f.owner->GetWorldInstanceEpoch() == epoch);
+  REQUIRE(QuestJournal::PersonalScriptState(*f.owner) == personal.Save());
+  REQUIRE(f.other->GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
+          badHost.dump());
+  // A malformed personal VM must not silently fall back to the host's state.
+  f.owner->SetPropertyValueDump(QuestJournal::kProperty, badHost.dump(), false,
+                                false);
+  const auto forms = *f.server.worldState.GetAllForms(0xff);
+  REQUIRE_THROWS(
+    CampaignReferenceFactory::Prepare(*f.owner, "fixture", { 0x8a986 }, 5));
+  REQUIRE(*f.server.worldState.GetAllForms(0xff) == forms);
+}
+
+TEST_CASE("Invalid destination preparation keeps the old phase and ledger",
+          "[Quest][CampaignAllocation]")
+{
+  AllocationWorld f;
+  f.owner->SetWorldInstance(f.other->GetWorldInstance());
+  const auto before = MpChangeForm::ToJson(f.owner->GetChangeForm());
+  const auto forms = *f.server.worldState.GetAllForms(0xff);
+  for (const std::string area :
+       { "", "bad:area", "bad area", "campaign:4278198274:fixture" })
+    REQUIRE_THROWS(
+      CampaignReferenceFactory::Prepare(*f.owner, area, { 0x1a677 }, 5));
+  REQUIRE_THROWS(CampaignReferenceFactory::Prepare(
+    *f.owner, std::string(49, 'a'), { 0x1a677 }, 5));
+  REQUIRE_THROWS(CampaignReferenceFactory::Prepare(*f.owner, "fixture",
+                                                   { 0x1a677, 0xf }, 5));
+  REQUIRE(MpChangeForm::ToJson(f.owner->GetChangeForm()) == before);
+  REQUIRE(*f.server.worldState.GetAllForms(0xff) == forms);
+}
+
+TEST_CASE("An authored area can be prepared and restored before admission",
+          "[Quest][CampaignAllocation]")
+{
+  AllocationWorld f;
+  f.owner->SetWorldInstance("");
+  auto& world = f.server.worldState;
+  const auto source = world.GetEspm().GetBrowser().LookupById(0x8a986);
+  const auto data = reinterpret_cast<const espm::REFR*>(source.rec)
+                      ->GetData(world.GetEspmCache());
+  const auto cell = source.ToGlobalId(
+    espm::GetWorldOrCell(world.GetEspm().GetBrowser(), source.rec));
+  const auto center = LocationalDataUtils::GetPos(data.loc);
+  const auto ids = CampaignReferenceFactory::PrepareArea(*f.owner, "fixture",
+                                                         cell, center, 1.f, 5);
+  REQUIRE_FALSE(ids.empty());
+  REQUIRE(f.owner->GetWorldInstance().empty());
+  auto savedOwner = f.owner->GetChangeForm();
+  savedOwner.profileId = 42;
+  savedOwner.isDisabled = true;
+  PartOne restarted;
+  restarted.AttachEspm(&GetEspmLoader());
+  for (const auto id : ids)
+    restarted.worldState.LoadChangeForm(
+      world.GetFormAt<MpObjectReference>(id).GetChangeForm(),
+      FormCallbacks::DoNothing());
+  restarted.worldState.LoadChangeForm(savedOwner, FormCallbacks::DoNothing());
+  auto& owner = restarted.worldState.GetFormAt<MpActor>(f.owner->GetFormId());
+  REQUIRE(CampaignReferenceFactory::PrepareArea(owner, "fixture", cell, center,
+                                                1.f, 50) == ids);
+  REQUIRE(owner.GetWorldInstance().empty());
+  REQUIRE(owner.IsDisabled());
 }

@@ -27,13 +27,23 @@ function worker(mode, state) {
   const authority = new PartyInstances({
     exists: id => server.get(id, "type") === "MpActor",
     getInstance: id => server.get(id, "worldInstance"),
+    prepareInstance: (id, area) => server.set(id, "campaignReferences", {
+      instanceArea: area.id, encounterLevel: area.encounterLevel, references: [0x1a677, 0x8a986],
+    }),
     setInstance: (id, key) => server.set(id, "worldInstance", key),
     disable: id => server.setEnabled(id, false), isInside: () => true,
-  }, [{ id: "fixture", worldOrCell: 0x3c, center: [10000, 10000, 10000], radius: 100 }]);
-  const snapshot = id => ({
-    id, instance: server.get(id, "worldInstance"), inventory: server.get(id, "inventory"),
-    journal: server.get(id, privateJournal),
-  });
+  }, [{ id: "fixture", worldOrCell: 0x3c, center: [10000, 10000, 10000], radius: 100, encounterLevel: 5 }]);
+  const snapshot = id => {
+    const allocations = server.get(id, "private.boyhouse.referenceAllocations") ?? null;
+    return {
+      id, instance: server.get(id, "worldInstance"), inventory: server.get(id, "inventory"),
+      journal: server.get(id, privateJournal), allocations,
+      copies: Object.entries(allocations?.copies ?? {}).map(([original, shortId]) => {
+        const copy = 0xff000000 + parseInt(shortId, 16);
+        return { original, copy, instance: server.get(copy, "worldInstance"), inventory: server.get(copy, "inventory") };
+      }),
+    };
+  };
   if (mode === "--write") {
     for (const [index, id] of ids.entries()) {
       server.createActor(id, [10000, 10000, 10000], 0, 0x3c, 1000 + index);
@@ -58,7 +68,12 @@ function worker(mode, state) {
     assert.equal(server.get(stranger, "questJournal").quests[questKey].stage, 10);
     assert.notEqual(server.get(owner, "worldInstance"), server.get(guest, "worldInstance"));
     assert.deepEqual(ids.map(id => server.get(id, privateJournal)), expected.map(form => form.journal));
-    console.log("SQLite server restart restored 32 journals/inventories and recovered private host/guest phases");
+    assert.deepEqual(snapshot(owner), expected[0], "Owner references and loot survive recovery unchanged");
+    const recovered = snapshot(guest);
+    assert.equal(recovered.copies.length, 2, "Guest recovery prepares a personal destination before admission");
+    assert.ok(recovered.copies.every(copy => copy.instance === recovered.instance));
+    assert.ok(recovered.copies.every(copy => !expected[0].copies.some(host => host.copy === copy.copy)));
+    console.log("SQLite restart restored 32 journals/inventories, preserved allocated loot, and prepared personal guest recovery");
     process.exit(0);
   }
 }

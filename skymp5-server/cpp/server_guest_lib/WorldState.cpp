@@ -470,8 +470,9 @@ void WorldState::CommitCampaignReferences(
       const auto original =
         CampaignReferenceBinding::SavedOriginal(*this, saved);
       const auto id = saved.formDesc.ToFormId(espmFiles);
-      if (nextForms.contains(id) ||
-          saved.worldInstance != owner.GetWorldInstance())
+      const auto prefix =
+        "campaign:" + std::to_string(owner.GetFormId()) + ":";
+      if (nextForms.contains(id) || !saved.worldInstance.starts_with(prefix))
         throw std::runtime_error("Campaign copy allocation conflict");
       const auto base = saved.baseDesc.ToFormId(espmFiles);
       const auto baseRecord = GetEspm().GetBrowser().LookupById(base);

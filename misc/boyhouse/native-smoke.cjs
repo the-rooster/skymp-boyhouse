@@ -19,10 +19,16 @@ for (const id of ids) server.createActor(id, [10000, 10000, 10000], 0, 0x3c);
 const authority = new PartyInstances({
   exists: id => server.get(id, "type") === "MpActor",
   getInstance: id => server.get(id, "worldInstance"),
+  prepareInstance: (id, area) => server.set(id, "campaignReferences", {
+    instanceArea: area.id, encounterLevel: area.encounterLevel,
+    // Include known authored references to exercise preparation on entry and
+    // revocation even though these bot players are in an empty test location.
+    references: [0x1a677, 0x8a986],
+  }),
   setInstance: (id, key) => server.set(id, "worldInstance", key),
   disable: id => server.setEnabled(id, false),
   isInside: () => true,
-}, [{ id: "fixture", worldOrCell: 0x3c, center: [10000, 10000, 10000], radius: 100 }]);
+}, [{ id: "fixture", worldOrCell: 0x3c, center: [10000, 10000, 10000], radius: 100, encounterLevel: 5 }]);
 const [owner, guest, stranger] = ids;
 const quest = 0x4e50d, key = "4e50d:Skyrim.esm";
 const progress = id => server.get(id, "questJournal");
@@ -91,6 +97,10 @@ feed.poll();
 assert.equal(packets[1].packet.journal.campaignOwner, guest);
 assert.deepEqual(packets[1].packet.journal.quests, guestPersonal);
 assert.notEqual(server.get(owner, "worldInstance"), server.get(guest, "worldInstance"));
+const guestAllocations = server.get(guest, "private.boyhouse.referenceAllocations");
+assert.notEqual(guestAllocations.copies["1a677:Skyrim.esm"], allocations.copies["1a677:Skyrim.esm"]);
+const guestNpc = 0xff000000 + parseInt(guestAllocations.copies["1a677:Skyrim.esm"], 16);
+assert.equal(server.get(guestNpc, "worldInstance"), server.get(guest, "worldInstance"));
 assert.throws(() => server.set(owner, "worldInstance", 42));
 console.log("Native server + party + private allocation + journal/feed + original MQ102/DA04 fragments passed (not quest playthroughs)");
 process.exit(0);

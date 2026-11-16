@@ -6,17 +6,19 @@ function fixture() {
   const scopes = new Map([[1, ""], [2, ""], [3, ""]]);
   const outside = new Set();
   const disabled = new Set();
+  const preparations = [];
   let time = 0;
   const adapter = {
     exists: id => scopes.has(id),
     getInstance: id => scopes.get(id),
+    prepareInstance: (id, area) => preparations.push({ id, area: area.id, previous: scopes.get(id) }),
     setInstance: (id, key) => scopes.set(id, key),
     disable: id => disabled.add(id),
     isInside: id => !outside.has(id),
   };
-  const areas = [{ id: "town", worldOrCell: 60, center: [0, 0, 0], radius: 50 }];
+  const areas = [{ id: "town", worldOrCell: 60, center: [0, 0, 0], radius: 50, encounterLevel: 5 }];
   const authority = new PartyInstances(adapter, areas, () => time);
-  return { authority, scopes, outside, disabled, adapter, areas, advance: ms => time += ms };
+  return { authority, scopes, outside, disabled, adapter, areas, preparations, advance: ms => time += ms };
 }
 
 test("a matching history never substitutes for party membership", () => {
@@ -124,4 +126,126 @@ test("snapshot mutation does not change party state", () => {
   snapshot.members.length = 0; snapshot.visit.owner = 3;
   assert.equal(a.snapshot(1).members.length, 2);
   assert.equal(a.snapshot(1).visit.owner, 1);
+});
+
+test("destination is prepared before admission, including guest revocation", () => {
+  const f = fixture(), a = f.authority;
+  f.adapter.setInstance = (id, key) => {
+    if (key) assert.equal(f.preparations.at(-1).id, Number(key.split(":")[1]));
+    f.scopes.set(id, key);
+  };
+  a.invite(1, 2); a.accept(2, 1);
+  a.enter(1, 1, "town"); a.enter(2, 1, "town"); a.kick(1, 2);
+  assert.deepEqual(f.preparations, [
+    { id: 1, area: "town", previous: "" },
+    { id: 1, area: "town", previous: "campaign:1:town" },
+    { id: 2, area: "town", previous: "campaign:1:town" },
+  ]);
+  assert.equal(f.scopes.get(2), "campaign:2:town");
+});
+
+test("failed voluntary preparation leaves the previous visit active", () => {
+  const f = fixture(), a = f.authority;
+  a.invite(1, 2); a.accept(2, 1);
+  a.enter(1, 1, "town"); a.enter(2, 2, "town");
+  f.adapter.prepareInstance = () => { throw Error("incomplete destination"); };
+  assert.throws(() => a.enter(2, 1, "town"), /incomplete destination/);
+  assert.equal(f.scopes.get(2), "campaign:2:town");
+  assert.equal(a.snapshot(2).visit.owner, 2);
+  assert.equal(f.disabled.size, 0);
+});
+
+test("failed preparation during revocation or recovery quarantines the guest", () => {
+  for (const recovering of [false, true]) {
+    const f = fixture(), a = f.authority;
+    a.invite(1, 2); a.accept(2, 1);
+    a.enter(1, 1, "town"); a.enter(2, 1, "town");
+    f.adapter.prepareInstance = () => { throw Error("incomplete destination"); };
+    if (recovering) {
+      const restarted = new PartyInstances(f.adapter, f.areas);
+      assert.throws(() => restarted.recover(2), /incomplete destination/);
+      assert.equal(restarted.snapshot(2).visit, null);
+    } else {
+      a.kick(1, 2);
+      assert.equal(a.snapshot(2).visit, null);
+    }
+    assert.ok(f.disabled.has(2));
+  }
+});
+
+test("a partially applied native transition is quarantined and has no visit", () => {
+  const f = fixture(), a = f.authority;
+  f.adapter.setInstance = (id, key) => { f.scopes.set(id, key); throw Error("subscription failure"); };
+  assert.throws(() => a.enter(1, 1, "town"), /subscription failure/);
+  assert.equal(f.scopes.get(1), "campaign:1:town");
+  assert.ok(f.disabled.has(1));
+  assert.equal(a.snapshot(1).visit, null);
+});
+
+test("leaving the area restores guests even while party membership remains", () => {
+  const f = fixture(), a = f.authority;
+  a.invite(1, 2); a.accept(2, 1);
+  a.enter(1, 1, "town"); a.enter(2, 1, "town");
+  f.outside.add(1);
+  assert.deepEqual(a.reconcile(), [1, 2]);
+  assert.equal(f.scopes.get(1), "");
+  assert.equal(f.scopes.get(2), "campaign:2:town");
+  assert.ok(a.sameParty(1, 2));
+  f.outside.add(2);
+  assert.deepEqual(a.reconcile(), [2]);
+  assert.equal(f.scopes.get(2), "");
+  assert.deepEqual(a.reconcile(), []);
+});
+
+test("an owner becoming a guest cannot leave visitors in the abandoned phase", () => {
+  const f = fixture(), a = f.authority;
+  a.invite(1, 2); a.accept(2, 1); a.invite(1, 3); a.accept(3, 1);
+  a.enter(1, 1, "town"); a.enter(2, 1, "town"); a.enter(3, 3, "town");
+  a.enter(1, 3, "town");
+  assert.equal(f.scopes.get(1), "campaign:3:town");
+  assert.equal(f.scopes.get(2), "campaign:2:town");
+  assert.equal(a.snapshot(2).visit.owner, 2);
+});
+
+test("recovery outside the saved boundary returns to shared space without allocation", () => {
+  const f = fixture();
+  f.scopes.set(2, "campaign:1:town"); f.outside.add(2);
+  f.authority.recover(2);
+  assert.equal(f.scopes.get(2), "");
+  assert.equal(f.authority.snapshot(2).visit, null);
+  assert.deepEqual(f.preparations, []);
+});
+
+test("area limits and trusted encounter levels are validated at startup", () => {
+  const f = fixture();
+  for (const fields of [{ encounterLevel: undefined }, { encounterLevel: 0 },
+    { encounterLevel: 1.5 }, { encounterLevel: 65536 }, { radius: 65537 },
+    { worldOrCell: 0 }, { worldOrCell: 0xff000000 }, { center: [60000000, 0, 0] }]) {
+    assert.throws(() => new PartyInstances(f.adapter, [{ ...f.areas[0], ...fields }]), /boundary/);
+  }
+  assert.throws(() => new PartyInstances({ ...f.adapter, prepareInstance: undefined }, f.areas), /preparation/);
+});
+
+test("a missing or unexpectedly moved host cannot strand authorized visitors", () => {
+  for (const missing of [false, true]) {
+    const f = fixture(), a = f.authority;
+    a.invite(1, 2); a.accept(2, 1);
+    a.enter(1, 1, "town"); a.enter(2, 1, "town");
+    if (missing) f.scopes.delete(1);
+    else f.scopes.set(1, "");
+    a.reconcile();
+    assert.equal(a.snapshot(1).visit, null);
+    assert.equal(f.scopes.get(2), "campaign:2:town");
+  }
+});
+
+test("invalid saved owner identities are quarantined, not normalized", () => {
+  for (const owner of ["0", "01", "4294967296", "99999999999999999999999"]) {
+    const f = fixture();
+    f.authority.enter(1, 1, "town");
+    f.scopes.set(1, `campaign:${owner}:town`);
+    assert.throws(() => f.authority.recover(1), /administrator recovery/);
+    assert.equal(f.authority.snapshot(1).visit, null);
+    assert.ok(f.disabled.has(1));
+  }
 });

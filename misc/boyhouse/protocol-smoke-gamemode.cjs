@@ -51,6 +51,18 @@ async function login(profileId) {
   await command(guest.bot, { action: "accept", leader: owner.actor });
   await command(guest.bot, { action: "enter", owner: owner.actor, area: "fixture" });
   assert.equal(scope(guest), scope(owner));
+  const ownerLocation = server.get(owner.actor, "locationalData");
+  server.set(owner.actor, "locationalData", {
+    ...ownerLocation, pos: [ownerLocation.pos[0] + 1024, ownerLocation.pos[1], ownerLocation.pos[2]],
+  });
+  await sleep(500);
+  assert.equal(scope(owner), "", "Boundary polling returns departed owners to shared space");
+  assert.equal(scope(guest), `campaign:${guest.actor}:fixture`, "Remaining visitors return to personal history when the host leaves");
+  assert.deepEqual(journal(guest).quests, personal);
+  server.set(owner.actor, "locationalData", ownerLocation);
+  await command(owner.bot, { action: "enter", area: "fixture" });
+  await command(guest.bot, { action: "enter", owner: owner.actor, area: "fixture" });
+  assert.equal(scope(guest), scope(owner), "Host departure from an area does not dissolve the party");
   owner.bot.destroy();
   await sleep(250);
   assert.equal(scope(guest), `campaign:${guest.actor}:fixture`, "Disconnect must revoke the departed owner's guest access");
@@ -60,8 +72,13 @@ async function login(profileId) {
   assert.equal(returning.actor, guest.actor);
   assert.equal(scope(returning), `campaign:${guest.actor}:fixture`);
   assert.deepEqual(journal(returning).quests, personal, "Reconnect preserves personal quest state");
+  const returningUser = returning.bot.getUserId();
+  server.set(returning.actor, "worldInstance", ""); // Deliberately invalidate the native visit.
+  await sleep(500);
+  assert.equal(server.getUserByActor(returning.actor), 65535, "Quarantine detaches native actor authority");
+  assert.equal(server.isConnected(returningUser), false, "Quarantine closes the connection");
   // Existing console output is routed to native logs; stdout here stays visible.
-  require("node:fs").writeSync(1, "Full server protocol smoke passed: login, forged sender/quest writes, party sharing, kick, disconnect, journal reconnect\n");
+  require("node:fs").writeSync(1, "Full server protocol smoke passed: login, forged sender/quest writes, prepared party entry, kick, boundary departure, reconnect, quarantine\n");
   process.exit(0);
 })().catch(error => {
   require("node:fs").writeSync(2, `${error.stack}\n`);

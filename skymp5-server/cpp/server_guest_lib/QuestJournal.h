@@ -29,6 +29,9 @@ public:
   static void EditInventory(MpActor& actor, MpObjectReference& target,
                             const std::function<void(Inventory&)>& edit);
   static nlohmann::json ScriptState(MpActor& actor);
+  // Trusted allocation/recovery must read this character's own history even
+  // while the character is visiting somebody else's campaign.
+  static nlohmann::json PersonalScriptState(MpActor& actor);
   static void SetScriptState(MpActor& actor, const nlohmann::json& state);
   static bool ReferenceInitialized(MpActor& actor, uint32_t original);
   static void MarkReferenceInitialized(MpActor& actor, uint32_t original);

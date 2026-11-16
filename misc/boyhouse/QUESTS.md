@@ -132,7 +132,27 @@ their own private phase. Alternatively supply `area: { worldOrCell, center:
 [x, y, z], radius }` instead of `references`; the plugin spatial index discovers
 winning placed records inside that sphere without loading shared references.
 The caller must supply the authoritative encounter level. This is not a client
-command and is not yet wired into automatic party entry.
+command.
+
+Supplying `instanceArea: "area_id"` prepares that owner's destination without
+changing their current phase. This is also valid while they are in shared space
+or visiting another campaign: allocation reads their personal saved globals,
+never the host's. The destination key is derived from the owner ID; callers
+cannot supply an arbitrary other owner's phase. Existing copies in a different
+area are still refused until cross-area migration exists.
+
+Party entry, revocation and pre-spawn recovery now prepare the configured area
+before changing native visibility. Each configured area requires a trusted
+integer `encounterLevel` from 1 through 65,535; existing deployments must add this
+field before starting this version. Preparation failure during voluntary entry
+leaves the prior visit intact. Failure during revocation/recovery, or after a
+native transition begins, disables the character, removes its visit/party
+membership, detaches native actor authority and closes its connection. A host
+leaving an area or visiting another campaign returns remaining guests to their
+own prepared versions. A 250 ms reconciliation loop handles boundary departures
+and missing hosts; recovery outside a saved boundary returns to shared space.
+First entry still uses the explicit instance command. Automatic entry and
+client acknowledgement require the projection protocol below.
 
 The factory creates unique/story NPCs, disabled references and placed item stacks,
 which the ordinary shared loader may skip. It selects template chains, inventory,
@@ -152,7 +172,7 @@ participate in that transaction. Notifications still precede asynchronous disk
 commit; see [the storage contract](STORAGE.md).
 
 This does not yet project original-to-copy replacement into Skyrim or make a
-location playable. Automatic entry/recovery integration, cross-area migration,
+location playable. Automatic entry, client transition acknowledgement, cross-area migration,
 enable-parent change propagation, scale/ownership/lock overlays, NPC auto-calculated
 stats, respawns and durable lifecycle delivery remain unfinished. The factory
 currently copies the relevant world indexes during a batch; this needs measurement
@@ -238,7 +258,7 @@ The [dependency analyzer](DEPENDENCIES.md) discovers shared work across the full
 | --- | --- |
 | Original quest execution | Extend the implemented scoped fragment runner with startup/stop events, alias filling and alias scripts, nested quest lifecycle transitions, repeatable stages, and the remaining condition/native semantics. The existing global VM must not become an alternate campaign-effect path. |
 | VM persistence | Shared arrays, variables, globals and alias bindings now persist; add alias lifecycle, timers, latent continuations, content hashes and content migrations. Restart during a stage/reward must neither lose nor duplicate effects. |
-| World overlays | Connect the reference factory to automatic area entry and client projection; extend isolated death/enable state, inventories, globals, factions, locations, doors, and encounters with their full mutation/event semantics. Filtering alone hides shared references. |
+| World overlays | Explicit entry/recovery prepares private references; add automatic area entry and client projection, then extend isolated death/enable state, inventories, globals, factions, locations, doors, and encounters with their full mutation/event semantics. Filtering alone hides shared references. |
 | Dialogue and story | Implement topic/response selection, conditions, aliases, scenes, packages, story-manager events, radiants, followers, and quest item/reward behavior. Every mutating effect must carry campaign context. |
 | Client engine | Port/audit Skyrim Platform for installed runtime 1.7.104; reset/rebind local world state when changing phases; integrate journal/objective markers without rerunning client fragments; acknowledge transitions. See [the native runtime audit](CLIENT_RUNTIME.md). Current native build is not proven compatible with that runtime. |
 | In-game quest coverage | For every quest and relevant branch, exercise solo and guest play, divergent histories, late joins, party removal, disconnects and restart mid-scene/mid-reward on actual Skyrim clients. Individual quests are integration tests; the completion target is the full five-master campaign. |
