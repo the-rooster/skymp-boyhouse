@@ -25,11 +25,77 @@ std::string Lower(std::string value)
   return value;
 }
 
+class CampaignGlobalObject final : public EspmGameObject
+{
+public:
+  CampaignGlobalObject(const espm::LookupResult& record, uint32_t owner)
+    : EspmGameObject(record)
+    , ownerId(owner)
+  {
+    if (!record.rec || record.rec->GetType() != "GLOB" || !owner)
+      throw std::invalid_argument("Expected a campaign global");
+    identity = "campaign:" + std::to_string(owner) +
+      ":global:" + std::to_string(record.ToGlobalId(record.rec->GetId()));
+  }
+  uint32_t OwnerId() const { return ownerId; }
+  const char* GetStringID() override { return identity.c_str(); }
+  bool EqualsByValue(const IGameObject& value) const override
+  {
+    const auto* other = dynamic_cast<const CampaignGlobalObject*>(&value);
+    return other && other->ownerId == ownerId &&
+      other->record.rec == record.rec;
+  }
+
+private:
+  uint32_t ownerId;
+  std::string identity;
+};
+
+float GlobalDefault(const espm::LookupResult& record, WorldState& world)
+{
+  std::optional<float> value;
+  espm::RecordHeaderAccess::IterateFields(
+    record.rec,
+    [&](const char* tag, uint32_t size, const char* data) {
+      if (std::memcmp(tag, "FLTV", 4))
+        return;
+      if (value || size != sizeof(float))
+        throw std::runtime_error("Malformed global value");
+      float number;
+      std::memcpy(&number, data, sizeof(number));
+      if (!std::isfinite(number))
+        throw std::runtime_error("Nonfinite global default");
+      value = number;
+    },
+    world.GetEspmCache());
+  if (!value)
+    throw std::runtime_error("Missing global default");
+  return *value;
+}
+
+class CampaignGlobalCondition final : public ConditionFunction
+{
+public:
+  explicit CampaignGlobalCondition(std::function<float(uint32_t)> read)
+    : read(std::move(read))
+  {
+  }
+  const char* GetName() const override { return "GetGlobalValue"; }
+  uint16_t GetFunctionIndex() const override { return 74; }
+  float Execute(MpActor&, uint32_t id, uint32_t,
+                const ConditionEvaluatorContext&) override
+  {
+    return read(id);
+  }
+
+private:
+  std::function<float(uint32_t)> read;
+};
+
 class Variables : public IVariablesHolder
 {
 public:
-  using Resolve =
-    std::function<std::shared_ptr<CampaignQuestObject>(uint32_t)>;
+  using Resolve = std::function<std::shared_ptr<IGameObject>(uint32_t)>;
   Variables(espm::QuestScript script_, espm::LookupResult record_, Json saved_,
             Resolve resolve_, QuestVmState& heap_)
     : script(std::move(script_))
@@ -187,7 +253,8 @@ std::vector<LogEntry> ReadLogs(const espm::LookupResult& record,
         if ((ctda.operatorFlag & 0x1e) ||
             static_cast<int>(ctda.GetOperator()) > 5 ||
             (ctda.functionIndex != 56 && ctda.functionIndex != 58 &&
-             ctda.functionIndex != 59 && ctda.functionIndex != 543) ||
+             ctda.functionIndex != 59 && ctda.functionIndex != 543 &&
+             ctda.functionIndex != 74) ||
             (ctda.runOnType != espm::CTDA::RunOnTypeFlags::Subject &&
              !(ctda.runOnType == espm::CTDA::RunOnTypeFlags::Reference &&
                record.ToGlobalId(ctda.reference) == 0x14)))
@@ -273,17 +340,24 @@ bool QuestScriptRuntime::ExecuteStage(
       std::shared_ptr<StackData>(new StackData{ StackIdHolder(vm) });
     policy->SetDefaultActor(stack->stackIdHolder.GetStackId(), &actor);
     const auto owner = QuestJournal::Owner(actor).GetFormId();
-    std::map<uint32_t, std::shared_ptr<CampaignQuestObject>> objects;
+    std::map<uint32_t, std::shared_ptr<IGameObject>> objects;
     std::map<std::string, std::shared_ptr<Variables>> variables;
-    std::function<std::shared_ptr<CampaignQuestObject>(uint32_t)> resolve;
+    std::function<std::shared_ptr<IGameObject>(uint32_t)> resolve;
     QuestVmState state(
       QuestJournal::ScriptState(actor),
       [&](IGameObject* value) -> Json {
-        auto* quest = dynamic_cast<CampaignQuestObject*>(value);
-        if (!quest || quest->OwnerId() != owner)
+        const EspmGameObject* form = nullptr;
+        if (auto* quest = dynamic_cast<CampaignQuestObject*>(value)) {
+          if (quest->OwnerId() == owner)
+            form = quest;
+        } else if (auto* global = dynamic_cast<CampaignGlobalObject*>(value)) {
+          if (global->OwnerId() == owner)
+            form = global;
+        }
+        if (!form)
           throw std::runtime_error("Unsupported saved campaign object");
         return FormDesc::FromFormId(
-                 quest->record.ToGlobalId(quest->record.rec->GetId()),
+                 form->record.ToGlobalId(form->record.rec->GetId()),
                  world.espmFiles)
           .ToString();
       },
@@ -293,10 +367,16 @@ bool QuestScriptRuntime::ExecuteStage(
                           .get());
       });
 
-    resolve = [&](uint32_t id) {
+    resolve = [&](uint32_t id) -> std::shared_ptr<IGameObject> {
       if (objects.count(id))
         return objects.at(id);
       const auto rec = world.GetEspm().GetBrowser().LookupById(id);
+      if (rec.rec && rec.rec->GetType() == "GLOB") {
+        auto global = std::make_shared<CampaignGlobalObject>(rec, owner);
+        objects[id] = global;
+        return global;
+      }
+
       if (!rec.rec || rec.rec->GetType() != "QUST")
         throw std::runtime_error(
           "World reference properties require a campaign overlay adapter");
@@ -327,6 +407,69 @@ bool QuestScriptRuntime::ExecuteStage(
       vm.AddObject(object, bindings);
       return object;
     };
+
+    auto globalObject = [&](const VarValue& self) -> CampaignGlobalObject& {
+      if (self.GetType() != VarValue::kType_Object)
+        throw std::invalid_argument("Expected campaign global self");
+      auto* value =
+        dynamic_cast<CampaignGlobalObject*>(static_cast<IGameObject*>(self));
+      if (!value || value->OwnerId() != owner)
+        throw std::runtime_error("Global belongs to another campaign");
+      return *value;
+    };
+    auto globalKey = [&](const CampaignGlobalObject& value) {
+      return FormDesc::FromFormId(
+               value.record.ToGlobalId(value.record.rec->GetId()),
+               world.espmFiles)
+        .ToString();
+    };
+    auto readGlobal = [&](const CampaignGlobalObject& value) {
+      const auto saved = state.GetGlobal(globalKey(value));
+      return saved ? *saved : GlobalDefault(value.record, world);
+    };
+    for (const auto* method :
+         { "GetValue", "GetValueInt", "SetValue", "SetValueInt", "Mod" }) {
+      const std::string name(method);
+      vm.RegisterFunction(
+        "GlobalVariable", name, FunctionType::Method,
+        [&, name](VarValue self, std::vector<VarValue> args) -> VarValue {
+          const auto& value = globalObject(self);
+          if (name == "GetValue" || name == "GetValueInt") {
+            if (!args.empty())
+              throw std::invalid_argument("Global getter takes no arguments");
+            const auto number = double(readGlobal(value));
+            if (name == "GetValue")
+              return VarValue(number);
+            if (number < INT32_MIN || number > INT32_MAX)
+              throw std::runtime_error("Global integer conversion overflow");
+            return VarValue(static_cast<int32_t>(number));
+          }
+          if (args.size() != 1 ||
+              (args[0].GetType() != VarValue::kType_Integer &&
+               args[0].GetType() != VarValue::kType_Float) ||
+              (name == "SetValueInt" &&
+               args[0].GetType() != VarValue::kType_Integer))
+            throw std::invalid_argument(
+              "Global setter needs one numeric value");
+          auto number = static_cast<double>(args[0]);
+          if (name == "Mod")
+            number += readGlobal(value);
+          state.SetGlobal(globalKey(value), number);
+          return name == "Mod"
+            ? VarValue(double(*state.GetGlobal(globalKey(value))))
+            : VarValue::None();
+        });
+    }
+    auto conditionFunctions =
+      ConditionFunctionFactory::CreateConditionFunctions();
+    conditionFunctions.RegisterConditionFunction(
+      std::make_shared<CampaignGlobalCondition>([&](uint32_t id) {
+        const auto value =
+          std::dynamic_pointer_cast<CampaignGlobalObject>(resolve(id));
+        if (!value)
+          throw std::runtime_error("Condition expected a campaign global");
+        return readGlobal(*value);
+      }));
     size_t depth = 0;
     std::function<bool(uint32_t, uint16_t)> execute;
     for (const auto* name : { "SetStage", "SetCurrentStageID" }) {
@@ -372,9 +515,9 @@ bool QuestScriptRuntime::ExecuteStage(
                                  { "op", "setStage" },
                                  { "index", targetStage } }))
         return false;
-      auto object = resolve(targetId);
-      const auto conditionFunctions =
-        ConditionFunctionFactory::CreateConditionFunctions();
+      auto object =
+        std::dynamic_pointer_cast<CampaignQuestObject>(resolve(targetId));
+
       std::set<uint32_t> seen;
       for (const auto& fragment : data.fragments) {
         if (fragment.stage != targetStage)

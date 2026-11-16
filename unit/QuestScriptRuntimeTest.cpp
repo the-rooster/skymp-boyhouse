@@ -5,6 +5,7 @@
 #include "script_objects/CampaignQuestObject.h"
 #include "script_storages/BsaArchiveScriptStorage.h"
 #include <fstream>
+#include <limits>
 
 extern espm::Loader& GetEspmLoader();
 
@@ -61,13 +62,13 @@ struct Fixture
                                "[\"4e50d:Skyrim.esm\"]", false, false);
     return actor;
   }
-  bool Run(MpActor& actor, uint16_t stage = 10)
+  bool Run(MpActor& actor, uint16_t stage = 10, uint32_t questId = kQuest)
   {
     const std::vector<PexScript::Lazy> scripts = {
       { fixture->source, [pex = fixture] { return pex; } },
       { quest->source, [pex = quest] { return pex; } }
     };
-    return QuestScriptRuntime::ExecuteStage(actor, kQuest, stage, metadata,
+    return QuestScriptRuntime::ExecuteStage(actor, questId, stage, metadata,
                                             scripts);
   }
   FunctionInfo& Fragment()
@@ -646,4 +647,214 @@ TEST_CASE(
           nlohmann::json::array({ 100 }));
   REQUIRE(QuestJournal::Get(actor, kQuest)["stages"] ==
           nlohmann::json::array({ 10 }));
+}
+
+namespace {
+constexpr uint32_t kGlobal = 0x17424; // DA16ErandurCheckpoint, default 0.
+const char* kGlobalKey = "17424:Skyrim.esm";
+void GlobalFixture(Fixture& f)
+{
+  espm::QuestScriptValue value;
+  value.type = 1;
+  value.formId = kGlobal;
+  f.metadata.scripts[0].properties.push_back({ "Checkpoint", 1, value });
+  f.fixture->objectTable[0].variables.push_back(
+    { "::Checkpoint_var", "GlobalVariable", 0, VarValue::None() });
+  f.Fragment().code.instructions = {
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("GetValueInt"), Id("::Checkpoint_var"), Id("counter"),
+        VarValue(0) } },
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("Mod"), Id("::Checkpoint_var"), Id("temp"), VarValue(1),
+        VarValue(5.0) } },
+    { FunctionCode::kOp_Return, { VarValue::None() } }
+  };
+}
+}
+
+TEST_CASE(
+  "Global variables persist per campaign and guest writes use the owner",
+  "[Quest][QuestVM][QuestGlobals]")
+{
+  Fixture f;
+  GlobalFixture(f);
+  auto& host = f.Add(0xff000001);
+  auto& guest = f.Add(0xff000002);
+  const auto instance =
+    "campaign:" + std::to_string(host.GetFormId()) + ":fixture";
+  host.SetWorldInstance(instance);
+  guest.SetWorldInstance(instance);
+  REQUIRE(f.Run(guest));
+  REQUIRE(QuestJournal::ScriptState(host)["globals"][kGlobalKey] == 5.0);
+  REQUIRE(
+    QuestJournal::ScriptState(host)["scripts"][kStateKey]["values"]
+                                   ["boyhousefixture/counter"]["value"] == 0);
+  REQUIRE(f.Run(guest, 20));
+  REQUIRE(QuestJournal::ScriptState(host)["globals"][kGlobalKey] == 10.0);
+  guest.SetWorldInstance("");
+  REQUIRE(QuestJournal::ScriptState(guest).empty());
+  REQUIRE(f.Run(guest));
+  REQUIRE(QuestJournal::ScriptState(guest)["globals"][kGlobalKey] == 5.0);
+  REQUIRE(QuestJournal::ScriptState(host)["globals"][kGlobalKey] == 10.0);
+  REQUIRE_FALSE(QuestJournal::Snapshot(host).contains("globals"));
+}
+
+TEST_CASE(
+  "Character reload keeps campaign globals and global object properties",
+  "[Quest][QuestVM][QuestGlobals]")
+{
+  Fixture f;
+  GlobalFixture(f);
+  auto& actor = f.Add(0xff000001);
+  REQUIRE(f.Run(actor));
+  Fixture restarted;
+  restarted.fixture = f.fixture;
+  restarted.metadata = f.metadata;
+  auto& restored = restarted.Add(actor.GetFormId());
+  const auto dump = MpChangeForm::ToJson(actor.GetChangeForm()).dump();
+  simdjson::dom::parser parser;
+  auto parsed = parser.parse(dump).value();
+  restored.ApplyChangeForm(MpChangeForm::JsonToChangeForm(parsed));
+  REQUIRE(restarted.Run(restored, 20));
+  REQUIRE(QuestJournal::ScriptState(restored)["globals"][kGlobalKey] == 10.0);
+  REQUIRE(QuestJournal::ScriptState(
+            restored)["scripts"][kStateKey]["values"]
+                     ["boyhousefixture/counter"]["value"] == 5);
+}
+
+TEST_CASE("Quest reset leaves campaign global effects intact",
+          "[Quest][QuestVM][QuestGlobals]")
+{
+  Fixture f;
+  GlobalFixture(f);
+  auto& actor = f.Add(0xff000001);
+  REQUIRE(f.Run(actor));
+  REQUIRE(
+    QuestJournal::Apply(actor, { { "quest", kQuest }, { "op", "reset" } }));
+  REQUIRE(QuestJournal::ScriptState(actor)["scripts"].empty());
+  REQUIRE(QuestJournal::ScriptState(actor)["globals"][kGlobalKey] == 5.0);
+  REQUIRE(f.Run(actor));
+  REQUIRE(QuestJournal::ScriptState(actor)["globals"][kGlobalKey] == 10.0);
+}
+
+TEST_CASE("Failed fragments cannot change saved campaign globals",
+          "[Quest][QuestVM][QuestGlobals]")
+{
+  Fixture f;
+  GlobalFixture(f);
+  auto& actor = f.Add(0xff000001);
+  REQUIRE(f.Run(actor));
+  const auto before =
+    actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty);
+  auto& code = f.Fragment().code.instructions;
+  code.insert(code.end() - 1,
+              { FunctionCode::kOp_CallMethod,
+                { VarValue("UnsupportedNative"), Id("self"), Id("temp"),
+                  VarValue(0) } });
+  REQUIRE_THROWS(f.Run(actor, 20));
+  REQUIRE(actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
+          before);
+}
+
+TEST_CASE("Global value natives preserve float and integer calling semantics",
+          "[Quest][QuestVM][QuestGlobals]")
+{
+  Fixture f;
+  GlobalFixture(f);
+  auto& actor = f.Add(0xff000001);
+  auto& code = f.Fragment().code.instructions;
+  code = { { FunctionCode::kOp_CallMethod,
+             { VarValue("SetValue"), Id("::Checkpoint_var"), Id("temp"),
+               VarValue(1), VarValue(12.75) } },
+           { FunctionCode::kOp_CallMethod,
+             { VarValue("GetValueInt"), Id("::Checkpoint_var"), Id("counter"),
+               VarValue(0) } },
+           { FunctionCode::kOp_Return, { VarValue::None() } } };
+  REQUIRE(f.Run(actor));
+  REQUIRE(QuestJournal::ScriptState(actor)["globals"][kGlobalKey] == 12.75);
+  REQUIRE(QuestJournal::ScriptState(
+            actor)["scripts"][kStateKey]["values"]["boyhousefixture/counter"]
+                  ["value"] == 12);
+  code[0].args[0] = VarValue("SetValueInt");
+  code[0].args[4] = VarValue(-4);
+  code[1].args[0] = VarValue("GetValue");
+  REQUIRE(f.Run(actor, 20));
+  REQUIRE(QuestJournal::ScriptState(actor)["globals"][kGlobalKey] == -4.0);
+}
+
+TEST_CASE("Invalid global values roll back the entire stage",
+          "[Quest][QuestVM][QuestGlobals]")
+{
+  Fixture f;
+  GlobalFixture(f);
+  auto& actor = f.Add(0xff000001);
+  auto& code = f.Fragment().code.instructions;
+  SECTION("wrong argument type")
+  {
+    code[1].args[4] = VarValue(true);
+  }
+  SECTION("nonfinite value")
+  {
+    code[1].args[4] = VarValue(std::numeric_limits<double>::infinity());
+  }
+  SECTION("float32 overflow")
+  {
+    code[1].args[4] = VarValue(1e100);
+  }
+  REQUIRE_THROWS(f.Run(actor));
+  REQUIRE(QuestJournal::Get(actor, kQuest)["stages"].empty());
+  REQUIRE(QuestJournal::ScriptState(actor).empty());
+}
+
+TEST_CASE(
+  "Original global conditions see writes from earlier nested fragments",
+  "[Quest][QuestVM][QuestGlobals]")
+{
+  Fixture f;
+  GlobalFixture(f);
+  constexpr uint32_t quest = 0x4a37b; // DA08: stage 60 branches on 216a9.
+  f.metadata.scripts[0].properties[0].value.formId = 0x216a9;
+  f.metadata.fragments = { { 10, 0, 1, "BoyhouseFixture", "Parent" },
+                           { 60, 0, 1, "BoyhouseFixture", "One" },
+                           { 60, 1, 1, "BoyhouseFixture", "Zero" } };
+  auto& functions = f.fixture->objectTable[0].states[0].functions;
+  const auto branch = GENERATE(0, 1);
+  auto parent = f.Fragment();
+  parent.code.instructions = {
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("SetValue"), Id("::Checkpoint_var"), Id("temp"), VarValue(1),
+        VarValue(double(branch)) } },
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("SetStage"), Id("self"), Id("temp"), VarValue(1),
+        VarValue(60) } },
+    { FunctionCode::kOp_Return, { VarValue::None() } }
+  };
+  auto one = f.Fragment(), zero = f.Fragment();
+  one.code.instructions = {
+    { FunctionCode::kOp_Assign, { Id("counter"), VarValue(11) } },
+    { FunctionCode::kOp_Return, { VarValue::None() } }
+  };
+  zero.code.instructions = {
+    { FunctionCode::kOp_Assign, { Id("counter"), VarValue(22) } },
+    { FunctionCode::kOp_Return, { VarValue::None() } }
+  };
+  functions.push_back({ "Parent", parent });
+  functions.push_back({ "One", one });
+  functions.push_back({ "Zero", zero });
+  auto& owner = f.Add(0xff000001);
+  auto& guest = f.Add(0xff000002);
+  owner.SetPropertyValueDump(QuestJournal::kEnabled, "[\"4a37b:Skyrim.esm\"]",
+                             false, false);
+  const auto instance =
+    "campaign:" + std::to_string(owner.GetFormId()) + ":fixture";
+  owner.SetWorldInstance(instance);
+  guest.SetWorldInstance(instance);
+  REQUIRE(f.Run(guest, 10, quest));
+  const auto state = QuestJournal::ScriptState(owner);
+  REQUIRE(state["globals"]["216a9:Skyrim.esm"] == branch);
+  REQUIRE(state["scripts"]["4a37b:Skyrim.esm/boyhousefixture"]["values"]
+               ["boyhousefixture/counter"]["value"] == (branch ? 11 : 22));
+  REQUIRE(QuestJournal::Get(owner, quest)["completed"] == true);
+  guest.SetWorldInstance("");
+  REQUIRE(QuestJournal::ScriptState(guest).empty());
 }

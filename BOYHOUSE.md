@@ -15,7 +15,16 @@ Experimental work on personal campaigns in a shared Skyrim world. Upstream basel
 
 Persistent personal/host journals, 23 Papyrus Quest state methods, four quest condition predicates, expired-context guards, and a read-only client journal feed are implemented. The new `questExecuteStage` trusted server API loads original PEX fragments into a campaign-scoped VM and commits journal changes and script variables together. It remains gated by experimental per-quest adapters; no complete vanilla quest is enabled. `mp "bh journal"` displays the diagnostic projection. See [the implementation contract and remaining gates](misc/boyhouse/QUESTS.md).
 
-## Fragment milestone verification on 2026-11-16 UTC
+## Current server verification on 2026-11-16 UTC
+
+- Linux Release server/addon build and full native suite passed: **311 cases, 519,173 assertions**. Focused quest suite: **48 cases, 41,984 assertions**.
+- Nested stage calls across quests now execute in the same campaign transaction and share the instruction budget. Failures roll back all affected stages and variables.
+- Shared Papyrus arrays retain allocation identity across scripts, character reloads and quest resets; null/equal-valued allocations stay distinct. Save migration and collection are tested.
+- Campaign globals persist independently, use the host's values during guest play, and participate in rollback. Original DA08 stage-60 conditions are fixtures for observing earlier writes in a nested stage; the quest itself is not playable.
+- The 25 JavaScript/TypeScript tests and four catalog tests passed during this change set. Native addon and full server protocol smoke checks passed against the final binary.
+- **Zero quests have certified multiplayer playthroughs.** Alias filling, lifecycle/events, NPC/world effects, dialogue/scenes, latent VM persistence and native client projection remain required for the full five-master campaign.
+
+## Earlier fragment milestone verification on 2026-11-16 UTC
 
 - Linux Release server/addon build passed. Full native suite: **290 cases, 518,484 assertions passed**.
 - Tests parse every QUST VMAD in the five owned masters and every PEX in the owned vanilla script archive.
@@ -86,8 +95,8 @@ Once a compatible fork client is installed, open the Skyrim console and use `mp 
 ## Next acceptance gates
 
 1. Confirm native Windows support for the installed runtime and pass a three-client in-game disappear/reappear, party entry, kick, reconnect, and delayed-packet test.
-2. Add transition epochs, reference identity `(campaign, original form)`, per-campaign vanilla overlays, and world-state transactions around the implemented personal journal; test a tiny scripted fixture before expanding content.
-3. Implement quest VM/API, dialogue/scene/alias and story-manager coverage; validate a first real quest with solo, party, divergent-history, restart, and late-join runs.
+2. Add transition epochs, reference identity `(campaign, original form)`, per-campaign vanilla overlays, and world-state transactions around the implemented personal journal; exercise these systems across the five-master quest catalog.
+3. Implement quest VM/API, dialogue/scene/alias and story-manager coverage; validate every scoped quest and branch with solo, party, divergent-history, restart and late-join runs.
 4. Expand the evidence-backed quest matrix to all scoped content, then pass 16/32-client load and recovery tests. Never convert an inventory entry to supported without recorded evidence.
 
 ## Windows runtime compatibility investigation

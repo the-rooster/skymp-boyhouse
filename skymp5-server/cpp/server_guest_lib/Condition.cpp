@@ -73,6 +73,10 @@ std::string ConvertRunOnTypeToString(espm::CTDA::RunOnTypeFlags runOnType)
 
 std::string ConvertFunctionIndexToString(uint16_t functionIndex)
 {
+  // GetGlobalValue is registered by the campaign executor with its private
+  // in-transaction globals, never with process-wide mutable values.
+  if (functionIndex == 74)
+    return "GetGlobalValue";
   static auto g_conditionFunctionMap =
     ConditionFunctionFactory::CreateConditionFunctions();
 

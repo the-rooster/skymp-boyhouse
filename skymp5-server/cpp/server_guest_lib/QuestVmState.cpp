@@ -77,17 +77,23 @@ QuestVmState::Json QuestVmState::Normalize(Json saved)
   if (!saved.is_object())
     throw std::runtime_error("Invalid saved quest VM");
   if (saved.contains("schemaVersion")) {
-    if (saved.at("schemaVersion") != 2)
+    if (saved.at("schemaVersion") == 2) {
+      saved["schemaVersion"] = 3;
+      if (!saved.contains("globals"))
+        saved["globals"] = Json::object();
+    } else if (saved.at("schemaVersion") != 3) {
       throw std::runtime_error("Unsupported saved quest VM version");
+    }
     Validate(saved);
     return saved;
   }
   // Legacy scripts stored inline, non-shared arrays. Assign a distinct heap
   // identity to each of those allocations; never deduplicate by array
   // contents.
-  Json result = { { "schemaVersion", 2 },
+  Json result = { { "schemaVersion", 3 },
                   { "scripts", saved },
-                  { "arrays", Json::object() } };
+                  { "arrays", Json::object() },
+                  { "globals", Json::object() } };
   uint64_t id = 1;
   for (auto& [key, script] : result["scripts"].items()) {
     if (!script.is_object() || script.at("schemaVersion") != 1 ||
@@ -117,9 +123,18 @@ QuestVmState::Json QuestVmState::Normalize(Json saved)
 
 void QuestVmState::Validate(const Json& saved)
 {
-  if (saved.at("schemaVersion") != 2 || !saved.at("scripts").is_object() ||
+  if (saved.at("schemaVersion") != 3 || !saved.at("scripts").is_object() ||
       !saved.at("arrays").is_object() || saved["arrays"].size() > 100000)
     throw std::runtime_error("Invalid saved quest heap");
+  {
+    if (!saved.at("globals").is_object())
+      throw std::runtime_error("Invalid saved campaign globals");
+    for (const auto& [key, value] : saved["globals"].items())
+      if (key.empty() || key.size() > 300 || !value.is_number() ||
+          !std::isfinite(value.get<double>()) ||
+          !std::isfinite(static_cast<float>(value.get<double>())))
+        throw std::runtime_error("Invalid saved campaign global");
+  }
   const auto& arrays = saved["arrays"];
   for (const auto& [id, node] : arrays.items()) {
     HeapId(id);
@@ -309,6 +324,22 @@ void QuestVmState::ResetQuest(Json& saved, const std::string& prefix)
     else
       ++it;
   Collect(saved);
-  if (scripts.empty())
+  if (scripts.empty() && saved.value("globals", Json::object()).empty())
     saved = Json::object();
+}
+
+std::optional<float> QuestVmState::GetGlobal(const std::string& key) const
+{
+  if (!state.contains("globals") || !state["globals"].contains(key))
+    return std::nullopt;
+  return state["globals"][key].get<float>();
+}
+
+void QuestVmState::SetGlobal(const std::string& key, double value)
+{
+  if (key.empty() || key.size() > 300 || !std::isfinite(value) ||
+      !std::isfinite(static_cast<float>(value)))
+    throw std::runtime_error("Invalid campaign global value");
+  // FLTV and the Skyrim native API use 32-bit float storage.
+  state["globals"][key] = static_cast<float>(value);
 }

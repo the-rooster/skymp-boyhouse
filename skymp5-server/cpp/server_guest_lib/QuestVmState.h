@@ -3,6 +3,7 @@
 #include <functional>
 #include <map>
 #include <nlohmann/json.hpp>
+#include <optional>
 
 // One heap per campaign transaction. Persist array identities across scripts;
 // resolving game objects stays with the campaign-specific runtime.
@@ -19,6 +20,8 @@ public:
   Json Encode(const VarValue& value);
   VarValue Decode(const Json& value);
   Json Save();
+  std::optional<float> GetGlobal(const std::string& key) const;
+  void SetGlobal(const std::string& key, double value);
   static void ResetQuest(Json& saved, const std::string& prefix);
 
 private:

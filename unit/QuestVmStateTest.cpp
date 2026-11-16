@@ -111,7 +111,7 @@ TEST_CASE("Legacy inline quest arrays migrate without merging equal values",
   REQUIRE(a.pArray != b.pArray);
   REQUIRE(static_cast<int>((*a.pArray)[0]) == 7);
   REQUIRE(static_cast<int>(migrated.Decode(values["count"])) == 4);
-  REQUIRE(migrated.Save()["schemaVersion"] == 2);
+  REQUIRE(migrated.Save()["schemaVersion"] == 3);
   REQUIRE(old["quest/a"]["values"]["a"].contains("value"));
 }
 
@@ -148,7 +148,7 @@ TEST_CASE("Invalid quest heap input cannot become valid-looking progress",
   auto good = heap.Save();
   SECTION("unknown version")
   {
-    good["schemaVersion"] = 3;
+    good["schemaVersion"] = 99;
   }
   SECTION("dangling pointer")
   {
@@ -211,4 +211,49 @@ TEST_CASE("Papyrus array equality recognizes identities and typed None",
     REQUIRE_FALSE(VarValue::None() == a);
     REQUIRE_FALSE(a == null);
   }
+}
+
+TEST_CASE("Campaign globals survive heap collection and reject corrupt saves",
+          "[Quest][QuestVM][QuestHeap]")
+{
+  auto heap = Heap();
+  heap.SetGlobal("17424:Skyrim.esm", 0.1);
+  auto saved = heap.Save();
+  REQUIRE(saved["globals"]["17424:Skyrim.esm"] == double(float(0.1)));
+  QuestVmState::ResetQuest(saved, "17424:Skyrim.esm/");
+  auto restored = Heap(saved);
+  REQUIRE(restored.GetGlobal("17424:Skyrim.esm") == float(0.1));
+  REQUIRE_FALSE(restored.GetGlobal("unknown"));
+  SECTION("wrong container type")
+  {
+    saved["globals"] = Json::array();
+  }
+  SECTION("non-number")
+  {
+    saved["globals"]["17424:Skyrim.esm"] = "1";
+  }
+  SECTION("float32 overflow")
+  {
+    saved["globals"]["17424:Skyrim.esm"] = 1e100;
+  }
+  REQUIRE_THROWS(Heap(saved));
+}
+
+TEST_CASE("Heap schema two migrates without changing shared allocations",
+          "[Quest][QuestVM][QuestHeap]")
+{
+  auto heap = Heap();
+  auto array = Integers(7);
+  heap.SetScript(
+    "quest/a",
+    Script({ { "a", heap.Encode(array) }, { "b", heap.Encode(array) } }));
+  auto old = heap.Save();
+  old["schemaVersion"] = 2;
+  old.erase("globals");
+  auto migrated = Heap(old);
+  const auto values = migrated.GetScript("quest/a")["values"];
+  REQUIRE(migrated.Decode(values["a"]).pArray ==
+          migrated.Decode(values["b"]).pArray);
+  REQUIRE(migrated.Save()["schemaVersion"] == 3);
+  REQUIRE(migrated.Save()["globals"].empty());
 }
