@@ -221,6 +221,60 @@ both game INIs and the platform INI were restored byte-for-byte, and all persona
 saves remained unchanged. The server deployment and quest certification status
 are unchanged.
 
+## Reversible reference suppression
+
+`ReferenceSuppressionService` now owns a bounded ledger of the original disabled
+and activation-blocked flags, with independent owner claims for each reference.
+`WorldCleanerService` uses it instead of deleting vanilla actors, killing the
+problematic chickens, changing alpha, or moving actors in dialogue. Discovery
+runs only while connected in multiplayer. Authored corpses remain visible;
+protected server views are excluded. Disconnect releases claims, and a new save
+discards the previous world's ledger instead of applying restoration to the new
+save's matching FormIDs.
+
+Native disable/enable calls are serialized per reference. Completion must be
+observed before settling; a release/reacquire cannot race an earlier operation.
+Overlapping owners retain suppression until the last claim leaves. Stored state
+survives plugin reloads, while generation checks prevent old completions from
+changing a new world's ledger. Dialogue delays hiding without moving or killing
+the speaker. Failed native operations remain unsettled and report an error.
+Updates reconcile at most 16 references by default (hard maximum 64); the ledger
+accepts at most 16,384 references and does not silently discard restoration data.
+
+All 108 Node regressions and the client build pass. The 25 suppression tests cover
+native failure/no-op behavior, overlapping ownership, canceled transitions,
+reloads, new saves, and the actual cleaner/service integration. A background
+native fixture on runtime 1.7.104.0 also passed against an authored ambient
+creature: it observed disabled/blocked state, retention by a second owner,
+restoration of both original flags, and restoration after cancellation during
+an in-flight native hide. The actor remained alive and undeleted, with unchanged
+health. This is a flag-restoration check: native AI/enable behavior changed its
+position, so it does not prove restoration of transforms or AI state.
+
+Build that isolated diagnostic plugin with:
+
+```sh
+node misc/boyhouse/build-reference-smoke.cjs <output.js>
+```
+
+It embeds the actual ledger and native adapter, loads a generated world, records
+the result, and exits. Installation and INI/save backups are separate. The fixture
+uses the SP3 global API and reacquires native wrappers within each callback;
+retaining an Actor wrapper across frames is invalid in this runtime. Initial
+fixture attempts exposed those two harness errors before the final passing run.
+Evidence is in ignored `artifacts/reference-suppression-runtime/`; the passing
+backup manifest is under
+`artifacts/game-backups/20261116T180417Z/reference-suppression/`. After testing,
+Skyrim exited, the test plugin and recorded generated saves were removed, all
+three INIs were restored byte-for-byte, and the four personal save hashes were
+unchanged.
+
+This removes one destructive cleanup path. Other original-reference mutations
+in `FormView`, `ModelApplyUtils`, and `ObjectReferenceEx`, restoration of AI and
+transforms, dynamic FormID reuse, long-distance reference eviction, and the
+client projection coordinator still need work. The staging server's projection
+flag remains off; no additional quests are certified by this test.
+
 ## Remaining acceptance
 
 The packet-epoch transport adds a separate `MpClientPlugin` codec version 2.1.0.

@@ -12,6 +12,7 @@ import { EnforceLimitationsService } from './services/services/enforceLimitation
 import { LoadGameService } from './services/services/loadGameService';
 import { SendInputsService } from './services/services/sendInputsService';
 import { PlayerLoadoutService } from './services/services/playerLoadoutService';
+import { ReferenceSuppressionService } from './services/services/referenceSuppressionService';
 import { SinglePlayerService } from './services/services/singlePlayerService';
 import { SpApiInteractor } from './services/spApiInteractor';
 import { TimeService } from "./services/services/timeService";
@@ -73,6 +74,7 @@ const main = () => {
       new BlockPapyrusEventsService(sp, controller),
       new LoadGameService(sp, controller),
       new SinglePlayerService(sp, controller),
+      new ReferenceSuppressionService(sp, controller),
       new EnforceLimitationsService(sp, controller),
       new SendInputsService(sp, controller),
       // Observe the final appearance before restoring the preview's loadout.
