@@ -1,5 +1,6 @@
-import { Equipment, applyPlayerEquipment, isPlayerEquipmentSettled, isBadMenuShown } from '../../sync/equipment';
-import { Inventory, applyInventory, isInventorySettled } from '../../sync/inventory';
+import { Equipment, isPlayerEquipmentSettled, isBadMenuShown } from '../../sync/equipment';
+import { Inventory, isInventorySettled, getEquipmentInventory } from '../../sync/inventory';
+import { requirePlayerLoadoutApi, checkPlayerLoadoutStatus, checkPlayerLoadoutDrain, playerLoadoutTarget, playerLoadoutTargetKey } from '../../sync/nativePlayerLoadout';
 import { Appearance, getAppearance } from '../../sync/appearance';
 import { CreateActorMessage } from '../messages/createActorMessage';
 import { ClientListener, CombinedController, Sp } from './clientListener';
@@ -29,8 +30,12 @@ interface LoadoutState {
   previewPrepared?: boolean;
   inventorySamples?: number;
   equipmentSamples?: number;
-  lastInventoryAttempt?: number;
-  lastEquipmentAttempt?: number;
+  nativeEpoch?: string;
+  nativeDrainEpoch?: string;
+  nativeRevision?: number;
+  nativeTargetKey?: string;
+  nativeCycleComplete?: boolean;
+  awaitingBaseline?: boolean;
 }
 
 const stateKey = 'playerLoadoutState';
@@ -55,15 +60,25 @@ export class PlayerLoadoutService extends ClientListener {
     const stored = sp.storage[stateKey] as LoadoutState | undefined;
     this.state = stored?.version === 1 ? stored : this.emptyState(0);
     sp.storage[stateKey] = this.state;
+    if (stored?.version === 1) {
+      // PlayerSpawnService does not retain a live spawn across a JS reload.
+      // Keep the character draft, but retire native work and old readiness
+      // until the replacement connection supplies its own self baseline.
+      this.cancelNative();
+      ++this.state.generation;
+      this.state.ready = false;
+      this.state.awaitingBaseline = true;
+    }
 
     controller.on('update', () => this.onUpdate());
     controller.on('tick', () => {
-      if (!this.projectionBlocked && this.state.deadline && Date.now() >= this.state.deadline)
+      if (!this.projectionBlocked && !this.state.awaitingBaseline && this.state.deadline && Date.now() >= this.state.deadline)
         this.fail('Character creation ' + this.state.creation + ' timed out');
     });
     controller.on('menuOpen', event => {
       if (event.name === 'RaceSex Menu' && this.state.actorId !== undefined &&
           ['pending', 'preparing', 'opening', 'editing'].includes(this.state.creation)) {
+        this.cancelNative();
         this.state.creation = 'editing'; this.state.deadline = undefined; this.state.closedSamples = 0;
       }
     });
@@ -74,6 +89,8 @@ export class PlayerLoadoutService extends ClientListener {
       }
     });
     controller.emitter.on('campaignProjectionPending', () => {
+      this.cancelNative();
+      this.state.awaitingBaseline = true;
       this.projectionBlocked = true;
       if (this.state.deadline && this.state.pausedAt === undefined) this.state.pausedAt = Date.now();
     });
@@ -92,6 +109,7 @@ export class PlayerLoadoutService extends ClientListener {
     controller.emitter.on('setRaceMenuOpenMessage', ({ message }) => {
       if (message.open) {
         if (this.state.creation === 'idle') {
+          this.cancelNative();
           this.state.creation = 'pending'; this.state.previewPrepared = false;
           this.state.creationCompletionPending = false; this.state.deadline = undefined;
         }
@@ -119,7 +137,6 @@ export class PlayerLoadoutService extends ClientListener {
         if (!this.state.ready || this.state.creation !== 'idle' || this.state.equipmentPending) {
           this.state.equipmentPending = true;
           this.state.equipmentSamples = 0;
-          this.state.lastEquipmentAttempt = undefined;
           this.state.inventoryPending = !!this.state.inventory;
         }
       }
@@ -134,7 +151,7 @@ export class PlayerLoadoutService extends ClientListener {
     const editing = ['opening', 'editing', 'capturing', 'confirming'].includes(previous.creation);
     if (editing && (previous.actorId === undefined || previous.actorId !== message.refrId))
       throw Error('Cannot replace the player during character creation');
-    const preserve = this.projectionBlocked && previous.actorId !== undefined && previous.actorId === message.refrId &&
+    const preserve = (this.projectionBlocked || previous.awaitingBaseline) && previous.actorId !== undefined && previous.actorId === message.refrId &&
       previous.creation !== 'failed' && (previous.creation !== 'idle' || previous.creationCompletionPending);
     this.reset();
     this.state.actorIdx = message.idx;
@@ -175,7 +192,8 @@ export class PlayerLoadoutService extends ClientListener {
 
   cancelSpawn(generation: number): void {
     if (generation !== this.state.generation) return;
-    if (this.projectionBlocked && this.state.creation !== 'failed' &&
+    this.cancelNative();
+    if ((this.projectionBlocked || this.state.awaitingBaseline) && this.state.creation !== 'failed' &&
         (this.state.creation !== 'idle' || this.state.creationCompletionPending)) {
       // Keep the draft across a same-player baseline replacement. A new
       // generation/actor index is assigned only after validating that baseline.
@@ -190,7 +208,7 @@ export class PlayerLoadoutService extends ClientListener {
   }
 
   get blocksGameplayInput(): boolean {
-    return (this.state.actorId !== undefined || this.state.actorIdx !== undefined) && (!this.state.ready || this.state.creation !== 'idle' ||
+    return (this.state.actorId !== undefined || this.state.actorIdx !== undefined) && (!this.state.ready || this.state.awaitingBaseline || this.state.creation !== 'idle' ||
       !!this.state.creationCompletionPending || !this.state.initialApplied);
   }
 
@@ -205,7 +223,7 @@ export class PlayerLoadoutService extends ClientListener {
   get projectionReadiness(): { ready: boolean; error?: string } {
     // Human editing happens after the world transfer or survives a same-actor
     // replacement. It must not hold the projection acknowledgement deadline.
-    return { ready: this.state.ready && !this.state.error &&
+    return { ready: this.state.ready && !this.state.awaitingBaseline && !this.state.error &&
       (this.state.creation !== 'idle' || (!this.state.inventoryPending && !this.state.equipmentPending)),
       error: this.state.error };
   }
@@ -221,7 +239,7 @@ export class PlayerLoadoutService extends ClientListener {
   }
 
   get blocksEquipmentInput(): boolean {
-    return !this.state.ready || this.state.creation !== 'idle' ||
+    return !this.state.ready || !!this.state.awaitingBaseline || this.state.creation !== 'idle' ||
       this.state.equipmentPending || this.state.inventoryPending ||
       this.sp.Ui.isMenuOpen('RaceSex Menu');
   }
@@ -231,7 +249,6 @@ export class PlayerLoadoutService extends ClientListener {
     this.state.inventoryPending = true;
     this.state.inventorySamples = 0;
     this.state.equipmentSamples = 0;
-    this.state.lastInventoryAttempt = undefined;
     this.sp.storage.pcInv = inventory;
   }
 
@@ -245,19 +262,33 @@ export class PlayerLoadoutService extends ClientListener {
   private applyUpdate(): void {
     const state = this.state;
     if (!state.ready || state.actorIdx === undefined || state.creation === 'failed') return;
+    requirePlayerLoadoutApi(this.sp);
     const player = this.sp.Game.getPlayer();
     if (!player) return;
     const shown = this.sp.Ui.isMenuOpen('RaceSex Menu');
+    const previewSafe = () => {
+      if (getEquipmentInventory(player).entries.some(item => item.count > 0 &&
+          (item.worn || item.wornLeft) && item.removeEnchantmentOnUnequip))
+        throw Error('Character preview cannot safely remove a worn temporary enchantment');
+    };
 
     if (shown) {
+      this.cancelNative();
       if (state.creation === 'confirming' || state.creationCompletionPending)
         throw Error('Character menu reopened before creation completed');
-      if (!state.previewPrepared) { player.unequipAll(); state.previewPrepared = true; }
+      if (!state.previewPrepared) {
+        if (!this.previewDrained()) return;
+        previewSafe();
+        player.unequipAll(); state.previewPrepared = true;
+      }
       state.creation = 'editing'; state.deadline = undefined; state.closedSamples = 0;
       return;
     }
     if (state.creation === 'pending') {
       if (this.projectionBlocked) return;
+      this.cancelNative();
+      if (!this.previewDrained()) return;
+      previewSafe();
       player.unequipAll();
       state.previewPrepared = true;
       state.creation = 'preparing';
@@ -286,48 +317,69 @@ export class PlayerLoadoutService extends ClientListener {
     }
     if (state.creation === 'confirming') return;
     if (!state.initialApplied && !state.deadline) this.setDeadline();
-    if (isBadMenuShown() || this.sp.Utility.isInMenuMode() || !player.is3DLoaded()) return;
+    if (state.awaitingBaseline || isBadMenuShown() || this.sp.Utility.isInMenuMode() || !player.is3DLoaded()) return;
 
     const inventoryDue = state.inventory &&
       (state.inventoryPending || state.equipmentPending || Date.now() - state.lastInventoryApply > 5000);
-    if (!state.equipmentPending && !inventoryDue) { this.finishCreation(); return; }
+    if (!state.equipmentPending && !inventoryDue) {
+      if (state.nativeEpoch) checkPlayerLoadoutStatus(requirePlayerLoadoutApi(this.sp).getPlayerLoadoutStatus(state.nativeEpoch),
+        state.nativeEpoch, state.nativeRevision!);
+      this.finishCreation(); return;
+    }
     let blocked = false;
     this.controller.emitter.emit('queryBlockSetInventoryEvent', { block: () => blocked = true });
     if (blocked || this.state !== state || state.creation !== 'idle') return;
 
-    if (state.inventory && inventoryDue) {
-      const inventory = state.inventory;
-      const settled = isInventorySettled(player, inventory);
-      if (this.state !== state || state.inventory !== inventory) return;
-      if (!settled) {
-        state.inventoryPending = true; state.inventorySamples = 0; state.equipmentSamples = 0;
-        // Do not retry additive inventory work every frame, or inspect it as
-        // completed in the same update that dispatched the native calls.
-        if (state.lastInventoryAttempt === undefined || Date.now() - state.lastInventoryAttempt >= 250) {
-          state.lastInventoryAttempt = Date.now();
-          applyInventory(player, inventory, false, true);
-        }
+    const inventory = state.inventory;
+    const equipment = state.equipmentPending ? state.equipment : undefined;
+    const api = requirePlayerLoadoutApi(this.sp);
+    const target = playerLoadoutTarget(inventory, equipment);
+    const key = playerLoadoutTargetKey(target);
+    const current = () => this.state === state && state.inventory === inventory &&
+      (!equipment || state.equipment === equipment) && state.creation === 'idle' && !state.awaitingBaseline;
+    // A changed pending target supersedes the request directly: polling first
+    // could schedule another operation for an already obsolete snapshot.
+    let status = state.nativeEpoch && (state.nativeTargetKey === key || state.nativeCycleComplete) ? checkPlayerLoadoutStatus(
+      api.getPlayerLoadoutStatus(state.nativeEpoch), state.nativeEpoch, state.nativeRevision!) : undefined;
+    if (!current()) return;
+    // Periodic observations do not reapply normal-play equipment or continuously
+    // enforce an old target. A completed cycle starts again only after drift.
+    if (state.nativeCycleComplete && !state.inventoryPending && !state.equipmentPending) {
+      if (!inventory || isInventorySettled(player, inventory)) {
+        if (current()) state.lastInventoryApply = Date.now();
         return;
       }
-      if (state.inventoryPending && (state.inventorySamples = (state.inventorySamples || 0) + 1) < 2) return;
-      state.inventoryPending = false;
-      state.lastInventoryApply = Date.now();
+      if (status?.status !== 'settled') throw Error('Completed native loadout lost its settled status');
+      state.inventoryPending = true;
+      state.nativeTargetKey = undefined;
     }
-    if (state.equipmentPending && state.equipment) {
-      const equipment = state.equipment;
-      const settled = isPlayerEquipmentSettled(player, equipment);
-      if (this.state !== state || state.equipment !== equipment) return;
-      if (!settled) {
-        state.equipmentSamples = 0;
-        if (state.lastEquipmentAttempt === undefined || Date.now() - state.lastEquipmentAttempt >= 250) {
-          state.lastEquipmentAttempt = Date.now();
-          applyPlayerEquipment(player, equipment);
-        }
-        return;
+    if (!state.nativeEpoch || state.nativeTargetKey !== key) {
+      if (!state.nativeEpoch) {
+        const epoch = api.beginPlayerLoadout();
+        if (typeof epoch !== 'string' || !epoch.length) throw Error('Invalid native player loadout epoch');
+        state.nativeEpoch = epoch;
       }
-      if ((state.equipmentSamples = (state.equipmentSamples || 0) + 1) < 2) return;
-      state.equipmentPending = false;
+      state.nativeRevision = (state.nativeRevision || 0) + 1;
+      if (!Number.isSafeInteger(state.nativeRevision)) throw Error('Player loadout revision overflow');
+      state.nativeTargetKey = key; state.nativeCycleComplete = false;
+      state.inventorySamples = 0; state.equipmentSamples = 0;
+      const result = api.requestPlayerLoadout(state.nativeEpoch, { ...target, revision: state.nativeRevision });
+      if (!current()) return;
+      checkPlayerLoadoutStatus(result, state.nativeEpoch, state.nativeRevision);
+      return; // Dispatch is never a readback, even for a native exact no-op.
     }
+    if (status?.status !== 'settled' || status.mutationPending) {
+      state.inventorySamples = 0; state.equipmentSamples = 0;
+      return;
+    }
+    const inventoryMatches = !inventory || isInventorySettled(player, inventory);
+    const equipmentMatches = !equipment || isPlayerEquipmentSettled(player, equipment);
+    if (!current()) return;
+    state.inventorySamples = inventoryMatches ? (state.inventorySamples || 0) + 1 : 0;
+    state.equipmentSamples = equipmentMatches ? (state.equipmentSamples || 0) + 1 : 0;
+    if (!inventoryMatches || !equipmentMatches || state.inventorySamples < 2 || state.equipmentSamples < 2) return;
+    state.inventoryPending = false; state.equipmentPending = false;
+    state.nativeCycleComplete = true; state.lastInventoryApply = Date.now();
     this.finishCreation();
   }
 
@@ -342,7 +394,6 @@ export class PlayerLoadoutService extends ClientListener {
     this.state.equipmentPending = !!this.state.equipment;
     this.state.inventoryPending = !!this.state.inventory;
     this.state.equipmentSamples = 0; this.state.inventorySamples = 0;
-    this.state.lastEquipmentAttempt = undefined; this.state.lastInventoryAttempt = undefined;
     this.setDeadline();
   }
 
@@ -362,11 +413,15 @@ export class PlayerLoadoutService extends ClientListener {
   private fail(error: string): void {
     if (this.state.creation === 'failed') return;
     this.state.creation = 'failed'; this.state.error = error; this.state.deadline = undefined;
+    this.cancelNative();
     this.controller.emitter.emit('playerLoadoutFailed', { generation: this.state.generation, error });
   }
 
   private reset(): void {
+    this.cancelNative();
+    const drain = this.state.nativeDrainEpoch;
     this.state = this.emptyState(this.state.generation + 1);
+    this.state.nativeDrainEpoch = drain;
     this.sp.storage[stateKey] = this.state;
     delete this.sp.storage.pcInv;
   }
@@ -374,6 +429,34 @@ export class PlayerLoadoutService extends ClientListener {
   private emptyState(generation: number): LoadoutState {
     return { version: 1, generation, ready: false, creation: 'idle', openAfter: 0,
       inventoryPending: false, equipmentPending: false, lastInventoryApply: 0 };
+  }
+
+  private cancelNative(): void {
+    const epoch = this.state.nativeEpoch;
+    this.state.nativeEpoch = undefined; this.state.nativeRevision = undefined;
+    this.state.nativeTargetKey = undefined; this.state.nativeCycleComplete = false;
+    this.state.inventorySamples = 0; this.state.equipmentSamples = 0;
+    if (epoch) {
+      this.state.nativeDrainEpoch = epoch;
+      requirePlayerLoadoutApi(this.sp).cancelPlayerLoadout(epoch);
+    }
+  }
+
+  private previewDrained(): boolean {
+    const api = requirePlayerLoadoutApi(this.sp);
+    if (!this.state.nativeDrainEpoch) {
+      // Also cover an older native epoch that survived a JS hot reload without
+      // retained client state. Beginning/cancelling an empty epoch makes no
+      // inventory changes and exposes the adapter's global mutation barrier.
+      const epoch = api.beginPlayerLoadout();
+      if (typeof epoch !== 'string' || !epoch.length) throw Error('Invalid native player loadout epoch');
+      this.state.nativeDrainEpoch = epoch;
+      api.cancelPlayerLoadout(epoch);
+    }
+    const epoch = this.state.nativeDrainEpoch;
+    const drained = checkPlayerLoadoutDrain(api.getPlayerLoadoutStatus(epoch), epoch);
+    if (!drained && !this.state.deadline) this.setDeadline();
+    return drained;
   }
 
   private state: LoadoutState;

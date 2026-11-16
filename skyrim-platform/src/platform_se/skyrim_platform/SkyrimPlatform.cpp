@@ -18,6 +18,7 @@
 #include "MagicApi.h"
 #include "MpClientPluginApi.h"
 #include "ObjectReferenceApi.h"
+#include "PlayerLoadoutApi.h"
 #include "Sp3Api.h"
 #include "TextApi.h"
 #include "ThreadPoolWrapper.h"
@@ -30,6 +31,7 @@
 CallNativeApi::NativeCallRequirements g_nativeCallRequirements;
 
 namespace {
+thread_local bool inJsPapyrusUpdate = false;
 bool EndsWith(const std::wstring& value, const std::wstring& ending)
 {
   return ending.size() <= value.size() &&
@@ -329,6 +331,7 @@ private:
     taskQueue.Clear();
     jsPromiseTaskQueue.Clear();
     nativeCallRequirements.jsThrQ->Clear();
+    PlayerLoadoutApi::ResetRuntime();
     settingsByPluginName.clear();
     settingsByPluginNameCache.reset();
   }
@@ -410,6 +413,13 @@ SkyrimPlatform* SkyrimPlatform::GetSingleton()
 
 void SkyrimPlatform::JsTick(Napi::Env env, bool gameFunctionsAvailable)
 {
+  const auto previousUpdateContext = inJsPapyrusUpdate;
+  struct RestoreContext
+  {
+    bool previous;
+    ~RestoreContext() { inJsPapyrusUpdate = previous; }
+  } restore{ previousUpdateContext };
+  inJsPapyrusUpdate = gameFunctionsAvailable;
   if (gameFunctionsAvailable) {
     pImpl->commonExecutionListener->GetJsEngine()->Tick();
   }
@@ -466,6 +476,38 @@ void SkyrimPlatform::PushToWorkerAndWait(
     std::bind(&Impl::RunInIOContext, pImpl, fPtr, stack, logger, vm, ret));
   pImpl->conditionalVariable.wait(
     lock, [] { return SkyrimPlatform::GetSingleton()->pImpl->complete; });
+}
+
+void SkyrimPlatform::RunOnGameThreadAndWait(const std::function<void()>& task)
+{
+  if (!inJsPapyrusUpdate || !g_nativeCallRequirements.vm ||
+      g_nativeCallRequirements.stackId ==
+        std::numeric_limits<StackID>::max() ||
+      pImpl->ioContext.stopped() ||
+      pImpl->ioContext.get_executor().running_in_this_thread()) {
+    throw std::runtime_error(
+      "Game-thread rendezvous requires a JS Papyrus update");
+  }
+  std::mutex mutex;
+  std::condition_variable completed;
+  bool done = false;
+  std::exception_ptr error;
+  asio::post(pImpl->ioContext, [&] {
+    try {
+      task();
+    } catch (...) {
+      error = std::current_exception();
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      done = true;
+    }
+    completed.notify_one();
+  });
+  std::unique_lock<std::mutex> lock(mutex);
+  completed.wait(lock, [&] { return done; });
+  if (error)
+    std::rethrow_exception(error);
 }
 
 void SkyrimPlatform::PrepareWorker()

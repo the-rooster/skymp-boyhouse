@@ -1623,6 +1623,32 @@ export interface ActorAnimationVariables {
 
 export declare function setInventory(formId: number, inventory: Inventory): void;
 
+export interface PlayerLoadoutEquipment {
+  inv: Inventory;
+  leftSpell?: number;
+  rightSpell?: number;
+  voiceSpell?: number;
+  instantSpell?: number;
+}
+export interface PlayerLoadoutRequest {
+  revision: number;
+  inventory?: Inventory;
+  equipment?: PlayerLoadoutEquipment;
+}
+export interface PlayerLoadoutStatus {
+  epoch: string;
+  revision?: number;
+  status: 'idle' | 'queued' | 'working' | 'observing' | 'settled' | 'failed' | 'superseded';
+  error?: string;
+  mutationPending: boolean;
+  uncertain: boolean;
+}
+export declare const playerLoadoutApiVersion: number;
+export declare function beginPlayerLoadout(): string;
+export declare function requestPlayerLoadout(epoch: string, target: PlayerLoadoutRequest): PlayerLoadoutStatus;
+export declare function getPlayerLoadoutStatus(epoch: string): PlayerLoadoutStatus;
+export declare function cancelPlayerLoadout(epoch: string): void;
+
 export declare function castSpellImmediate(actorCasterFormId: number, castingSource: SpellType, formIdSpell: number, formIdTarget: number, aimAngle: number, aimHeading: number, animationVariables: ActorAnimationVariables): void;
 export declare function interruptCast(actorCasterFormId: number, castingSource: SpellType, animationVariables: ActorAnimationVariables): void;
 export declare function getAnimationVariablesFromActor(actorFormId: number): ActorAnimationVariables;

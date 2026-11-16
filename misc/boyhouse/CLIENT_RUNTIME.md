@@ -675,21 +675,18 @@ lengths before accepting values. Truncation and impossible lengths fail instead
 of becoming partial appearance or gameplay state. These checks complement the
 epoch and actor-identity guards; they are not gameplay certification.
 
-Self loadout restoration now observes equality of the represented inventory fields on two
-updates before handling equipment. It equips existing inventory items without
-queuing the older additive equipment-inventory task, then observes worn variants,
-hands and spells on two updates before releasing the creation gate. No-op native
-calls cannot satisfy that check. Retries are spaced at least 250 ms apart; paused
-menus and unloaded actors wait. Ordinary play retains its five-second inventory
-checks without taking the creation input lease. Self inventory and equipment
+Self loadout restoration uses the native epoch/revision API described below.
+The client requires native settlement and two later matching inventory/equipment
+observations before releasing the creation gate. No-op native calls cannot
+satisfy that check. Ordinary play retains its five-second inventory checks
+without taking the creation input lease. Self inventory and equipment
 preserve names, raw float32 health, charge presence and the other represented
 extra-data fields through parsing and every merge. Explicit names compare exactly
 (only absent/empty names normalize to the base form name); absent charge and
 explicit zero charge differ. General remote inventory replication retains its
-older normalization. When selection is required,
-differing variants of one base ID are
-refused before changing gear because `equipItemEx` cannot select a specific item
-instance.
+older normalization. Exact native selection replaces the self path's earlier
+base-ID-only `equipItemEx` calls; ordinary remote equipment still uses its
+existing implementation.
 
 Controlled service tests now cover these observations and failed/no-op native
 calls; **284 JavaScript tests and the client webpack build passed**, including six
@@ -704,6 +701,10 @@ barrier is active. No quest adapters are enabled and **zero quests are certified
 playable**.
 
 ## Represented inventory fidelity and write limits
+
+The reader guarantees below remain in use. The legacy self-write restrictions
+in this section describe the preceding implementation, now superseded by the
+native reconciliation path in the next section.
 
 The native inventory reader now exports the contained soul level (0–5), rather
 than the extra-data record's type number, and includes `removeOnUnequip` for
@@ -743,6 +744,72 @@ reader compiled successfully, and its production field emitters passed
 `artifacts/native-inventory-tests/results.txt`. The new DLL has not been installed
 or accepted in a real Skyrim run; these results do not extend the native creation
 acceptance below.
+
+## Native player loadout reconciliation
+
+Self restoration requires `playerLoadoutApiVersion === 1`. `beginPlayerLoadout`
+creates an epoch; `requestPlayerLoadout` accepts a positive, increasing revision
+and optional inventory/equipment targets. Omitted components are unmanaged.
+An identical revision and canonical target deduplicates; conflicting or stale
+revisions fail. `getPlayerLoadoutStatus` reports queued work, observation,
+settlement or failure. A settled request is terminal: subsequent gameplay does
+not cause the native worker to enforce that old target again.
+
+The portable planner retains matching item instances, validates the complete
+requested transition, and selects one bounded operation at a time. Physical
+operations use a fresh native inventory snapshot and an exact `ExtraDataList`
+binding when available. Raw instance pointers never survive an update. This
+path does not clear the player's inventory. Metadata construction preserves
+explicit zero charge/soul, represented enchantment and poison fields, precise
+health and names within the bridge limit. Existing unknown extras and quest
+ownership stay attached to retained instances; destructive changes requiring
+unsupported metadata fail before dispatch. These are represented-field
+guarantees, not serialization of every native extra-data class.
+
+Dispatch alone never completes an operation. A global pending-effect barrier
+survives cancel, replacement revisions, new epochs and JavaScript reloads.
+Another operation waits for a later native observation of the dispatched
+effect. Unexpected state or an effect timeout quarantines further writes;
+starting a new request cannot erase that uncertainty. Failed save-load attempts
+must not count as a confirmed world replacement. Character preview waits for
+the barrier to drain before unequipping gear. The client separately requires
+two later matching observations before declaring its restoration complete.
+
+Native work uses the active Papyrus update's synchronous game-thread rendezvous.
+Spell reads/calls use ordinary Papyrus builtins in that same update. Equipment
+planning accounts for hand and biped conflicts, two copies for dual wielding,
+and spell removal before conflicting physical equips. Only documented,
+independent hand-spell changes are supported; other selected slots and
+correlated two-handed spell transitions can remain unchanged but cannot yet be
+restored. Shouts are absent from the current equipment protocol. Menus,
+unloaded actors and furniture interactions prevent new mutations; an already
+dispatched effect retains its completion deadline.
+
+The bridge limits are 4,096 inventory/native stack rows, 128 equipped copies,
+1,024 UTF-8 bytes per display name and at most 32,767 items per count mutation.
+These are explicit resource policies, not engine maxima. Ambiguous plain
+remainders, unsupported ammunition metadata operations, protected destructive
+changes and temporary enchantments that would disappear on unequip remain
+limitations. Multiple equips that require an unproven split of one native stack
+are refused; distinct selectable instances can be planned separately. Metadata
+additions whose desired aggregate exceeds 32,767 are also refused until native
+merging/splitting is accepted. Ordinary ineligible samples pause the 30-second
+work budget, while a dispatched effect has a separate five-second wall deadline.
+The allocator handles the different native extra-list layouts;
+its runtime allocation and all new mutation paths still need live Skyrim
+acceptance. Automated planner/client tests cannot establish that acceptance.
+
+The Windows Release native target and client webpack build passed. Portable
+tests exercise the production planner and adapter policies: **26 cases / 8,474
+assertions**. The full Linux verification passed **528 native cases / 382,897
+assertions, 320 JavaScript tests and 43 Python tests**, plus native-addon,
+ordinary/projection protocol and SQLite restart smokes. The owned scan still
+reports **zero certified quests**. Evidence is in ignored
+`artifacts/native-loadout-platform-build.log`,
+`artifacts/native-loadout-tests/results.txt`,
+`artifacts/native-loadout-linux-build.log` and
+`artifacts/native-loadout-verify.log`. This DLL has not been installed or run in
+Skyrim; staging remains on the earlier frozen deployment.
 
 ## Fresh-character native acceptance on 2026-11-16 UTC
 

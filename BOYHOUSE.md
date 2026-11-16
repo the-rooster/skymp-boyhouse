@@ -43,20 +43,22 @@ Persistent personal/host journals, 23 Papyrus Quest state methods, four quest co
   refreshes and waits for an authoritative echo; binary decoding rejects
   truncated values/containers and mismatched constants. Native creation
   completion and settled engine loadout restoration still need acceptance.
-- Self inventory checks now preserve charge presence, precise health and the
-  other exported item fields. Native soul/enchantment metadata exports are
-  corrected. Unsupported legacy restores fail before inventory reset or
-  equipment removal; this may also block unrelated updates when the desired
-  inventory contains an item the writer cannot recreate. Unexported native
-  extras and exact item-instance updates remain incomplete. See
-  [the inventory limits](misc/boyhouse/CLIENT_RUNTIME.md#represented-inventory-fidelity-and-write-limits).
-- Combined automated verification passed on 2026-11-16 UTC: **502 native cases,
-  374,706 assertions; 295 JavaScript tests; 43 Python tests**. The fresh-player
+- Self restoration now uses a versioned native loadout API. It retains matching
+  instances, selects exact native item lists, and observes each operation before
+  starting another. Cancellation and reconnect cannot erase an unresolved
+  effect. Full preflight covers later equipment changes as well as initial
+  inventory changes; temporary-enchantment loss and unsupported destructive
+  changes are refused. The Windows implementation still needs live engine
+  acceptance, and selected spell/shout, metadata and ambiguous plain-stack
+  operations remain incomplete. See
+  [the native loadout limits](misc/boyhouse/CLIENT_RUNTIME.md#native-player-loadout-reconciliation).
+- Combined automated verification passed on 2026-11-16 UTC: **528 native cases,
+  382,897 assertions; 320 JavaScript tests; 43 Python tests**. The fresh-player
   nested `OnLoad` regression and saved-dead-copy integration fixtures pass.
   The full owned scan covered **2,274 quests and 14,026 PEX objects**; native
   addon, full server protocol and projection smokes passed, along with SQLite
   restart recovery of **32 disposable characters**. Evidence is in ignored
-  `artifacts/parallel-runtime-verify-2.log` (terminal exit 0). This is automated
+  `artifacts/native-loadout-verify.log` (terminal exit 0). This is automated
   coverage, not a completed native character-creation flow or a multiplayer
   quest playthrough.
 - The fresh-character Skyrim run opened the creator after projection became

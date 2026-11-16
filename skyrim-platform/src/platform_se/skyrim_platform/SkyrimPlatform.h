@@ -11,6 +11,9 @@ public:
   void AddUpdateTask(const std::function<void(Napi::Env env)>& f);
   void PushAndWait(const std::function<void(Napi::Env env)>& task);
   void Push(const std::function<void(Napi::Env env)>& task);
+  // Internal, synchronous game-thread work from the active JS Papyrus update.
+  // The callback must not call JS or recursively wait on this rendezvous.
+  void RunOnGameThreadAndWait(const std::function<void()>& task);
   void PushToWorkerAndWait(
     RE::BSTSmartPointer<RE::BSScript::IFunction> fPtr,
     const RE::BSTSmartPointer<RE::BSScript::Stack>& stack,

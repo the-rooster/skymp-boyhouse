@@ -2,6 +2,7 @@
 #include "EventManager.h"
 #include "EventsApi.h"
 #include "JsUtils.h"
+#include "PlayerLoadoutApi.h"
 #include "SkyrimPlatform.h"
 #include "TickHandler.h"
 
@@ -72,12 +73,18 @@ void EventHandler::HandleSKSEMessage(SKSE::MessagingInterface::Message* msg)
       SendSimpleEventOnTick("skyrimLoaded");
     } break;
     case SKSE::MessagingInterface::kNewGame:
+      PlayerLoadoutApi::InvalidateWorld();
       SendSimpleEventOnTick("newGame");
       break;
     case SKSE::MessagingInterface::kPreLoadGame:
+      PlayerLoadoutApi::BeginLoad();
       SendSimpleEventOnTick("preLoadGame");
       break;
     case SKSE::MessagingInterface::kPostLoadGame:
+      // SKSE Hooks_SaveLoad passes the bool result as (void*)result, length1;
+      // data is not a pointer to dereference. A failed attempt is not a reset.
+      PlayerLoadoutApi::CompleteLoad(
+        msg->dataLen == 1 && reinterpret_cast<uintptr_t>(msg->data) == 1);
       SendSimpleEventOnTick("postLoadGame");
       break;
     case SKSE::MessagingInterface::kSaveGame:
