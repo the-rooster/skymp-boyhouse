@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "scope": "Audited isolated campaign fragment runner only; all entries are partial implementations, not quest certification",
   "sourceHashes": {
-    "skymp5-server/cpp/server_guest_lib/QuestScriptRuntime.cpp": "abcf704f8cbd2b0b6a140169e405fd2b8772d47b622817f2c04874dc08f75f8a",
+    "skymp5-server/cpp/server_guest_lib/QuestScriptRuntime.cpp": "eee222c6e3861075d9c2fd3bafb674ba6e084e886eca3c3310e20a00d897f099",
     "skymp5-server/cpp/server_guest_lib/script_classes/PapyrusQuest.cpp": "85b17221763600d66214b711691e47093e17f3d4e05f7ac10751ee5ba563a823",
     "libespm/src/QuestAliasData.cpp": "4cf16635f74b63707a9f7b46d1003779f354289b29b327137877e996cd18def4",
     "libespm/include/libespm/QuestAliasData.h": "481593ca4c17423f6a2c3cd9d60a9f79d38cd75a6f1c801759e4a342ff38da95",
@@ -52,7 +52,9 @@
     "referencealias.getactorref",
     "referencealias.getactorreference",
     "referencealias.getref",
-    "referencealias.getreference"
+    "referencealias.getreference",
+    "scene.getowningquest",
+    "topicinfo.getowningquest"
   ],
   "conditionSubsets": [
     "56",
@@ -69,7 +71,8 @@
     "Campaign forms are logical owner/form identities, not materialized world overlays; mutable world natives remain absent.",
     "Alias getters support deterministic forced reference/location, unambiguous unique actor, and external-alias targets only. Conditions, runtime fills, creation, propagation, lifecycle, reservations and alias effects remain unsupported.",
     "Alias script variables and resolved bindings persist transactionally in VM schema 4. Getter support does not imply alias lifecycle or quest support.",
-    "Game.GetForm resolves owned static forms; dynamic forms require campaign allocation and are explicitly rejected."
+    "Game.GetForm resolves owned static forms; dynamic forms require campaign allocation and are explicitly rejected.",
+    "Scene/TopicInfo.GetOwningQuest resolve owned metadata into the active campaign; dialogue/scene selection, execution and effects remain unsupported."
   ],
   "conditionNames": {
     "0": "GetWantBlocking",

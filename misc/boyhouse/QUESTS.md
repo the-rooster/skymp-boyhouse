@@ -45,6 +45,8 @@ The bounded metadata parser reads every owned quest alias, including signed crea
 
 Alias bindings, alias-script variables, globals and journal changes commit together. Failure after a binding or script mutation rolls back the whole transaction. Character reload retains bindings; quest reset removes that quest's bindings and script roots while preserving other quests and campaign globals. Live world state and inventory transactions remain future work.
 
+Scene and TopicInfo `GetOwningQuest` now return a quest object in the active campaign. Topic ownership follows its winning DIAL record; scene package-action PNAM fields are distinguished from the parent QUST. The regression invokes objective changes through those returned objects during guest play and checks personal-history isolation and rollback. Dialogue selection, scene actions and their event dispatch are not implemented by these getters.
+
 ### Journal state operations
 
 `mp.get(actorId, "questJournal")` returns:

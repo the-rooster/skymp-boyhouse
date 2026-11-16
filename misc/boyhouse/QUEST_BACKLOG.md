@@ -50,7 +50,6 @@ Generated static analysis. Counts include internal/helper quests and potential d
 | API | Quest records affected |
 | --- | ---: |
 | quest.stop | 877 |
-| topicinfo.getowningquest | 563 |
 | objectreference.additem | 450 |
 | utility.wait | 444 |
 | objectreference.disable | 441 |
@@ -66,7 +65,6 @@ Generated static analysis. Counts include internal/helper quests and potential d
 | objectreference.moveto | 250 |
 | actor.startcombat | 247 |
 | debug.trace | 241 |
-| scene.getowningquest | 231 |
 | actor.kill | 210 |
 | referencealias.forcerefto | 210 |
 | actor.setrelationshiprank | 205 |
@@ -79,6 +77,8 @@ Generated static analysis. Counts include internal/helper quests and potential d
 | form.registerforupdategametime | 186 |
 | actor.setalpha | 164 |
 | cell.isattached | 163 |
+| alias.registerforsingleupdate | 160 |
+| actor.attachashpile | 146 |
 
 ## Most widely referenced missing condition functions
 
@@ -118,7 +118,7 @@ Implement shared capabilities, then rerun this report and the regression suites.
 
 ## Reproducibility
 
-Capability registry SHA-256: 054ca67763db4cbcca1becb3963c0be942c154743340c9cf16ef2b30514ec5c3
+Capability registry SHA-256: 26c6a4a12332e7256c6ea64864d7a681602d0c842eed2d11ebb218a6f8882c64
 
 - Skyrim.esm: e198c3b85e5e48e0c92a6580d8f66e644256b68d812ee32b61735cf9b753df73
 - Update.esm: b298b0f65fa0127fd13c1f5ef6bb30eaf9d21fd19f5e6f8f91f829c9007d3280

@@ -19,6 +19,11 @@ The [catalog analyzer](misc/boyhouse/DEPENDENCIES.md) scans all five owned maste
 
 Persistent personal/host journals, 23 Papyrus Quest state methods, four quest condition predicates, expired-context guards, and a read-only client journal feed are implemented. The new `questExecuteStage` trusted server API loads original PEX fragments into a campaign-scoped VM and commits journal changes and script variables together. It remains gated by experimental per-quest adapters; no complete vanilla quest is enabled. `mp "bh journal"` displays the diagnostic projection. See [the implementation contract and remaining gates](misc/boyhouse/QUESTS.md).
 
+## Dialogue/scene owner lookup verification on 2026-11-16 UTC
+
+- Scene and TopicInfo `GetOwningQuest` resolve to the active campaign, including guest-triggered objective changes. Package-action fields and parent-topic ownership are handled separately. Dialogue/scene execution remains unfinished.
+- Release build, **78 instance/quest cases with 89,450 assertions**, 25 JavaScript/TypeScript tests, 31 Python tests and both server smoke checks passed. The catalog report was regenerated; no quest status changed.
+
 ## Current alias/form verification on 2026-11-16 UTC
 
 - Linux Release server/addon build and full native suite passed: **331 cases, 565,315 assertions**. Combined instance/quest suite: **77 cases, 89,430 assertions**.

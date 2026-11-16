@@ -6,6 +6,7 @@
 #include "WorldState.h"
 #include "condition_functions/ConditionFunctionFactory.h"
 #include "libespm/CTDA.h"
+#include "libespm/GroupHeader.h"
 #include "libespm/QuestAliasData.h"
 #include "libespm/RecordHeaderAccess.h"
 #include "papyrus-vm/Reader.h"
@@ -116,6 +117,60 @@ uint32_t ReferenceBase(const espm::LookupResult& record, WorldState& world)
   if (!base || !*base)
     throw std::runtime_error("Reference has no base object");
   return *base;
+}
+
+// INFO ownership is inherited from its DIAL group. SCEN reuses PNAM for
+// package actions, so only a QUST target is the scene's owning quest.
+uint32_t RecordOwningQuest(espm::LookupResult record, WorldState& world)
+{
+  auto& browser = world.GetEspm().GetBrowser();
+  const bool scene = record.rec->GetType() == "SCEN";
+  std::optional<espm::LookupResult> parentTopic;
+  if (!scene) {
+    if (record.rec->GetType() != "INFO")
+      throw std::invalid_argument("Expected scene or topic info");
+    std::optional<uint32_t> topic;
+    for (const auto* group : browser.GetParentGroupsEnsured(record.rec)) {
+      uint32_t raw;
+      if (group->GetParentDIAL(raw)) {
+        if (topic)
+          throw std::runtime_error("Ambiguous topic info parent");
+        topic = record.ToGlobalId(raw);
+      }
+    }
+    if (!topic || !*topic)
+      throw std::runtime_error("Topic info has no parent topic");
+    parentTopic.emplace(browser.LookupById(*topic));
+    if (!parentTopic->rec || parentTopic->rec->IsDeleted() ||
+        parentTopic->rec->GetType() != "DIAL")
+      throw std::runtime_error("Invalid topic info parent");
+  }
+  const auto& source = parentTopic ? *parentTopic : record;
+  std::optional<uint32_t> quest;
+  espm::RecordHeaderAccess::IterateFields(
+    source.rec,
+    [&](const char* tag, uint32_t size, const char* bytes) {
+      if (std::memcmp(tag, scene ? "PNAM" : "QNAM", 4))
+        return;
+      if (size != 4)
+        throw std::runtime_error("Malformed owning quest field");
+      uint32_t raw;
+      std::memcpy(&raw, bytes, 4);
+      if (!raw)
+        return;
+      const auto id = source.ToGlobalId(raw);
+      const auto target = browser.LookupById(id);
+      if (scene && target.rec && target.rec->GetType() == "PACK")
+        return;
+      if (!target.rec || target.rec->IsDeleted() ||
+          target.rec->GetType() != "QUST")
+        throw std::runtime_error("Invalid owning quest target");
+      if (quest)
+        throw std::runtime_error("Ambiguous owning quest target");
+      quest = id;
+    },
+    world.GetEspmCache());
+  return quest.value_or(0);
 }
 
 class Variables : public IVariablesHolder
@@ -605,6 +660,23 @@ bool QuestScriptRuntime::ExecuteStage(
                         FunctionType::Method, baseObject);
     vm.RegisterFunction("Actor", "GetActorBase", FunctionType::Method,
                         baseObject);
+
+    for (const auto& [cls, type] :
+         std::vector<std::pair<std::string, std::string>>{
+           { "Scene", "SCEN" }, { "TopicInfo", "INFO" } }) {
+      vm.RegisterFunction(
+        cls, "GetOwningQuest", FunctionType::Method,
+        [&, type](VarValue self, std::vector<VarValue> args) {
+          const auto record =
+            world.GetEspm().GetBrowser().LookupById(formId(self));
+          if (!args.empty() || !record.rec ||
+              record.rec->GetType().ToString() != type)
+            throw std::invalid_argument(
+              "Invalid GetOwningQuest receiver or arguments");
+          const auto quest = RecordOwningQuest(record, world);
+          return quest ? VarValue(resolve(quest).get()) : VarValue::None();
+        });
+    }
 
     vm.RegisterFunction(
       "Quest", "GetAlias", FunctionType::Method,

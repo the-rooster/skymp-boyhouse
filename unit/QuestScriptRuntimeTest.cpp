@@ -877,7 +877,9 @@ void BaseScripts(Fixture& f)
          { "Alias", "" },
          { "ReferenceAlias", "Alias" },
          { "LocationAlias", "Alias" },
-         { "Location", "Form" } }) {
+         { "Location", "Form" },
+         { "Scene", "Form" },
+         { "TopicInfo", "Form" } }) {
     auto script = std::make_shared<PexScript>();
     script->source = name;
     Object object;
@@ -1302,6 +1304,66 @@ TEST_CASE("Invalid saved targets cannot empty or retype required aliases",
                             ? "Required alias has an empty saved binding"
                             : "Alias target type mismatch"));
     REQUIRE(actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
+            before);
+  }
+}
+
+TEST_CASE("Scene and dialogue ownership resolves the host campaign quest",
+          "[Quest][QuestRecordOwners]")
+{
+  for (const auto& [id, type] : std::vector<std::pair<uint32_t, std::string>>{
+         { 0xd50f3, "Scene" }, { 0x98d4a, "TopicInfo" } }) {
+    Fixture f;
+    auto& host = f.Add(0xff000001);
+    auto& guest = f.Add(0xff000002);
+    BaseScripts(f);
+    espm::QuestScriptValue value;
+    value.type = 1;
+    value.formId = id;
+    value.alias = 0xffff;
+    f.metadata.scripts[0].properties.push_back({ "Record", 1, value });
+    f.fixture->objectTable[0].variables.push_back(
+      { "::Record_var", type, 0, VarValue::None() });
+    f.fixture->objectTable[0].variables.push_back(
+      { "owner", "Quest", 0, VarValue::None() });
+    f.Fragment().code.instructions = {
+      { FunctionCode::kOp_CallMethod,
+        { VarValue("GetOwningQuest"), Id("::Record_var"), Id("owner"),
+          VarValue(0) } },
+      { FunctionCode::kOp_CallMethod,
+        { VarValue("GetFormID"), Id("owner"), Id("counter"), VarValue(0) } },
+      { FunctionCode::kOp_CallMethod,
+        { VarValue("SetObjectiveDisplayed"), Id("owner"), Id("temp"),
+          VarValue(2), VarValue(10), VarValue(true) } },
+      { FunctionCode::kOp_Return, { VarValue::None() } }
+    };
+    const auto instance =
+      "campaign:" + std::to_string(host.GetFormId()) + ":fixture";
+    host.SetWorldInstance(instance);
+    guest.SetWorldInstance(instance);
+    REQUIRE(f.Run(guest));
+    REQUIRE(Counter(host) == kQuest);
+    REQUIRE(QuestJournal::Get(host, kQuest)["objectives"]["10"]["displayed"] ==
+            true);
+    REQUIRE(QuestJournal::ScriptState(
+              host)["scripts"][kStateKey]["values"]["boyhousefixture/owner"]
+                   ["value"] == "4e50d:Skyrim.esm");
+    // The scene has several package-action PNAMs before its parent quest.
+    // The INFO's owning quest comes from its winning DIAL, not its own fields.
+    guest.SetWorldInstance("");
+    REQUIRE(QuestJournal::Get(guest, kQuest)["objectives"].empty());
+    REQUIRE(QuestJournal::ScriptState(guest).empty());
+    REQUIRE(f.Run(guest));
+    REQUIRE(Counter(guest) == kQuest);
+    auto& code = f.Fragment().code.instructions;
+    code.insert(code.end() - 1,
+                { FunctionCode::kOp_CallMethod,
+                  { VarValue("UnsupportedNative"), Id("owner"), Id("temp"),
+                    VarValue(0) } });
+    const auto before =
+      guest.GetDynamicFields().GetValueDump(QuestJournal::kProperty);
+    REQUIRE_THROWS(f.Run(guest, 20));
+    REQUIRE(guest.GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
             before);
   }
 }
