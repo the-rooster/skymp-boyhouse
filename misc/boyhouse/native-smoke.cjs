@@ -102,5 +102,46 @@ assert.notEqual(guestAllocations.copies["1a677:Skyrim.esm"], allocations.copies[
 const guestNpc = 0xff000000 + parseInt(guestAllocations.copies["1a677:Skyrim.esm"], 16);
 assert.equal(server.get(guestNpc, "worldInstance"), server.get(guest, "worldInstance"));
 assert.throws(() => server.set(owner, "worldInstance", 42));
-console.log("Native server + party + private allocation + journal/feed + original MQ102/DA04 fragments passed (not quest playthroughs)");
+// Cross the real N-API and native serializer boundary. Unit tests separately
+// cover binary payload/reliability and recipient-specific frame delivery.
+const bot = server.createBot(true);
+server.tick();
+const user = bot.getUserId(), received = [];
+server.on("customPacket", (id, content) => received.push({ id, content: JSON.parse(content) }));
+assert.equal(server.getPacketEpoch(user), "");
+assert.throws(() => server.beginPacketEpoch(user), /Close the gameplay gate/);
+for (const invalid of [-1, 0.5, 65536, 0x100000000, "0", null]) {
+  assert.throws(() => server.getPacketEpoch(invalid));
+  assert.throws(() => server.beginPacketEpoch(invalid));
+}
+server.setGameplayBlocked(user, true);
+const epoch = server.beginPacketEpoch(user);
+assert.match(epoch, /^[a-f0-9]{32}$/);
+assert.equal(server.getPacketEpoch(user), epoch);
+const input = { t: 1, contentJsonDump: JSON.stringify({ customPacketType: "boyhouse.instance" }) };
+const send = message => { bot.send(message); server.tick(); };
+send({ t: 34, epoch, message: input });
+assert.equal(received.length, 0);
+server.setGameplayBlocked(user, false);
+send(input);
+assert.equal(received.length, 0);
+send({ t: 34, epoch, message: input });
+assert.equal(received.length, 1);
+assert.equal(received[0].id, user);
+server.setGameplayBlocked(user, true);
+const nextEpoch = server.beginPacketEpoch(user);
+assert.notEqual(nextEpoch, epoch);
+server.setGameplayBlocked(user, false);
+send({ t: 34, epoch, message: input });
+assert.equal(received.length, 1);
+send({ t: 34, epoch: nextEpoch, message: input });
+assert.equal(received.length, 2);
+server.sendCustomPacket(user, JSON.stringify({ customPacketType: "boyhouse.projection", kind: "pause" }));
+assert.equal(JSON.parse(bot.pollCustomPackets()[0]).kind, "pause");
+bot.destroy(); server.tick();
+assert.throws(() => server.getPacketEpoch(user));
+const returning = server.createBot(); server.tick();
+assert.equal(server.getPacketEpoch(returning.getUserId()), "");
+returning.destroy(); server.tick();
+console.log("Native server + party + private allocation + journal/feed + original MQ102/DA04 fragments + packet epochs passed (not quest playthroughs)");
 process.exit(0);

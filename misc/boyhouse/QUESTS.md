@@ -201,9 +201,46 @@ The pure client replica validates and assembles chunks, but acknowledges only
 when an engine adapter explicitly reports application complete. The protocol
 smoke uses real native bot packets and simulates that engine completion. It is
 not an in-game test. Incoming gameplay gating does not freeze server simulation
-or outgoing replication. The Skyrim engine adapter, replication fencing and
+or outgoing replication. The Skyrim engine adapter, transition coordinator and
 reference restoration are still unfinished. Keep the flag unset in staging and
 normal clients until those are implemented and tested. No quests are certified.
+
+### Packet epochs (transport implemented; transition integration pending)
+
+Trusted `mp.beginPacketEpoch(userId)` requires a connected user with gameplay
+blocked. It creates a fresh, random 128-bit token; `mp.getPacketEpoch(userId)`
+reads it. A new connection starts without a token and retains legacy transport.
+No production coordinator calls these methods yet, including the experimental
+projection feed. The manifest acknowledgement token and packet epoch currently
+remain separate facilities.
+
+Once selected, the native server requires the current token on all gameplay
+input, including custom commands, even after the gameplay gate reopens. Outbound
+replication carries the recipient's token. `CampaignFrame` (message type 34)
+retains the original binary payload and reliability, adding 22 bytes. Frames are
+bounded to a 1 MiB payload; nested, truncated and trailing frames are rejected.
+Projection control stays unframed; initial login may pass before actor binding.
+Deferred messages capture the enqueue-time token and are dropped after rotation
+instead of being relabeled as current state. A fresh baseline must replace them.
+
+The client's `NetworkingService` routes structured, raw and reference-ID sends
+through a common gate. Explicit selection queues only that epoch's replication,
+bounded to 4,096 messages and 8 MiB of estimated text. Gameplay input is dropped
+while paused, and resumes only after explicit release drains the queue. A new
+selection/disconnect cancels old replay. Old and untagged gameplay packets remain
+rejected after release. Failures close input and schedule connection cleanup;
+cleanup from an obsolete connection cannot close its replacement. The native
+client retains the delivering connection until `Tick` returns and stops its old
+packet batch when a callback replaces or destroys it.
+
+Epoch transport requires the matching `MpClientPlugin` 2.1.0 codec; older codecs
+are refused with input closed. Neither receipt of a frame nor a manifest enables
+gameplay. The coordinator still must rotate before allocation/phase changes,
+send a fresh authoritative baseline after epoch selection, apply/restore engine
+references, and cancel stale asynchronous engine work before acknowledging and
+releasing. Large replication baselines need bounded batching and explicit failure
+handling. These tests exercise the transport and service wiring, not Skyrim's
+engine or a playable quest.
 
 ### Deferred client effect lifetime
 
@@ -221,8 +258,9 @@ disable the actor without invalidating the pending map. Signed or oversized wire
 indices cannot alias another wait after narrowing to 32 bits.
 
 This guards server queues and continuations. It cannot retract packets already
-sent or cancel Skyrim-side callbacks. Connection ownership changes, packet epoch
-tagging and engine-side cancellation still require the transition integration.
+sent or cancel Skyrim-side callbacks. The packet transport above rejects stale
+epochs once enabled, but connection ownership changes and engine-side
+cancellation still require the transition integration.
 The client transport currently uses RELIABLE (without ordering) for reliable
 outbound messages, while the server uses RELIABLE_ORDERED. Unreliable movement
 can arrive across a phase boundary; ordering must not be assumed as a substitute
@@ -321,10 +359,11 @@ Transition integration must establish a new packet generation before allocation 
 
 ```sh
 # Node 24: includes TypeScript replica tests
-node --test misc/boyhouse/partyInstances.test.cjs misc/boyhouse/instanceCommand.test.cjs misc/boyhouse/questJournalFeed.test.cjs misc/boyhouse/questJournalReplica.test.cjs misc/boyhouse/worldProjection.test.cjs
+node --test misc/boyhouse/partyInstances.test.cjs misc/boyhouse/instanceCommand.test.cjs misc/boyhouse/questJournalFeed.test.cjs misc/boyhouse/questJournalReplica.test.cjs misc/boyhouse/worldProjection.test.cjs misc/boyhouse/campaignPacketChannel.test.cjs
 
 # Linux builder with owned masters mounted at /game-data
 ./build/unit/unit '[Quest]'
+./build/unit/unit '[CampaignFrame]'
 node misc/boyhouse/native-smoke.cjs
 node misc/boyhouse/protocol-smoke.cjs
 node misc/boyhouse/protocol-smoke.cjs --projection

@@ -1,5 +1,6 @@
 #pragma once
 #include "ActivateMessage.h"
+#include "CampaignFrameMessage.h"
 #include "ChangeValuesMessage.h"
 #include "ConsoleCommandMessage.h"
 #include "CraftItemMessage.h"
@@ -34,6 +35,7 @@
 #include "UpdatePropertyMessage.h"
 
 #define REGISTER_MESSAGES                                                     \
+  REGISTER_MESSAGE(CampaignFrameMessage)                                      \
   REGISTER_MESSAGE(ActivateMessage)                                           \
   REGISTER_MESSAGE(ConsoleCommandMessage)                                     \
   REGISTER_MESSAGE(CraftItemMessage)                                          \

@@ -54,22 +54,30 @@ void MpClientPlugin::Tick(State& state, OnPacket onPacket,
                           DeserializeMessage deserializeMessageFn,
                           void* state_)
 {
-  if (!state.cl)
+  auto client = state.cl;
+  if (!client)
     return;
 
-  std::tuple<OnPacket, DeserializeMessage, void*> locals(
-    onPacket, deserializeMessageFn, state_);
+  using TickContext = std::tuple<OnPacket, DeserializeMessage, void*, State*,
+                                 std::shared_ptr<Networking::IClient>>;
+  TickContext locals(onPacket, deserializeMessageFn, state_, &state, client);
 
-  state.cl->Tick(
+  client->Tick(
     [](void* rawState, Networking::PacketType packetType,
        Networking::PacketData data, size_t length, const char* error) {
-      const auto& [onPacket, deserializeMessageFn, state] =
-        *reinterpret_cast<std::tuple<OnPacket, DeserializeMessage, void*>*>(
-          rawState);
+      const auto& [onPacket, deserializeMessageFn, state, owner,
+                   expectedClient] = *reinterpret_cast<TickContext*>(rawState);
+      // A callback may close/reconnect. Retain the delivering client until its
+      // Tick returns, and suppress the remainder of its obsolete packet batch.
+      if (owner->cl != expectedClient)
+        return;
 
       if (packetType != Networking::PacketType::Message) {
         return onPacket(static_cast<int32_t>(packetType), "", 0, error, state);
       }
+
+      if (!data || length < 2)
+        return;
 
       std::string deserializedJsonContent;
       if (deserializeMessageFn(data, length, deserializedJsonContent)) {

@@ -14,6 +14,9 @@ public:
                                  ActionListener& actionListener);
 
 private:
+  void Dispatch(Networking::UserId userId, Networking::PacketData data,
+                size_t length, ActionListener& listener,
+                bool hasVerifiedEpoch);
   struct Impl;
   std::shared_ptr<Impl> pImpl;
 };

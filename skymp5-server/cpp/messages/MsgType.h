@@ -39,6 +39,7 @@ enum class MsgType : uint8_t
   Teleport2 = 31,
   UpdateGamemodeData = 32,
   CreateActor = 33,
+  CampaignFrame = 34,
 
   Max
 };

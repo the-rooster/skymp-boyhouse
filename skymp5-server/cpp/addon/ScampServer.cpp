@@ -104,6 +104,8 @@ Napi::Object ScampServer::Init(Napi::Env env, Napi::Object exports)
       InstanceMethod("kick", &ScampServer::Kick),
       InstanceMethod("setGameplayBlocked", &ScampServer::SetGameplayBlocked),
       InstanceMethod("getGameplayBlocked", &ScampServer::GetGameplayBlocked),
+      InstanceMethod("beginPacketEpoch", &ScampServer::BeginPacketEpoch),
+      InstanceMethod("getPacketEpoch", &ScampServer::GetPacketEpoch),
 
       InstanceMethod("getLocalizedString", &ScampServer::GetLocalizedString),
       InstanceMethod("getServerSettings", &ScampServer::GetServerSettings),
@@ -830,6 +832,30 @@ Napi::Value ScampServer::GetGameplayBlocked(const Napi::CallbackInfo& info)
       throw std::invalid_argument("Invalid gameplay gate user");
     return Napi::Boolean::New(
       info.Env(), partOne->serverState.userInfo[id]->gameplayBlocked);
+  } catch (const std::exception& error) {
+    throw Napi::Error::New(info.Env(), error.what());
+  }
+}
+
+Napi::Value ScampServer::BeginPacketEpoch(const Napi::CallbackInfo& info)
+{
+  try {
+    const auto id = NapiHelper::ExtractUInt32(info[0], "userId");
+    if (id >= partOne->serverState.userInfo.size())
+      throw std::invalid_argument("Invalid packet epoch user");
+    return Napi::String::New(info.Env(), partOne->BeginPacketEpoch(id));
+  } catch (const std::exception& error) {
+    throw Napi::Error::New(info.Env(), error.what());
+  }
+}
+
+Napi::Value ScampServer::GetPacketEpoch(const Napi::CallbackInfo& info)
+{
+  try {
+    const auto id = NapiHelper::ExtractUInt32(info[0], "userId");
+    if (id >= partOne->serverState.userInfo.size())
+      throw std::invalid_argument("Invalid packet epoch user");
+    return Napi::String::New(info.Env(), partOne->GetPacketEpoch(id));
   } catch (const std::exception& error) {
     throw Napi::Error::New(info.Env(), error.what());
   }

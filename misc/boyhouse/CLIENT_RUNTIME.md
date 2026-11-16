@@ -76,6 +76,14 @@ converted into an official Address Library, or used to fill gaps with guesses.
 
 ## Remaining acceptance
 
+The packet-epoch transport adds a separate `MpClientPlugin` codec version 2.1.0.
+Its binary frame retains the inner packet and exposes decoded frames to the
+TypeScript networking service. Epoch-aware sessions refuse earlier codecs with
+gameplay input closed. Native unit tests cover frame round trips, stale-epoch
+rejection and reconnecting inside a packet callback; service tests cover every
+outgoing path and bounded replication replay. This transport is not yet enabled
+by the projection coordinator and does not validate Skyrim's hooks or layouts.
+
 Obtain the correct Address Library, finish hook/layout checks, package the native
 and TypeScript client, and exercise native calls and event delivery in-game.
 Then connect two and three real clients and test movement, party entry/exit,

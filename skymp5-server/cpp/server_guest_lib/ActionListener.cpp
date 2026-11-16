@@ -108,12 +108,24 @@ MpActor* ActionListener::SendToNeighbours(uint32_t idx,
                           rawMsgData.unparsedLength, reliable);
 }
 
-bool ActionListener::IsMessageAllowed(Networking::UserId userId,
-                                      MsgType type) const
+bool ActionListener::IsMessageAllowed(Networking::UserId userId, MsgType type,
+                                      bool hasVerifiedEpoch) const
 {
   const auto& users = partOne.serverState.userInfo;
-  return userId >= users.size() || !users[userId] ||
-    !users[userId]->gameplayBlocked || type == MsgType::CustomPacket;
+  if (userId >= users.size() || !users[userId])
+    return true;
+  return type == MsgType::CustomPacket ||
+    (!users[userId]->gameplayBlocked &&
+     (users[userId]->packetEpoch.empty() || hasVerifiedEpoch));
+}
+
+bool ActionListener::IsPacketEpochCurrent(Networking::UserId userId,
+                                          const std::string& epoch) const
+{
+  const auto& users = partOne.serverState.userInfo;
+  return userId < users.size() && users[userId] &&
+    !users[userId]->gameplayBlocked && !users[userId]->packetEpoch.empty() &&
+    users[userId]->packetEpoch == epoch;
 }
 
 void ActionListener::OnCustomPacket(const RawMessageData& rawMsgData,
@@ -123,7 +135,9 @@ void ActionListener::OnCustomPacket(const RawMessageData& rawMsgData,
   auto content = parser.parse(msg.contentJsonDump).value();
   const auto& users = partOne.serverState.userInfo;
   if (rawMsgData.userId < users.size() && users[rawMsgData.userId] &&
-      users[rawMsgData.userId]->gameplayBlocked) {
+      (users[rawMsgData.userId]->gameplayBlocked ||
+       (!users[rawMsgData.userId]->packetEpoch.empty() &&
+        !rawMsgData.hasVerifiedEpoch))) {
     std::string_view type;
     if (content["customPacketType"].get(type) != simdjson::SUCCESS ||
         (type != "boyhouse.projection" &&

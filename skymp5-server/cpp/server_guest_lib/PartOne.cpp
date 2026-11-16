@@ -1,8 +1,10 @@
 #include "PartOne.h"
+#include "CampaignFrameMessage.h"
 #include "CampaignReferenceBinding.h"
 #include <array>
 #include <cassert>
 #include <chrono>
+#include <openssl/rand.h>
 #include <string>
 #include <vector>
 
@@ -21,8 +23,9 @@
 #include "PacketParser.h"
 
 PartOneSendTargetWrapper::PartOneSendTargetWrapper(
-  Networking::ISendTarget& underlyingSendTarget_)
+  Networking::ISendTarget& underlyingSendTarget_, ServerState& state_)
   : underlyingSendTarget(underlyingSendTarget_)
+  , state(state_)
 {
 }
 
@@ -30,7 +33,26 @@ void PartOneSendTargetWrapper::Send(Networking::UserId targetUserId,
                                     Networking::PacketData data, size_t length,
                                     bool reliable)
 {
+  if (targetUserId < state.userInfo.size() && state.userInfo[targetUserId] &&
+      !state.userInfo[targetUserId]->packetEpoch.empty()) {
+    CampaignFrameMessage frame;
+    frame.epoch = state.userInfo[targetUserId]->packetEpoch;
+    if (length > CampaignFrameMessage::kMaxPayload)
+      throw std::runtime_error("Campaign frame payload exceeds limit");
+    frame.payload.assign(data, data + length);
+    return SendUnframed(targetUserId, frame, reliable);
+  }
   return underlyingSendTarget.Send(targetUserId, data, length, reliable);
+}
+
+void PartOneSendTargetWrapper::SendUnframed(Networking::UserId userId,
+                                            const IMessageBase& message,
+                                            bool reliable)
+{
+  SLNet::BitStream stream;
+  PartOne::GetMessageSerializerInstance().Serialize(message, stream);
+  underlyingSendTarget.Send(userId, stream.GetData(),
+                            stream.GetNumberOfBytesUsed(), reliable);
 }
 
 void PartOneSendTargetWrapper::Send(Networking::UserId targetUserId,
@@ -127,7 +149,7 @@ void PartOne::SetSendTarget(Networking::ISendTarget* sendTarget)
     sendTarget ? sendTarget : &pImpl->fakeSendTarget;
 
   pImpl->sendTarget.reset(
-    new PartOneSendTargetWrapper(*underlyingSendTargetToSet));
+    new PartOneSendTargetWrapper(*underlyingSendTargetToSet, serverState));
 }
 
 void PartOne::SetDamageFormula(std::unique_ptr<IDamageFormula> dmgFormula)
@@ -239,6 +261,32 @@ std::string PartOne::GetUserGuid(Networking::UserId userId)
   return serverState.UserGuid(userId);
 }
 
+std::string PartOne::BeginPacketEpoch(Networking::UserId userId)
+{
+  serverState.EnsureUserExists(userId);
+  auto& user = *serverState.userInfo[userId];
+  if (!user.gameplayBlocked)
+    throw std::runtime_error(
+      "Close the gameplay gate before advancing its packet epoch");
+  std::array<unsigned char, 16> token;
+  if (RAND_bytes(token.data(), token.size()) != 1)
+    throw std::runtime_error("Unable to generate packet epoch");
+  static constexpr char hex[] = "0123456789abcdef";
+  std::string epoch;
+  for (auto byte : token) {
+    epoch.push_back(hex[byte >> 4]);
+    epoch.push_back(hex[byte & 15]);
+  }
+  user.packetEpoch = epoch;
+  return epoch;
+}
+
+std::string PartOne::GetPacketEpoch(Networking::UserId userId)
+{
+  serverState.EnsureUserExists(userId);
+  return serverState.userInfo[userId]->packetEpoch;
+}
+
 Networking::UserId PartOne::GetUserByActor(uint32_t formId)
 {
   auto& form = worldState.LookupFormById(formId);
@@ -286,6 +334,16 @@ void PartOne::SendCustomPacket(Networking::UserId userId,
 {
   CustomPacketMessage message;
   message.contentJsonDump = jContent;
+  if (userId < serverState.userInfo.size() && serverState.userInfo[userId] &&
+      !serverState.userInfo[userId]->packetEpoch.empty()) {
+    const auto content = nlohmann::json::parse(jContent);
+    if (content.is_object() &&
+        content.value("customPacketType", std::string{}) ==
+          "boyhouse.projection") {
+      pImpl->sendTarget->SendUnframed(userId, message, true);
+      return;
+    }
+  }
   pImpl->sendTarget->Send(userId, message, true);
 }
 
@@ -717,6 +775,7 @@ FormCallbacks PartOne::CreateFormCallbacks()
       };
       deferredMessage.packetReliable = reliable;
       deferredMessage.actorIdExpected = actor->GetFormId();
+      deferredMessage.packetEpochExpected = userInfo->packetEpoch;
       deferredMessage.actorLifetimeExpected =
         worldState.LookupFormByIdNoLoad(actor->GetFormId());
       if (dynamic_cast<const SpSnippetMessage*>(&message)) {
@@ -1034,7 +1093,8 @@ void PartOne::TickDeferredMessages()
         }
 
         if (message.actorIdExpected != actor->GetFormId() ||
-            message.actorLifetimeExpected.lock().get() != actor) {
+            message.actorLifetimeExpected.lock().get() != actor ||
+            message.packetEpochExpected != userInfo->packetEpoch) {
           continue;
         }
 

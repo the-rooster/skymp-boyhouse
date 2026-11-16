@@ -28,7 +28,7 @@ class PartOneSendTargetWrapper : public Networking::ISendTarget
 {
 public:
   explicit PartOneSendTargetWrapper(
-    Networking::ISendTarget& underlyingSendTarget_);
+    Networking::ISendTarget& underlyingSendTarget_, ServerState& state_);
 
   void Send(Networking::UserId targetUserId, Networking::PacketData data,
             size_t length, bool reliable) override;
@@ -37,7 +37,11 @@ public:
             bool reliable);
 
 private:
+  friend class PartOne;
+  void SendUnframed(Networking::UserId userId, const IMessageBase& message,
+                    bool reliable);
   Networking::ISendTarget& underlyingSendTarget;
+  ServerState& state;
 };
 
 class PartOne
@@ -73,6 +77,8 @@ public:
                        uint32_t cellOrWorld, ProfileId profileId = -1);
   void SetUserActor(Networking::UserId userId, uint32_t actorFormId);
   uint32_t GetUserActor(Networking::UserId userId);
+  std::string BeginPacketEpoch(Networking::UserId userId);
+  std::string GetPacketEpoch(Networking::UserId userId);
   std::string GetUserGuid(Networking::UserId userId);
   Networking::UserId GetUserByActor(uint32_t formId);
   void DestroyActor(uint32_t actorFormId);

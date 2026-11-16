@@ -28,7 +28,10 @@ public:
 
   virtual void OnCustomPacket(const RawMessageData& rawMsgData,
                               const CustomPacketMessage& msg);
-  bool IsMessageAllowed(Networking::UserId userId, MsgType type) const;
+  bool IsMessageAllowed(Networking::UserId userId, MsgType type,
+                        bool hasVerifiedEpoch = false) const;
+  bool IsPacketEpochCurrent(Networking::UserId userId,
+                            const std::string& epoch) const;
 
   virtual void OnUpdateMovement(const RawMessageData& rawMsgData,
                                 const UpdateMovementMessage& msg);

@@ -29,6 +29,14 @@ void PacketParser::TransformPacketIntoAction(Networking::UserId userId,
                                              size_t length,
                                              ActionListener& actionListener)
 {
+  Dispatch(userId, data, length, actionListener, false);
+}
+
+void PacketParser::Dispatch(Networking::UserId userId,
+                            Networking::PacketData data, size_t length,
+                            ActionListener& actionListener,
+                            bool hasVerifiedEpoch)
+{
   if (!length) {
     throw std::runtime_error("Zero-length message packets are not allowed");
   }
@@ -37,13 +45,23 @@ void PacketParser::TransformPacketIntoAction(Networking::UserId userId,
     data,
     length,
     userId,
+    hasVerifiedEpoch,
   };
 
   auto result = pImpl->serializer->Deserialize(data, length);
   if (result != std::nullopt) {
+    if (result->msgType == MsgType::CampaignFrame) {
+      auto& frame = static_cast<CampaignFrameMessage&>(*result->message);
+      if (!hasVerifiedEpoch &&
+          actionListener.IsPacketEpochCurrent(userId, frame.epoch))
+        Dispatch(userId, frame.payload.data(), frame.payload.size(),
+                 actionListener, true);
+      return;
+    }
     // One gate covers binary/JSON packets and recorded playback alike. The
     // custom-packet handler separately limits the handshake control channel.
-    if (!actionListener.IsMessageAllowed(userId, result->msgType))
+    if (!actionListener.IsMessageAllowed(userId, result->msgType,
+                                         hasVerifiedEpoch))
       return;
     if (result->format == DeserializeInputFormat::Json) {
       std::call_once(pImpl->jsonWarning, [&] {

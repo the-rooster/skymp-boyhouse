@@ -45,7 +45,7 @@ bool MyDeserializeMessage(const uint8_t* data, size_t length,
 extern "C" {
 __declspec(dllexport) const char* MpCommonGetVersion()
 {
-  return "2.0.0";
+  return "2.1.0";
 }
 
 __declspec(dllexport) void CreateClient(const char* targetHostname,

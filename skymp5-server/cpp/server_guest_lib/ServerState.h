@@ -38,6 +38,7 @@ struct DeferredMessage
   std::vector<uint8_t> packetData;
   bool packetReliable = false;
   uint32_t actorIdExpected = 0;
+  std::string packetEpochExpected;
   std::weak_ptr<MpForm> actorLifetimeExpected;
   // Inventory snapshots are personal to the actor; executable snippets also
   // require the original campaign context.
@@ -51,6 +52,9 @@ struct UserInfo
   // user slot. Trusted server code releases it after projection
   // acknowledgement.
   bool gameplayBlocked = false;
+  // Empty retains the legacy transport. Once enabled, gameplay requires this
+  // connection's current epoch even after its application gate opens.
+  std::string packetEpoch;
 
   bool isPacketHistoryRecording = false;
   PacketHistory packetHistory;

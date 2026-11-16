@@ -47,6 +47,8 @@ export interface ScampServer {
   kick(userId: number): void;
   setGameplayBlocked(userId: number, blocked: boolean): void;
   getGameplayBlocked(userId: number): boolean;
+  beginPacketEpoch(userId: number): string;
+  getPacketEpoch(userId: number): string;
 
   executeJavaScriptOnChakra(src: string): void;
   clear(): void;
