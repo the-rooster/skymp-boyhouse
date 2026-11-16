@@ -1,6 +1,8 @@
 #pragma once
+#include "FormDesc.h"
 #include "libespm/Combiner.h"
 #include "libespm/QuestScriptData.h"
+#include <functional>
 
 class WorldState;
 
@@ -10,5 +12,6 @@ class CampaignReferenceScripts
 {
 public:
   static std::vector<espm::QuestScript> Read(
-    WorldState& world, const espm::LookupResult& reference);
+    WorldState& world, const espm::LookupResult& reference,
+    const std::function<std::vector<FormDesc>()>& selectedTemplates = {});
 };

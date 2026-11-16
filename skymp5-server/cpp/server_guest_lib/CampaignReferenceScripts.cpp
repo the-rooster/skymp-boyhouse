@@ -72,7 +72,8 @@ void Merge(std::vector<espm::QuestScript>& result,
 }
 
 std::vector<espm::QuestScript> CampaignReferenceScripts::Read(
-  WorldState& world, const espm::LookupResult& reference)
+  WorldState& world, const espm::LookupResult& reference,
+  const std::function<std::vector<FormDesc>()>& selectedTemplates)
 {
   if (!reference.rec || reference.rec->IsDeleted() ||
       (reference.rec->GetType() != "REFR" &&
@@ -96,19 +97,43 @@ std::vector<espm::QuestScript> CampaignReferenceScripts::Read(
   const auto& browser = world.GetEspm().GetBrowser();
   auto sourceId = *baseId;
   std::set<uint32_t> templates;
+  std::optional<uint32_t> previousNpc;
+  std::optional<std::vector<FormDesc>> selected;
   while (true) {
     const auto source = browser.LookupById(sourceId);
     if (!source.rec || source.rec->IsDeleted())
       throw std::runtime_error("Missing reference script base/template");
-    if (source.rec->GetType() == "LVLN")
-      throw std::runtime_error(
-        "Reference scripts require campaign leveled actor template selection");
+    if (source.rec->GetType() == "LVLN") {
+      if (!selectedTemplates || !previousNpc)
+        throw std::runtime_error(
+          "Reference scripts require campaign leveled actor template selection");
+      // Allocation already selected and persisted this NPC's template chain.
+      // Script initialization must use that same choice, never roll again.
+      if (!selected)
+        selected = selectedTemplates();
+      if (selected->empty() || selected->size() > 128 ||
+          selected->front().ToFormId(world.espmFiles) != *baseId)
+        throw std::runtime_error("Invalid campaign script template selection");
+      auto current = std::find_if(selected->begin(), selected->end(),
+                                  [&](const auto& value) {
+        return value.ToFormId(world.espmFiles) == *previousNpc;
+      });
+      if (current == selected->end() || ++current == selected->end())
+        throw std::runtime_error("Incomplete campaign script template selection");
+      sourceId = current->ToFormId(world.espmFiles);
+      const auto chosen = browser.LookupById(sourceId);
+      if (!chosen.rec || chosen.rec->IsDeleted() ||
+          chosen.rec->GetType() != "NPC_")
+        throw std::runtime_error("Invalid selected campaign script NPC");
+      continue;
+    }
     if (source.rec->GetType() != "NPC_")
       break;
     const auto id = source.ToGlobalId(source.rec->GetId());
     if (!templates.insert(id).second || templates.size() > 128)
       throw std::runtime_error(
         "Reference script template cycle/depth exceeded");
+    previousNpc = id;
     std::optional<uint32_t> parent;
     std::optional<uint16_t> flags;
     espm::RecordHeaderAccess::IterateFields(

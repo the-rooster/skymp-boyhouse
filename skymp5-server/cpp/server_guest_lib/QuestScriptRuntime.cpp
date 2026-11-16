@@ -641,7 +641,11 @@ bool QuestScriptRuntime::Execute(MpActor& actor, uint32_t questId,
             (rec.rec->GetType() == "REFR" || rec.rec->GetType() == "ACHR")) {
           std::vector<VirtualMachine::ScriptInfo> bindings;
           for (const auto& script :
-               CampaignReferenceScripts::Read(world, rec)) {
+               CampaignReferenceScripts::Read(world, rec, [&] {
+                 auto& copy = CampaignReferenceBinding::Resolve(actor, id);
+                 QuestJournal::ReadInventory(actor, copy);
+                 return copy.GetChangeForm().templateChain;
+               })) {
             const auto pex = vm.GetPexByName(script.name);
             if (!pex.fn)
               throw std::runtime_error("Missing campaign reference script: " +

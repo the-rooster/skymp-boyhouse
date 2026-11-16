@@ -1,5 +1,7 @@
 #include "CampaignReferenceFactory.h"
 #include "CampaignReferenceBinding.h"
+#include "CampaignReferenceScripts.h"
+#include "QuestScriptRuntime.h"
 #include "LocationalDataUtils.h"
 #include "QuestJournal.h"
 #include "QuestVmState.h"
@@ -109,6 +111,41 @@ TEST_CASE(
             CampaignReferenceFactory::kAllocations) != "null");
   REQUIRE(batch[npc.GetIdx()]->inv.GetItemCount(0xf) == 123);
   REQUIRE(batch[item.GetIdx()]->count == 15);
+}
+
+TEST_CASE("Campaign NPC scripts reuse the persisted leveled template choice",
+          "[Quest][CampaignAllocation][ReferenceScripts]")
+{
+  AllocationWorld f;
+  auto& world = f.server.worldState;
+  // This rabbit is next to the native client transition fixture. Its script
+  // inheritance reaches a leveled list even though the selected NPC has no
+  // attached scripts. Looking only at plugin records used to abort admission.
+  constexpr uint32_t original = 1080569;
+  const auto ids = CampaignReferenceFactory::Ensure(*f.owner, { original }, 5);
+  const auto selected = world.GetFormAt<MpActor>(ids.front()).GetChangeForm().templateChain;
+  const auto reference = world.GetEspm().GetBrowser().LookupById(original);
+  REQUIRE(selected.size() >= 2);
+  REQUIRE_THROWS(CampaignReferenceScripts::Read(world, reference));
+  int reads = 0;
+  const auto scripts = CampaignReferenceScripts::Read(world, reference, [&] {
+    ++reads;
+    return selected;
+  });
+  REQUIRE(reads == 1);
+  REQUIRE(scripts.empty());
+  QuestScriptRuntime::ExecuteReferenceLoad(*f.owner, original, {});
+  REQUIRE(QuestJournal::ReferenceInitialized(*f.owner, original));
+  REQUIRE(world.GetFormAt<MpActor>(ids.front()).GetChangeForm().templateChain == selected);
+  REQUIRE_THROWS(CampaignReferenceScripts::Read(world, reference, [] {
+    return std::vector<FormDesc>{};
+  }));
+  REQUIRE_THROWS(CampaignReferenceScripts::Read(world, reference, [&] {
+    return std::vector<FormDesc>{ selected.front() };
+  }));
+  REQUIRE_THROWS(CampaignReferenceScripts::Read(world, reference, [&] {
+    return std::vector<FormDesc>{ selected.front(), FormDesc::FromFormId(0xf, world.espmFiles) };
+  }));
 }
 
 TEST_CASE("Invalid allocation batches publish no references or owner metadata",
