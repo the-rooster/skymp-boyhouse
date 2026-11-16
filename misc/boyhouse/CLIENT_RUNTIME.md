@@ -275,6 +275,73 @@ transforms, dynamic FormID reuse, long-distance reference eviction, and the
 client projection coordinator still need work. The staging server's projection
 flag remains off; no additional quests are certified by this test.
 
+## Temporary-reference lifetime and spawn cancellation
+
+`OwnedReferenceService` now owns temporary FormView references from capture until
+native deletion completes. Ownership combines the engine reference handle
+(including its age) with a client world generation. A matching FormID/base is
+insufficient: work and cleanup recheck the handle on update, and a new save
+discards the old generation. Only temporary references (`0xff000000` and above)
+can enter this deletion path. `getReferenceHandle` is a new native API required
+by this client build; an older native DLL is rejected at service startup.
+
+Spawn rotation, position, enabling, resurrection/physics, and deletion are
+serialized through the owned-reference queue. Native promise completions only
+settle records; subsequent work runs on update with a fresh native wrapper.
+Retiring a view cancels its queued work and ready callback, waits for unfinished
+native work, then deletes it and releases cleaner protection exactly once.
+Deletion failures/no-ops remain unsettled instead of falsely acknowledging a
+transition. Work is bounded to 16 references per update (maximum 64), 16 queued
+operations per reference, and 4,096 owned references. Capacity is checked before
+placing another temporary view.
+
+`FormView.destroy()` now clears local identity/readiness immediately, and a late
+completion cannot mark its replacement ready. Reused model-array slots replace
+the old remote identity. The untracked `formViewFunc1/2` storage hooks have been
+removed: the fork's temporary actors all use the tracked native spawning path.
+`WorldView` stops rendering disconnected/personal-save sessions, invalidates old
+resume timers, and preserves an explicit rendering gate across startup, game
+loads, and reconnections until its caller requests resumption. Delayed character
+menu snippets also carry the gate generation, so an old request cannot open the
+menu or resume rendering after another transition has taken ownership. The
+pre-load event invalidates ownership/suppression and suspends views/cleaner work
+before waiting for the loaded-world event, rather than keeping old tasks active
+through the loading interval.
+
+All 137 Node regressions pass, including 28 new lifecycle/integration tests. The
+client webpack build, native Release build, and C++ formatting checks pass. A
+background native test on runtime 1.7.104.0 spawned an authored creature's
+temporary copy, observed it ready/alive with the same engine handle, retired it,
+observed native deletion/handle invalidation, and repeated with cancellation
+during positioning. The canceled copy never signaled ready and was deleted only
+after its pending work settled. The fixture embeds the real lifetime service,
+queue, spawn process, and object-reference helper:
+
+```sh
+node misc/boyhouse/build-lifetime-smoke.cjs <output.js>
+```
+
+Evidence is in ignored `artifacts/reference-lifetime-runtime/`; the backup
+manifest is under `artifacts/game-backups/20261116T182319Z/reference-lifetime/`.
+The installed/tested native DLL SHA-256 is
+`7ff5d7c82aa2cbed801f22b8fc5aac3a747469d60221be41014d4746e95cec9b`.
+The test game exited, its diagnostic plugin and generated save were removed,
+all three INIs were restored byte-for-byte, and all four personal save hashes
+were unchanged. The new native API remains installed. C++ formatting after the
+native test changed only whitespace, not behavior.
+
+Native appearance/tint spawning, real engine FormID reuse, and an actual plugin
+reload during a latent operation are not certified by this fixture. The
+live fixture also did not load another save with work pending; load-boundary
+coverage here is automated. The
+reload/unit tests prove adoption when the outstanding promise settles, but
+`SkyrimPlatform.cpp::ClearState` clears completion queues during plugin reload;
+a dropped completion can therefore leave cleanup waiting. That needs native
+reload coverage/recovery before treating reloads as reliable. Other asynchronous
+model/remote-server mutations and original-reference restoration still need
+the same lifetime discipline. This is a prerequisite for the phase coordinator,
+not a completed engine projection or quest playthrough.
+
 ## Remaining acceptance
 
 The packet-epoch transport adds a separate `MpClientPlugin` codec version 2.1.0.

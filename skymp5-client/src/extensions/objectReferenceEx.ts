@@ -34,7 +34,7 @@ export class ObjectReferenceEx {
     return Math.sqrt(deltaX * deltaX + deltaY * deltaY);
   };
 
-  static dealWithRef(self: ObjectReference, base: Form): void {
+  static dealWithRef(self: ObjectReference, base: Form, configureMotion = true): void {
     const t = base.getType();
     const isItem = FormTypeEx.isItem(t);
 
@@ -59,12 +59,12 @@ export class ObjectReferenceEx {
       self.lock(false, false);
     }
 
-    if (isItem) {
+    if (configureMotion && isItem) {
       self.setMotionType(MotionType.Keyframed, false);
     }
 
     // https://github.com/skyrim-multiplayer/issue-tracker/issues/36
-    if (t === FormType.Flora && Flora.from(base)?.getIngredient()) {
+    if (configureMotion && t === FormType.Flora && Flora.from(base)?.getIngredient()) {
       self.setMotionType(MotionType.Keyframed, false);
     }
   }

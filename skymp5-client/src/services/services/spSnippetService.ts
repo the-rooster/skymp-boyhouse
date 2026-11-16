@@ -90,12 +90,13 @@ export class SpSnippetService extends ClientListener {
       if (functionLowerCase === "showracemenu" || functionLowerCase === "showlimitedracemenu") {
         logTrace(this, "showracemenu called");
         const worldView = this.controller.lookupListener(WorldView);
-        worldView.setFormViewUpdateAllowed(false);
+        const generation = worldView.setFormViewUpdateAllowed(false);
 
         logTrace(this, "Waiting 1.0s before calling showracemenu");
         this.sp.Utility.wait(1.0).then(() => {
+          if (!worldView.isUpdateGateCurrent(generation)) return;
           this.runStatic(snippet);
-          worldView.waitGameTimeAndAllowFormViewUpdate(1.0);
+          worldView.waitGameTimeAndAllowFormViewUpdate(1.0, generation);
         });
         return;
       }

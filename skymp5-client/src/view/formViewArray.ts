@@ -7,7 +7,8 @@ import { GamemodeUpdateService } from "../services/services/gamemodeUpdateServic
 export class FormViewArray {
   updateForm(form: FormModel, i: number) {
     const view = this.formViews[i];
-    if (!view) {
+    if (!view || view.getRemoteRefrId() !== form.refrId) {
+      view?.destroy();
       this.formViews[i] = new FormView(form.refrId);
     } else {
       view.update(form);

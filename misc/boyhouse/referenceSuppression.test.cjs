@@ -70,7 +70,7 @@ function serviceFixture(options = {}) {
   suppression = new ReferenceSuppressionService(sp, controller);
   const cleaner = new WorldCleanerService(sp, controller);
   return { actor, player, calls, errors, jobs, forms, suppression, cleaner, makeActor,
-    tick: () => events.emit('update'), event: (...args) => emitter.emit(...args),
+    tick: () => events.emit('update'), event: (...args) => emitter.emit(...args), native: (...args) => events.emit(...args),
     get searches() { return searches; }, setCandidate(value) { candidate = value; },
     setSinglePlayer(value) { singlePlayer = value; }, setConnected(value) { connected = value; },
     async complete() { assert.ok(jobs.length); jobs.shift()(); await Promise.resolve(); },
@@ -141,9 +141,10 @@ test('a quest suppression claim retains an actor after the world cleaner release
   assert.equal(f.actor.state.disabled, false); assert.equal(f.actor.state.blocked, false);
 });
 
-test('loading a different save discards old suppression and pending completions', async () => {
+for (const event of ['gameLoad', 'preLoadGame']) test(`${event} discards old suppression and pending completions`, async () => {
   const f = serviceFixture(); f.tick(); f.tick();
-  f.event('gameLoad', { isCausedBySkyrimPlatform: false }); f.setSinglePlayer(true);
+  if (event === 'preLoadGame') f.native(event);
+  else { f.event(event, { isCausedBySkyrimPlatform: false }); f.setSinglePlayer(true); }
   const newActor = f.makeActor(100, { blocked: true }), original = structuredClone(newActor.state);
   await f.complete(); f.tick(); f.tick();
   assert.deepEqual(newActor.state, original);

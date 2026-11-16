@@ -11,7 +11,8 @@ export class WorldCleanerService extends ClientListener {
     constructor(private sp: Sp, private controller: CombinedController) {
         super();
         controller.on('update', () => this.onUpdate());
-        controller.emitter.on('gameLoad', () => { this.protection.clear(); this.active = false; });
+        controller.on('preLoadGame', () => { this.loading = true; this.protection.clear(); this.active = false; });
+        controller.emitter.on('gameLoad', () => { this.loading = false; this.protection.clear(); this.active = false; });
     }
 
     modWcProtection(actorId: number, mod: number): void {
@@ -27,6 +28,7 @@ export class WorldCleanerService extends ClientListener {
     private get references() { return this.controller.lookupListener(ReferenceSuppressionService).references; }
 
     private onUpdate(): void {
+        if (this.loading) return;
         const multiplayer = !this.controller.lookupListener(SinglePlayerService).isSinglePlayer &&
             this.controller.lookupListener(NetworkingService).isConnected();
         if (!multiplayer) {
@@ -52,4 +54,5 @@ export class WorldCleanerService extends ClientListener {
     private protection = new Map<number, number>();
     // Also release a persisted claim if a plugin reload starts disconnected.
     private active = true;
+    private loading = false;
 }

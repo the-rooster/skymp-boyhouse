@@ -17,6 +17,8 @@ export declare function writePlugin(pluginName: string, newSources: string, over
 export declare function getPlatformVersion(): string
 export declare function disableCtrlPrtScnHotkey(): void
 export declare function blockPapyrusEvents(block: boolean): void
+// Current-world engine identity; zero for absent/deleted references. Call on update.
+export declare function getReferenceHandle(refrFormId: number): number
 export declare function sendIpcMessage(targetSystemName: string, message: ArrayBuffer): void
 export declare function encodeUtf8(text: string): ArrayBuffer
 export declare function decodeUtf8(buffer: ArrayBuffer): string

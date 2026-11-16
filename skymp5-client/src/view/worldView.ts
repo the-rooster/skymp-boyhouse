@@ -1,5 +1,3 @@
-import { Form } from "skyrimPlatform";
-
 import { WorldModel } from './model';
 import { FormViewArray } from './formViewArray';
 import { PlayerCharacterDataHolder } from './playerCharacterDataHolder';
@@ -7,6 +5,7 @@ import { ClientListener, CombinedController, Sp } from '../services/services/cli
 import { logTrace } from "../logging";
 import { SinglePlayerService } from "../services/services/singlePlayerService";
 import { RemoteServer } from "../services/services/remoteServer";
+import { NetworkingService } from '../services/services/networkingService';
 
 export class WorldView extends ClientListener {
   constructor(private sp: Sp, private controller: CombinedController) {
@@ -23,6 +22,16 @@ export class WorldView extends ClientListener {
     this.oldView = typeof oldView === "object" ? oldView as WorldView : undefined;
 
     this.sp.storage["view"] = this;
+    controller.on('preLoadGame', () => { this.loading = true; this.destroy(); });
+    controller.emitter.on('gameLoad', () => {
+      this.loading = false;
+      this.destroy();
+      if (!this.explicitlyBlocked) this.waitGameTimeAndAllowFormViewUpdate(1);
+    });
+    controller.emitter.on('connectionAccepted', () => {
+      this.destroy();
+      if (!this.explicitlyBlocked) this.waitGameTimeAndAllowFormViewUpdate(1);
+    });
   }
 
   getRemoteRefrId(clientsideRefrId: number): number {
@@ -40,6 +49,7 @@ export class WorldView extends ClientListener {
   }
 
   destroy() {
+    ++this.allowUpdateGeneration;
     this.state.formViews.resize(0);
     this.state.cloneFormViews.resize(0); // Recenrly added, not tested if it's needed
     this.state = this.makeEmptyState();
@@ -50,13 +60,19 @@ export class WorldView extends ClientListener {
   }
 
   private onUpdate() {
-    this.resetAllFormViewsIfPlayerChangedWorld();
-
+    if (this.loading) return;
     const singlePlayerService = this.controller.lookupListener(SinglePlayerService);
-    if (!singlePlayerService.isSinglePlayer) {
-      const modelSource = this.controller.lookupListener(RemoteServer);
-      this.updateWorld(modelSource.getWorldModel());
+    const connected = this.controller.lookupListener(NetworkingService).isConnected();
+    if (singlePlayerService.isSinglePlayer || !connected) {
+      if (this.hadConnectedWorld) this.destroy();
+      this.hadConnectedWorld = false;
+      return;
     }
+    this.hadConnectedWorld = true;
+    if (!this.sp.Game.getPlayer()) return;
+    this.resetAllFormViewsIfPlayerChangedWorld();
+    const modelSource = this.controller.lookupListener(RemoteServer);
+    this.updateWorld(modelSource.getWorldModel());
   }
 
   private onceUpdate() {
@@ -65,15 +81,15 @@ export class WorldView extends ClientListener {
       this.oldView = undefined;
       logTrace(this, 'Previous View destroyed');
     }
-    this.waitGameTimeAndAllowFormViewUpdate(1.0);
+    if (this.allowUpdateGeneration === 0 && !this.explicitlyBlocked)
+      this.waitGameTimeAndAllowFormViewUpdate(1.0);
   }
 
   private resetAllFormViewsIfPlayerChangedWorld() {
     const state = this.state;
-    const pc = this.sp.Game.getPlayer()!;
-    const pcWorldOrCell = (
-      (pc.getWorldSpace() || pc.getParentCell()) as Form
-    ).getFormID();
+    const pc = this.sp.Game.getPlayer();
+    const pcWorldOrCell = (pc?.getWorldSpace() || pc?.getParentCell())?.getFormID();
+    if (!pcWorldOrCell) return;
     if (state.pcWorldOrCell !== pcWorldOrCell) {
       if (state.pcWorldOrCell) {
         logTrace(this, 'Reset all form views');
@@ -88,17 +104,29 @@ export class WorldView extends ClientListener {
   // Default nord in Race Menu will have very ugly face
   // If other players are spawning when we show this menu
   // TODO: separate listener
-  public waitGameTimeAndAllowFormViewUpdate(seconds: number) {
+  public waitGameTimeAndAllowFormViewUpdate(seconds: number, expectedGeneration?: number) {
+    if (expectedGeneration !== undefined && !this.isUpdateGateCurrent(expectedGeneration)) return;
+    this.explicitlyBlocked = false;
+    const generation = ++this.allowUpdateGeneration;
+    const state = this.state;
     // Wait 1s game time (time spent in Race Menu isn't counted)
     this.sp.Utility.wait(seconds).then(() => {
-      this.state.allowUpdate = true;
+      if (generation !== this.allowUpdateGeneration || state !== this.state || this.sp.storage['view'] !== this) return;
+      state.allowUpdate = true;
       logTrace(this, 'Update is now allowed');
     });
   }
 
   public setFormViewUpdateAllowed(allowed: boolean) {
+    this.explicitlyBlocked = !allowed;
+    ++this.allowUpdateGeneration;
     this.state.allowUpdate = allowed;
     logTrace(this, 'Update is now', allowed ? 'allowed' : 'disallowed');
+    return this.allowUpdateGeneration;
+  }
+
+  public isUpdateGateCurrent(generation: number): boolean {
+    return generation === this.allowUpdateGeneration && this.sp.storage['view'] === this;
   }
 
   private updateWorld(model: WorldModel): void {
@@ -156,4 +184,8 @@ export class WorldView extends ClientListener {
   };
 
   private oldView?: WorldView;
+  private allowUpdateGeneration = 0;
+  private hadConnectedWorld = false;
+  private explicitlyBlocked = false;
+  private loading = false;
 }

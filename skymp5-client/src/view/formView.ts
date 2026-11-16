@@ -1,4 +1,4 @@
-import { Actor, ActorBase, createText, destroyText, Form, FormType, Game, Keyword, NetImmerse, ObjectReference, once, printConsole, setTextPos, setTextSize, setTextString, storage, TESModPlatform, Utility, worldPointToScreenPoint } from "skyrimPlatform";
+import { Actor, ActorBase, createText, destroyText, Form, FormType, Game, getReferenceHandle, Keyword, NetImmerse, ObjectReference, printConsole, setTextPos, setTextSize, setTextString, storage, TESModPlatform, Utility, worldPointToScreenPoint } from "skyrimPlatform";
 import { setDefaultAnimsDisabled, applyAnimation } from "../sync/animation";
 import { Appearance, applyAppearance } from "../sync/appearance";
 import { isBadMenuShown, applyEquipment } from "../sync/equipment";
@@ -15,6 +15,8 @@ import { localIdToRemoteId } from "./worldViewMisc";
 import { SpApiInteractor } from "../services/spApiInteractor";
 import { WorldCleanerService } from "../services/services/worldCleanerService";
 import { GamemodeUpdateService } from "../services/services/gamemodeUpdateService";
+import { OwnedReferenceService } from '../services/services/ownedReferenceService';
+import { OwnedReference } from '../campaign/ownedReferenceLifetime';
 
 export interface ScreenResolution {
   width: number;
@@ -36,6 +38,13 @@ export class FormView {
   constructor(private remoteRefrId?: number) { }
 
   update(model: FormModel): void {
+    if (this.ownedReference && (!this.lifetime.isCurrent(this.ownedReference) ||
+        getReferenceHandle(this.ownedReference.id) !== this.ownedReference.handle)) {
+      // Failed/canceled spawns remain unavailable until the view is replaced.
+      this.lifetime.retire(this.ownedReference);
+      this.ready = false;
+      return;
+    }
     // Other players mutate into PC clones when moving to another location
     if (model.movement) {
       if (!this.lastWorldOrCell)
@@ -165,60 +174,19 @@ export class FormView {
 
         const player = Game.getPlayer() as Actor;
 
-        const spawnMethodOriginal = {
-          spawn(baseForm: Form, _spawnPosition: [number, number, number], _spawnRotation: [number, number, number]): ObjectReference {
-            return player.placeAtMe(
-              baseForm,
-              1,
-              true,
-              true
-            ) as ObjectReference;
-          },
-
-          triggerSpawnProcess(spawningRefr: ObjectReference, spawnPosition: [number, number, number], appearance: Appearance | null, callback: () => void) {
-            new SpawnProcess(
-              appearance,
-              spawnPosition,
-              spawningRefr.getFormID(),
-              callback
-            );
-          }
-        };
-
-        const spawnMethodStub = {
-          spawn(baseForm: Form, spawnPosition: [number, number, number], spawnRotation: [number, number, number]): ObjectReference {
-            const f = storage["formViewFunc1"] as Function;
-            const ref: ObjectReference = f(baseForm, spawnPosition, spawnRotation);
-            return ref;
-          },
-
-          triggerSpawnProcess(spawningRefr: ObjectReference, spawnPosition: [number, number, number], appearance: Appearance | null, callback: () => void) {
-            const f = storage["formViewFunc2"] as Function;
-            f(spawningRefr, spawnPosition, appearance, callback);
-          }
-        };
-
-        const spawnUsingStubMethod = base.getType() === FormType.NPC
-          && !this.appearanceState.appearance
-          && storage["formViewFunc1Set"] === true
-          && storage["formViewFunc2Set"] === true;
-        const spawnMethod = spawnUsingStubMethod ? spawnMethodStub : spawnMethodOriginal;
-
-        if (model.movement) {
-          refr = spawnMethod.spawn(base, model.movement.pos, model.movement.rot);
-        } else {
-          printConsole("model.movement was " + model.movement);
-        }
+        // Every temporary view uses the tracked spawn path. The legacy
+        // storage-provided spawn hooks could launch uncancelable native work.
+        if (!model.movement) return;
+        this.lifetime.requireCapacity();
+        refr = player.placeAtMe(base, 1, true, true);
+        if (!refr) return;
+        this.refrId = refr.getFormID();
+        this.ownedReference = this.lifetime.claim(this.refrId);
+        SpApiInteractor.getControllerInstance().lookupListener(WorldCleanerService).modWcProtection(this.refrId, 1);
 
         this.state = {};
         delete this.wasHostedByOther;
-        if (base.getType() !== FormType.NPC) {
-          refr?.setAngle(
-            model.movement?.rot[0] || 0,
-            model.movement?.rot[1] || 0,
-            model.movement?.rot[2] || 0
-          );
-        } else {
+        if (base.getType() === FormType.NPC) {
           const race = Actor.from(refr)?.getRace()?.getFormID();
           const draugrRace = 0xd53;
           const falmerRace = 0x131f4;
@@ -254,10 +222,6 @@ export class FormView {
           }
         }
 
-        if (refr !== null) {
-          SpApiInteractor.getControllerInstance().lookupListener(WorldCleanerService).modWcProtection(refr.getFormID(), 1);
-        }
-
         // TODO: reset all states?
         this.eqState = this.getDefaultEquipState();
         this.animState = this.getDefaultAnimState();
@@ -274,10 +238,12 @@ export class FormView {
         }
 
         if (refr) {
-          spawnMethod.triggerSpawnProcess(refr, spawnPos, model.appearance || null, () => {
+          const reference = this.ownedReference;
+          new SpawnProcess(model.appearance || null, spawnPos, reference, this.lifetime, () => {
+            if (this.ownedReference !== reference || !this.lifetime.isCurrent(reference)) return;
             this.ready = true;
             this.spawnMoment = Date.now();
-          });
+          }, base.getType() === FormType.NPC ? undefined : model.movement.rot);
         } else {
           printConsole("Unable to triggerSpawnProcess for null refr");
         }
@@ -313,24 +279,22 @@ export class FormView {
   destroy(): void {
     this.isOnScreen = false;
     this.spawnMoment = 0;
-    const refrId = this.refrId;
-    once("update", () => {
-      if (refrId >= 0xff000000) {
-        const refr = ObjectReference.from(Game.getFormEx(refrId));
-        if (refr) {
-          refr.delete();
-        }
-        SpApiInteractor.getControllerInstance().lookupListener(WorldCleanerService).modWcProtection(refrId, -1);
-        const ac = Actor.from(refr);
-        if (ac) {
-          TESModPlatform.setWeaponDrawnMode(ac, -1);
-        }
-      }
-    })
-
+    if (this.ownedReference) this.lifetime.retire(this.ownedReference);
+    this.ownedReference = undefined;
+    this.refrId = 0;
+    this.ready = false;
     this.localImmortal = false;
     this.removeNickname();
+    this.movState = { lastNumChanges: 0, lastApply: 0, lastRehost: 0, everApplied: false };
+    this.lastHarvestedApply = 0; this.lastOpenApply = 0;
+    this.isSetNodeScaleApplied = false; this.isSetNodeTextureSetApplied = false;
   }
+
+  private get lifetime() {
+    return SpApiInteractor.getControllerInstance().lookupListener(OwnedReferenceService).references;
+  }
+
+  private ownedReference?: OwnedReference;
 
   private lastHarvestedApply = 0;
   private lastOpenApply = 0;
