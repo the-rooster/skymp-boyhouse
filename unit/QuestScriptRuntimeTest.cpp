@@ -101,18 +101,24 @@ TEST_CASE(
   REQUIRE(f.Run(a));
   REQUIRE(QuestJournal::Get(a, kQuest)["objectives"]["10"]["displayed"] ==
           true);
-  REQUIRE(QuestJournal::ScriptState(
-            a)[kStateKey]["values"]["boyhousefixture/counter"]["value"] == 1);
+  REQUIRE(
+    QuestJournal::ScriptState(
+      a)["scripts"][kStateKey]["values"]["boyhousefixture/counter"]["value"] ==
+    1);
   REQUIRE_FALSE(QuestJournal::Snapshot(a).contains("vm"));
   const auto snapshot = QuestJournal::Snapshot(a);
   REQUIRE_FALSE(f.Run(a));
   REQUIRE(QuestJournal::Snapshot(a) == snapshot);
   REQUIRE(f.Run(a, 20));
-  REQUIRE(QuestJournal::ScriptState(
-            a)[kStateKey]["values"]["boyhousefixture/counter"]["value"] == 2);
+  REQUIRE(
+    QuestJournal::ScriptState(
+      a)["scripts"][kStateKey]["values"]["boyhousefixture/counter"]["value"] ==
+    2);
   REQUIRE(f.Run(b));
-  REQUIRE(QuestJournal::ScriptState(
-            b)[kStateKey]["values"]["boyhousefixture/counter"]["value"] == 1);
+  REQUIRE(
+    QuestJournal::ScriptState(
+      b)["scripts"][kStateKey]["values"]["boyhousefixture/counter"]["value"] ==
+    1);
   Fixture restarted;
   auto& restored = restarted.Add(a.GetFormId());
   auto json = MpChangeForm::ToJson(a.GetChangeForm()).dump();
@@ -133,8 +139,10 @@ TEST_CASE("Guest fragments update only the owner's script variables",
   a.SetWorldInstance(instance);
   b.SetWorldInstance(instance);
   REQUIRE(f.Run(b));
-  REQUIRE(QuestJournal::ScriptState(
-            a)[kStateKey]["values"]["boyhousefixture/counter"]["value"] == 1);
+  REQUIRE(
+    QuestJournal::ScriptState(
+      a)["scripts"][kStateKey]["values"]["boyhousefixture/counter"]["value"] ==
+    1);
   b.SetWorldInstance("");
   REQUIRE(QuestJournal::ScriptState(b).empty());
   REQUIRE(QuestJournal::Get(b, kQuest)["stage"] == 0);
@@ -150,9 +158,9 @@ TEST_CASE("Quest reset discards script variables before the next run",
     QuestJournal::Apply(actor, { { "quest", kQuest }, { "op", "reset" } }));
   REQUIRE(QuestJournal::ScriptState(actor).empty());
   REQUIRE(f.Run(actor));
-  REQUIRE(QuestJournal::ScriptState(
-            actor)[kStateKey]["values"]["boyhousefixture/counter"]["value"] ==
-          1);
+  REQUIRE(
+    QuestJournal::ScriptState(actor)["scripts"][kStateKey]["values"]
+                                    ["boyhousefixture/counter"]["value"] == 1);
 }
 
 TEST_CASE(
@@ -175,14 +183,14 @@ TEST_CASE(
   owner.SetWorldInstance(instance);
   guest.SetWorldInstance(instance);
   REQUIRE(f.Run(guest));
-  REQUIRE(QuestJournal::ScriptState(
-            owner)[kStateKey]["values"]["boyhousefixture/counter"]["value"] ==
-          2);
+  REQUIRE(
+    QuestJournal::ScriptState(owner)["scripts"][kStateKey]["values"]
+                                    ["boyhousefixture/counter"]["value"] == 2);
   guest.SetWorldInstance("");
   REQUIRE(f.Run(guest));
-  REQUIRE(QuestJournal::ScriptState(
-            guest)[kStateKey]["values"]["boyhousefixture/counter"]["value"] ==
-          1);
+  REQUIRE(
+    QuestJournal::ScriptState(guest)["scripts"][kStateKey]["values"]
+                                    ["boyhousefixture/counter"]["value"] == 1);
 }
 
 TEST_CASE("Runaway fragments roll back and do not poison later executions",
@@ -219,8 +227,8 @@ TEST_CASE(
                 { VarValue("Count"), Id("self"), VarValue(42) } });
   REQUIRE(f.Run(actor));
   REQUIRE(QuestJournal::ScriptState(
-            actor)[kStateKey]["values"]["boyhousefixture/counter"]["value"] ==
-          42);
+            actor)["scripts"][kStateKey]["values"]["boyhousefixture/counter"]
+                  ["value"] == 42);
   const auto before = QuestJournal::Snapshot(actor);
   f.Fragment().locals.push_back({ "target", "Quest" });
   code[2].args[1] = Id("target");
@@ -229,9 +237,8 @@ TEST_CASE(
   REQUIRE(QuestJournal::Snapshot(actor) == before);
 }
 
-TEST_CASE(
-  "Quest arrays persist, while unrepresentable shared identities roll back",
-  "[Quest][QuestVM]")
+TEST_CASE("Fragments keep shared arrays across saved campaign reloads",
+          "[Quest][QuestVM]")
 {
   Fixture f;
   auto& actor = f.Add(0xff000001);
@@ -244,24 +251,41 @@ TEST_CASE(
              { Id("a"), VarValue(0), VarValue(7) } },
            { FunctionCode::kOp_Assign, { Id("b"), Id("a") } },
            { FunctionCode::kOp_Return, { VarValue::None() } } };
-  const auto before = QuestJournal::Snapshot(actor);
-  REQUIRE_THROWS_WITH(
-    f.Run(actor), Catch::Matchers::ContainsSubstring("Shared quest arrays"));
-  REQUIRE(QuestJournal::Snapshot(actor) == before);
-  code.erase(code.begin() + 2);
   REQUIRE(f.Run(actor));
-  code = { { FunctionCode::kOp_ArrayGetElement,
-             { Id("counter"), Id("a"), VarValue(0) } },
-           { FunctionCode::kOp_IAdd,
-             { Id("counter"), Id("counter"), VarValue(1) } },
-           { FunctionCode::kOp_ArraySetElement,
-             { Id("a"), VarValue(0), Id("counter") } },
-           { FunctionCode::kOp_Return, { VarValue::None() } } };
-  REQUIRE(f.Run(actor, 20));
-  REQUIRE(
-    QuestJournal::ScriptState(
-      actor)[kStateKey]["values"]["boyhousefixture/a"]["value"][0]["value"] ==
-    8);
+
+  Fixture restarted;
+  auto& restored = restarted.Add(actor.GetFormId());
+  const auto dump = MpChangeForm::ToJson(actor.GetChangeForm()).dump();
+  simdjson::dom::parser parser;
+  auto parsed = parser.parse(dump).value();
+  restored.ApplyChangeForm(MpChangeForm::JsonToChangeForm(parsed));
+  restarted.fixture = f.fixture;
+  restarted.Fragment().code.instructions = {
+    { FunctionCode::kOp_ArraySetElement,
+      { Id("a"), VarValue(0), VarValue(8) } },
+    { FunctionCode::kOp_ArrayGetElement,
+      { Id("counter"), Id("b"), VarValue(0) } },
+    { FunctionCode::kOp_Return, { VarValue::None() } }
+  };
+  REQUIRE(restarted.Run(restored, 20));
+  const auto saved = QuestJournal::ScriptState(restored);
+  REQUIRE(saved["scripts"][kStateKey]["values"]["boyhousefixture/counter"]
+               ["value"] == 8);
+  REQUIRE(saved["arrays"].size() == 1);
+  // A failed later fragment must not leak an in-memory heap mutation.
+  const auto before =
+    restored.GetDynamicFields().GetValueDump(QuestJournal::kProperty);
+  restarted.metadata.fragments.push_back(
+    { 100, 0, 1, "BoyhouseFixture", "Fragment" });
+  restarted.Fragment().code.instructions.insert(
+    restarted.Fragment().code.instructions.end() - 1,
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("UnsupportedNative"), Id("self"), Id("temp"),
+        VarValue(0) } });
+  restarted.Fragment().code.instructions[0].args[2] = VarValue(99);
+  REQUIRE_THROWS(restarted.Run(restored, 100));
+  REQUIRE(restored.GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
+          before);
 }
 
 TEST_CASE(
@@ -284,7 +308,7 @@ TEST_CASE(
 }
 
 TEST_CASE(
-  "Missing bindings and recursive stage changes cannot silently complete",
+  "Missing bindings and unsupported lifecycle calls cannot silently complete",
   "[Quest][QuestVM]")
 {
   Fixture f;
@@ -294,10 +318,9 @@ TEST_CASE(
   REQUIRE_THROWS(f.Run(a));
   REQUIRE(QuestJournal::Snapshot(a) == before);
   f.metadata.fragments[0].function = "Fragment";
-  f.Fragment().code.instructions[1] = {
-    FunctionCode::kOp_CallMethod,
-    { VarValue("SetStage"), Id("self"), Id("temp"), VarValue(1), VarValue(20) }
-  };
+  f.Fragment().code.instructions[1] = { FunctionCode::kOp_CallMethod,
+                                        { VarValue("Stop"), Id("self"),
+                                          Id("temp"), VarValue(0) } };
   REQUIRE_THROWS(f.Run(a));
   REQUIRE(QuestJournal::Snapshot(a) == before);
   f.metadata.scripts[0].name = "MissingPex";
@@ -378,15 +401,15 @@ TEST_CASE("Reusing a character ID cannot receive an old quest transaction",
   Fixture f;
   const uint32_t id = 0xff000001;
   auto& actor = f.Add(id);
-  REQUIRE_THROWS_WITH(
-    QuestJournal::Atomic(
-      actor,
-      [&] {
-        QuestJournal::Apply(actor, { { "quest", kQuest }, { "op", "start" } });
-        f.server.worldState.DestroyForm(id);
-        f.Add(id);
-      }),
-    Catch::Matchers::ContainsSubstring("context changed"));
+  REQUIRE_THROWS_WITH(QuestJournal::Atomic(
+                        actor,
+                        [&] {
+                          QuestJournal::Apply(
+                            actor, { { "quest", kQuest }, { "op", "start" } });
+                          f.server.worldState.DestroyForm(id);
+                          f.Add(id);
+                        }),
+                      Catch::Matchers::ContainsSubstring("context changed"));
   REQUIRE(QuestJournal::Snapshot(
             f.server.worldState.GetFormAt<MpActor>(id))["quests"]
             .empty());
@@ -498,4 +521,129 @@ TEST_CASE("Owned vanilla PEX files parse after archive decompression",
     REQUIRE(parsed.size() == 1);
     REQUIRE(parsed.front()->objectTable.size() == 1);
   }
+}
+
+TEST_CASE(
+  "Nested original stages execute once in the same campaign transaction",
+  "[Quest][QuestVM]")
+{
+  Fixture f;
+  auto& host = f.Add(0xff000001);
+  auto& guest = f.Add(0xff000002);
+  const auto instance =
+    "campaign:" + std::to_string(host.GetFormId()) + ":fixture";
+  host.SetWorldInstance(instance);
+  guest.SetWorldInstance(instance);
+  // Both 10 and 20 call 20. The second call observes the in-transaction
+  // visited stage and returns false; it must neither recurse forever nor run
+  // twice.
+  auto& code = f.Fragment().code.instructions;
+  code.insert(code.end() - 1,
+              { FunctionCode::kOp_CallMethod,
+                { VarValue("SetStage"), Id("self"), Id("temp"), VarValue(1),
+                  VarValue(20) } });
+  REQUIRE(f.Run(guest));
+  const auto journal = QuestJournal::Get(host, kQuest);
+  REQUIRE(journal["stages"] == nlohmann::json::array({ 10, 20 }));
+  REQUIRE(
+    QuestJournal::ScriptState(host)["scripts"][kStateKey]["values"]
+                                   ["boyhousefixture/counter"]["value"] == 2);
+  guest.SetWorldInstance("");
+  REQUIRE(QuestJournal::Get(guest, kQuest)["stages"].empty());
+  REQUIRE(QuestJournal::ScriptState(guest).empty());
+}
+
+TEST_CASE("Failure after a nested stage rolls back every stage and variable",
+          "[Quest][QuestVM]")
+{
+  Fixture f;
+  auto& actor = f.Add(0xff000001);
+  auto& object = f.fixture->objectTable[0];
+  auto parent = f.Fragment();
+  parent.code.instructions = {
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("SetCurrentStageID"), Id("self"), Id("temp"), VarValue(1),
+        VarValue(20) } },
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("UnsupportedNative"), Id("self"), Id("temp"), VarValue(0) } },
+    { FunctionCode::kOp_Return, { VarValue::None() } }
+  };
+  object.states[0].functions.push_back({ "Parent", parent });
+  f.metadata.fragments[0].function = "Parent";
+  const auto before =
+    actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty);
+  REQUIRE_THROWS(f.Run(actor));
+  REQUIRE(actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
+          before);
+  REQUIRE(QuestJournal::Get(actor, kQuest)["stages"].empty());
+  REQUIRE(QuestJournal::ScriptState(actor).empty());
+  // The failed transaction cannot poison the next VM.
+  object.states[0].functions.back().function.code.instructions.erase(
+    object.states[0].functions.back().function.code.instructions.begin() + 1);
+  REQUIRE(f.Run(actor));
+  REQUIRE(QuestJournal::Get(actor, kQuest)["stages"] ==
+          nlohmann::json::array({ 10, 20 }));
+}
+
+TEST_CASE("Nested stages validate indices without recording partial progress",
+          "[Quest][QuestVM]")
+{
+  Fixture f;
+  auto& actor = f.Add(0xff000001);
+  auto& code = f.Fragment().code.instructions;
+  const auto index = GENERATE(-1, 65536, 65535);
+  code.insert(code.end() - 1,
+              { FunctionCode::kOp_CallMethod,
+                { VarValue("SetStage"), Id("self"), Id("temp"), VarValue(1),
+                  VarValue(index) } });
+  REQUIRE_THROWS(f.Run(actor));
+  REQUIRE(QuestJournal::Get(actor, kQuest)["stages"].empty());
+  REQUIRE(QuestJournal::ScriptState(actor).empty());
+}
+
+TEST_CASE(
+  "Nested stages can advance a different quest without losing atomicity",
+  "[Quest][QuestVM]")
+{
+  Fixture f;
+  auto& actor = f.Add(0xff000001);
+  // An owned helper quest with actual stages and no fragments/aliases.
+  constexpr uint32_t other = 0xc07c1;
+  espm::QuestScriptValue value;
+  value.type = 1;
+  value.formId = other;
+  f.metadata.scripts[0].properties.push_back({ "Target", 1, value });
+  f.fixture->objectTable[0].variables.push_back(
+    { "::Target_var", "Quest", 0, VarValue::None() });
+  f.Fragment().code.instructions = {
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("SetStage"), Id("::Target_var"), Id("temp"), VarValue(1),
+        VarValue(100) } },
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("UnsupportedNative"), Id("self"), Id("temp"), VarValue(0) } },
+    { FunctionCode::kOp_Return, { VarValue::None() } }
+  };
+  const auto before =
+    actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty);
+  // Another quest is not automatically opted in by a script reference.
+  REQUIRE_THROWS_WITH(
+    f.Run(actor),
+    Catch::Matchers::ContainsSubstring("adapter is not enabled"));
+  REQUIRE(actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
+          before);
+  actor.SetPropertyValueDump(QuestJournal::kEnabled,
+                             "[\"4e50d:Skyrim.esm\",\"c07c1:Skyrim.esm\"]",
+                             false, false);
+  REQUIRE_THROWS_WITH(f.Run(actor),
+                      Catch::Matchers::ContainsSubstring("UnsupportedNative"));
+  REQUIRE(actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
+          before);
+  REQUIRE(QuestJournal::Get(actor, other)["stages"].empty());
+  f.Fragment().code.instructions.erase(f.Fragment().code.instructions.begin() +
+                                       1);
+  REQUIRE(f.Run(actor));
+  REQUIRE(QuestJournal::Get(actor, other)["stages"] ==
+          nlohmann::json::array({ 100 }));
+  REQUIRE(QuestJournal::Get(actor, kQuest)["stages"] ==
+          nlohmann::json::array({ 10 }));
 }

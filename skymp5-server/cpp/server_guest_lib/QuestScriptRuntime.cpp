@@ -2,6 +2,7 @@
 #include "ConditionsEvaluator.h"
 #include "MpActor.h"
 #include "QuestJournal.h"
+#include "QuestVmState.h"
 #include "WorldState.h"
 #include "condition_functions/ConditionFunctionFactory.h"
 #include "libespm/CTDA.h"
@@ -30,12 +31,12 @@ public:
   using Resolve =
     std::function<std::shared_ptr<CampaignQuestObject>(uint32_t)>;
   Variables(espm::QuestScript script_, espm::LookupResult record_, Json saved_,
-            Resolve resolve_, const std::vector<std::string>& files_)
+            Resolve resolve_, QuestVmState& heap_)
     : script(std::move(script_))
     , record(record_)
     , saved(std::move(saved_))
     , resolve(std::move(resolve_))
-    , files(files_)
+    , heap(heap_)
   {
     if (!saved.is_object())
       throw std::runtime_error("Invalid saved script variables");
@@ -89,18 +90,18 @@ public:
     if (!found)
       return nullptr;
     if (saved.contains(qualified))
-      initial = Decode(saved.at(qualified));
+      initial = heap.Decode(saved.at(qualified));
     for (const auto& variable : pex.objectTable.at(0).variables)
       if (Lower(variable.name) == key)
         initial.objectType = variable.typeName;
     return &values.emplace(qualified, std::move(initial)).first->second;
   }
 
-  Json Save(std::set<const void*>& arraysSeen) const
+  Json Save() const
   {
     auto result = saved;
     for (const auto& [name, value] : values)
-      result[name] = Encode(value, arraysSeen);
+      result[name] = heap.Encode(value);
     return { { "schemaVersion", 1 }, { "values", result } };
   }
 
@@ -143,112 +144,11 @@ private:
         return array;
     }
   }
-  Json Encode(const VarValue& value, std::set<const void*>& arraysSeen) const
-  {
-    if (value.promise)
-      throw std::runtime_error("Cannot save latent quest value");
-    Json result{ { "type", value.GetType() } };
-    switch (value.GetType()) {
-      case VarValue::kType_Object: {
-        auto* object = static_cast<IGameObject*>(value);
-        if (!object)
-          result["value"] = nullptr;
-        else {
-          auto* quest = dynamic_cast<CampaignQuestObject*>(object);
-          if (!quest)
-            throw std::runtime_error("Unsupported saved quest object");
-          result["value"] =
-            FormDesc::FromFormId(
-              quest->record.ToGlobalId(quest->record.rec->GetId()), files)
-              .ToString();
-        }
-        break;
-      }
-      case VarValue::kType_String:
-        result["value"] = std::string(static_cast<const char*>(value));
-        break;
-      case VarValue::kType_Integer:
-        result["value"] = static_cast<int32_t>(value);
-        break;
-      case VarValue::kType_Float: {
-        const auto number = static_cast<double>(value);
-        if (!std::isfinite(number))
-          throw std::runtime_error("Nonfinite quest variable");
-        result["value"] = number;
-        break;
-      }
-      case VarValue::kType_Bool:
-        result["value"] = static_cast<bool>(value);
-        break;
-      default:
-        if (value.GetType() < 11 || value.GetType() > 15)
-          throw std::runtime_error("Unsupported quest variable type");
-        result["value"] = nullptr;
-        if (value.pArray) {
-          if (!arraysSeen.insert(value.pArray.get()).second)
-            throw std::runtime_error(
-              "Shared quest arrays require reference-preserving persistence");
-          result["value"] = Json::array();
-          for (const auto& element : *value.pArray)
-            result["value"].push_back(Encode(element, arraysSeen));
-        }
-    }
-    return result;
-  }
-  VarValue Decode(const Json& json)
-  {
-    if (!json.at("type").is_number_integer())
-      throw std::runtime_error("Invalid saved type tag");
-    const auto type = json.at("type").get<int>();
-    const auto& value = json.at("value");
-    switch (type) {
-      case 0:
-        return value.is_null()
-          ? VarValue::None()
-          : VarValue(
-              resolve(
-                FormDesc::FromString(value.get<std::string>()).ToFormId(files))
-                .get());
-      case 2:
-        return VarValue(value.get<std::string>());
-      case 3: {
-        const auto integer = value.get<int64_t>();
-        if (!value.is_number_integer() || integer < INT32_MIN ||
-            integer > INT32_MAX)
-          throw std::runtime_error("Invalid saved integer");
-        return VarValue(int32_t(integer));
-      }
-      case 4: {
-        const auto number = value.get<double>();
-        if (!std::isfinite(number))
-          throw std::runtime_error("Invalid saved float");
-        return VarValue(number);
-      }
-      case 5:
-        return VarValue(value.get<bool>());
-      default:
-        if (type < 11 || type > 15)
-          throw std::runtime_error("Invalid saved variable type");
-        VarValue array(static_cast<uint8_t>(type));
-        if (!value.is_null()) {
-          if (!value.is_array() || value.size() > 1000000)
-            throw std::runtime_error("Invalid saved array");
-          array.pArray = std::make_shared<std::vector<VarValue>>();
-          for (const auto& element : value) {
-            auto decoded = Decode(element);
-            if (decoded.GetType() != (type == 11 ? 0 : type - 10))
-              throw std::runtime_error("Saved array element type mismatch");
-            array.pArray->push_back(std::move(decoded));
-          }
-        }
-        return array;
-    }
-  }
   espm::QuestScript script;
   espm::LookupResult record;
   Json saved;
   Resolve resolve;
-  const std::vector<std::string>& files;
+  QuestVmState& heap;
   std::map<std::string, VarValue> values;
 };
 
@@ -354,22 +254,14 @@ bool QuestScriptRuntime::ExecuteStage(
   const auto record = world.GetEspm().GetBrowser().LookupById(questId);
   if (!record.rec || record.rec->GetType() != "QUST")
     throw std::invalid_argument("Expected quest record");
-  const auto logs = ReadLogs(record, stage, world);
   bool changed = false;
   QuestJournal::Atomic(actor, [&] {
-    changed = QuestJournal::Apply(
-      actor,
-      { { "quest", questId }, { "op", "setStage" }, { "index", stage } });
-    if (!changed)
-      return;
-    auto state = QuestJournal::ScriptState(actor);
     VirtualMachine vm(scripts);
     vm.SetStrictExecution(true);
     auto policy = std::make_shared<HeuristicPolicy>(&world);
     PapyrusQuest questApi;
     questApi.Register(vm, policy);
-    for (const auto* name :
-         { "Start", "Stop", "Reset", "SetStage", "SetCurrentStageID" }) {
+    for (const auto* name : { "Start", "Stop", "Reset" }) {
       vm.RegisterFunction(
         "Quest", name, FunctionType::Method,
         [](VarValue, std::vector<VarValue>) -> VarValue {
@@ -384,6 +276,23 @@ bool QuestScriptRuntime::ExecuteStage(
     std::map<uint32_t, std::shared_ptr<CampaignQuestObject>> objects;
     std::map<std::string, std::shared_ptr<Variables>> variables;
     std::function<std::shared_ptr<CampaignQuestObject>(uint32_t)> resolve;
+    QuestVmState state(
+      QuestJournal::ScriptState(actor),
+      [&](IGameObject* value) -> Json {
+        auto* quest = dynamic_cast<CampaignQuestObject*>(value);
+        if (!quest || quest->OwnerId() != owner)
+          throw std::runtime_error("Unsupported saved campaign object");
+        return FormDesc::FromFormId(
+                 quest->record.ToGlobalId(quest->record.rec->GetId()),
+                 world.espmFiles)
+          .ToString();
+      },
+      [&](const Json& value) -> VarValue {
+        return VarValue(resolve(FormDesc::FromString(value.get<std::string>())
+                                  .ToFormId(world.espmFiles))
+                          .get());
+      });
+
     resolve = [&](uint32_t id) {
       if (objects.count(id))
         return objects.at(id);
@@ -411,64 +320,112 @@ bool QuestScriptRuntime::ExecuteStage(
         if (variables.count(key))
           throw std::runtime_error("Duplicate quest script binding");
         auto holder = std::make_shared<Variables>(
-          script, rec, state.value(key, Json::object()), resolve,
-          world.espmFiles);
+          script, rec, state.GetScript(key), resolve, state);
         variables[key] = holder;
         bindings.push_back({ script.name, holder });
       }
       vm.AddObject(object, bindings);
       return object;
     };
-    auto object = resolve(questId);
-    const auto conditionFunctions =
-      ConditionFunctionFactory::CreateConditionFunctions();
-    std::set<uint32_t> seen;
-    for (const auto& fragment : metadata.fragments) {
-      if (fragment.stage != stage)
-        continue;
-      if (fragment.logEntry >= logs.size() ||
-          !seen.insert(fragment.logEntry).second)
-        throw std::runtime_error(
-          "Invalid or duplicate quest fragment log binding");
+    size_t depth = 0;
+    std::function<bool(uint32_t, uint16_t)> execute;
+    for (const auto* name : { "SetStage", "SetCurrentStageID" }) {
+      vm.RegisterFunction(
+        "Quest", name, FunctionType::Method,
+        [&](VarValue self, std::vector<VarValue> args) -> VarValue {
+          if (self.GetType() != VarValue::kType_Object)
+            throw std::invalid_argument("Expected a campaign quest object");
+          auto* object = dynamic_cast<CampaignQuestObject*>(
+            static_cast<IGameObject*>(self));
+          if (!object || object->OwnerId() != owner)
+            throw std::runtime_error(
+              "Nested stage belongs to another campaign");
+          if (args.size() != 1 || args[0].GetType() != VarValue::kType_Integer)
+            throw std::invalid_argument("Quest stage must be an integer");
+          const auto index = static_cast<int32_t>(args[0]);
+          if (index < 0 || index > 65535)
+            throw std::invalid_argument("Quest stage out of range");
+          return VarValue(
+            execute(object->record.ToGlobalId(object->record.rec->GetId()),
+                    static_cast<uint16_t>(index)));
+        });
     }
-    for (size_t logIndex = 0; logIndex < logs.size(); ++logIndex) {
-      bool passes = logs[logIndex].conditions.empty();
-      if (!passes)
-        ConditionsEvaluator::EvaluateConditions(
-          conditionFunctions, {}, ConditionsEvaluatorCaller::kCraft,
-          logs[logIndex].conditions, actor, actor,
-          [&](bool result, auto&) { passes = result; });
-      if (!passes)
-        continue;
-      for (const auto& fragment : metadata.fragments) {
-        if (fragment.stage != stage || fragment.logEntry != logIndex)
-          continue;
-        const auto script = object->Script(fragment.script);
-        const auto function =
-          script->GetFunctionByName(fragment.function.c_str(), "");
-        if (!function.valid || function.IsNative())
-          throw std::runtime_error("Missing quest stage fragment: " +
-                                   fragment.function);
-        std::vector<VarValue> args;
-        VarValue result;
-        try {
-          result = script->StartFunction(function, args, stack);
-        } catch (const std::exception& error) {
-          throw std::runtime_error(fragment.script + "." + fragment.function +
-                                   ": " + error.what());
-        }
-        if (result.promise)
-          throw std::runtime_error(
-            "Latent quest fragment requires durable continuation support");
+    execute = [&](uint32_t targetId, uint16_t targetStage) {
+      if (++depth > 128) {
+        --depth;
+        throw std::runtime_error("Quest stage recursion limit exceeded");
       }
-      if (logs[logIndex].flags & 1)
-        QuestJournal::Apply(actor,
-                            { { "quest", questId }, { "op", "complete" } });
-    }
-    std::set<const void*> arraysSeen;
+      struct DepthGuard
+      {
+        size_t& depth;
+        ~DepthGuard() { --depth; }
+      } guard{ depth };
+      const auto target = world.GetEspm().GetBrowser().LookupById(targetId);
+      if (!target.rec || target.rec->GetType() != "QUST")
+        throw std::invalid_argument("Expected nested quest record");
+      const auto data = targetId == questId
+        ? metadata
+        : espm::QuestScriptData::Read(target.rec, world.GetEspmCache());
+      const auto logs = ReadLogs(target, targetStage, world);
+      if (!QuestJournal::Apply(actor,
+                               { { "quest", targetId },
+                                 { "op", "setStage" },
+                                 { "index", targetStage } }))
+        return false;
+      auto object = resolve(targetId);
+      const auto conditionFunctions =
+        ConditionFunctionFactory::CreateConditionFunctions();
+      std::set<uint32_t> seen;
+      for (const auto& fragment : data.fragments) {
+        if (fragment.stage != targetStage)
+          continue;
+        if (fragment.logEntry >= logs.size() ||
+            !seen.insert(fragment.logEntry).second)
+          throw std::runtime_error(
+            "Invalid or duplicate quest fragment log binding");
+      }
+      for (size_t logIndex = 0; logIndex < logs.size(); ++logIndex) {
+        bool passes = logs[logIndex].conditions.empty();
+        if (!passes)
+          ConditionsEvaluator::EvaluateConditions(
+            conditionFunctions, {}, ConditionsEvaluatorCaller::kCraft,
+            logs[logIndex].conditions, actor, actor,
+            [&](bool result, auto&) { passes = result; });
+        if (!passes)
+          continue;
+        for (const auto& fragment : data.fragments) {
+          if (fragment.stage != targetStage || fragment.logEntry != logIndex)
+            continue;
+          const auto script = object->Script(fragment.script);
+          const auto function =
+            script->GetFunctionByName(fragment.function.c_str(), "");
+          if (!function.valid || function.IsNative())
+            throw std::runtime_error("Missing quest stage fragment: " +
+                                     fragment.function);
+          std::vector<VarValue> args;
+          VarValue result;
+          try {
+            result = script->StartFunction(function, args, stack);
+          } catch (const std::exception& error) {
+            throw std::runtime_error(fragment.script + "." +
+                                     fragment.function + ": " + error.what());
+          }
+          if (result.promise)
+            throw std::runtime_error(
+              "Latent quest fragment requires durable continuation support");
+        }
+        if (logs[logIndex].flags & 1)
+          QuestJournal::Apply(actor,
+                              { { "quest", targetId }, { "op", "complete" } });
+      }
+      return true;
+    };
+    changed = execute(questId, stage);
+    if (!changed)
+      return;
     for (const auto& [key, holder] : variables)
-      state[key] = holder->Save(arraysSeen);
-    QuestJournal::SetScriptState(actor, state);
+      state.SetScript(key, holder->Save());
+    QuestJournal::SetScriptState(actor, state.Save());
   });
   return changed;
 }

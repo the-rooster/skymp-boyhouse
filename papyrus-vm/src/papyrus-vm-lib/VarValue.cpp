@@ -428,11 +428,24 @@ bool VarValue::operator==(const VarValue& argument2) const
 {
   switch (this->type) {
     case VarValue::kType_Object: {
+      if (argument2.type >= kType_ObjectArray &&
+          argument2.type <= kType_BoolArray)
+        return data.id == nullptr && !argument2.pArray;
       return argument2.type == VarValue::kType_Object &&
         (argument2.data.id == data.id ||
          (argument2.data.id && data.id &&
           data.id->EqualsByValue(*argument2.data.id)));
     }
+    case kType_ObjectArray:
+    case kType_StringArray:
+    case kType_IntArray:
+    case kType_FloatArray:
+    case kType_BoolArray:
+      // Array assignment shares an allocation; equality compares that
+      // allocation, not element contents. Typed null arrays also equal None.
+      if (argument2.type == kType_Object)
+        return !pArray && argument2.data.id == nullptr;
+      return type == argument2.type && pArray == argument2.pArray;
     case VarValue::kType_Identifier:
     case VarValue::kType_String: {
       if (argument2.type != VarValue::kType_String) {

@@ -1,5 +1,6 @@
 #include "QuestJournal.h"
 #include "MpActor.h"
+#include "QuestVmState.h"
 #include "WorldState.h"
 #include "libespm/QUST.h"
 #include "libespm/RecordHeaderAccess.h"
@@ -225,14 +226,7 @@ bool QuestJournal::Apply(MpActor& actor, const nlohmann::json& command)
   } else if (op == "reset") {
     quest = EmptyQuest();
     if (ledger.contains("vm")) {
-      auto& vm = ledger["vm"];
-      const auto prefix = def.key + "/";
-      for (auto it = vm.begin(); it != vm.end();) {
-        if (it.key().compare(0, prefix.size(), prefix) == 0)
-          it = vm.erase(it);
-        else
-          ++it;
-      }
+      QuestVmState::ResetQuest(ledger["vm"], def.key + "/");
     }
   } else if (op == "complete") {
     quest["completed"] = true;
