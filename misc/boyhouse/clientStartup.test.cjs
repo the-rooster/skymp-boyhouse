@@ -5,7 +5,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const { EventEmitter } = require('node:events');
 const root = path.resolve(__dirname, '../../skymp5-client');
-const ts = require(require.resolve('typescript', { paths: [root] }));
+const ts = require(require.resolve('typescript', { paths: [root, path.resolve(root, '../skymp5-server')] }));
 
 function load(file, dependencies) {
   const source = fs.readFileSync(path.join(root, 'src/services/services', file), 'utf8');
