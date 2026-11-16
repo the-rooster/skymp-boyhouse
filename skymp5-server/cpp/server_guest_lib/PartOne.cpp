@@ -11,6 +11,7 @@
 #include "DestroyActorMessage.h"
 #include "HostStopMessage.h"
 #include "SetRaceMenuOpenMessage.h"
+#include "SpSnippetMessage.h"
 #include "UpdateGameModeDataMessage.h"
 
 #include "ActionListener.h"
@@ -716,6 +717,11 @@ FormCallbacks PartOne::CreateFormCallbacks()
       };
       deferredMessage.packetReliable = reliable;
       deferredMessage.actorIdExpected = actor->GetFormId();
+      deferredMessage.actorLifetimeExpected =
+        worldState.LookupFormByIdNoLoad(actor->GetFormId());
+      if (dynamic_cast<const SpSnippetMessage*>(&message)) {
+        deferredMessage.effectContext = ClientEffectContext::Capture(*actor);
+      }
 
       if (userInfo->deferredChannels.size() <= deferredChannelId) {
         userInfo->deferredChannels.resize(deferredChannelId + 1);
@@ -1010,12 +1016,16 @@ void PartOne::TickPacketHistoryPlaybacks()
 
 void PartOne::TickDeferredMessages()
 {
+  std::vector<std::shared_ptr<MpActor>> actorsToReconcile;
   for (size_t i = 0, n = serverState.maxConnectedId; i <= n; ++i) {
     Networking::UserId userId = static_cast<Networking::UserId>(i);
     auto& userInfo = serverState.userInfo[userId];
     if (!userInfo) {
       continue;
     }
+    if (auto actor = serverState.ActorByUser(userId))
+      actorsToReconcile.push_back(std::dynamic_pointer_cast<MpActor>(
+        worldState.LookupFormByIdNoLoad(actor->GetFormId())));
     for (auto& channel : userInfo->deferredChannels) {
       for (auto& message : channel) {
         auto actor = serverState.ActorByUser(userId);
@@ -1023,7 +1033,13 @@ void PartOne::TickDeferredMessages()
           continue;
         }
 
-        if (message.actorIdExpected != actor->GetFormId()) {
+        if (message.actorIdExpected != actor->GetFormId() ||
+            message.actorLifetimeExpected.lock().get() != actor) {
+          continue;
+        }
+
+        if (message.effectContext &&
+            !message.effectContext->IsCurrent(*actor)) {
           continue;
         }
 
@@ -1035,6 +1051,11 @@ void PartOne::TickDeferredMessages()
       channel.clear();
     }
   }
+  // Rejection callbacks may detach users or enqueue fresh work. Run them only
+  // after traversal, holding the original actor lifetimes across callbacks.
+  for (const auto& actor : actorsToReconcile)
+    if (actor)
+      actor->RejectStaleSnippets();
 }
 
 MessageSerializer& PartOne::GetMessageSerializerInstance()

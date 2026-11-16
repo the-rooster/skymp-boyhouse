@@ -205,6 +205,29 @@ or outgoing replication. The Skyrim engine adapter, replication fencing and
 reference restoration are still unfinished. Keep the flag unset in staging and
 normal clients until those are implemented and tested. No quests are certified.
 
+### Deferred client effect lifetime
+
+Queued native client snippets now capture the actor's registered lifetime and
+phase epoch. Campaign guests also capture the host's lifetime and epoch. Leaving
+and returning to the same phase does not revive an earlier command. Deferred
+inventory snapshots remain personal to the same actor, but cannot be delivered
+to a replacement actor that reused its numeric ID.
+
+Pending snippet replies undergo the same context checks. Expired waits reject
+on the next connected-user tick even if no reply arrives; disabling an actor
+rejects waits instead of resuming the script with a fabricated None result.
+Continuations are removed before callbacks so callbacks can create more work or
+disable the actor without invalidating the pending map. Signed or oversized wire
+indices cannot alias another wait after narrowing to 32 bits.
+
+This guards server queues and continuations. It cannot retract packets already
+sent or cancel Skyrim-side callbacks. Connection ownership changes, packet epoch
+tagging and engine-side cancellation still require the transition integration.
+The client transport currently uses RELIABLE (without ordering) for reliable
+outbound messages, while the server uses RELIABLE_ORDERED. Unreliable movement
+can arrive across a phase boundary; ordering must not be assumed as a substitute
+for context validation.
+
 ### Inventory defaults for private reference allocation
 
 The shared spawn helpers now preserve nested leveled-entry quantities, apply
@@ -291,6 +314,8 @@ The [dependency analyzer](DEPENDENCIES.md) discovers shared work across the full
 | Community release | Test 16/32 real or representative clients, load/recovery, reward idempotency, content-version agreement, authentication, and packaging. |
 
 The next execution slice needs area-entry/client integration for materialized references, complete alias fill/effect semantics, and lifecycle execution around them. Vanilla stage fragments already expose these dependencies. A global reference plus one progress map cannot resolve conflicting NPC states.
+
+Transition integration must establish a new packet generation before allocation or phase changes emit reference updates, carry that generation on gameplay packets in both directions (including binary movement), and provide a fresh authoritative replication baseline when a manifest is superseded. The client must bound its pending queue, discard old generations, and guard delayed engine callbacks. Only after original-reference replacement/restoration finishes may it acknowledge and resume input. A manifest receipt alone is insufficient.
 
 ## Verification commands
 

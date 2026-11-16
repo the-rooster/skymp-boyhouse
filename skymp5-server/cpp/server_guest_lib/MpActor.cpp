@@ -2,6 +2,7 @@
 #include "ActiveMagicEffectsMap.h"
 #include "ActorValues.h"
 #include "ChangeFormGuard.h"
+#include "ClientEffectContext.h"
 #include "CropRegeneration.h"
 #include "EvaluateTemplate.h"
 #include "FormCallbacks.h"
@@ -47,7 +48,12 @@ struct MpActor::Impl
   std::set<std::shared_ptr<DestroyEventSink>> destroyEventSinks;
   std::set<std::shared_ptr<DisableEventSink>> disableEventSinks;
 
-  std::map<uint32_t, Viet::Promise<VarValue>> snippetPromises;
+  struct PendingSnippet
+  {
+    Viet::Promise<VarValue> promise;
+    ClientEffectContext context;
+  };
+  std::map<uint32_t, PendingSnippet> snippetPromises;
   uint32_t snippetIndex = 0;
   uint32_t respawnTimerIndex = 0;
   bool isRespawning = false;
@@ -401,19 +407,7 @@ void MpActor::Disable()
 
   MpObjectReference::Disable();
 
-  for (auto [snippetIdx, promise] : pImpl->snippetPromises) {
-    spdlog::warn("Disabling actor {:x} with pending snippet promise",
-                 GetFormId());
-    try {
-      promise.Resolve(VarValue::None());
-    } catch (std::exception& e) {
-      // Not sure if this is possible, but better safe than sorry
-      spdlog::error("Exception while resolving pending snippet promise: {}",
-                    e.what());
-    }
-  }
-
-  pImpl->snippetPromises.clear();
+  RejectAllSnippets("Client effect actor was disabled");
 }
 
 void MpActor::SendToUser(const IMessageBase& message, bool reliable)
@@ -627,9 +621,13 @@ void MpActor::ApplyChangeForm(const MpChangeForm& newChangeForm)
 uint32_t MpActor::NextSnippetIndex(
   std::optional<Viet::Promise<VarValue>> promise)
 {
+  if (pImpl->snippetIndex == std::numeric_limits<uint32_t>::max())
+    throw std::overflow_error("Client snippet indices exhausted");
   auto res = pImpl->snippetIndex++;
   if (promise) {
-    pImpl->snippetPromises[res] = *promise;
+    pImpl->snippetPromises.emplace(
+      res,
+      Impl::PendingSnippet{ *promise, ClientEffectContext::Capture(*this) });
   }
   return res;
 }
@@ -638,10 +636,57 @@ void MpActor::ResolveSnippet(uint32_t snippetIdx, VarValue v)
 {
   auto it = pImpl->snippetPromises.find(snippetIdx);
   if (it != pImpl->snippetPromises.end()) {
-    auto& promise = it->second;
-    promise.Resolve(v);
+    if (!it->second.context.IsCurrent(*this)) {
+      RejectSnippet(snippetIdx, "Client effect campaign context expired");
+      return;
+    }
+    auto pending = it->second;
+    // Remove before callbacks: a continuation may disable/rebind this actor
+    // or start another snippet without invalidating this iterator.
     pImpl->snippetPromises.erase(it);
+    pending.promise.Resolve(v);
   }
+}
+
+void MpActor::RejectSnippet(uint32_t snippetIdx, const char* reason)
+{
+  auto it = pImpl->snippetPromises.find(snippetIdx);
+  if (it == pImpl->snippetPromises.end())
+    return;
+  auto promise = it->second.promise;
+  pImpl->snippetPromises.erase(it);
+  try {
+    promise.Reject(reason);
+  } catch (const std::exception& error) {
+    spdlog::error("Client snippet cancellation handler failed: {}",
+                  error.what());
+  }
+}
+
+void MpActor::RejectStaleSnippets()
+{
+  // A rejection handler is allowed to remove this actor from the world.
+  const auto lifetime = GetParent()
+    ? GetParent()->LookupFormByIdNoLoad(GetFormId())
+    : std::shared_ptr<MpForm>{};
+  std::vector<uint32_t> expired;
+  for (const auto& [index, pending] : pImpl->snippetPromises)
+    if (!pending.context.IsCurrent(*this))
+      expired.push_back(index);
+  for (auto index : expired)
+    RejectSnippet(index, "Client effect campaign context expired");
+}
+
+void MpActor::RejectAllSnippets(const char* reason)
+{
+  const auto lifetime = GetParent()
+    ? GetParent()->LookupFormByIdNoLoad(GetFormId())
+    : std::shared_ptr<MpForm>{};
+  std::vector<uint32_t> pending;
+  for (const auto& [index, _] : pImpl->snippetPromises)
+    pending.push_back(index);
+  for (auto index : pending)
+    RejectSnippet(index, reason);
 }
 
 void MpActor::SetPercentage(espm::ActorValue av, float percentage)

@@ -1,5 +1,6 @@
 #pragma once
 #include "ActorsMap.h"
+#include "ClientEffectContext.h"
 #include "Config.h"
 #include <Networking.h>
 #include <array>
@@ -37,6 +38,10 @@ struct DeferredMessage
   std::vector<uint8_t> packetData;
   bool packetReliable = false;
   uint32_t actorIdExpected = 0;
+  std::weak_ptr<MpForm> actorLifetimeExpected;
+  // Inventory snapshots are personal to the actor; executable snippets also
+  // require the original campaign context.
+  std::optional<ClientEffectContext> effectContext;
 };
 
 struct UserInfo

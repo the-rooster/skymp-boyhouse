@@ -122,6 +122,9 @@ public:
     std::optional<Viet::Promise<VarValue>> promise = std::nullopt);
 
   void ResolveSnippet(uint32_t snippetIdx, VarValue v);
+  void RejectSnippet(uint32_t snippetIdx, const char* reason);
+  void RejectStaleSnippets();
+  void RejectAllSnippets(const char* reason);
   void SetPercentages(const ActorValues& actorValues,
                       MpActor* aggressor = nullptr);
   void SetPercentage(espm::ActorValue av, float percentage);

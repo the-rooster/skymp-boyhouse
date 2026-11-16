@@ -631,6 +631,11 @@ void ActionListener::OnPlayerBowShot(const RawMessageData& rawMsgData,
 void ActionListener::OnFinishSpSnippet(const RawMessageData& rawMsgData,
                                        const FinishSpSnippetMessage& msg)
 {
+  // Wire indices are signed 64-bit; narrowing first would let negative or
+  // oversized values alias another pending continuation.
+  if (msg.snippetIdx < 0 ||
+      msg.snippetIdx >= std::numeric_limits<uint32_t>::max())
+    return;
   MpActor* actor = partOne.serverState.ActorByUser(rawMsgData.userId);
   if (!actor) {
     throw std::runtime_error(
