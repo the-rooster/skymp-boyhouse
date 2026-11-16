@@ -115,6 +115,7 @@ export class RemoteServer extends ClientListener {
   resetWorldModel(): void {
     ++this.lifetime.generation;
     this.originals.clear();
+    this.originalApplications.clear();
     this.sp.storage['worldModel'] = { forms: [], playerCharacterFormIdx: -1, playerCharacterRefrId: 0 };
     this.sp.storage['idManager'] = new IdManager();
     this.sp.storage['hosted'] = [];
@@ -155,6 +156,13 @@ export class RemoteServer extends ClientListener {
   private lifetime: { generation: number };
   private loading = false;
   private originals = new Map<number, { idx: number }>();
+  private originalApplications = new Map<number, { pending: boolean; error?: string }>();
+
+  getOriginalApplicationProgress(): { ready: boolean; error?: string } {
+    const entries = Array.from(this.originalApplications.values());
+    const error = entries.find(entry => entry.error)?.error;
+    return { ready: !error && entries.every(entry => !entry.pending), error };
+  }
 
   private onHostStartMessage(event: ConnectionMessage<HostStartMessage>) {
     const msg = event.message;
@@ -256,7 +264,9 @@ export class RemoteServer extends ClientListener {
 
   private onCreateActorMessage(event: ConnectionMessage<CreateActorMessage>): void {
     const msg = event.message;
-    this.originals.forEach((entry, id) => { if (entry.idx === msg.idx) this.originals.delete(id); });
+    this.originals.forEach((entry, id) => {
+      if (entry.idx === msg.idx) { this.originals.delete(id); this.originalApplications.delete(id); }
+    });
     const previous = this.getIdManager().getId(msg.idx);
     if (previous >= 0) getViewFromStorage()?.getFormViews().destroyForm(previous);
     if (this.skipFormViewCreation(msg)) {
@@ -266,62 +276,68 @@ export class RemoteServer extends ClientListener {
       }
       const refrId = msg.refrId!;
       this.originals.set(refrId, { idx: msg.idx });
+      const application: { pending: boolean; error?: string } = { pending: true };
+      this.originalApplications.set(refrId, application);
       const current = this.captureOriginal(refrId);
-      this.onceLoad(refrId, (refr: ObjectReference) => {
-        if (refr) {
-          ObjectReferenceEx.dealWithRef(refr, refr.getBaseObject() as Form, true, current);
-          if (msg.props) {
-            if (msg.props.inventory) {
-              ModelApplyUtils.applyModelInventory(refr, msg.props.inventory);
-            }
-            ModelApplyUtils.applyModelIsOpen(refr, !!msg.props['isOpen']);
-            ModelApplyUtils.applyModelIsHarvested(refr, !!msg.props['isHarvested'], current);
+      this.onceLoad(refrId, (refr: ObjectReference | null) => {
+        try {
+          if (refr) {
+            ObjectReferenceEx.dealWithRef(refr, refr.getBaseObject() as Form, true, current);
+            if (msg.props) {
+              if (msg.props.inventory) {
+                ModelApplyUtils.applyModelInventory(refr, msg.props.inventory);
+              }
+              ModelApplyUtils.applyModelIsOpen(refr, !!msg.props['isOpen']);
+              ModelApplyUtils.applyModelIsHarvested(refr, !!msg.props['isHarvested'], current);
 
-            ModelApplyUtils.applyModelNodeScale(refr, msg.props.setNodeScale);
+              ModelApplyUtils.applyModelNodeScale(refr, msg.props.setNodeScale);
 
-            ModelApplyUtils.applyModelNodeTextureSet(refr, msg.props.setNodeTextureSet);
+              ModelApplyUtils.applyModelNodeTextureSet(refr, msg.props.setNodeTextureSet);
 
-            ModelApplyUtils.applyModelIsDisabled(refr, !!msg.props['disabled'], current);
+              ModelApplyUtils.applyModelIsDisabled(refr, !!msg.props['disabled'], current);
 
-            // TODO: move to a separate module
-            const animation = msg.props.lastAnimation;
-            if (typeof animation === "string") {
-              const refrid = refr.getFormID();
+              // TODO: move to a separate module
+              const animation = msg.props.lastAnimation;
+              if (typeof animation === "string") {
+                const refrid = refr.getFormID();
 
-              const handle = this.sp.getReferenceHandle(refrid);
-              let attempts = 0, nextAttempt = 0;
-              const play = () => {
-                if (!current() || this.sp.getReferenceHandle(refrid) !== handle) return;
-                if (Date.now() >= nextAttempt) {
-                  ++attempts; nextAttempt = Date.now() + 2000;
-                  if (ObjectReference.from(Game.getFormEx(refrid))?.playAnimation(animation) || attempts >= 5) return;
-                }
+                const handle = this.sp.getReferenceHandle(refrid);
+                let attempts = 0, nextAttempt = 0;
+                const play = () => {
+                  if (!current() || this.sp.getReferenceHandle(refrid) !== handle) return;
+                  if (Date.now() >= nextAttempt) {
+                    ++attempts; nextAttempt = Date.now() + 2000;
+                    if (ObjectReference.from(Game.getFormEx(refrid))?.playAnimation(animation) || attempts >= 5) return;
+                  }
+                  this.defer(play, current);
+                };
                 this.defer(play, current);
-              };
-              this.defer(play, current);
-            }
-
-
-            let displayName = msg.props.displayName;
-
-            // keep in sync with spSnippetService.ts
-            if (typeof displayName === "string") {
-
-              const replaceValue = refr.getBaseObject()?.getName();
-
-              if (replaceValue !== undefined) {
-                displayName = displayName.replace(/%original_name%/g, replaceValue);
-              } else {
-                logError(this, "Couldn't get a replaceValue for SetDisplayName, refr.getFormID() was", refr.getFormID().toString(16));
               }
 
-              refr.setDisplayName(displayName, true);
-              logTrace(this, `calling setDisplayName`, displayName, `for`, refr.getFormID().toString(16));
+
+              let displayName = msg.props.displayName;
+
+              // keep in sync with spSnippetService.ts
+              if (typeof displayName === "string") {
+
+                const replaceValue = refr.getBaseObject()?.getName();
+
+                if (replaceValue !== undefined) {
+                  displayName = displayName.replace(/%original_name%/g, replaceValue);
+                } else {
+                  logError(this, "Couldn't get a replaceValue for SetDisplayName, refr.getFormID() was", refr.getFormID().toString(16));
+                }
+
+                refr.setDisplayName(displayName, true);
+                logTrace(this, `calling setDisplayName`, displayName, `for`, refr.getFormID().toString(16));
+              }
             }
+          } else {
+            application.error = 'Original reference did not load: ' + refrId.toString(16);
+            logError(this, 'Failed to apply model to', refrId.toString(16));
           }
-        } else {
-          logError(this, 'Failed to apply model to', refrId.toString(16));
-        }
+        } catch (error) { application.error = String(error); throw error; }
+        finally { application.pending = false; }
       }, 120, current);
       return;
     }
@@ -420,7 +436,9 @@ export class RemoteServer extends ClientListener {
   private onDestroyActorMessage(event: ConnectionMessage<DestroyActorMessage>): void {
     const msg = event.message;
 
-    this.originals.forEach((entry, id) => { if (entry.idx === msg.idx) this.originals.delete(id); });
+    this.originals.forEach((entry, id) => {
+      if (entry.idx === msg.idx) { this.originals.delete(id); this.originalApplications.delete(id); }
+    });
     const i = this.getIdManager().getId(msg.idx);
     if (i < 0) return;
     this.worldModel.forms[i] = undefined;
@@ -686,7 +704,7 @@ export class RemoteServer extends ClientListener {
 
   private onceLoad(
     refrId: number,
-    callback: (refr: ObjectReference) => void,
+    callback: (refr: ObjectReference | null) => void,
     maxAttempts: number = 120,
     current = this.capture(),
   ) {
@@ -700,6 +718,7 @@ export class RemoteServer extends ClientListener {
           this.defer(() => this.onceLoad(refrId, callback, maxAttempts, current), current);
         } else {
           logError(this, 'Failed to load object reference ' + refrId.toString(16));
+          callback(null);
         }
       }
     }, current);

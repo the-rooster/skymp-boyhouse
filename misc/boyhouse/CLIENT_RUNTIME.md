@@ -559,12 +559,87 @@ the four personal save hashes stayed unchanged. The final AI-restoration no-op
 guard was unit-tested and rebuilt after the live run; that native fixture had
 independently checked the restored AI flags.
 
-The projection coordinator remains unwired and staging projection remains off.
+At this milestone the projection coordinator was still unwired. The following
+section records its integration; staging projection remains off.
 An actor whose engine death state cannot be changed fails rather than becoming
 an acknowledged incorrect copy; essential/protected actor-base overrides still
 need campaign support. Corpse inventory, general reference restoration, remaining
 combat/death lifecycle work, and quest runtime integration are not completed by
 this change. **Zero quests are certified playable.**
+
+## Experimental world projection coordinator
+
+`CampaignProjectionService` connects the version-2 protocol to
+`NativeWorldProjectionService` when `campaign-projection: true` is configured.
+Transitions block gameplay input, retire the previous model and owned copies,
+drain outstanding native calls, and restore previously suppressed originals.
+Only then does the normal networking dispatcher apply the validated baseline.
+The self baseline can bootstrap a generated save before update events exist.
+
+Once the player is observed ready, the adapter captures and suppresses original
+references in batches of 16, installs original-to-copy aliases, and enables
+remote rendering. A mapped original never becomes a fallback interaction target
+while its copy is missing. Ordinary virtual NPC IDs receive suppression too.
+The coordinator waits for original baseline application, suppression, temporary
+copy cleanup, and spawn readiness before acknowledgement. Following server
+release, it applies queued replication and observes the resulting native work
+before restoring the controls it changed. Previously disabled controls remain
+disabled; camera and looking controls remain available during a transition.
+
+The journal clears during each transition and subscribes again after release,
+so a subscription cannot be dropped by the input gate or retain another phase's
+history. Connection generations reject stale acknowledgements, old engine
+callbacks, and delayed failure closures. Transitions have a 30-second deadline;
+receiving replacement manifests does not extend it indefinitely. Failure keeps
+input closed and schedules native network cleanup outside its packet callback.
+
+The full client builds and 243 Node tests pass. These cover the actual service
+bindings and native adapter with controlled engine responses, including queued
+replication, reconnects, native no-ops, identity mismatches, missing originals,
+control restoration, and phase-specific journal subscriptions. This is not
+end-to-end quest certification.
+
+The first disposable native server run completed the initial shared-world
+handshake, positioned the player, and restored controls. Instance entry exposed
+a server script-inheritance error: allocated NPCs had persisted leveled template
+choices, but script loading still walked the original leveled list. Script
+loading now consumes the validated copy's saved choice. The native instance,
+quest, and SQLite selection passes 159 cases with 90,414 assertions, including
+that regression; the native projection bot protocol test also passes.
+
+The full client then passed a real shared-world → personal-instance →
+shared-world round trip on Skyrim 1.7.104.0 in 12.484 seconds. The fixture used
+an existing offline test character and one authored NPC selected by the native
+area scan. It observed the original hidden/activation-blocked, the replicated
+copy loaded with the correct base and alias, and controls restored after entry.
+Incremental native movement went through ordinary client movement replication
+and server boundary reconciliation. After exit, five observations verified the
+original visibility/activation/alive/health state, deleted temporary-copy
+identity, cleared aliases, and restored controls. The final native queues,
+owned-copy set, and suppression ledger were empty. This proves that specific
+transition, not quest execution, arbitrary locations, or multiple real players.
+
+Fixture development also exposed two assumptions: an explicit exit is refused
+inside an altered area, and generated-save loading temporarily blocks native
+scripted teleports. The observer now moves across the boundary and retries
+against observed position within a bounded window. Player movement/teleport
+readiness across that native grace period still needs broader acceptance.
+
+Evidence is in ignored `artifacts/projection-runtime-runtime/`,
+`artifacts/projection-runtime-server-e.log`, `artifacts/projection-native-tests.log`,
+and `artifacts/projection-template-protocol.log`. The successful run's backup
+manifest is `artifacts/game-backups/20261116T204325Z/projection-runtime/`.
+Skyrim exited, all three INIs were restored byte-for-byte, diagnostic files were
+removed, all four personal save hashes were unchanged, and no new saves remained.
+The disposable loopback server and SSH relay stopped. Private staging was not
+redeployed.
+
+New-character creation under projection, complete original inventory/lock/
+motion restoration, native journal integration, and the full quest runtime
+remain unfinished. The adapter's readiness checks cover spawn/lifetime work;
+they do not certify every inventory, equipment, animation, or arbitrary
+gamemode effect. Staging projection remains disabled and **zero quests are
+certified playable**.
 
 ## Remaining acceptance
 
@@ -577,8 +652,8 @@ outgoing path and bounded replication replay. The experimental server projection
 feed now rotates epochs and transfers authoritative world baselines using
 protocol version 2; native bot sessions verify that path. The client replica
 requires both the baseline and manifest before engine acknowledgement. The
-Skyrim-side coordinator is still unwired, so this does not validate engine
-application or restoration. See [the protocol contract](QUESTS.md#packet-epochs-and-world-baselines-experimental-server-integration).
+Skyrim-side coordinator is now opt-in, with acceptance limits described above.
+See [the protocol contract](QUESTS.md#packet-epochs-and-world-baselines-experimental-server-integration).
 
 Finish hook/layout checks, align content, and package the native and TypeScript
 client. Broaden native API/event coverage beyond the smoke above.

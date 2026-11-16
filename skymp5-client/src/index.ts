@@ -16,6 +16,8 @@ import { PlayerSpawnService } from './services/services/playerSpawnService';
 import { ReferenceSuppressionService } from './services/services/referenceSuppressionService';
 import { OwnedReferenceService } from './services/services/ownedReferenceService';
 import { NativeReferenceOperationService } from './services/services/nativeReferenceOperationService';
+import { NativeWorldProjectionService } from './services/services/nativeWorldProjectionService';
+import { CampaignProjectionService } from './services/services/campaignProjectionService';
 import { SinglePlayerService } from './services/services/singlePlayerService';
 import { SpApiInteractor } from './services/spApiInteractor';
 import { TimeService } from "./services/services/timeService";
@@ -72,6 +74,7 @@ once("update", () => {
 const main = () => {
   try {
     const controller = SpApiInteractor.getControllerInstance();
+    const projectionEngine = new NativeWorldProjectionService(sp, controller);
 
     const listeners = [
       new BlockPapyrusEventsService(sp, controller),
@@ -85,6 +88,9 @@ const main = () => {
       // Observe the final appearance before restoring the preview's loadout.
       new PlayerLoadoutService(sp, controller),
       new PlayerSpawnService(sp, controller),
+      projectionEngine,
+      // Establish the epoch gate before journal subscription and Auth login.
+      new CampaignProjectionService(sp, controller, projectionEngine),
       new SkympClient(sp, controller),
       new TimeService(sp, controller),
       new SpVersionCheckService(sp, controller),

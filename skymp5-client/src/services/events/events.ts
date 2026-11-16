@@ -45,6 +45,8 @@ import { NicknameDestroyEvent } from "./nicknameDestroyEvent";
 type EventTypes = {
     'gameLoad': [GameLoadEvent],
     'worldModelReset': [],
+    'campaignProjectionPending': [],
+    'campaignProjectionReady': [],
 
     'sendMessage': [SendMessageEvent<AnyMessage>],
     'sendRawMessage': [SendRawMessageEvent],

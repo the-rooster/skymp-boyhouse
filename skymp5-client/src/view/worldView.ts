@@ -48,6 +48,15 @@ export class WorldView extends ClientListener {
     return this.state.formViews.getLocalRefrId(remoteRefrId);
   }
 
+  setProjectionReferences(references: readonly { original: number; copy: number }[]): void {
+    this.projectedCopies = new Map(references.map(reference => [reference.original, reference.copy]));
+  }
+
+  getProjectedLocalRefrId(original: number): number | undefined {
+    const copy = this.projectedCopies.get(original);
+    return copy === undefined ? undefined : this.getLocalRefrId(copy);
+  }
+
   syncFormArray(model: WorldModel) {
     const { settings } = this.sp;
     const showMe = settings['skymp5-client']['show-me'];
@@ -55,6 +64,7 @@ export class WorldView extends ClientListener {
   }
 
   destroy() {
+    this.projectedCopies.clear();
     ++this.allowUpdateGeneration;
     this.state.formViews.resize(0);
     this.state.cloneFormViews.resize(0); // Recenrly added, not tested if it's needed
@@ -205,4 +215,5 @@ export class WorldView extends ClientListener {
   private hadConnectedWorld = false;
   private explicitlyBlocked = false;
   private loading = false;
+  private projectedCopies = new Map<number, number>();
 }

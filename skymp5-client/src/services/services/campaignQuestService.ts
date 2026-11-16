@@ -1,6 +1,7 @@
 import { QuestJournalReplica } from "../../campaign/questJournalReplica";
 import { MsgType } from "../../messages";
 import { ClientListener, CombinedController, Sp } from "./clientListener";
+import { NetworkingService } from './networkingService';
 
 export class CampaignQuestService extends ClientListener {
     readonly replica = new QuestJournalReplica();
@@ -8,19 +9,25 @@ export class CampaignQuestService extends ClientListener {
     constructor(private sp: Sp, private controller: CombinedController) {
         super();
         controller.emitter.on("connectionAccepted", () => {
-            const subscriptionId = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
-            this.replica.begin(subscriptionId);
-            controller.emitter.emit("sendMessage", {
-                message: { t: MsgType.CustomPacket, contentJsonDump: JSON.stringify({
-                    customPacketType: "boyhouse.questJournal", action: "subscribe", subscriptionId,
-                }) }, reliability: "reliable",
-            });
+            if (!controller.lookupListener(NetworkingService).packetEpochRequired) this.subscribe();
         });
+        controller.emitter.on('campaignProjectionPending', () => this.replica.clear());
+        controller.emitter.on('campaignProjectionReady', () => this.subscribe());
         for (const event of ["connectionDisconnect", "connectionDenied", "connectionFailed"] as const)
             controller.emitter.on(event, () => this.replica.clear());
         controller.emitter.on("customPacketMessage", event => {
             try { this.replica.accept(JSON.parse(event.message.contentJsonDump)); }
             catch { /* Ignore invalid JSON; do not replace the current projection. */ }
+        });
+    }
+
+    private subscribe(): void {
+        const subscriptionId = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+        this.replica.begin(subscriptionId);
+        this.controller.emitter.emit('sendMessage', {
+            message: { t: MsgType.CustomPacket, contentJsonDump: JSON.stringify({
+                customPacketType: 'boyhouse.questJournal', action: 'subscribe', subscriptionId,
+            }) }, reliability: 'reliable',
         });
     }
 

@@ -94,10 +94,13 @@ export class CampaignPacketChannel {
         this.queuedBytes += bytes;
     }
 
-    release(epoch: string, deliver: (message: any) => void): boolean {
+    // Apply queued replication while gameplay input remains blocked. The
+    // coordinator observes the resulting engine work before releasing input.
+    drain(epoch: string, deliver: (message: any) => void): boolean {
         if (!this.active || !this.epoch || epoch !== this.epoch || this.released || this.releasing) return false;
         const generation = this.generation;
         const pending = this.queued;
+        this.queued = []; this.queuedBytes = 0;
         this.releasing = true;
         try {
             for (const message of pending) {
@@ -110,9 +113,15 @@ export class CampaignPacketChannel {
             throw error;
         }
         if (generation !== this.generation) return false;
-        this.queued = [];
-        this.queuedBytes = 0;
         this.releasing = false;
+        return true;
+    }
+
+    release(epoch: string, deliver: (message: any) => void): boolean {
+        if (!this.drain(epoch, deliver)) return false;
+        // A delivery callback can enqueue more replication. It needs another
+        // drain/observation pass, never silently discard it or open input early.
+        if (this.queued.length) return false;
         this.released = true;
         return true;
     }

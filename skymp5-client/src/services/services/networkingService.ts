@@ -9,6 +9,7 @@ import { RemoteServer } from "./remoteServer";
 import { SendRawMessageEvent } from "../events/sendRawMessageEvent";
 
 import { CampaignPacketChannel } from "../../campaign/campaignPacketChannel";
+import { WorldBaseline } from '../../campaign/worldProjection';
 
 export class NetworkingService extends ClientListener {
   private campaignPackets = new CampaignPacketChannel();
@@ -25,6 +26,28 @@ export class NetworkingService extends ClientListener {
   selectPacketEpoch(epoch: string): void {
     this.requirePacketEpoch();
     this.campaignPackets.select(epoch);
+  }
+
+  get packetEpochRequired(): boolean { return this.campaignPackets.enabled; }
+
+  drainPacketEpoch(epoch: string): boolean {
+    try { return this.campaignPackets.drain(epoch, message => this.dispatchMessage(message)); }
+    catch (error) { this.failCampaignTransport(error); return false; }
+  }
+
+  // Only a fully assembled and validated projection baseline reaches this API.
+  // Its messages use normal service dispatch, while ordinary network input stays
+  // gated. Reentrant disconnects or epoch changes stop the remaining baseline.
+  applyCampaignBaseline(baseline: WorldBaseline): boolean {
+    const generation = this.connectionGeneration;
+    const current = () => generation === this.connectionGeneration && this.campaignPackets.enabled &&
+      !this.campaignPackets.ready && this.campaignPackets.currentEpoch === baseline.packetEpoch;
+    if (!current()) return false;
+    for (const message of baseline.messages) {
+      if (!current()) return false;
+      this.dispatchMessage(message as AnyMessage);
+    }
+    return current();
   }
 
   releasePacketEpoch(epoch: string): boolean {

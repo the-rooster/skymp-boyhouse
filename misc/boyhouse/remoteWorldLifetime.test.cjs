@@ -190,6 +190,45 @@ test('reusing a static actor index invalidates work for the previous original', 
   assert.equal(f.calls.filter(c => c[0] === 'configure').length, 1);
 });
 
+test('original baseline readiness waits for application and rejects exhausted native lookup', () => {
+  const f = fixture(); f.create(create(3, 0x100, false));
+  assert.equal(f.server.getOriginalApplicationProgress().ready, false);
+  f.update(); assert.equal(f.server.getOriginalApplicationProgress().ready, false);
+  f.forms.set(0x100, true); f.update(); f.update();
+  assert.equal(f.server.getOriginalApplicationProgress().ready, true);
+  f.create(create(4, 0x101, false));
+  for (let i = 0; i < 241; ++i) f.update();
+  assert.equal(f.server.getOriginalApplicationProgress().ready, false);
+  assert.match(f.server.getOriginalApplicationProgress().error, /Original reference did not load: 101/);
+  f.server.resetWorldModel(); assert.equal(f.server.getOriginalApplicationProgress().ready, true);
+});
+
+test('native application errors cannot appear ready and replacing an index cancels its old pending original', () => {
+  const f = fixture(), message = create(3, 0x100, false);
+  Object.defineProperty(message.props, 'inventory', { get() { throw Error('Native application rejected'); } });
+  f.forms.set(0x100, true); f.create(message);
+  assert.throws(() => f.update(), /Native application rejected/);
+  assert.equal(f.server.getOriginalApplicationProgress().ready, false);
+  assert.match(f.server.getOriginalApplicationProgress().error, /Native application rejected/);
+  f.create(create(3, 0x101, false)); f.create(create(3, 0x102, false)); f.forms.set(0x102, true);
+  f.update(); assert.equal(f.server.getOriginalApplicationProgress().ready, true);
+  for (let i = 0; i < 241; ++i) f.update();
+  assert.equal(f.server.getOriginalApplicationProgress().ready, true);
+});
+
+test('projected reference resolution never falls back to a hidden original while its copy is missing', () => {
+  let local = 0;
+  const storage = { view: { getProjectedLocalRefrId: id => id === 0x100 ? local : undefined, getLocalRefrId: () => 0 } };
+  const { remoteIdToLocalId } = load('view/worldViewMisc.ts', { skyrimPlatform: { storage },
+    '../services/spApiInteractor': {}, '../services/services/remoteServer': {} });
+  assert.equal(remoteIdToLocalId(0x100), 0);
+  local = 0xff000123; assert.equal(remoteIdToLocalId(0x100), local);
+  assert.equal(remoteIdToLocalId(0x101), 0x101);
+  assert.equal(remoteIdToLocalId(0xff000001), 0);
+  storage.view = { getLocalRefrId: () => 0 }; // Retained view from an older plugin.
+  assert.equal(remoteIdToLocalId(0x100), 0x100);
+});
+
 function harvestFixture() {
   const events = new EventEmitter(), calls = [], completions = [], errors = [];
   let frame = 0, handle = 1, current = true, plant = true, disabled = false, harvested = true, noop = false;

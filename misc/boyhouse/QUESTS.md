@@ -43,8 +43,9 @@ Placed reference objects now bind their original base/reference scripts to the
 campaign VM. Reference properties override base properties, with every object or
 array element mapped through the plugin that supplied it. Both removed-script
 flags and removed properties are honored. NPC `UseScript` inheritance follows
-deterministic NPC templates; leveled template selection, cycles and invalid
-bindings fail. Missing attached PEX is an error, including when encountered
+deterministic NPC templates. When inheritance reaches a leveled list, it uses
+the bound campaign copy's persisted template selection; it never rerolls during
+script loading. Missing selections, cycles and invalid bindings fail. Missing attached PEX is an error, including when encountered
 while resolving a reference property.
 
 Reference script variables and arrays persist under `reference:<FormDesc>/<script>`
@@ -204,9 +205,10 @@ parts, but acknowledges only when an engine adapter explicitly reports
 application complete. The protocol smoke uses real native bot packets and
 simulates that engine completion. It is not an in-game test. Incoming gameplay
 gating does not freeze server simulation or outgoing replication. The Skyrim
-engine adapter, client transition coordinator and reference restoration remain
-unfinished. Keep the flag unset in staging and normal clients until those are
-implemented and tested. No quests are certified.
+engine adapter and client transition coordinator are now connected behind the
+client's `campaign-projection: true` setting. General reference restoration and
+quest execution remain unfinished. Keep projection unset in staging and normal
+clients while native acceptance continues. No quests are certified.
 
 ### Packet epochs and world baselines (experimental server integration)
 
@@ -217,8 +219,8 @@ The experimental projection feed now rotates the epoch at connection setup,
 before changing a phase, and before capturing a replacement manifest/baseline.
 That native token is also the acknowledgement token. An epoch changed by trusted
 server code invalidates a pending acknowledgement even if the manifest matches.
-Staging still has projection disabled; the ordinary client has no engine
-transition coordinator wired yet.
+Staging still has projection disabled; the client coordinator is opt-in and
+requires `campaign-projection: true` in its settings.
 
 Once selected, the native server requires the current token on all gameplay
 input, including custom commands, even after the gameplay gate reopens. Outbound
@@ -271,9 +273,13 @@ packet batch when a callback replaces or destroys it.
 
 Epoch transport requires the matching `MpClientPlugin` 2.1.0 codec; older codecs
 are refused with input closed. Neither receipt of a frame nor a manifest enables
-gameplay. The remaining client coordinator must select the validated epoch,
-apply/restore engine references and baseline state, and cancel stale asynchronous
-engine work before acknowledging and releasing. Capture and publication are
+gameplay. The client coordinator selects the validated epoch, cancels the prior
+world, and waits for temporary-copy deletion, native calls, and original-NPC
+visibility restoration before applying the new baseline. It suppresses mapped
+originals, observes player/copy readiness, acknowledges, and waits for server
+release. Queued deltas are applied and observed before player input resumes.
+Journal subscriptions are replaced only after that release. General native
+property restoration and quest execution still need implementation. Capture and publication are
 currently synchronous and bounded; incremental streaming, loading deadlines and
 16/32-client performance still require work. Tests exercise the native baseline,
 transport and server/client protocol assembly, not Skyrim's engine or a playable

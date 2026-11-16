@@ -35,6 +35,8 @@ export const localIdToRemoteId = (localFormId: number, newCast: boolean = false)
 };
 
 export const remoteIdToLocalId = (remoteFormId: number): number => {
+  const projected = getViewFromStorage()?.getProjectedLocalRefrId?.(remoteFormId);
+  if (projected !== undefined) return projected;
   if (remoteFormId >= 0xff000000) {
     const view = getViewFromStorage();
     if (!view) {

@@ -25,13 +25,18 @@ export class WorldCleanerService extends ClientListener {
 
     getWcProtection(actorId: number): number { return this.protection.get(actorId) || 0; }
 
+    setProjectionMode(enabled: boolean): void {
+        this.projectionMode = enabled;
+        if (enabled) { this.references.releaseOwner('worldCleaner'); this.active = false; }
+    }
+
     private get references() { return this.controller.lookupListener(ReferenceSuppressionService).references; }
 
     private onUpdate(): void {
         if (this.loading) return;
         const multiplayer = !this.controller.lookupListener(SinglePlayerService).isSinglePlayer &&
             this.controller.lookupListener(NetworkingService).isConnected();
-        if (!multiplayer) {
+        if (!multiplayer || this.projectionMode) {
             if (this.active) this.references.releaseOwner('worldCleaner');
             this.active = false;
             return;
@@ -55,4 +60,5 @@ export class WorldCleanerService extends ClientListener {
     // Also release a persisted claim if a plugin reload starts disconnected.
     private active = true;
     private loading = false;
+    private projectionMode = false;
 }

@@ -66,7 +66,7 @@ test('a new epoch during replay cancels the old batch and cannot open input', ()
   assert.equal(channel.currentEpoch, b);
 });
 
-test('reentrant replay is refused while newly arriving matching packets drain in order', () => {
+test('reentrant replay is refused and newly arriving packets require another observed drain', () => {
   const channel = new CampaignPacketChannel(), seen = [];
   channel.select(a);
   channel.incoming(frame(a, { t: 2, idx: 1 }), () => assert.fail());
@@ -75,9 +75,25 @@ test('reentrant replay is refused while newly arriving matching packets drain in
     assert.equal(channel.release(a, () => assert.fail()), false);
     assert.equal(channel.outgoing(move), undefined);
     if (message.idx === 1) channel.incoming(frame(a, { t: 2, idx: 2 }), () => assert.fail());
-  }), true);
+  }), false);
+  assert.deepEqual(seen, [1]);
+  assert.equal(channel.ready, false);
+  assert.equal(channel.drain(a, message => seen.push(message.idx)), true);
   assert.deepEqual(seen, [1, 2]);
+  assert.equal(channel.ready, false);
+  assert.equal(channel.release(a, () => assert.fail()), true);
   assert.equal(channel.ready, true);
+});
+
+test('replication can drain repeatedly while all gameplay input remains blocked', () => {
+  const channel = new CampaignPacketChannel(), seen = [];
+  channel.select(a); channel.incoming(frame(a, { t: 2, idx: 1 }), () => assert.fail());
+  assert.equal(channel.drain(a, message => seen.push(message.idx)), true);
+  assert.deepEqual(seen, [1]); assert.equal(channel.ready, false); assert.equal(channel.outgoing(move), undefined);
+  channel.incoming(frame(a, { t: 2, idx: 2 }), () => assert.fail());
+  assert.equal(channel.drain(a, message => seen.push(message.idx)), true);
+  assert.deepEqual(seen, [1, 2]); assert.equal(channel.ready, false);
+  assert.equal(channel.release(a, () => assert.fail()), true);
 });
 
 test('count overflow, byte overflow and application exceptions all leave input closed', () => {
@@ -181,6 +197,28 @@ test('NetworkingService gates every outgoing API and unwraps frames before ordin
   assert.equal(h.sent[1].message.message.idx, 42);
   assert.deepEqual(h.sent[2].message.raw, [134, 2, 5]);
   assert.deepEqual(h.errors, []);
+});
+
+test('NetworkingService applies a selected baseline through normal dispatch and preserves input gating', () => {
+  const h = harness(), seen = [];
+  h.emitter.on('anyMessage', event => seen.push(event.message.t));
+  const baseline = { schemaVersion: 1, actor: 0xff000001, packetEpoch: a,
+    messages: [{ t: 32 }, { t: 33 }, { t: 26 }] };
+  assert.equal(h.service.applyCampaignBaseline(baseline), false);
+  h.service.selectPacketEpoch(a); assert.equal(h.service.applyCampaignBaseline(baseline), true);
+  assert.deepEqual(seen, [32, 33, 26]);
+  h.emitter.emit('sendMessage', { message: move, reliability: 'reliable' }); assert.equal(h.sent.length, 0);
+  h.message(frame(a)); h.tick(); assert.equal(h.service.drainPacketEpoch(a), true);
+  assert.deepEqual(seen, [32, 33, 26, 2]);
+  h.emitter.emit('sendMessage', { message: move, reliability: 'reliable' }); assert.equal(h.sent.length, 0);
+});
+
+test('a reentrant epoch change interrupts baseline dispatch before later messages', () => {
+  const h = harness(), seen = []; h.service.selectPacketEpoch(a);
+  h.emitter.on('anyMessage', event => { seen.push(event.message.t); h.service.selectPacketEpoch(b); });
+  assert.equal(h.service.applyCampaignBaseline({ schemaVersion: 1, actor: 0xff000001, packetEpoch: a,
+    messages: [{ t: 32 }, { t: 33 }] }), false);
+  assert.deepEqual(seen, [32]);
 });
 
 test('explicit closure notifies world cleanup after destroying transport without reconnecting', () => {
