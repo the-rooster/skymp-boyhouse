@@ -86,6 +86,167 @@ Variable CallNative::AnySafeToVariable(const CallNative::AnySafe& v,
     v);
 }
 
+NativeArrayArguments::ElementType CallNative::GetArrayElementType(
+  const TypeInfo& type)
+{
+  using Element = NativeArrayArguments::ElementType;
+  switch (type.GetUnmangledRawType()) {
+    case TypeInfo::RawType::kIntArray:
+      return Element::Int;
+    case TypeInfo::RawType::kFloatArray:
+      return Element::Float;
+    case TypeInfo::RawType::kBoolArray:
+      return Element::Bool;
+    case TypeInfo::RawType::kStringArray:
+      return Element::String;
+    case TypeInfo::RawType::kObjectArray:
+      if (type.IsObjectArray() && type.GetTypeInfo()) {
+        return Element::Object;
+      }
+      break;
+    default:
+      break;
+  }
+  throw std::runtime_error("Unsupported or unresolved Papyrus array type");
+}
+
+namespace {
+TypeInfo ArrayElementInfo(const TypeInfo& arrayType)
+{
+  switch (CallNative::GetArrayElementType(arrayType)) {
+    case NativeArrayArguments::ElementType::Int:
+      return TypeInfo(TypeInfo::RawType::kInt);
+    case NativeArrayArguments::ElementType::Float:
+      return TypeInfo(TypeInfo::RawType::kFloat);
+    case NativeArrayArguments::ElementType::Bool:
+      return TypeInfo(TypeInfo::RawType::kBool);
+    case NativeArrayArguments::ElementType::String:
+      return TypeInfo(TypeInfo::RawType::kString);
+    case NativeArrayArguments::ElementType::Object:
+      return TypeInfo(arrayType.GetTypeInfo()->GetRawType());
+  }
+  throw std::runtime_error("Unsupported Papyrus array element type");
+}
+
+Variable PackArrayObject(const CallNative::ObjectPtr& source,
+                         const TypeInfo& elementType)
+{
+  if (!source) {
+    return Variable(elementType);
+  }
+  auto result = CallNative::AnySafeToVariable(source, false);
+  const auto object = result.GetObject();
+  const auto actualType = object ? object->GetTypeInfo() : nullptr;
+  auto expected = elementType.GetTypeInfo();
+  if (!object || !actualType || !expected) {
+    throw std::runtime_error("Papyrus array object could not be bound");
+  }
+  auto vm = VM::GetSingleton();
+  RE::VMTypeID typeId = 0;
+  if (!vm || !vm->GetTypeIDForScriptObject(actualType->GetName(), typeId) ||
+      object->Resolve(typeId) != source->GetNativeObjectPtr()) {
+    throw std::runtime_error("Papyrus array object is no longer available");
+  }
+  for (auto actual = actualType; actual; actual = actual->GetParent()) {
+    if (!stricmp(actual->GetName(), expected->GetName())) {
+      return result;
+    }
+  }
+  throw std::runtime_error(
+    "Papyrus array object does not derive from its declared element type");
+}
+}
+
+Variable CallNative::ArgumentToVariable(const AnySafe& value,
+                                        const TypeInfo& expectedType)
+{
+  if (!expectedType.IsArray()) {
+    return AnySafeToVariable(value, expectedType.IsInt());
+  }
+  const auto kind = GetArrayElementType(expectedType);
+  const auto elementType = ArrayElementInfo(expectedType);
+  if (const auto* none = std::get_if<ObjectPtr>(&value); none && !*none) {
+    // SetArray(nullptr) asserts. The typed Variable constructor initializes
+    // its value to null while preserving the declared array type.
+    return Variable(expectedType);
+  }
+
+  // Convert and validate every element before allocating/publishing an array
+  // or invoking the native function. Empty arrays still use expectedType.
+  std::vector<Variable> elements;
+  std::visit(
+    [&](const auto& items) {
+      using T = std::decay_t<decltype(items)>;
+      if constexpr (std::is_same_v<T, std::vector<double>> ||
+                    std::is_same_v<T, std::vector<bool>> ||
+                    std::is_same_v<T, std::vector<std::string>> ||
+                    std::is_same_v<T, std::vector<ObjectPtr>>) {
+        using Item = typename T::value_type;
+        if constexpr (std::is_same_v<Item, double>) {
+          if (kind != NativeArrayArguments::ElementType::Int &&
+              kind != NativeArrayArguments::ElementType::Float) {
+            throw std::runtime_error(
+              "Numeric array does not match parameter type");
+          }
+        } else if constexpr (std::is_same_v<Item, bool>) {
+          if (kind != NativeArrayArguments::ElementType::Bool) {
+            throw std::runtime_error(
+              "Bool array does not match parameter type");
+          }
+        } else if constexpr (std::is_same_v<Item, std::string>) {
+          if (kind != NativeArrayArguments::ElementType::String) {
+            throw std::runtime_error(
+              "String array does not match parameter type");
+          }
+        } else if (kind != NativeArrayArguments::ElementType::Object) {
+          throw std::runtime_error(
+            "Object array does not match parameter type");
+        }
+        NativeArrayArguments::Length(items.size());
+        elements.reserve(items.size());
+        for (const auto& item : items) {
+          Variable converted;
+          if constexpr (std::is_same_v<Item, double>) {
+            if (kind == NativeArrayArguments::ElementType::Int) {
+              converted.SetSInt(NativeArrayArguments::Int(item));
+            } else {
+              converted.SetFloat(NativeArrayArguments::Float(item));
+            }
+          } else if constexpr (std::is_same_v<Item, bool>) {
+            converted.SetBool(static_cast<bool>(item));
+          } else if constexpr (std::is_same_v<Item, std::string>) {
+            if (item.find('\0') != std::string::npos) {
+              throw std::runtime_error(
+                "Papyrus String array cannot contain embedded NUL");
+            }
+            converted.SetString(item);
+          } else {
+            converted = PackArrayObject(item, elementType);
+          }
+          elements.push_back(std::move(converted));
+        }
+      } else {
+        throw std::runtime_error("Expected a typed array argument");
+      }
+    },
+    value);
+
+  auto vm = VM::GetSingleton();
+  RE::BSTSmartPointer<RE::BSScript::Array> array;
+  if (!vm ||
+      !vm->CreateArray(elementType,
+                       NativeArrayArguments::Length(elements.size()), array) ||
+      !array || array->size() != elements.size()) {
+    throw std::runtime_error("Papyrus array allocation failed");
+  }
+  for (size_t i = 0; i < elements.size(); ++i) {
+    (*array)[static_cast<uint32_t>(i)] = std::move(elements[i]);
+  }
+  Variable result;
+  result.SetArray(std::move(array));
+  return result;
+}
+
 namespace {
 
 CallNative::ObjectPtr GetSingleObjectPtr(
@@ -130,6 +291,9 @@ CallNative::AnySafe VariableToAnySafe(
 {
   using namespace CallNative;
 
+  if ((r.varType.IsArray() || r.varType.IsNoneArray()) && !r.GetArray()) {
+    return ObjectPtr();
+  }
   switch (r.varType.GetUnmangledRawType()) {
     case TypeInfo::RawType::kNone:
       return ObjectPtr();
@@ -426,24 +590,27 @@ CallNative::AnySafe CallNative::CallNativeSafe(Arguments& args_)
     return ObjectPtr();
   }
 
-  auto topArgs = stackIterator->second->top->args;
-  for (int i = 0; i < numArgs; i++) {
+  // Marshal once, retain engine references, and publish only after all
+  // arguments validate. Latent dispatch must not repack raw object pointers
+  // or allocate a second array after the first conversion has succeeded.
+  std::vector<Variable> marshalledArgs;
+  marshalledArgs.reserve(numArgs);
+  for (size_t i = 0; i < numArgs; i++) {
     FixedString unusedNameOut;
     TypeInfo typeOut;
     f->GetParam(i, unusedNameOut, typeOut);
 
-    topArgs[i] = AnySafeToVariable(args[i], typeOut.IsInt());
+    marshalledArgs.push_back(ArgumentToVariable(args[i], typeOut));
+  }
+  auto topArgs = stackIterator->second->top->args;
+  for (size_t i = 0; i < numArgs; ++i) {
+    topArgs[i] = marshalledArgs[i];
   }
 
   if (funcInfo->IsLatent()) {
     VmFunctionArguments vmFuncArgs(
       [](void* numArgs) { return (size_t)numArgs; },
-      [&args_, &f](size_t i) {
-        FixedString unusedNameOut;
-        TypeInfo typeOut;
-        f->GetParam(i, unusedNameOut, typeOut);
-        return AnySafeToVariable(args_.args[i], typeOut.IsInt());
-      },
+      [marshalledArgs](size_t i) { return marshalledArgs.at(i); },
       (void*)numArgs);
     auto fsClassName = AnySafeToVariable(className).GetString();
     auto fsClassFunc = AnySafeToVariable(classFunc).GetString();

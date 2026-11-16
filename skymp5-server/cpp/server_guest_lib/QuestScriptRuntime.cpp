@@ -1,15 +1,14 @@
 #include "QuestScriptRuntime.h"
+#include "CampaignCondition.h"
 #include "CampaignInventoryApi.h"
 #include "CampaignReferenceBinding.h"
 #include "CampaignReferenceQueryApi.h"
 #include "CampaignReferenceScripts.h"
 #include "CampaignWorldStateApi.h"
-#include "ConditionsEvaluator.h"
 #include "MpActor.h"
 #include "QuestJournal.h"
 #include "QuestVmState.h"
 #include "WorldState.h"
-#include "condition_functions/ConditionFunctionFactory.h"
 #include "libespm/CTDA.h"
 #include "libespm/GroupHeader.h"
 #include "libespm/QuestAliasData.h"
@@ -82,52 +81,6 @@ float GlobalDefault(const espm::LookupResult& record, WorldState& world)
     throw std::runtime_error("Missing global default");
   return *value;
 }
-
-class CampaignGlobalCondition final : public ConditionFunction
-{
-public:
-  explicit CampaignGlobalCondition(std::function<float(uint32_t)> read)
-    : read(std::move(read))
-  {
-  }
-  const char* GetName() const override { return "GetGlobalValue"; }
-  uint16_t GetFunctionIndex() const override { return 74; }
-  float Execute(MpActor&, uint32_t id, uint32_t,
-                const ConditionEvaluatorContext&) override
-  {
-    return read(id);
-  }
-
-private:
-  std::function<float(uint32_t)> read;
-};
-
-class CampaignVariableCondition final : public ConditionFunction
-{
-public:
-  using Read = std::function<float(uint32_t, const std::string&)>;
-  explicit CampaignVariableCondition(Read read)
-    : read(std::move(read))
-  {
-  }
-  const char* GetName() const override { return "GetVMQuestVariable"; }
-  uint16_t GetFunctionIndex() const override { return 629; }
-  float Execute(MpActor&, uint32_t, uint32_t,
-                const ConditionEvaluatorContext&) override
-  {
-    throw std::runtime_error("Quest variable condition requires CIS2");
-  }
-  float Execute(MpActor&, const Condition& condition,
-                const ConditionEvaluatorContext&) override
-  {
-    // ReadLogs supplies a resolved FormID and the owned CIS2 variable name.
-    return read(std::stoul(condition.parameter1, nullptr, 16),
-                condition.parameter2);
-  }
-
-private:
-  Read read;
-};
 
 bool Conditional(const PexScript& pex, uint32_t flags)
 {
@@ -359,8 +312,7 @@ private:
 struct LogEntry
 {
   uint8_t flags = 0;
-  std::vector<Condition> conditions;
-  std::map<size_t, uint32_t> comparisonGlobals;
+  std::vector<CampaignCondition> conditions;
 };
 std::vector<LogEntry> ReadLogs(const espm::LookupResult& record,
                                uint16_t stage, WorldState& world)
@@ -392,36 +344,8 @@ std::vector<LogEntry> ReadLogs(const espm::LookupResult& record,
           throw std::runtime_error("Malformed quest log condition");
         espm::CTDA ctda;
         std::memcpy(&ctda, data, sizeof(ctda));
-        // Only implemented quest predicates and explicitly resolved player
-        // scope.
-        if ((ctda.operatorFlag & 0x1a) ||
-            static_cast<int>(ctda.GetOperator()) > 5 ||
-            (ctda.functionIndex != 56 && ctda.functionIndex != 58 &&
-             ctda.functionIndex != 59 && ctda.functionIndex != 543 &&
-             ctda.functionIndex != 74 && ctda.functionIndex != 629) ||
-            (ctda.runOnType != espm::CTDA::RunOnTypeFlags::Subject &&
-             !(ctda.runOnType == espm::CTDA::RunOnTypeFlags::Reference &&
-               record.ToGlobalId(ctda.reference) == 0x14)))
-          throw std::runtime_error(
-            "Unsupported quest log condition or run-on context");
-        auto condition = Condition::FromCtda(ctda);
-        condition.runsOn = "Subject";
-        condition.parameter1 = fmt::format(
-          "0x{:x}", record.ToGlobalId(ctda.GetDefaultData().firstParameter));
-        if (ctda.operatorFlag & 4) {
-          uint32_t raw;
-          std::memcpy(&raw, &ctda.comparisonValue, sizeof(raw));
-          if (!raw)
-            throw std::runtime_error("Quest comparison global is null");
-          logs.back().comparisonGlobals.emplace(logs.back().conditions.size(),
-                                                record.ToGlobalId(raw));
-          condition.value = 0; // Resolved from the transaction at evaluation.
-        } else if (!std::isfinite(condition.value)) {
-          throw std::runtime_error("Nonfinite quest condition comparison");
-        }
-        if (ctda.functionIndex == 629)
-          condition.parameter2.clear(); // The CTDA slot is not a string ID.
-        logs.back().conditions.push_back(std::move(condition));
+        logs.back().conditions.push_back(CampaignCondition::Compile(
+          ctda, [&](uint32_t raw) { return record.ToGlobalId(raw); }));
         canReadString = true;
       } else if (selected &&
                  (!std::memcmp(tag, "CIS1", 4) ||
@@ -431,10 +355,7 @@ std::vector<LogEntry> ReadLogs(const espm::LookupResult& record,
             data[size - 1] != 0 || std::memchr(data, 0, size - 1))
           throw std::runtime_error("Invalid quest condition string");
         auto& condition = logs.back().conditions.back();
-        if (condition.function != "GetVMQuestVariable" ||
-            !condition.parameter2.empty())
-          throw std::runtime_error("Unexpected quest condition string");
-        condition.parameter2.assign(data, size - 1);
+        condition.SetVariableName(std::string(data, size - 1));
         canReadString = false;
       } else {
         canReadString = false;
@@ -443,9 +364,7 @@ std::vector<LogEntry> ReadLogs(const espm::LookupResult& record,
     world.GetEspmCache());
   for (const auto& log : logs)
     for (const auto& condition : log.conditions)
-      if (condition.function == "GetVMQuestVariable" &&
-          condition.parameter2.empty())
-        throw std::runtime_error("Missing quest condition variable name");
+      condition.Validate();
   return logs;
 }
 
@@ -1241,12 +1160,18 @@ bool QuestScriptRuntime::Execute(MpActor& actor, uint32_t questId,
       throw std::runtime_error("Conditional quest variable does not exist: " +
                                name);
     };
-    auto conditionFunctions =
-      ConditionFunctionFactory::CreateConditionFunctions();
-    conditionFunctions.RegisterConditionFunction(
-      std::make_shared<CampaignGlobalCondition>(readGlobalId));
-    conditionFunctions.RegisterConditionFunction(
-      std::make_shared<CampaignVariableCondition>(readQuestVariable));
+    auto conditionAlias = [&](uint32_t id, uint32_t aliasId) {
+      const auto object = std::dynamic_pointer_cast<CampaignAliasObject>(
+        resolveAlias(id, aliasId));
+      if (!object ||
+          object->Definition().kind !=
+            espm::QuestAliasDefinition::Kind::Reference)
+        throw std::runtime_error("Condition requires a reference alias");
+      const auto value = aliasTarget(*object);
+      if (!static_cast<IGameObject*>(value))
+        throw std::runtime_error("Quest condition reference alias is empty");
+      return formId(value);
+    };
     size_t depth = 0;
     std::function<bool(uint32_t, uint16_t)> execute;
     for (const auto* name : { "SetStage", "SetCurrentStageID" }) {
@@ -1305,15 +1230,9 @@ bool QuestScriptRuntime::Execute(MpActor& actor, uint32_t questId,
             "Invalid or duplicate quest fragment log binding");
       }
       for (size_t logIndex = 0; logIndex < logs.size(); ++logIndex) {
-        auto conditions = logs[logIndex].conditions;
-        for (const auto& [index, global] : logs[logIndex].comparisonGlobals)
-          conditions.at(index).value = readGlobalId(global);
-        bool passes = conditions.empty();
-        if (!passes)
-          ConditionsEvaluator::EvaluateConditions(
-            conditionFunctions, {}, ConditionsEvaluatorCaller::kCraft,
-            conditions, actor, actor,
-            [&](bool result, auto&) { passes = result; });
+        const bool passes = CampaignCondition::Evaluate(
+          logs[logIndex].conditions,
+          { actor, targetId, readGlobalId, readQuestVariable, conditionAlias });
         if (!passes)
           continue;
         for (const auto& fragment : data.fragments) {

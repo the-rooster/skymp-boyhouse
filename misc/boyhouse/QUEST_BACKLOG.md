@@ -16,7 +16,7 @@ Generated static analysis. Counts include internal/helper quests and potential d
 | condition.non-stage-evaluation | 2118 |
 | alias.reference | 1978 |
 | engine.dialogue | 1865 |
-| world.campaign-references | 1796 |
+| world.campaign-references | 1810 |
 | engine.story-manager | 1424 |
 | alias.fill.unique-actor | 1378 |
 | engine.scenes | 1309 |
@@ -24,23 +24,24 @@ Generated static analysis. Counts include internal/helper quests and potential d
 | alias.fill.event | 1180 |
 | condition.run-on:7 | 1062 |
 | alias.properties | 1058 |
-| forms.asset-bindings | 910 |
+| forms.asset-bindings | 918 |
 | alias.scripts | 699 |
 | engine.packages | 592 |
 | alias.fill.forced-reference | 547 |
 | alias.fill.matching-or-script | 520 |
+| world.campaign-player | 493 |
 | alias.location | 486 |
 | alias.fill.created-reference | 384 |
 | condition.run-on:5 | 277 |
+| condition.run-on:2 | 271 |
 | alias.fill.location-or-alias | 265 |
 | condition.flags | 255 |
 | condition.run-on:1 | 164 |
-| condition.run-on:2 | 154 |
 | alias.fill.specific-location | 142 |
 | alias.fill.matching-reference | 138 |
-| world.campaign-player | 114 |
 | quest.log-flags | 72 |
 | alias.fill.external-alias | 63 |
+| condition.run-on:0:physical | 38 |
 | condition.run-on:3 | 31 |
 | condition.run-on:6 | 7 |
 | condition.run-on:4 | 3 |
@@ -95,8 +96,6 @@ Generated static analysis. Counts include internal/helper quests and potential d
 | GetIsVoiceType (426) | 242 |
 | LocationHasKeyword (562) | 219 |
 | IsSceneActionComplete (550) | 199 |
-| GetItemCount (47) | 179 |
-| GetDead (46) | 173 |
 | HasRefType (561) | 169 |
 | IsInDialogueWithPlayer (249) | 144 |
 | GetActorValue (14) | 126 |
@@ -104,6 +103,8 @@ Generated static analysis. Counts include internal/helper quests and potential d
 | IsLinkedTo (650) | 117 |
 | GetPCIsSex (131) | 105 |
 | GetInWorldspace (310) | 100 |
+| IsInInterior (300) | 93 |
+| GetRandomPercent (77) | 92 |
 
 ## Limits and next steps
 
@@ -118,7 +119,7 @@ Implement shared capabilities, then rerun this report and the regression suites.
 
 ## Reproducibility
 
-Capability registry SHA-256: f29140fb8e2dee8ad75c11973cda315c3de2dc10e540eecea1436188f0ca79ef
+Capability registry SHA-256: fa3b50b487da37a6b8a91331ecf04c6976d4faaaeca5b6defb00890f5e01433d
 
 - Skyrim.esm: e198c3b85e5e48e0c92a6580d8f66e644256b68d812ee32b61735cf9b753df73
 - Update.esm: b298b0f65fa0127fd13c1f5ef6bb30eaf9d21fd19f5e6f8f91f829c9007d3280

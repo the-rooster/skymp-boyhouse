@@ -79,12 +79,34 @@ Napi::Value CallNativeImpl(
                              "' can't be called in this context");
 
   CallNative::AnySafe nativeArgs[CallNative::g_maxArgs + 1];
-  auto n =
-    (size_t)std::max(static_cast<int>(info.Length()) - nativeArgsStart, 0);
+  const size_t n =
+    info.Length() > nativeArgsStart ? info.Length() - nativeArgsStart : 0;
+  // Check before writing nativeArgs, not only later in CallNativeSafe.
+  if (n > CallNative::g_maxArgs) {
+    throw std::runtime_error("Too many native arguments");
+  }
+  auto& provider = VmProvider::GetSingleton();
+  auto f = provider.GetFunctionInfo(className, functionName);
+  if (!f) {
+    requirements.vm->ReloadType(className.data());
+    f = provider.GetFunctionInfo(className, functionName);
+  }
+  if (!f || f->GetParamCount() != n) {
+    throw std::runtime_error(
+      "Native function or argument count does not match '" + className + "." +
+      functionName + "'");
+  }
+  const auto function = f->GetIFunction();
+  if (!function) {
+    throw std::runtime_error("Native function metadata is unavailable");
+  }
 
   for (size_t i = 0; i < n; ++i) {
+    FixedString unusedName;
+    TypeInfo expectedType;
+    function->GetParam(i, unusedName, expectedType);
     nativeArgs[i] = SP3NativeValueCasts::GetSingleton().JsValueToNativeValue(
-      info[nativeArgsStart + i]);
+      info[nativeArgsStart + i], &expectedType);
   }
 
   if (!requirements.gameThrQ) {
@@ -94,8 +116,6 @@ Napi::Value CallNativeImpl(
   if (!requirements.jsThrQ) {
     throw NullPointerException("jsThrQ");
   }
-
-  auto& provider = VmProvider::GetSingleton();
 
   CallNative::Arguments callNativeArgs{
     requirements.vm,
@@ -111,7 +131,6 @@ Napi::Value CallNativeImpl(
     nullptr
   };
 
-  auto f = provider.GetFunctionInfo(className, functionName);
   auto isAddOrRemove =
     (functionName == "removeItem") || (functionName == "addItem");
 

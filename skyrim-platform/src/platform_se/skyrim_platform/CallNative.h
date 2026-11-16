@@ -1,5 +1,6 @@
 #pragma once
 #include "FunctionInfoProvider.h"
+#include "NativeArrayArguments.h"
 
 namespace CallNative {
 static constexpr size_t g_maxArgs = 12;
@@ -36,6 +37,9 @@ static inline size_t GetIndexFor()
 }
 
 Variable AnySafeToVariable(const AnySafe& v, bool treatNumberAsInt);
+NativeArrayArguments::ElementType GetArrayElementType(const TypeInfo& type);
+Variable ArgumentToVariable(const AnySafe& value,
+                            const TypeInfo& expectedType);
 
 using LatentCallback = std::function<void(Napi::Env, AnySafe)>;
 

@@ -730,6 +730,44 @@ specific reason. Its server and relay were closed; this attempt contributes no
 new projection acceptance evidence. Earlier recorded projection evidence is
 unchanged. **Zero quests are certified playable.**
 
+## Typed native-array arguments
+
+The client native-call bridge now decodes JavaScript arrays against the native
+function's declared Papyrus parameter type. Int, Float, Bool, String and object
+arrays retain their element type even when empty. A null/undefined whole array
+becomes typed None; object elements may be null. Sparse arrays, undefined or
+nested elements, type coercion, embedded string NULs, invalid signed-int32
+values, and Float overflow/underflow or nonfinite values are refused before the
+native call. The bridge's 65,536-element ceiling is a resource policy, not an
+engine or SKSE array limit.
+
+Object-array inputs require wrappers from the current Papyrus update, a valid
+pool index, a live packed binding and the declared class ancestry. Marshalling
+retains engine variables once for ordinary and latent dispatch. This does not
+change the isolated server's unsupported durable latent execution. It also does
+not establish native UI completion: the acceptance failure above remains the
+latest real Skyrim result, and the rebuilt array path still needs an engine run.
+
+The compile-only Windows plugin build and seven portable boundary tests (76
+assertions) passed. These tests execute the shared conversion rules; they do not
+exercise N-API property access, engine allocation, object binding or latent
+dispatch inside Skyrim.
+
+Generate the opt-in engine acceptance observer with:
+
+```powershell
+node misc/boyhouse/build-character-creation-runtime-smoke.cjs artifacts/boyhouse-native-array-runtime-test.js --native-array-inputs
+```
+
+This mode checks temporary primitive arrays, empty/None arrays, a fresh player
+as a Form element, null-only Alias arrays, and malformed-input refusals before
+driving the observed character-creation UI with `Ui.invokeIntA`. It still requires
+the real appearance echo, loadout settlement and private/shared phase roundtrip.
+Without the flag, the observer uses the scalar UI calls for older plugin builds.
+Both generated modes passed syntax and simulated observer-flow checks; neither
+mode has completed the new engine acceptance run. Real non-null Alias bindings
+are not covered by this observer.
+
 ## Remaining acceptance
 
 The packet-epoch transport adds a separate `MpClientPlugin` codec version 2.1.0.

@@ -11,10 +11,12 @@ public:
 
   static SP3NativeValueCasts& GetSingleton();
 
-  CallNative::ObjectPtr JsObjectToNativeObject(const Napi::Value& v);
+  CallNative::ObjectPtr JsObjectToNativeObject(
+    const Napi::Value& v, bool requireCurrentUpdate = false);
   Napi::Value NativeObjectToJsObject(Napi::Env env,
                                      const CallNative::ObjectPtr& obj);
-  CallNative::AnySafe JsValueToNativeValue(const Napi::Value& v);
+  CallNative::AnySafe JsValueToNativeValue(
+    const Napi::Value& v, const TypeInfo* expectedType = nullptr);
   Napi::Value NativeValueToJsValue(Napi::Env env,
                                    const CallNative::AnySafe& v);
 

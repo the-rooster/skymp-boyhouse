@@ -5,7 +5,10 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const root = path.resolve(__dirname, '../..');
-if (process.argv.length !== 3) throw Error('Usage: node build-character-creation-runtime-smoke.cjs <output.js>');
+if (process.argv.length < 3 || process.argv.length > 4 ||
+    (process.argv[3] && process.argv[3] !== '--native-array-inputs'))
+  throw Error('Usage: node build-character-creation-runtime-smoke.cjs <output.js> [--native-array-inputs]');
+const nativeArrayInputs = process.argv[3] === '--native-array-inputs';
 const output = path.resolve(process.argv[2]);
 const source = path.join(root, 'build/dist/client/Data/Platform/Plugins/skymp5-client.js');
 if (output === source) throw Error('Write a separate observer bundle, not the production client');
@@ -13,14 +16,16 @@ const client = fs.readFileSync(source, 'utf8');
 const observer = String.raw`
 ;(() => {
   const sp = skyrimPlatform, started = Date.now(), desiredName = 'Boyhouse Creation Test';
+  const nativeArrayInputs = ${nativeArrayInputs};
   const raceMenu = 'RaceSex Menu', panel = '_root.RaceSexMenuBaseInstance.RaceSexPanelsInstance';
   const entry = panel + '.NameEntryInstance', input = entry + '.TextInputInstance';
   // Verified by reading the installed Interface.bsa's racesex_menu.gfx,
   // messagebox.swf and textentry.swf, including AS2 function bytecode:
   // panel.onDoneClicked -> ConfirmDone; button.onPress -> ClickCallback;
   // entry.onAccept -> nameChange -> ChangeName. Invoke their normal UI path.
-  // Use documented scalar InvokeInt: the current SP3 bridge cannot marshal
-  // JS array arguments. The zero-argument done/accept callbacks ignore 0.
+  // Default to documented scalar InvokeInt for compatibility with the older
+  // SP3 bridge. --native-array-inputs explicitly tests the repaired array path.
+  // The zero-argument done/accept callbacks ignore the scalar compatibility 0.
   // Button.onPress takes controllerIdx first; keyboardOrMouse is unused and
   // MessageBox's press listener reads only event.target._name, supplied by
   // EventDispatcher. It does not require the omitted mouse-button argument.
@@ -29,11 +34,66 @@ const observer = String.raw`
   let editingSince = 0, editingSamples = 0, restoreControls, initialEpoch, initialVersion, selfIdx;
   let pendingAppearance, initialAppearanceChanges = 0, accepted = false, settledSamples = 0;
   let confirmationPressed = false, original, copies = [], enteredVersion = 0, leaveSteps = 0, waitUntil = 0;
+  let arrayCasesComplete = false;
   const log = (event, data) => sp.writeLogs('boyhouseCharacterCreationRuntimeTest', event, JSON.stringify(data));
   const canonical = value => Array.isArray(value) ? value.map(canonical) : value && typeof value === 'object'
     ? Object.keys(value).sort().reduce((out, key) => { out[key] = canonical(value[key]); return out; }, {}) : value;
   const equal = (a, b) => JSON.stringify(canonical(a)) === JSON.stringify(canonical(b));
   const assert = (value, error) => { if (!value) throw Error(error); };
+  const invoke = (menu, target, args) => nativeArrayInputs
+    ? sp.Ui.invokeIntA(menu, target, args) : sp.Ui.invokeInt(menu, target, 0);
+  const runArrayInputCases = () => {
+    // Verified SKSE PapyrusUtility.cpp ResizeArray only copies/fills temporary
+    // VM arrays. PapyrusArgs.h PackValue emits None for a zero-length result.
+    // No quest, inventory, actor, controls, or service state is mutated here.
+    const check = (name, actual, expected) => {
+      assert(equal(actual, expected), name + ': ' + JSON.stringify({ actual, expected }));
+      log('native-array-case', { name, result: actual });
+    };
+    for (const [kind, values, fill, expected] of [
+      ['Int', [-2147483648, 0, 2147483647], 17, [-2147483648, 0, 2147483647]],
+      ['Float', [0.1, -1.25, 2], 1.5, [Math.fround(0.1), -1.25, 2]],
+      ['Bool', [true, false, true], true, [true, false, true]],
+      ['String', ['', 'Boyhouse', 'array'], 'fill', ['', 'Boyhouse', 'array']],
+    ]) {
+      const resize = (...args) => sp.Utility['resize' + kind + 'Array'](...args);
+      check(kind + '-roundtrip', resize(values, values.length, fill), expected);
+      check(kind + '-empty-input', resize([], 1, fill), [fill]);
+      check(kind + '-null-input', resize(null, 1, fill), [fill]);
+      check(kind + '-empty-result', resize([], 0, fill), null);
+    }
+    check('Form-empty-input', sp.Utility.resizeFormArray([], 1, null), [null]);
+    check('Form-null-input', sp.Utility.resizeFormArray(null, 1, null), [null]);
+    check('Form-empty-result', sp.Utility.resizeFormArray([], 0, null), null);
+    // Obtain the wrapper immediately before use, inside this native update.
+    const freshPlayer = sp.Game.getPlayer();
+    const playerId = freshPlayer.getFormID();
+    const forms = sp.Utility.resizeFormArray([freshPlayer, null], 3, null);
+    assert(Array.isArray(forms), 'Form roundtrip returned no array');
+    check('Form-subclass-and-null', forms.map(form => form === null ? null : sp.Form.from(form).getFormID()),
+      [playerId, null, null]);
+    check('Alias-empty-input', sp.Utility.resizeAliasArray([], 1, null), [null]);
+    check('Alias-null-input', sp.Utility.resizeAliasArray(null, 1, null), [null]);
+    check('Alias-null-elements', sp.Utility.resizeAliasArray([null, null], 2, null), [null, null]);
+    check('Alias-empty-result', sp.Utility.resizeAliasArray([], 0, null), null);
+    const rejected = (name, call) => {
+      let error;
+      try { call(); } catch (caught) { error = String(caught); }
+      assert(error, name + ' was accepted unexpectedly');
+      log('native-array-rejection', { name, error });
+    };
+    rejected('fractional-int', () => sp.Utility.resizeIntArray([1.5], 1, 0));
+    rejected('int-overflow', () => sp.Utility.resizeIntArray([2147483648], 1, 0));
+    rejected('nonfinite-float', () => sp.Utility.resizeFloatArray([Infinity], 1, 0));
+    rejected('heterogeneous-bool', () => sp.Utility.resizeBoolArray([true, 1], 1, false));
+    rejected('undefined-element', () => sp.Utility.resizeFormArray([undefined], 1, null));
+    rejected('nested-array', () => sp.Utility.resizeIntArray([[1]], 1, 0));
+    rejected('sparse-array', () => sp.Utility.resizeIntArray(new Array(1), 1, 0));
+    rejected('bridge-size-limit', () => sp.Utility.resizeIntArray(new Array(65537), 0, 0));
+    arrayCasesComplete = true;
+    log('native-array-cases-complete', { primitiveKinds: 4, formSubclass: true,
+      aliasCoverage: 'empty/null only; no real alias binding claim' });
+  };
   const controls = () => [sp.Game.isMovementControlsEnabled(), sp.Game.isFightingControlsEnabled(),
     sp.Game.isCamSwitchControlsEnabled(), sp.Game.isLookingControlsEnabled(), sp.Game.isSneakingControlsEnabled(),
     sp.Game.isMenuControlsEnabled(), sp.Game.isActivateControlsEnabled(), sp.Game.isJournalControlsEnabled()];
@@ -45,6 +105,7 @@ const observer = String.raw`
     if (stopping) return;
     stopping = true;
     log('test-end', { passed, phase, elapsedMs: Date.now() - started, accepted,
+      nativeArrayInputs, arrayCasesComplete,
       editingSamples, editingMs: editingSince && Date.now() - editingSince, detail });
     sp.win32.exitProcess();
   };
@@ -117,6 +178,7 @@ const observer = String.raw`
         assert(projection && projection.instance === '' && self && !self.appearance,
           'Fixture must create a fresh character in the shared world');
         assert(restoreControls, 'Initial native control lease was not observed');
+        if (nativeArrayInputs && !arrayCasesComplete) runArrayInputCases();
         selfIdx = self.idx; initialEpoch = coordinator.replica.packetEpoch; initialVersion = status.version;
         initialAppearanceChanges = self.numAppearanceChanges || 0; editingSince = Date.now();
         setPhase('editing', 60000);
@@ -130,7 +192,7 @@ const observer = String.raw`
         ++editingSamples;
         if (Date.now() - editingSince < 45000) return; // Exceeds the old 30-second transfer deadline.
         log('editing-observed', { durationMs: Date.now() - editingSince, editingSamples });
-        sp.Ui.invokeInt(raceMenu, panel + '.onDoneClicked', 0);
+        invoke(raceMenu, panel + '.onDoneClicked', []);
         setPhase('confirming-ui', 15000); return;
       }
       if (phase === 'confirming-ui') {
@@ -146,7 +208,7 @@ const observer = String.raw`
           log('native-confirmation', { prompt, yes, no });
           assert(/finish|name.*character/i.test(prompt) && /^(yes|ok)$/i.test(yes.trim()) && /^(no|cancel)$/i.test(no.trim()),
             'Unexpected confirmation menu; refusing to press a different dialog');
-          sp.Ui.invokeInt('MessageBoxMenu', yesButton + '.onPress', 0);
+          invoke('MessageBoxMenu', yesButton + '.onPress', [0, 0, 0]);
           confirmationPressed = true;
         }
         return;
@@ -155,7 +217,7 @@ const observer = String.raw`
         assert(nameEntryReady() && gameplayHeld(flags), 'Name entry lost its native state');
         if (sp.Ui.getString(raceMenu, input + '.text') !== desiredName) return;
         log('native-name-observed', { value: desiredName });
-        sp.Ui.invokeInt(raceMenu, entry + '.onAccept', 0);
+        invoke(raceMenu, entry + '.onAccept', []);
         setPhase('awaiting-close', 45000); return;
       }
       if (phase === 'awaiting-close') {
@@ -217,7 +279,7 @@ const observer = String.raw`
       }
     } catch (error) { finish(false, String(error.stack || error)); }
   });
-  log('loaded', { platform: sp.getPlatformVersion(), desiredName, profileId: 2026111650,
+  log('loaded', { platform: sp.getPlatformVersion(), desiredName, profileId: 2026111650, nativeArrayInputs,
     menuDriver: 'observed Skyrim Scaleform callbacks; no desktop input' });
 })();
 `;

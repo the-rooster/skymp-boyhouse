@@ -1,6 +1,7 @@
 #include "SP3NativeValueCasts.h"
 
 #include "CallNative.h"
+#include "NativeArrayArguments.h"
 #include "NullPointerException.h"
 #include "Overloaded.h"
 #include "PapyrusTESModPlatform.h"
@@ -25,31 +26,35 @@ SP3NativeValueCasts& SP3NativeValueCasts::GetSingleton()
 }
 
 CallNative::ObjectPtr SP3NativeValueCasts::JsObjectToNativeObject(
-  const Napi::Value& v)
+  const Napi::Value& v, bool requireCurrentUpdate)
 {
   if (v.IsNull() || v.IsUndefined()) {
     return nullptr;
   }
 
-  if (!v.IsObject()) {
+  if (!v.IsObject() || v.IsArray()) {
     throw std::runtime_error(
       "JsObjectToNativeObject expected object or null or undefined");
   }
 
-  // This might treat NaN as 0. Check omitted for performance.
-  const int64_t indexInPool =
-    v.As<Napi::Object>()
-      .Get(SP3NativeValueCasts::kSkyrimPlatformIndexInPoolProperty)
-      .ToNumber()
-      .Int64Value();
-
-  if (indexInPool < 0) {
-    throw std::runtime_error(fmt::format(
-      "JsObjectToNativeObject expected a non-negative {}, but got {}",
-      SP3NativeValueCasts::kSkyrimPlatformIndexInPoolProperty, indexInPool));
+  // The return path rotates the pool lazily. Array inputs must not dereference
+  // a prior-update object merely because no new object has been returned yet.
+  if (requireCurrentUpdate &&
+      pImpl->numPapyrusUpdates != TESModPlatform::GetNumPapyrusUpdates()) {
+    throw std::runtime_error(
+      "Papyrus array contains an expired native object wrapper");
   }
 
-  const uint64_t unsignedIndexinPool = static_cast<uint64_t>(indexInPool);
+  const auto object = v.As<Napi::Object>();
+  if (!object.HasOwnProperty(kSkyrimPlatformIndexInPoolProperty)) {
+    throw std::runtime_error("Expected a live native object wrapper");
+  }
+  const auto index = object.Get(kSkyrimPlatformIndexInPoolProperty);
+  if (!index.IsNumber()) {
+    throw std::runtime_error("Native object pool index must be a number");
+  }
+  const uint64_t unsignedIndexinPool =
+    NativeArrayArguments::PoolIndex(index.As<Napi::Number>().DoubleValue());
   const uint64_t rangeBegin = pImpl->objectPool.GetActiveWindowStart();
   const uint64_t rangeEnd = pImpl->objectPool.GetTotalProcessedCount();
   if (unsignedIndexinPool < rangeBegin || unsignedIndexinPool >= rangeEnd) {
@@ -87,8 +92,41 @@ Napi::Value SP3NativeValueCasts::NativeObjectToJsObject(
 }
 
 CallNative::AnySafe SP3NativeValueCasts::JsValueToNativeValue(
-  const Napi::Value& v)
+  const Napi::Value& v, const TypeInfo* expectedType)
 {
+  if (expectedType && expectedType->IsArray()) {
+    // None is distinct from a present zero-length array. Its declared array
+    // type is restored by the Papyrus adapter, including for latent calls.
+    if (v.IsNull() || v.IsUndefined()) {
+      return CallNative::ObjectPtr();
+    }
+    if (!v.IsArray()) {
+      throw std::runtime_error("Expected a JavaScript array or null");
+    }
+    const auto array = v.As<Napi::Array>();
+    return NativeArrayArguments::Decode<CallNative::AnySafe,
+                                        CallNative::ObjectPtr>(
+      CallNative::GetArrayElementType(*expectedType), array.Length(),
+      [&](size_t i) -> CallNative::AnySafe {
+        if (!array.HasOwnProperty(std::to_string(i))) {
+          throw std::runtime_error(
+            "Sparse Papyrus array arguments are unsupported");
+        }
+        const auto element = array.Get(static_cast<uint32_t>(i));
+        if (element.IsUndefined() || element.IsArray()) {
+          throw std::runtime_error(
+            "Papyrus array elements cannot be undefined or arrays");
+        }
+        if (element.IsObject()) {
+          return JsObjectToNativeObject(element, true);
+        }
+        return JsValueToNativeValue(element);
+      });
+  }
+  if (v.IsArray()) {
+    throw std::runtime_error(
+      "Array argument requires a declared Papyrus array parameter");
+  }
   // TODO: better switch(v.Type()) for performance
   if (v.IsBoolean()) {
     return static_cast<bool>(v.As<Napi::Boolean>());

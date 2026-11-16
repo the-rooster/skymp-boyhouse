@@ -69,7 +69,12 @@ Logical campaign form and alias getters are now audited subsets; the broader
 alias/world feature gates remain missing until filling, effects and lifecycle
 are implemented.
 Quest-variable conditions now contribute their target-quest dependency, and
-global comparisons contribute their GLOB dependency. Comparison globals have
+global comparisons contribute their GLOB dependency. Explicit Run On Reference
+conditions contribute the placed-reference dependency, and `GetItemCount`
+contributes its base-item dependency unless the parameter uses an unsupported
+alias/package flag. Run On Quest Alias reads the signed alias ID at byte 28;
+alias zero is valid and the unused byte-24 value is never a FormID.
+Comparison globals have
 their own audited subset; unsupported flags and non-stage evaluation remain
 separate missing capabilities.
 Implemented APIs are labeled `implemented-subset`; the report never calls a
@@ -82,11 +87,22 @@ The current registry contains **59 partial native methods**, including ten
 physical-reference queries and five private-copy visibility methods. Queries
 require tracked owner/private-copy snapshots; visibility additionally requires
 transactional staging and a complete observer projection barrier. The same-named
-condition functions are not enabled by these native registrations. Source guards
+condition functions are not enabled by these native registrations. A separate
+typed stage-log evaluator now audits three physical condition subsets:
+`GetDisabled` (35) and `GetItemCount` (47) on explicit references, and `GetDead`
+(46) on explicit references or safely resolved reference aliases. The registry
+has **nine partial condition functions**. Qualified stage-selector features mark
+only these combinations as partial; implicit physical subjects, unsupported
+alias/function combinations and non-stage evaluation retain missing gates.
+Source guards
 include the barrier bridge, projection feed, character-creation gate and binary
 decoder used by this path. These guards detect source changes; they do not prove
 behavior or expand the analyzer's graph coverage. The generated backlog must be
 regenerated against the updated registry before its capability counts are used.
+
+The client native-array bridge is guarded separately from campaign capabilities.
+Accepting JavaScript arrays as typed Papyrus native arguments does not implement
+any missing isolated-server native API or durable latent continuation.
 
 The [runtime contract](QUESTS.md#physical-reference-queries-and-visibility-mutations)
 lists the limits: no fade, enable-parent propagation or latent support; a fresh

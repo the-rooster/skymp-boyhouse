@@ -26,6 +26,16 @@ Persistent personal/host journals, 23 Papyrus Quest state methods, four quest co
   explicit private copy and validate saved state, binding identity and lifetime
   at transaction commit. The capability registry contains **59 partial native
   methods**, not 59 completed quest systems.
+- A separate stage-log evaluator adds bounded `GetDisabled`, `GetItemCount`
+  and `GetDead` conditions. Explicit references resolve to the owner or private
+  copies; `GetDead` also accepts safely resolved reference aliases. Inventory
+  initialization, staged writes and transaction conflicts are checked. The
+  registry has **nine partial condition functions**; implicit physical subjects,
+  general alias filling and dialogue conditions remain unfinished.
+  This batch passed 499 native cases, 284 JavaScript tests and 43 Python tests,
+  plus protocol, projection and SQLite restart checks. These are automated
+  component/integration checks; zero quests have completed native playthrough
+  certification.
 - Supported enable/disable changes stage with journal, VM and inventory state.
   A native/JS barrier gates every connected observer in the private phase,
   advances packet epochs, then publishes fresh manifests and baselines after

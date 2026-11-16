@@ -153,18 +153,30 @@ def summarize_record(typ, flags, form, values, groups, origins, plugin):
                 raise ValueError("Invalid CTDA size")
             op = data[0]
             index = struct.unpack_from("<H", data, 8)[0]
-            run_on, reference = struct.unpack_from("<II", data, 20)
+            run_on, reference, alias_id = struct.unpack_from("<IIi", data, 20)
+            stage_log = context.startswith("stage:") and typ == "QUST"
+            physical = index in (35, 46, 47)
             feature(f"condition:{index}", where)
             if op & 0x1a or op >> 5 > 5:
                 feature("condition.flags", where)
             if op & 4:
                 feature("condition.global-comparison", where)
                 ref(struct.unpack_from("<I", data, 4)[0], where)
-            if run_on != 0 and not (run_on == 2 and stable_form(reference, origins) == "Skyrim.esm:000014"):
+            # Run On Reference stores a FormID at byte 24. Quest Alias uses
+            # the signed ID at byte 28 instead; alias 0 is valid, and the
+            # unused byte-24 value must never become a dependency.
+            reference_key = ref(reference, where) if run_on == 2 else None
+            if stage_log and physical and run_on == 2 and reference_key:
+                feature("condition.stage-run-on:2:private-reference", where)
+            elif stage_log and index == 46 and run_on == 5 and alias_id >= 0:
+                feature("condition.stage-run-on:5:reference-alias", where)
+            elif physical and run_on == 0:
+                feature("condition.run-on:0:physical", where)
+            elif run_on != 0 and not (not physical and run_on == 2 and reference_key == "Skyrim.esm:000014"):
                 feature(f"condition.run-on:{run_on}", where)
-            if not context.startswith("stage:") or typ != "QUST":
+            if not stage_log:
                 feature("condition.non-stage-evaluation", where)
-            if index in (56, 58, 59, 74, 543, 629) and not op & 0x0a:
+            if index in (47, 56, 58, 59, 74, 543, 629) and not op & 0x0a:
                 ref(struct.unpack_from("<I", data, 12)[0], where)
         elif tag == b"QSDT" and typ == "QUST":
             if len(data) != 1:

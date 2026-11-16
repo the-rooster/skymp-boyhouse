@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "scope": "Audited isolated campaign fragment runner only; all entries are partial implementations, not quest certification",
   "sourceHashes": {
-    "skymp5-server/cpp/server_guest_lib/QuestScriptRuntime.cpp": "729b70f7d439d210365488d83b059add5a0365c43f45d95e40c75c0e192320a0",
+    "skymp5-server/cpp/server_guest_lib/QuestScriptRuntime.cpp": "917cc9f8750ec689c722103df69c2805e69638086ece7ac96097d31ece6c51be",
     "skymp5-server/cpp/server_guest_lib/script_classes/PapyrusQuest.cpp": "85b17221763600d66214b711691e47093e17f3d4e05f7ac10751ee5ba563a823",
     "libespm/src/QuestAliasData.cpp": "4cf16635f74b63707a9f7b46d1003779f354289b29b327137877e996cd18def4",
     "libespm/include/libespm/QuestAliasData.h": "481593ca4c17423f6a2c3cd9d60a9f79d38cd75a6f1c801759e4a342ff38da95",
@@ -81,7 +81,15 @@
     "skymp5-client/src/services/services/campaignQuestService.ts": "1b53e73b3d942a7b38625bbf6b551dcbbee12dbcb084738ed60cf4ca6b726864",
     "skymp5-client/src/services/events/events.ts": "d4aa64c6b8b5c353fd6df9e3b2a23d2939157e19067399c8b21e5b86b3398c78",
     "skymp5-client/src/sync/inventory.ts": "409a5200c901c20595b6d48bd04f43c2c7cd3fc0b546328983a7acd0ef640c01",
-    "skymp5-client/src/sync/equipment.ts": "b3d6275f13a3558cd56f1eeb53dd4e1be976b85aa19d3fccd06229f396f73450"
+    "skymp5-client/src/sync/equipment.ts": "b3d6275f13a3558cd56f1eeb53dd4e1be976b85aa19d3fccd06229f396f73450",
+    "skymp5-server/cpp/server_guest_lib/CampaignCondition.cpp": "43f89425f00b60cb2c416feb0ff67b93aef0e0715b700cf6b3d4f0689e967568",
+    "skymp5-server/cpp/server_guest_lib/CampaignCondition.h": "f33c8640843e67e5e0e93713ebe28c313f2bb43d0be6e85df39c8a2b486f3d71",
+    "skyrim-platform/src/platform_se/skyrim_platform/CallNative.cpp": "85d469c505ce316dcd1a2b5f9c3a021307377a420eee75b3feaa2a5226148e65",
+    "skyrim-platform/src/platform_se/skyrim_platform/CallNative.h": "d276dbeb9c46042f8ff8b3022762e9f2d128d24d9aa70bf7159d6b7e9fa83533",
+    "skyrim-platform/src/platform_se/skyrim_platform/CallNativeApi.cpp": "c50919da76e8c6179cb45f8ed03698495b8c10f328a47d9fc28be4fbd32100f1",
+    "skyrim-platform/src/platform_se/skyrim_platform/Sp3NativeValueCasts.cpp": "d6712ae5ee7f2aa0599697aa5203fba3aa84bd4d85218ed8ec174f676d89409b",
+    "skyrim-platform/src/platform_se/skyrim_platform/Sp3NativeValueCasts.h": "da06f367627df20b256b5df90750d9775df845efded5a5027012ca5e3b710304",
+    "skyrim-platform/src/platform_se/skyrim_platform/NativeArrayArguments.h": "3ac231a9908fc38db7959b9844f733d03b1b7b300d9c6110aa0d9d69a9558e2c"
   },
   "nativeSubsets": [
     "actor.getactorbase",
@@ -145,6 +153,9 @@
     "topicinfo.getowningquest"
   ],
   "conditionSubsets": [
+    "35",
+    "46",
+    "47",
     "56",
     "58",
     "59",
@@ -158,7 +169,7 @@
     "Condition support is limited to stage-log contexts and specific flags/run-on types.",
     "Do not infer campaign support from other global VM native registrations.",
     "Campaign forms remain logical identities. Physical natives resolve PlayerRef to the campaign owner or an explicitly bound private reference copy; they never fall back to a shared vanilla reference. Explicit entry/recovery can materialize selected copies; automatic area-entry and full world coverage remain incomplete.",
-    "Alias getters support deterministic forced reference/location, unambiguous unique actor, and external-alias targets only. Conditions, runtime fills, creation, propagation, lifecycle, reservations and alias effects remain unsupported.",
+    "Alias getters support deterministic forced reference/location, unambiguous unique actor, and external-alias targets only. Alias-fill conditions, runtime fills, creation, propagation, lifecycle, reservations and alias effects remain unsupported.",
     "Alias script variables and resolved bindings persist transactionally in VM schema 4. Getter support does not imply alias lifecycle or quest support.",
     "Game.GetForm resolves owned static forms; dynamic forms require campaign allocation and are explicitly rejected.",
     "Scene/TopicInfo.GetOwningQuest resolve owned metadata into the active campaign; dialogue/scene selection, execution and effects remain unsupported.",
@@ -167,12 +178,14 @@
     "Placed-reference bindings merge owned base/reference properties and deterministic NPC templates. Variables persist in campaign reference roots. Transaction-generated inventory events run synchronously on these bindings and scripted active aliases; general world events, lifecycle, leveled templates and PlayerRef base bindings remain incomplete.",
     "Strict method dispatch scopes self, typed receivers and Parent to the matching script chain. Missing native implementations, invalid inheritance and ambiguous script bindings fail. Unique ancestor casts are supported; dynamic script-handle identity, general lifecycle/events and durable latent calls remain incomplete.",
     "Inventory GetItemCount/AddItem/RemoveItem support concrete base items, staged reads, extra-data-preserving transfers and synchronous OnItemAdded/OnItemRemoved handlers. FormLists, leveled/reference items, equipped-item removal, inventory-event filters, pickup UI messages and external pickup/drop/container-transfer event routing remain unsupported. Persistent inventory commits require atomic storage. Latent handlers fail and roll back the complete transaction.",
-    "Reference queries cover GetPositionX/Y/Z, GetAngleX/Y/Z (server degrees), Actor.IsDead, GetDistance, GetParentCell and GetWorldSpace. They require a transaction and registered campaign-owner/private-copy snapshots, validate full saved state, binding identity and phase at commit, reject nonfinite/overflowing spatial values, and never query a shared original. Distance requires one interior or worldspace. GetParentCell rejects a WRLD-only location without a campaign cell index; an interior GetWorldSpace returns None. These native methods do not add equivalent condition-function support or live engine spatial/AI state.",
+    "Reference queries cover GetPositionX/Y/Z, GetAngleX/Y/Z (server degrees), Actor.IsDead, GetDistance, GetParentCell and GetWorldSpace. They require a transaction and registered campaign-owner/private-copy snapshots, validate full saved state, binding identity and phase at commit, reject nonfinite/overflowing spatial values, and never query a shared original. Distance requires one interior or worldspace. GetParentCell rejects a WRLD-only location without a campaign cell index; an interior GetWorldSpace returns None. These native methods do not add spatial condition-function support or live engine spatial/AI state.",
     "IsDisabled plus Enable/Disable/EnableNoWait/DisableNoWait operate on validated bound private copies with staged read-your-writes. Mutation requires fade=false, no enable-parent/child links, no player target, no occupied reference, pending actor snippets/disable callbacks or respawn. Nonzero visibility changes commit with journal/VM/inventory state and an atomic save batch; latent execution, enable-parent propagation and engine fade behavior remain unsupported.",
     "Visibility publication requires an explicitly installed projection barrier. Every connected assigned actor in the private phase must have a native packet epoch; all gates close before mutation and every token advances. Captured actor/connection lifetimes and phase epochs are revalidated. Fresh manifests/baselines publish after subscription reconciliation; only their ordinary current-token ack may reopen gameplay. Abort/desynchronization quarantines captured connections; reused connection slots are protected. Native and JS callback receipts are synchronous, not durable disk acknowledgements.",
     "Enabling a previously uninitialized copy can trigger its first subscription OnLoad transaction during postcommit reconciliation. A visibility mutation nested inside that load is refused by the active barrier. The outer visibility state has already committed; observers are quarantined rather than claiming rollback or playability. Defer/queue semantics for this lifecycle case remain unimplemented.",
     "Native new-character gameplay is gated until a finite appearance for the assigned actor is accepted; projection control remains available. Binary decoding rejects truncated primitives/containers and mismatched constants. These transport and creation guards do not certify native character-creation completion, arbitrary loadout application or quests.",
-    "Self loadout restoration observes normalized full inventory on two updates, then worn-entry variants/hand/spells on two updates before releasing creation input. It no longer queues additive equipment inventory tasks. Equipment names and charges survive native extra-data parsing and every merge; explicit names compare exactly, with only absent/empty names normalized to the base form name. Different variants sharing a base ID are refused when item selection is necessary; exact item-instance selection and native character-creation completion remain unverified. General inventory normalization remains less strict than equipped-item comparison."
+    "Self loadout restoration observes normalized full inventory on two updates, then worn-entry variants/hand/spells on two updates before releasing creation input. It no longer queues additive equipment inventory tasks. Equipment names and charges survive native extra-data parsing and every merge; explicit names compare exactly, with only absent/empty names normalized to the base form name. Different variants sharing a base ID are refused when item selection is necessary; exact item-instance selection and native character-creation completion remain unverified. General inventory normalization remains less strict than equipped-item comparison.",
+    "Typed stage-log CTDA 35 GetDisabled and 47 GetItemCount require explicit Reference targets; 46 GetDead also accepts a nonnegative signed QuestAlias ID at byte 28 through existing owning-quest alias resolution. PlayerRef maps to the owner; other targets require bound private copies. Item counts use initialized transactional inventories, concrete base items (currently excluding keys), exact signed-int32-bounded counts and staged writes. Explicit target record kinds are preflighted before OR (live placed REFR/ACHR, and ACHR for GetDead); skipped branches do not resolve private copies or aliases. Implicit physical Subject/Target, evaluated empty or unsupported alias fills, nonactor GetDead, special flags 0x1a and non-stage evaluation remain unsupported. Qualified selector features do not widen other function/context combinations.",
+    "The client native-array bridge uses declared native parameter types, typed empty/None arrays, strict element validation, a 65,536-element resource ceiling and current-update object-array wrappers. It does not add server campaign natives, durable latent continuations or real-game acceptance."
   ],
   "conditionNames": {
     "0": "GetWantBlocking",
@@ -583,6 +596,8 @@
     "sha256": "99f5f4ac8415c33a78d42fdef3ddcd91d72f7a8bad60f2bd96d1a937fa10988e"
   },
   "featureSubsets": [
-    "condition.global-comparison"
+    "condition.global-comparison",
+    "condition.stage-run-on:2:private-reference",
+    "condition.stage-run-on:5:reference-alias"
   ]
 }
