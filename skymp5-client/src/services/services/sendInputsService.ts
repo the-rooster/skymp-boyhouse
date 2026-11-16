@@ -23,6 +23,7 @@ import { UpdateAppearanceMessage } from "../messages/updateAppearanceMessage";
 import { RemoteServer } from "./remoteServer";
 import { DeathService } from "./deathService";
 import { logTrace } from "../../logging";
+import { PlayerLoadoutService } from "./playerLoadoutService";
 
 const playerFormId = 0x14;
 
@@ -66,6 +67,9 @@ export class SendInputsService extends ClientListener {
             this.equipmentChanged = true;
         }
 
+        // Preview changes must not overwrite the server's equipped state or run item scripts.
+        if (this.controller.lookupListener(PlayerLoadoutService).blocksEquipmentInput) return;
+
         // Send OnEquip for any equips including spell tomes, potions, ingredients
         // Otherwise, the server won't trigger spell learn, potion drink, ingredient eat and Papyrus scripts
         this.controller.emitter.emit("sendMessage", {
@@ -85,9 +89,8 @@ export class SendInputsService extends ClientListener {
     }
 
     private onLoadGame() {
-        // Currently only armor is equipped after relogging (see remoteServer.ts)
-        // This hack forces sending /equipment without weapons/ back to the server
-        this.sp.Utility.wait(3).then(() => (this.equipmentChanged = true));
+        // Keep this pending until the current spawn's loadout is ready.
+        this.equipmentChanged = true;
     }
 
     private sendInputs() {
@@ -262,6 +265,7 @@ export class SendInputsService extends ClientListener {
         if (_refrId) {
           return;
         }
+        if (this.controller.lookupListener(PlayerLoadoutService).blocksEquipmentInput) return;
         if (this.equipmentChanged) {
             const eq = getEquipment(
                 this.sp.Game.getPlayer() as Actor,

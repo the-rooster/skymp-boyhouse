@@ -1,7 +1,6 @@
 // @ts-expect-error (TODO: Remove in 2.10.0)
 import { Actor, Form, FormType, Menu, interruptCast, castSpellImmediate, printConsole, applyAnimationVariablesToActor, ActorAnimationVariables } from 'skyrimPlatform';
 import {
-  Armor,
   Cell,
   Game,
   ObjectReference,
@@ -9,7 +8,6 @@ import {
   Ui,
   Utility,
   WorldSpace,
-  on, // TODO: use this.controller.on instead
   once, // TODO: use this.controller.once instead
   storage, // TODO: use this.sp.storage instead
 } from 'skyrimPlatform';
@@ -22,8 +20,7 @@ import { IdManager } from '../../lib/idManager';
 import { nameof } from '../../lib/nameof';
 import { setActorValuePercentage } from '../../sync/actorvalues';
 import { applyAppearanceToPlayer } from '../../sync/appearance';
-import { applyEquipment, isBadMenuShown } from '../../sync/equipment';
-import { Inventory, applyInventory } from '../../sync/inventory';
+import { Inventory } from '../../sync/inventory';
 import { Movement } from '../../sync/movement';
 import { learnSpells, removeAllSpells } from '../../sync/spell';
 import { ModelApplyUtils } from '../../view/modelApplyUtils';
@@ -44,10 +41,8 @@ import { ClientListener, CombinedController, Sp } from './clientListener';
 import { HostStartMessage } from '../messages/hostStartMessage';
 import { HostStopMessage } from '../messages/hostStopMessage';
 import { ConnectionMessage } from '../events/connectionMessage';
-import { SetInventoryMessage } from '../messages/setInventoryMessage';
 import { CreateActorMessage, CreateActorMessageAdditionalProps } from '../messages/createActorMessage';
 import { DestroyActorMessage } from '../messages/destroyActorMessage';
-import { SetRaceMenuOpenMessage } from '../messages/setRaceMenuOpenMessage';
 import { UpdatePropertyMessage } from '../messages/updatePropertyMessage';
 import { TeleportMessage2 } from '../messages/teleportMessage2';
 
@@ -62,7 +57,7 @@ import { logTrace, logError } from '../../logging';
 
 import { SpellCastMessage } from '../messages/spellCastMessage';
 import { UpdateAnimVariablesMessage } from '../messages/updateAnimVariablesMessage';
-import { MsgType } from '../../messages';
+import { PlayerLoadoutService } from './playerLoadoutService';
 
 export const getPcInventory = (): Inventory | undefined => {
   const res = storage['pcInv'];
@@ -72,39 +67,12 @@ export const getPcInventory = (): Inventory | undefined => {
   return undefined;
 };
 
-const setPcInventory = (inv: Inventory): void => {
-  storage['pcInv'] = inv;
-};
-
-let pcInvLastApply = 0;
-on('update', () => {
-  if (isBadMenuShown()) {
-    return;
-  }
-  if (Date.now() - pcInvLastApply > 5000) {
-    pcInvLastApply = Date.now();
-    const pcInv = getPcInventory();
-    if (pcInv) {
-      applyInventory(Game.getPlayer()!, pcInv, false, true);
-    }
-  }
-});
-
-const unequipIronHelmet = () => {
-  const ironHelment = Armor.from(Game.getFormEx(0x00012e4d));
-  const pl = Game.getPlayer();
-  if (pl) {
-    pl.unequipItem(ironHelment, false, true);
-  }
-};
-
 export class RemoteServer extends ClientListener {
   constructor(private sp: Sp, private controller: CombinedController) {
     super();
 
     this.controller.emitter.on("hostStartMessage", (e) => this.onHostStartMessage(e));
     this.controller.emitter.on("hostStopMessage", (e) => this.onHostStopMessage(e));
-    this.controller.emitter.on("setInventoryMessage", (e) => this.onSetInventoryMessage(e));
     this.controller.emitter.on("openContainerMessage", (e) => this.onOpenContainerMessage(e));
     this.controller.emitter.on("updateMovementMessage", (e) => this.onUpdateMovementMessage(e));
     this.controller.emitter.on("updateAnimationMessage", (e) => this.onUpdateAnimationMessage(e));
@@ -115,7 +83,6 @@ export class RemoteServer extends ClientListener {
     this.controller.emitter.on("teleportMessage2", (e) => this.onTeleportMessage(e));
     this.controller.emitter.on("createActorMessage", (e) => this.onCreateActorMessage(e));
     this.controller.emitter.on("destroyActorMessage", (e) => this.onDestroyActorMessage(e));
-    this.controller.emitter.on("setRaceMenuOpenMessage", (e) => this.onSetRaceMenuOpenMessage(e));
     this.controller.emitter.on("updatePropertyMessage", (e) => this.onUpdatePropertyMessage(e));
     this.controller.emitter.on("deathStateContainerMessage", (e) => this.onDeathStateContainerMessage(e));
 
@@ -152,25 +119,6 @@ export class RemoteServer extends ClientListener {
     if (typeof hosted === typeof []) {
       storage['hosted'] = hosted.filter((x) => x !== target);
     }
-  }
-
-  private onSetInventoryMessage(event: ConnectionMessage<SetInventoryMessage>): void {
-    this.numSetInventory++;
-
-    const msg = event.message;
-    once('update', () => {
-      setPcInventory(msg.inventory);
-
-      let blocked = false;
-
-      this.controller.emitter.emit('queryBlockSetInventoryEvent', {
-        block: () => blocked = true
-      });
-
-      if (!blocked) {
-        pcInvLastApply = 0;
-      }
-    });
   }
 
   private onOpenContainerMessage(event: ConnectionMessage<OpenContainerMessage>): void {
@@ -427,30 +375,10 @@ export class RemoteServer extends ClientListener {
     if (msg.props && !msg.props.isHostedByOther) {
     }
 
-    if (msg.props && msg.props.isRaceMenuOpen && msg.isMe) {
-      this.onSetRaceMenuOpenMessage({ message: { t: MsgType.SetRaceMenuOpen, open: true } });
-    }
-
-    const numSetInventory = this.numSetInventory;
-
-    const applyPcInv = () => {
-      if (msg.equipment) {
-        applyEquipment(Game.getPlayer()!, msg.equipment)
-      }
-
-      if (numSetInventory !== this.numSetInventory) {
-        logTrace(this, 'Skipping inventory apply due to newer setInventory message');
-        return;
-      }
-
-      if (msg.props && msg.props.inventory) {
-        this.onSetInventoryMessage({
-          message: {
-            t: MsgType.SetInventory,
-            inventory: msg.props.inventory
-          }
-        });
-      }
+    const loadout = this.controller.lookupListener(PlayerLoadoutService);
+    const spawnGeneration = msg.isMe ? loadout.beginSpawn(msg) : undefined;
+    const markLoadoutReady = () => {
+      if (spawnGeneration !== undefined) loadout.markSpawnReady(spawnGeneration);
     };
 
     if (msg.isMe && msg.props && msg.props.learnedSpells) {
@@ -524,9 +452,8 @@ export class RemoteServer extends ClientListener {
               }
             }
           })();
-          // Unfortunatelly it requires two calls to work
-          Utility.wait(1).then(applyPcInv);
-          Utility.wait(1.3).then(applyPcInv);
+          // The loadout service waits for this spawn and applies only its latest snapshot.
+          Utility.wait(1).then(markLoadoutReady);
           // Note: appearance part was copy-pasted
           if (msg.appearance) {
             applyAppearanceToPlayer(msg.appearance);
@@ -605,8 +532,7 @@ export class RemoteServer extends ClientListener {
               { minutes: 0, seconds: 0, hours: this.controller.lookupListener(TimeService).getTime().newGameHourValue }
             );
             once('update', () => {
-              applyPcInv();
-              Utility.wait(0.3).then(applyPcInv);
+              Utility.wait(0.3).then(markLoadoutReady);
               // Note: appearance part was copy-pasted
               if (msg.appearance) {
                 applyAppearanceToPlayer(msg.appearance);
@@ -842,23 +768,6 @@ export class RemoteServer extends ClientListener {
     });
   }
 
-  private onSetRaceMenuOpenMessage(event: ConnectionMessage<SetRaceMenuOpenMessage>): void {
-    const msg = event.message;
-
-    if (msg.open) {
-      // wait 0.3s cause we can see visual bugs when teleporting
-      // and showing this menu at the same time in onConnect
-      once('update', () =>
-        Utility.wait(0.3).then(() => {
-          unequipIronHelmet();
-          Game.showRaceMenu();
-        }),
-      );
-    } else {
-      // TODO: Implement closeMenu in SkyrimPlatform
-    }
-  }
-
   /** Packet handlers end **/
 
   getWorldModel(): WorldModel {
@@ -989,5 +898,4 @@ export class RemoteServer extends ClientListener {
     });
   }
 
-  private numSetInventory = 0;
 }

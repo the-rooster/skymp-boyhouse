@@ -11,6 +11,7 @@ import { BlockPapyrusEventsService } from './services/services/blockPapyrusEvent
 import { EnforceLimitationsService } from './services/services/enforceLimitationsService';
 import { LoadGameService } from './services/services/loadGameService';
 import { SendInputsService } from './services/services/sendInputsService';
+import { PlayerLoadoutService } from './services/services/playerLoadoutService';
 import { SinglePlayerService } from './services/services/singlePlayerService';
 import { SpApiInteractor } from './services/spApiInteractor';
 import { TimeService } from "./services/services/timeService";
@@ -74,6 +75,8 @@ const main = () => {
       new SinglePlayerService(sp, controller),
       new EnforceLimitationsService(sp, controller),
       new SendInputsService(sp, controller),
+      // Observe the final appearance before restoring the preview's loadout.
+      new PlayerLoadoutService(sp, controller),
       new SkympClient(sp, controller),
       new TimeService(sp, controller),
       new SpVersionCheckService(sp, controller),

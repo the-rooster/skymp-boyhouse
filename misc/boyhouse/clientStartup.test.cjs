@@ -24,12 +24,14 @@ function equipmentHarness() {
   const events = new EventEmitter(), emitter = new EventEmitter();
   const player = { getFormID: () => 0x14 };
   let count = -1;
+  let blocked = false, menuOpen = false;
   const dependencies = {
     './clientListener': { ClientListener: class {} },
-    './singlePlayerService': {}, '../../messages': { MsgType: { UpdateEquipment: 5 } },
+    './singlePlayerService': {}, './playerLoadoutService': {},
+    '../../messages': { MsgType: { UpdateEquipment: 5, UpdateAppearance: 4, OnEquip: 29 } },
     '../../sync/movementGet': {}, '../../view/worldViewMisc': {}, '../../sync/animation': {},
     skyrimPlatform: { FormType: { Book: 27, Potion: 46, Ingredient: 30 } },
-    '../../sync/appearance': {}, '../../sync/actorvalues': {},
+    '../../sync/appearance': { getAppearance: () => ({ name: 'Finished character' }) }, '../../sync/actorvalues': {},
     '../../sync/equipment': { getEquipment: (actor, numChanges) => {
       assert.equal(actor, player);
       return { inv: { entries: [{ baseId: 0x12e46, count }] }, numChanges };
@@ -38,12 +40,33 @@ function equipmentHarness() {
     '../../logging': { logTrace() {} },
   };
   const { SendInputsService } = load('sendInputsService.ts', dependencies);
-  const service = new SendInputsService({ Game: { getPlayer: () => player } }, {
+  const service = new SendInputsService({
+    Game: { getPlayer: () => player }, Ui: { isMenuOpen: () => menuOpen }, printConsole() {},
+  }, {
     on: (...args) => events.on(...args), emitter,
+    lookupListener: () => ({ blocksEquipmentInput: blocked }),
   });
   const changed = () => events.emit('equip', { actor: player, baseObj: { getType: () => 26, getFormID: () => 0x12e46 } });
-  return { service, emitter, changed, setCount(value) { count = value; }, send: () => service.sendEquipment() };
+  return { service, emitter, changed, setCount(value) { count = value; },
+    setBlocked(value) { blocked = value; }, setMenuOpen(value) { menuOpen = value; },
+    send: () => service.sendEquipment(), appearance: () => service.sendAppearance() };
 }
+
+test('character preview suppresses equipment and item scripts but still submits the final appearance', () => {
+  const h = equipmentHarness(), sent = [], itemEvents = [];
+  h.emitter.on('sendMessageWithRefrId', e => sent.push(e.message));
+  h.emitter.on('sendMessage', e => itemEvents.push(e.message));
+  h.setCount(1); h.setBlocked(true); h.setMenuOpen(true);
+  h.appearance(); h.changed(); h.send();
+  assert.equal(sent.length, 0);
+  assert.equal(itemEvents.length, 0);
+  h.setMenuOpen(false); h.appearance(); h.send();
+  assert.deepEqual(sent.map(m => m.t), [4]);
+  h.setBlocked(false); h.send(); h.send();
+  assert.deepEqual(sent.map(m => m.t), [4, 5]);
+  h.changed();
+  assert.deepEqual(itemEvents.map(m => m.t), [29]);
+});
 
 test('equipment waits for a valid inventory and retries without another equip event', () => {
   const h = equipmentHarness(), sent = [];

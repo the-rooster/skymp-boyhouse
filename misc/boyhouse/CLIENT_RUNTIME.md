@@ -183,9 +183,43 @@ hashes remained unchanged, and no generated test saves remained. Native fixes
 and prerequisites stay installed. Background testing used a backed-up temporary
 `bAlwaysActive=1` setting and did not require focus after that change.
 
-The new character currently receives starter gear before character creation
-finishes; the one-time helmet unequip races with inventory application. That
-join-flow issue remains open. None of these checks certify any quest.
+That run also exposed starter gear being applied before character creation
+finished; the one-time helmet unequip raced with inventory application. See the
+loadout fix below. None of these checks certify any quest.
+
+## Character creation loadout
+
+`PlayerLoadoutService` now owns local player loadout application. It keeps the
+latest server snapshots queued while the spawn is loading or character creation
+is pending/open, unequips the preview before opening the menu, and waits until
+the native menu has actually been observed open and then closed before restoring
+the loadout. The old independent initial/retry/periodic inventory callbacks no
+longer apply equipment behind the preview. A generation token prevents an old
+spawn's readiness callback from releasing a later character's inventory.
+
+`SendInputsService` submits the finished appearance before restoration, retains
+equipment changes until restoration succeeds, and suppresses preview equip
+events so they cannot overwrite saved equipment or trigger item scripts. Normal
+play equipment echoes update the cached snapshot without rebuilding the local
+inventory. Resetting a connection or loading a personal save discards pending
+loadouts; a plugin hot reload preserves a preview already in progress.
+
+The client build and 76 Node tests pass, including delayed/duplicate messages,
+blocked native applications, reconnects, hot reload, reentrant resets, and final
+appearance/equipment ordering. In a background full-client run against the
+unchanged private staging server, five samples over 25 seconds of the actual
+RaceSex Menu reported no worn armor or equipped weapons. The generated save
+initially contained the old starter armor, so the check exercised its removal.
+Live menu completion/restoration remains unverified; that transition is covered
+by the automated service tests only.
+
+Evidence is in ignored `artifacts/character-creation-runtime/`; file and save
+hashes are recorded in
+`artifacts/game-backups/20261116T171823Z/character-creation/manifest.json`.
+The test game and transport exited, diagnostic/client plugins were removed,
+both game INIs and the platform INI were restored byte-for-byte, and all personal
+saves remained unchanged. The server deployment and quest certification status
+are unchanged.
 
 ## Remaining acceptance
 
