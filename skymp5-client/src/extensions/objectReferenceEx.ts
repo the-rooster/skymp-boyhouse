@@ -1,6 +1,8 @@
 import { Flora, Form, FormType, MotionType, ObjectReference } from "skyrimPlatform";
 import { NiPoint3 } from "../sync/movement";
 import { FormTypeEx } from "./formTypeEx";
+import { SpApiInteractor } from '../services/spApiInteractor';
+import { NativeReferenceOperationService } from '../services/services/nativeReferenceOperationService';
 
 export class ObjectReferenceEx {
   static getWorldOrCell(self: ObjectReference): number {
@@ -34,7 +36,7 @@ export class ObjectReferenceEx {
     return Math.sqrt(deltaX * deltaX + deltaY * deltaY);
   };
 
-  static dealWithRef(self: ObjectReference, base: Form, configureMotion = true): void {
+  static dealWithRef(self: ObjectReference, base: Form, configureMotion = true, current: () => boolean = () => true): void {
     const t = base.getType();
     const isItem = FormTypeEx.isItem(t);
 
@@ -59,13 +61,10 @@ export class ObjectReferenceEx {
       self.lock(false, false);
     }
 
-    if (configureMotion && isItem) {
-      self.setMotionType(MotionType.Keyframed, false);
-    }
-
-    // https://github.com/skyrim-multiplayer/issue-tracker/issues/36
-    if (configureMotion && t === FormType.Flora && Flora.from(base)?.getIngredient()) {
-      self.setMotionType(MotionType.Keyframed, false);
+    // Serialize native physics changes with visibility, harvesting and cleanup.
+    if (configureMotion && (isItem || (t === FormType.Flora && Flora.from(base)?.getIngredient()))) {
+      SpApiInteractor.getControllerInstance().lookupListener(NativeReferenceOperationService)
+        .submit(self.getFormID(), 'motion', current, reference => reference.setMotionType(MotionType.Keyframed, false));
     }
   }
 }

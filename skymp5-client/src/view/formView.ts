@@ -133,7 +133,7 @@ export class FormView {
         if (refr) {
           const base = refr.getBaseObject();
           if (base) {
-            ObjectReferenceEx.dealWithRef(refr, base);
+            ObjectReferenceEx.dealWithRef(refr, base, true, this.captureLifetime());
           }
         }
       }
@@ -298,6 +298,12 @@ export class FormView {
   private ownedReference?: OwnedReference;
   private generation = 0;
 
+  private captureLifetime(): () => boolean {
+    const id = this.refrId, reference = this.ownedReference, generation = this.generation;
+    return () => this.generation === generation && this.refrId === id && this.ready &&
+      this.ownedReference === reference && (!reference || this.lifetime.isCurrent(reference));
+  }
+
   private lastHarvestedApply = 0;
   private lastOpenApply = 0;
   private isSetNodeTextureSetApplied = false;
@@ -313,10 +319,7 @@ export class FormView {
     const now = Date.now();
     if (now - this.lastHarvestedApply > 666) {
       this.lastHarvestedApply = now;
-      const id = this.refrId, reference = this.ownedReference, generation = this.generation;
-      ModelApplyUtils.applyModelIsHarvested(refr, !!model.isHarvested,
-        () => this.generation === generation && this.refrId === id && this.ready && this.ownedReference === reference &&
-          (!reference || this.lifetime.isCurrent(reference)));
+      ModelApplyUtils.applyModelIsHarvested(refr, !!model.isHarvested, this.captureLifetime());
     }
     if (now - this.lastOpenApply > 133) {
       this.lastOpenApply = now;

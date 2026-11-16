@@ -129,7 +129,7 @@ export class DeathService extends ClientListener {
       // TODO: use different iGetUpType if ressurecting under water
       this.sp.Game.getPlayer()!.setAnimationVariableInt("iGetUpType", 1);
       this.sp.Debug.sendAnimationEvent(actor, AnimationEventName.GetUpBegin);
-    });
+    }, () => !this.playerDead);
   };
 
   private isPlayer = (actor: Actor): boolean => {

@@ -2,6 +2,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs'), path = require('node:path'), vm = require('node:vm');
 const { EventEmitter } = require('node:events');
+const { NativeReferenceOperations } = require('../../skymp5-client/src/campaign/nativeReferenceOperations.ts');
 const root = path.resolve(__dirname, '../../skymp5-client');
 const ts = require(require.resolve('typescript', { paths: [root, path.resolve(root, '../skymp5-server')] }));
 function load(file, dependencies = {}, extra = {}) {
@@ -177,14 +178,14 @@ test('reusing a static actor index invalidates work for the previous original', 
 });
 
 function harvestFixture() {
-  const events = new EventEmitter(), calls = [], completions = [];
-  let frame = 0, handle = 1, current = true, plant = true, disabled = false;
+  const events = new EventEmitter(), calls = [], completions = [], errors = [];
+  let frame = 0, handle = 1, current = true, plant = true, disabled = false, harvested = true, noop = false;
   const reference = () => {
     const captured = frame, valid = () => assert.equal(frame, captured, 'Harvest wrapper escaped its native update');
     return { getFormID() { valid(); return 0x100; }, getBaseObject: () => ({ getType: () => plant ? 1 : 3 }),
-      isHarvested: () => true, isDisabled: () => disabled, isDeleted: () => false,
-      setHarvested: value => calls.push(['harvested', value]),
-      disable() { valid(); calls.push(['disable']); return new Promise(resolve => completions.push(() => { disabled = true; resolve(); })); },
+      isHarvested: () => harvested, isDisabled: () => disabled, isDeleted: () => false,
+      setHarvested: value => { calls.push(['harvested', value]); harvested = value; },
+      disable() { valid(); calls.push(['disable']); return new Promise(resolve => completions.push(() => { if (!noop) disabled = true; resolve(); })); },
       enable() { valid(); calls.push(['enable']); disabled = false; return Promise.resolve(); },
       delete() { assert.fail('Harvesting must never delete a reference'); },
     };
@@ -195,11 +196,21 @@ function harvestFixture() {
   };
   const { ModelApplyUtils } = load('view/modelApplyUtils.ts', {
     skyrimPlatform: sp, '../sync/inventory': {}, '../logging': {},
+    '../services/services/nativeReferenceOperationService': {},
+    '../services/spApiInteractor': { SpApiInteractor: { getControllerInstance: () => ({ lookupListener: () => ({
+      submit(id, key, current, steps) {
+        return operations.submit(id, key, current, (Array.isArray(steps) ? steps : [steps]).map(step => () => step(reference())));
+      },
+    }) }) } },
   });
-  return { calls, apply: value => ModelApplyUtils.applyModelIsHarvested(reference(), value, () => current),
+  const operations = new NativeReferenceOperations({ identity: () => handle, canStart: () => true, report: job => errors.push(job.error) });
+  return { calls, errors, operations, apply(value) { ModelApplyUtils.applyModelIsHarvested(reference(), value, () => current); operations.update(); },
+    visibility(value) { ModelApplyUtils.applyModelIsDisabled(reference(), value, () => current); operations.update(); },
+    disabled(value) { disabled = value; }, noop(value) { noop = value; },
     replace() { ++handle; }, cancel() { current = false; }, object() { plant = false; },
     async complete() { completions.shift()(); await Promise.resolve(); },
-    update() { ++frame; events.emit('update'); },
+    async drain() { for (let i = 0; i < 4; ++i) { await Promise.resolve(); ++frame; operations.update(); } },
+    update() { ++frame; operations.update(); events.emit('update'); },
   };
 }
 
@@ -209,11 +220,23 @@ for (const changed of ['none', 'identity', 'world']) test(`harvest refresh check
   if (changed === 'world') f.cancel();
   await f.complete(); assert.equal(f.calls.some(c => c[0] === 'enable'), false);
   f.update(); assert.equal(f.calls.filter(c => c[0] === 'enable').length, changed === 'none' ? 1 : 0);
+  await f.drain(); assert.deepEqual(f.errors, []); assert.equal(f.operations.isBusy(), false);
 });
 
 test('harvesting an ordinary object never deletes its authored reference', async () => {
   const f = harvestFixture(); f.object(); f.apply(true); await f.complete(); f.update();
   assert.deepEqual(f.calls, [['disable']]);
+  await f.drain(); assert.deepEqual(f.errors, []);
+});
+
+test('harvest model refresh preserves a plant that was already disabled', async () => {
+  const f = harvestFixture(); f.disabled(true); f.apply(false); await f.drain();
+  assert.deepEqual(f.calls, [['harvested', false]]); assert.deepEqual(f.errors, []);
+});
+
+test('a no-op native visibility change is rejected after observing the reference', async () => {
+  const f = harvestFixture(); f.noop(true); f.visibility(true); await f.complete(); await f.drain();
+  assert.equal(f.errors.length, 1); assert.match(f.errors[0], /visibility/);
 });
 
 function gamemodeFixture() {

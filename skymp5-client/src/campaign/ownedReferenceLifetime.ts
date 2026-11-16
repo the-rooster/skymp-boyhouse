@@ -35,6 +35,7 @@ export interface OwnedReferenceAdapter {
     dispose(id: number, handle: number): Promise<void>;
     released(id: number): void;
     report(id: number, error: string): void;
+    canStart?(id: number, handle: number): boolean;
 }
 
 // Native promises only settle records. All following work and cleanup run on
@@ -103,6 +104,12 @@ export class OwnedReferenceLifetime {
         return Array.from(this.state.references.values()).some(reference => reference.retired);
     }
 
+    hasNativeOperation(id: number, handle?: number): boolean {
+        const reference = this.state.references.get(id);
+        return !!reference && (handle === undefined || reference.handle === handle) &&
+            !!reference.operation && !reference.operation.settled;
+    }
+
     update(budget = 16): void {
         if (!Number.isInteger(budget) || budget < 1 || budget > 64) throw Error('Invalid reference work budget');
         const count = Math.min(budget, this.state.queue.length - this.state.cursor);
@@ -168,6 +175,9 @@ export class OwnedReferenceLifetime {
             }
             if (!reference.retired && operation?.work?.complete) operation.work.complete();
             if (!this.contains(reference)) return;
+            if (this.adapter.canStart && !this.adapter.canStart(reference.id, reference.handle)) {
+                this.schedule(reference.id); return;
+            }
             if (reference.retired) {
                 this.start(reference, () => this.adapter.dispose(reference.id, reference.handle),
                     { disposal: true, settled: false });

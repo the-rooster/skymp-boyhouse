@@ -393,10 +393,11 @@ for (const loadNewWorld of [false, 'gameLoad', 'preLoadGame']) test(`service rec
   f.lifetime.enqueue(reference, () => f.work('pending')); f.tick();
   const events = new EventEmitter(), emitter = new EventEmitter(), changes = [];
   const controller = { on: (...args) => events.on(...args), once: (...args) => events.once(...args), emitter,
-    lookupListener: () => ({ modWcProtection: (...args) => changes.push(args) }) };
+    lookupListener: () => ({ modWcProtection: (...args) => changes.push(args), operations: { isBusy: () => false } }) };
   const { OwnedReferenceService } = load('services/services/ownedReferenceService.ts', {
     '../../campaign/ownedReferenceLifetime': { OwnedReferenceLifetime }, '../../logging': { logError() {} },
     './clientListener': { ClientListener: class {} }, './worldCleanerService': {},
+    './nativeReferenceOperationService': {},
   });
   const service = new OwnedReferenceService({
     storage: { boyhouseOwnedReferences: f.lifetime.state }, getReferenceHandle: f.adapter.identity,

@@ -13,6 +13,8 @@ function compile(file) {
   } }).outputText;
 }
 const modules = {
+  '../../campaign/nativeReferenceOperations': compile('campaign/nativeReferenceOperations.ts'),
+  './nativeReferenceOperationService': compile('services/services/nativeReferenceOperationService.ts'),
   '../../campaign/referenceSuppression': compile('campaign/referenceSuppression.ts'),
   service: compile('services/services/referenceSuppressionService.ts'),
 };
@@ -22,6 +24,7 @@ const prelude = `const sp = skyrimPlatform;
 const log = (event, value) => sp.writeLogs('boyhouseReferenceSmoke', event, JSON.stringify(value));
 const dependencies = {
   './clientListener': { ClientListener: class {} },
+  './ownedReferenceService': { OwnedReferenceService: class {} },
   '../../logging': { logError: (...args) => log('service-error', args.map(String)) },
 };
 `;
@@ -43,7 +46,14 @@ function fixture() {
     },
     emit(event, value) { for (const callback of listeners.get(event) || []) callback(value); },
   };
-  const controller = { emitter, on: (event, callback) => sp.on(event, callback) };
+  let native;
+  const controller = { emitter, on: (event, callback) => sp.on(event, callback), lookupListener: type => {
+    if (type === dependencies['./nativeReferenceOperationService'].NativeReferenceOperationService) return native;
+    if (type === dependencies['./ownedReferenceService'].OwnedReferenceService)
+      return { references: { hasNativeOperation: () => false } }; // No owned copies in this fixture.
+    throw Error('Unexpected service lookup');
+  } };
+  native = new dependencies['./nativeReferenceOperationService'].NativeReferenceOperationService(sp, controller);
   const service = new dependencies.service.ReferenceSuppressionService(sp, controller);
   const ledger = service.references;
   const started = Date.now();
@@ -117,7 +127,9 @@ function fixture() {
         check(ledger.state.entries.size === 0, 'Restoration record not released');
         // Cancel while the native disable is in flight, then wait for a real
         // enable and restoration of activation before accepting the result.
-        ledger.acquire('canceledPhase', original.id); ledger.update();
+        ledger.acquire('canceledPhase', original.id); ledger.update(); native.operations.update();
+        check(native.operations.isBusy(original.id), 'Cancellation must occur with native work pending');
+        emitter.emit('worldModelReset');
         ledger.releaseOwner('canceledPhase'); phase = 'cancel';
       } else if (phase === 'cancel' && ledger.isSettled([original.id])) {
         const restored = snapshot(reference); log('canceled-phase-restored', restored);

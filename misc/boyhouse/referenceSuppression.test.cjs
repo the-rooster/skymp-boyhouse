@@ -48,10 +48,12 @@ function serviceFixture(options = {}) {
   candidate = actor;
   class NetworkingService {}
   class SinglePlayerService {}
+  class NativeReferenceOperationService {}
   const dependencies = {
     './clientListener': { ClientListener: class {} }, '../../logging': { logError: (...args) => errors.push(args) },
     '../../campaign/referenceSuppression': { ReferenceSuppression },
     './networkingService': { NetworkingService }, './singlePlayerService': { SinglePlayerService },
+    './nativeReferenceOperationService': { NativeReferenceOperationService },
   };
   const { ReferenceSuppressionService } = loadService('referenceSuppressionService.ts', dependencies);
   dependencies['./referenceSuppressionService'] = { ReferenceSuppressionService };
@@ -65,6 +67,9 @@ function serviceFixture(options = {}) {
     if (type === ReferenceSuppressionService) return suppression;
     if (type === NetworkingService) return { isConnected: () => connected };
     if (type === SinglePlayerService) return { isSinglePlayer: singlePlayer };
+    if (type === NativeReferenceOperationService) return { submitPersistent: (_id, _key, current, run) => {
+      assert.equal(current(), true); return run();
+    } };
     throw Error('Unexpected service');
   } };
   suppression = new ReferenceSuppressionService(sp, controller);

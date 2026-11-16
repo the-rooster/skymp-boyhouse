@@ -249,7 +249,7 @@ export class RemoteServer extends ClientListener {
       };
       const actor = Actor.from(reference);
       if (actor) this.controller.lookupListener(RagdollService).safeRemoveRagdollFromWorld(actor,
-        () => this.defer(move, current));
+        () => this.defer(move, current), current);
       else move();
     }, current);
   }
@@ -269,7 +269,7 @@ export class RemoteServer extends ClientListener {
       const current = this.captureOriginal(refrId);
       this.onceLoad(refrId, (refr: ObjectReference) => {
         if (refr) {
-          ObjectReferenceEx.dealWithRef(refr, refr.getBaseObject() as Form);
+          ObjectReferenceEx.dealWithRef(refr, refr.getBaseObject() as Form, true, current);
           if (msg.props) {
             if (msg.props.inventory) {
               ModelApplyUtils.applyModelInventory(refr, msg.props.inventory);
@@ -281,7 +281,7 @@ export class RemoteServer extends ClientListener {
 
             ModelApplyUtils.applyModelNodeTextureSet(refr, msg.props.setNodeTextureSet);
 
-            ModelApplyUtils.applyModelIsDisabled(refr, !!msg.props['disabled']);
+            ModelApplyUtils.applyModelIsDisabled(refr, !!msg.props['disabled'], current);
 
             // TODO: move to a separate module
             const animation = msg.props.lastAnimation;
@@ -545,7 +545,7 @@ export class RemoteServer extends ClientListener {
         } else if (msg.propName === 'isHarvested') {
           ModelApplyUtils.applyModelIsHarvested(refr, !!msgData, current);
         } else if (msg.propName === 'disabled') {
-          ModelApplyUtils.applyModelIsDisabled(refr, !!msgData);
+          ModelApplyUtils.applyModelIsDisabled(refr, !!msgData, current);
         }
       }, current);
       return;

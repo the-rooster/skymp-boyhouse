@@ -15,6 +15,7 @@ import { PlayerLoadoutService } from './services/services/playerLoadoutService';
 import { PlayerSpawnService } from './services/services/playerSpawnService';
 import { ReferenceSuppressionService } from './services/services/referenceSuppressionService';
 import { OwnedReferenceService } from './services/services/ownedReferenceService';
+import { NativeReferenceOperationService } from './services/services/nativeReferenceOperationService';
 import { SinglePlayerService } from './services/services/singlePlayerService';
 import { SpApiInteractor } from './services/spApiInteractor';
 import { TimeService } from "./services/services/timeService";
@@ -77,6 +78,7 @@ const main = () => {
       new LoadGameService(sp, controller),
       new SinglePlayerService(sp, controller),
       new ReferenceSuppressionService(sp, controller),
+      new NativeReferenceOperationService(sp, controller),
       new OwnedReferenceService(sp, controller),
       new EnforceLimitationsService(sp, controller),
       new SendInputsService(sp, controller),

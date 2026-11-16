@@ -2,6 +2,7 @@ import { OwnedReferenceLifetime, OwnedReferenceState } from '../../campaign/owne
 import { logError } from '../../logging';
 import { ClientListener, CombinedController, Sp } from './clientListener';
 import { WorldCleanerService } from './worldCleanerService';
+import { NativeReferenceOperationService } from './nativeReferenceOperationService';
 
 export class OwnedReferenceService extends ClientListener {
     readonly references: OwnedReferenceLifetime;
@@ -16,6 +17,7 @@ export class OwnedReferenceService extends ClientListener {
         sp.storage[key] = state;
         this.references = new OwnedReferenceLifetime({
             identity: id => sp.getReferenceHandle(id),
+            canStart: id => !controller.lookupListener(NativeReferenceOperationService).operations.isBusy(id),
             dispose: (id, handle) => {
                 if (sp.getReferenceHandle(id) !== handle) throw Error('Owned reference identity changed before disposal');
                 const reference = sp.ObjectReference.from(sp.Game.getFormEx(id));

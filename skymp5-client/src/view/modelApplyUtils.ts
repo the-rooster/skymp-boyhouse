@@ -1,11 +1,17 @@
-import { ObjectReference, Actor, Game, FormType, TextureSet, NetImmerse, getReferenceHandle, once } from "skyrimPlatform";
+import { ObjectReference, Game, FormType, TextureSet, NetImmerse } from "skyrimPlatform";
 import { Inventory, applyInventory } from "../sync/inventory";
 import { logError, logTrace } from "../logging";
+import { SpApiInteractor } from '../services/spApiInteractor';
+import { NativeReferenceOperationService } from '../services/services/nativeReferenceOperationService';
 import { SetNodeScaleEntry, SetNodeTextureSetEntry } from "src/services/messages/createActorMessage";
 
 // For 0xff000000+ used from FormView
 // For objects from master files used directly from remoteServer.ts
 export class ModelApplyUtils {
+  private static get operations(): NativeReferenceOperationService {
+    return SpApiInteractor.getControllerInstance().lookupListener(NativeReferenceOperationService);
+  }
+
   static applyModelInventory(refr: ObjectReference, inventory: Inventory) {
     applyInventory(refr, inventory, false, true);
   }
@@ -34,70 +40,38 @@ export class ModelApplyUtils {
     }
   }
 
-  static applyModelIsDisabled(refr: ObjectReference, disabled: boolean): void {
-    const wasDisabled: boolean = refr.isDisabled();
-    if (wasDisabled == disabled) {
-      return;
-    }
-
-    if (disabled) {
-      refr.disable(false);
-    } else {
-      refr.enable(true);
-    }
+  static applyModelIsDisabled(refr: ObjectReference, disabled: boolean, current: () => boolean = () => true): void {
+    this.operations.submit(refr.getFormID(), 'visibility', current, [reference => {
+      if (reference.isDisabled() !== disabled) return disabled ? reference.disable(false) : reference.enable(false);
+    }, reference => {
+      if (reference.isDisabled() !== disabled) throw Error('Native visibility did not reach the requested state');
+    }]);
   }
 
-  static applyModelIsHarvested(refr: ObjectReference, isHarvested: boolean, isCurrent: () => boolean = () => true) {
-    const base = refr.getBaseObject();
-    if (base) {
-      const t = base.getType();
-      if (t == FormType.Tree || t == FormType.Flora) {
-        const wasHarvested = refr.isHarvested();
-        if (isHarvested != wasHarvested) {
-          let ac: Actor | null = null;
-          if (isHarvested) {
-            for (let i = 0; i < 20; ++i) {
-              ac = Game.findRandomActor(
-                refr.getPositionX(),
-                refr.getPositionY(),
-                refr.getPositionZ(),
-                10000,
-              );
-              if (ac && ac.getFormID() !== 0x14) {
-                break;
-              }
-            }
-          }
-          if (isHarvested && ac && ac.getFormID() !== 0x14) {
-            refr.activate(ac, true);
-          } else {
-            refr.setHarvested(isHarvested);
-            const id = refr.getFormID();
-            const handle = getReferenceHandle(id);
-            refr.disable(false).then(() => {
-              // Promise completion is not a native update context. Never
-              // revive another world/view or a reused reference identity.
-              once('update', () => {
-                if (!isCurrent() || !handle || getReferenceHandle(id) !== handle) return;
-                const restoredRefr = ObjectReference.from(Game.getFormEx(id));
-                if (restoredRefr && !restoredRefr.isDeleted()) restoredRefr.enable(false);
-              });
-            });
-          }
-        }
-      } else {
-        const wasHarvested = refr.isDisabled();
-        if (isHarvested != wasHarvested) {
-          if (isHarvested) {
-            // Harvesting changes visibility. It must never permanently delete
-            // an authored reference needed by another campaign history.
-            refr.disable(false);
-          } else {
-            refr.enable(true);
-          }
-        }
+  static applyModelIsHarvested(refr: ObjectReference, harvested: boolean, current: () => boolean = () => true): void {
+    let refresh = false, plant = false, expectedDisabled = false;
+    this.operations.submit(refr.getFormID(), 'harvest', current, [reference => {
+      const type = reference.getBaseObject()?.getType();
+      plant = type === FormType.Tree || type === FormType.Flora;
+      expectedDisabled = reference.isDisabled();
+      if (plant) {
+        if (reference.isHarvested() === harvested) return;
+        reference.setHarvested(harvested);
+        // Refresh the model without triggering a nearby NPC's activation
+        // scripts or changing a reference that was already disabled.
+        if (!reference.isDisabled()) { refresh = true; return reference.disable(false); }
+      } else if (reference.isDisabled() !== harvested) {
+        return harvested ? reference.disable(false) : reference.enable(false);
       }
-    }
+    }, reference => {
+      if (refresh) {
+        if (!reference.isDisabled()) throw Error('Harvest refresh disable did not complete');
+        return reference.enable(false);
+      }
+    }, reference => {
+      if (plant ? reference.isHarvested() !== harvested || reference.isDisabled() !== expectedDisabled :
+        reference.isDisabled() !== harvested) throw Error('Native harvest did not reach the requested state');
+    }]);
   }
 
   static applyModelNodeTextureSet(refr: ObjectReference, setNodeTextureSet?: SetNodeTextureSetEntry[]) {

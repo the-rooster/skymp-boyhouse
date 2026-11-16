@@ -446,6 +446,70 @@ other FormView mutations and full save/reload recovery need further lifetime
 work. The baseline coordinator, native journal projection and quest execution
 remain unfinished; staging projection stays disabled and no quests are certified.
 
+## Native operation serialization and cancellation
+
+`NativeReferenceOperationService` now serializes borrowed native work per engine
+reference handle. A bounded queue coalesces queued property updates, runs each
+sequence without interleaving, and observes native completion before continuing
+on an update. Visibility, harvest refresh, motion changes, suppression and
+ragdoll recovery use this queue. Superseding a campaign cancels queued work and
+late callbacks but keeps an already submitted native call tracked until it
+settles. Suppression restoration survives campaign cancellation; loading a new
+save invalidates all old work. Failures remain recorded and cannot imply a
+successful engine acknowledgement.
+
+The owned-reference lifetime and borrowed-operation queue now coordinate:
+borrowed work waits for an active owned native operation, and owned spawn/deletion
+waits for pending borrowed work. Thus retiring a view cannot delete its actor
+while its visibility/ragdoll work is still running. Every native step resolves a
+fresh wrapper and verifies identity; wrappers are never kept across callbacks.
+
+Ragdoll recovery captures the six existing damage difficulty multipliers, shares
+the temporary override across overlapping calls, and restores the exact captured
+values when the last call settles. It preserves settings changed by another
+owner in the meantime. Reload restores a retained override instead of leaving
+damage at zero. The former unconditional reset of every multiplier to 1 is gone.
+Harvesting no longer activates a random nearby NPC; it changes the harvest flag
+and refreshes visibility through the queue, preserving already-disabled plants.
+
+All 203 Node tests and the client build pass. Two scripted native fixtures passed
+on runtime 1.7.104.0 using generated saves:
+
+- `build-native-operations-smoke.cjs` exercised actual owned and borrowed client
+  services: work waited for owned enable/disable, deletion waited for an entire
+  borrowed sequence, epoch cancellation suppressed follow-up work while still
+  draining the pending call, and normal/cancelled ragdoll operations restored
+  `[0.75, 1.5, 3, 1, 0.5, 2]` exactly. It passed in 6.2 seconds.
+- `build-reference-smoke.cjs` now includes the actual native operation service.
+  Hide, overlapping suppression claims, restoration and cancellation during a
+  pending disable passed in 5.7 seconds. The authored creature retained its
+  original alive/health/visibility/activation flags. AI still changed its position;
+  this fixture does not prove full reference-state restoration.
+
+The fixture builders only write diagnostic artifacts. Evidence is in ignored
+`artifacts/native-operations-runtime/` and
+`artifacts/reference-suppression-runtime/`; backup manifests are under
+`artifacts/game-backups/20261116T193835Z/native-operations/` and
+`artifacts/game-backups/20261116T193920Z/reference-suppression/`. Both test games
+exited, all three INIs were restored byte-for-byte, diagnostic files were removed,
+and all four personal save hashes were unchanged.
+
+The rebuilt full client also connected to unchanged private staging and passed
+the five-sample positioned/loaded/ready and unequipped character-menu observer
+in 8.8 seconds. Its evidence is in `artifacts/player-spawn-runtime/`, with backup
+manifest `artifacts/game-backups/20261116T193949Z/player-spawn/`. The test game
+exited and the same INI/save cleanup checks passed. None of these three native
+runs logged callback exceptions. The full-client fixture validates startup and
+service registration, not quest play or phase application.
+
+This covers the listed native operations, not all native APIs. Native plugin
+reload can still drop an outstanding promise callback; the queue must not be
+treated as successfully drained in that case. Original inventory/lock/motion
+restoration, remaining death-service timers, baseline application, phase-ready
+acknowledgement, quest execution and real multi-client play remain unfinished.
+Harvest behavior has automated coverage but has not been certified on native
+flora. Staging projection remains disabled and **zero quests are certified**.
+
 ## Remaining acceptance
 
 The packet-epoch transport adds a separate `MpClientPlugin` codec version 2.1.0.

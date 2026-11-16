@@ -17,6 +17,9 @@ const dependencies = {
   skyrimPlatform: sp,
   './clientListener': { ClientListener: class {} },
   './worldCleanerService': { WorldCleanerService: class {} },
+  './nativeReferenceOperationService': { NativeReferenceOperationService: class {} },
+  '../services/services/nativeReferenceOperationService': { NativeReferenceOperationService: class {} },
+  '../services/spApiInteractor': { SpApiInteractor: {} },
   '../../logging': { logError: (...args) => log('service-error', args.map(String)) },
   '../sync/appearance': { applyTints: () => { throw Error('This fixture uses unmodified NPC appearance'); } },
 };
@@ -43,6 +46,7 @@ function fixture() {
     emit(event) { for (const callback of listeners.get(event) || []) callback(); },
   };
   const controller = { emitter, on: sp.on, once: sp.once, lookupListener: () => ({
+    operations: { isBusy: () => false }, // This isolated fixture submits no borrowed mutations.
     modWcProtection(id, amount) { protection.set(id, (protection.get(id) || 0) + amount); },
   }) };
   const service = new dependencies.service.OwnedReferenceService(sp, controller);

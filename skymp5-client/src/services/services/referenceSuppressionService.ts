@@ -1,6 +1,7 @@
 import { ReferenceSuppression, SuppressionState } from '../../campaign/referenceSuppression';
 import { logError } from '../../logging';
 import { ClientListener, CombinedController, Sp } from './clientListener';
+import { NativeReferenceOperationService } from './nativeReferenceOperationService';
 
 export class ReferenceSuppressionService extends ClientListener {
     readonly references: ReferenceSuppression;
@@ -28,8 +29,12 @@ export class ReferenceSuppressionService extends ClientListener {
             },
             blockActivation: (id, baseId, blocked) => resolve(id, baseId).blockActivation(blocked),
             setDisabled: (id, baseId, disabled) => {
-                const reference = resolve(id, baseId);
-                return disabled ? reference.disable(false) : reference.enable(false);
+                const generation = state.generation;
+                return controller.lookupListener(NativeReferenceOperationService).submitPersistent(id, 'suppression',
+                    () => generation === state.generation, () => {
+                        const reference = resolve(id, baseId);
+                        return disabled ? reference.disable(false) : reference.enable(false);
+                    });
             },
             report: (id, error) => logError(this, 'Reference suppression failed', id.toString(16), error),
         }, state);
