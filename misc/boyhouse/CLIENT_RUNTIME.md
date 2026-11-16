@@ -510,6 +510,62 @@ acknowledgement, quest execution and real multi-client play remain unfinished.
 Harvest behavior has automated coverage but has not been certified on native
 flora. Staging projection remains disabled and **zero quests are certified**.
 
+## Observed remote spawns and initially dead actors
+
+The client no longer skips a remote actor because its initial model is dead.
+`SpawnProcess` accepts the desired death state: it silently kills a living copy
+for a corpse baseline and resurrects only when an alive baseline requires it.
+`FormView` does not apply its living-actor health/deferred-kill override to a
+corpse. If death state changes during spawn, the old owned reference retires and
+the replacement receives the new state. Reliable death properties also update
+the model's movement hint, and subsequent movement packets cannot contradict an
+explicit authoritative death state. Previously the synthetic initial movement
+always claimed the actor was alive.
+
+Native-call completion alone no longer makes a spawn ready. The owned spawn
+temporarily holds the copy's AI, enables it, waits for its 3D model, applies
+death/physics state, and reapplies position to the loaded reference. It requires
+two update observations of enabled/loaded state, matching alive/dead state, and
+position within 128 units of the target. It then restores and verifies the exact
+original AI setting. A failed call, no-op enable/AI restoration, or a 30-second
+observation deadline retires the copy without signaling ready. All steps and
+cleanup remain inside the owned-reference lifetime queue.
+
+`FormView`, `FormViewArray`, and `WorldView` expose `getSpawnReadiness()` for the
+future projection coordinator. It checks model identity, native handle, loaded
+state, death state, and outstanding owned/borrowed work; aggregation reports
+pending/failed forms and excludes other worlds explicitly. World readiness also
+requires the selected self world, current view, rendering gate, and connection.
+This is spawn readiness only: it does not certify inventory, equipment, authored
+reference restoration, journal state, or quest execution.
+
+All 218 Node tests and the client build pass. Fifteen additional cases cover
+corpse creation, changing death state, unloaded/misplaced copies, deadlines,
+cancellation, AI restoration, model identity, and readiness aggregation/gates.
+The actual native lifetime/spawn fixture on runtime 1.7.104.0 passed living actor,
+corpse and ordinary-object creation; both actors restored their original enabled
+AI; all three loaded references were deleted; a cancelled spawn never reported
+ready. The final run completed in 6.0 seconds without native callback exceptions.
+It uses the actual spawn/lifetime classes; the FormView/WorldView aggregation and
+packet-model changes have automated coverage, not full live phase certification.
+
+The first two native runs timed out: a newly enabled creature was already moving
+away before placement could be observed. Holding AI and reapplying the target
+after loading resolved this. Evidence from the final run is in ignored
+`artifacts/reference-lifetime-runtime/`, with backup manifest
+`artifacts/game-backups/20261116T195424Z/reference-lifetime/`. Each test game exited,
+all three INIs were restored byte-for-byte, diagnostic files were removed, and
+the four personal save hashes stayed unchanged. The final AI-restoration no-op
+guard was unit-tested and rebuilt after the live run; that native fixture had
+independently checked the restored AI flags.
+
+The projection coordinator remains unwired and staging projection remains off.
+An actor whose engine death state cannot be changed fails rather than becoming
+an acknowledged incorrect copy; essential/protected actor-base overrides still
+need campaign support. Corpse inventory, general reference restoration, remaining
+combat/death lifecycle work, and quest runtime integration are not completed by
+this change. **Zero quests are certified playable.**
+
 ## Remaining acceptance
 
 The packet-epoch transport adds a separate `MpClientPlugin` codec version 2.1.0.

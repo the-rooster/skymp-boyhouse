@@ -7,12 +7,12 @@ const root = path.resolve(__dirname, '../../skymp5-client');
 const ts = require(require.resolve('typescript', { paths: [root, path.resolve(root, '../skymp5-server')] }));
 const id = 0xff000001;
 
-function load(file, dependencies) {
+function load(file, dependencies, extra = {}) {
   const compiled = ts.transpileModule(fs.readFileSync(path.join(root, 'src', file), 'utf8'), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
   }).outputText;
   const module = { exports: {} };
-  vm.runInNewContext(compiled, { module, exports: module.exports, require: name => {
+  vm.runInNewContext(compiled, { module, exports: module.exports, ...extra, require: name => {
     if (!(name in dependencies)) throw Error(`Unexpected dependency ${name}`);
     return dependencies[name];
   } }, { filename: file });
@@ -20,9 +20,10 @@ function load(file, dependencies) {
 }
 
 function fixture(count = 1) {
-  const forms = new Map(Array.from({ length: count }, (_, i) => [id + i, { handle: i + 1, base: 123, deleted: false }]));
+  const forms = new Map(Array.from({ length: count }, (_, i) => [id + i,
+    { handle: i + 1, base: 123, deleted: false, dead: true, disabled: true, loaded: true, position: [0, 0, 0] }]));
   const calls = [], jobs = [], errors = [], released = [];
-  let frame = 0;
+  let frame = 0, now = 0;
   const work = (name, formId = id, effect = () => {}) => {
     calls.push([name, formId]);
     return new Promise((resolve, reject) => jobs.push({ name, resolve, reject, effect }));
@@ -44,12 +45,24 @@ function fixture(count = 1) {
       getFormID() { valid(); return formId; },
       getBaseObject() { valid(); return { getFormID: () => forms.get(formId).base, getType: () => 43 }; },
       getRace() { valid(); return null; },
-      setActorValue() { valid(); }, startDeferredKill() { valid(); }, setDisplayName() { valid(); },
+      setActorValue() { valid(); }, startDeferredKill() { valid(); forms.get(formId).deferredKill = true; }, setDisplayName() { valid(); },
       isDeleted() { valid(); return forms.get(formId).deleted; },
-      setPosition() { valid(); return work('position', formId); },
+      isDisabled() { valid(); return !!forms.get(formId).disabled; },
+      isDead() { valid(); return !!forms.get(formId).dead; },
+      is3DLoaded() { valid(); return forms.get(formId).loaded !== false; },
+      isAIEnabled() { valid(); return forms.get(formId).ai !== false; },
+      enableAI(enabled) { valid(); forms.get(formId).ai = enabled; },
+      getPositionX() { valid(); return forms.get(formId).position?.[0] || 0; },
+      getPositionY() { valid(); return forms.get(formId).position?.[1] || 0; },
+      getPositionZ() { valid(); return forms.get(formId).position?.[2] || 0; },
+      setPosition(...position) { valid(); return work('position', formId, () => {
+        if (!forms.get(formId).ignorePosition) forms.get(formId).position = position;
+      }); },
       setAngle() { valid(); return work('angle', formId); },
-      enable() { valid(); return work('enable', formId); },
-      resurrect() { valid(); return work('resurrect', formId); },
+      enable() { valid(); return work('enable', formId, () => { forms.get(formId).disabled = false; }); },
+      resurrect() { valid(); return work('resurrect', formId, () => { forms.get(formId).dead = false; }); },
+      endDeferredKill() { valid(); calls.push(['endDeferredKill', formId]); },
+      killSilent() { valid(); calls.push(['killSilent', formId]); forms.get(formId).dead = true; },
       setMotionType() { valid(); return work('motion', formId); },
     };
   };
@@ -65,11 +78,18 @@ function fixture(count = 1) {
     '../extensions/objectReferenceEx': { ObjectReferenceEx: { dealWithRef(ref, base, motion) {
       assert.equal(motion, false, 'Motion changes must use the tracked queue'); calls.push(['prepare', ref.getFormID()]);
     } } },
-  });
+  }, { Date: { now: () => now } });
   return { lifetime, adapter, forms, calls, jobs, errors, released, work, sp,
     tick() { ++frame; lifetime.update(); },
-    spawn(reference, complete, appearance = null, rotation) {
-      new SpawnProcess(appearance, [1, 2, 3], reference, lifetime, complete, rotation);
+    spawn(reference, complete, appearance = null, rotation, dead = false) {
+      new SpawnProcess(appearance, [1, 2, 3], reference, lifetime, complete, rotation, dead);
+    },
+    advance(ms) { now += ms; },
+    async drain(limit = 20) {
+      for (let i = 0; i < limit; ++i) {
+        if (jobs.length) await this.complete();
+        await Promise.resolve(); this.tick();
+      }
     },
     setActor(value) { actor = value; },
     async complete({ error, apply = true } = {}) {
@@ -88,7 +108,8 @@ test('actor spawn serializes native stages and reports ready only after their co
   await f.complete(); assert.equal(f.calls.length, 1, 'Promise completion must not call the engine');
   f.tick(); assert.deepEqual(f.calls.map(c => c[0]), ['position', 'tints', 'enable']);
   await f.complete(); f.tick(); assert.equal(ready, 0);
-  await f.complete(); f.tick(); assert.equal(ready, 1);
+  await f.complete(); f.tick(); assert.equal(ready, 0, 'Native completion is not observed readiness');
+  await f.drain(); assert.equal(ready, 1);
   assert.equal(f.forms.get(id).base, 7, 'Tint base-ID adjustment does not invalidate reference identity');
   assert.equal(f.errors.length, 0);
 });
@@ -126,6 +147,70 @@ test('object angle, movement and physics work are tracked and canceled without s
   f.lifetime.retire(reference); await f.complete(); f.tick();
   assert.equal(ready, false); assert.equal(f.jobs[0].name, 'delete');
   await f.complete(); f.tick(); assert.equal(f.errors.length, 0);
+});
+
+test('an initially dead model creates an observed corpse without resurrecting it', async () => {
+  const f = fixture(), reference = f.lifetime.claim(id); let ready = 0;
+  f.forms.get(id).dead = false;
+  f.spawn(reference, () => ++ready, null, [0, 0, 90], true); f.tick(); await f.drain();
+  assert.equal(ready, 1); assert.equal(f.forms.get(id).dead, true);
+  assert.equal(f.calls.filter(c => c[0] === 'killSilent').length, 1);
+  assert.equal(f.calls.some(c => c[0] === 'resurrect'), false); assert.equal(f.errors.length, 0);
+});
+
+test('native completion waits for a loaded model at the target position and stable observations', async () => {
+  const f = fixture(), reference = f.lifetime.claim(id); let ready = 0;
+  f.forms.get(id).position = [1000, 0, 0]; f.forms.get(id).ignorePosition = true;
+  f.forms.get(id).loaded = false; f.spawn(reference, () => ++ready); f.tick(); await f.drain();
+  assert.equal(ready, 0);
+  f.forms.get(id).loaded = true; await f.drain();
+  assert.equal(ready, 0);
+  f.forms.get(id).position = [1, 2, 3]; await f.drain(1); assert.equal(ready, 0);
+  await f.drain(5); assert.equal(ready, 1);
+});
+
+for (const ai of [true, false]) test(`spawn holds AI until observed and restores its original ${ai ? 'enabled' : 'disabled'} state`, async () => {
+  const f = fixture(), reference = f.lifetime.claim(id); f.forms.get(id).ai = ai;
+  let ready = 0; f.spawn(reference, () => ++ready); f.tick();
+  assert.equal(f.forms.get(id).ai, false); assert.equal(ready, 0);
+  await f.drain(); assert.equal(ready, 1); assert.equal(f.forms.get(id).ai, ai);
+  assert.equal(f.calls.filter(c => c[0] === 'position').length, 2, 'Loaded placement must follow disabled placement');
+});
+
+test('an AI restoration no-op fails the spawn instead of leaving an acknowledged frozen actor', async () => {
+  const f = fixture(), reference = f.lifetime.claim(id); let ready = 0;
+  const actor = f.sp.Actor.from;
+  f.sp.Actor.from = value => {
+    const result = actor(value);
+    return result ? { ...result, enableAI(enabled) { if (!enabled) result.enableAI(false); } } : null;
+  };
+  f.spawn(reference, () => ++ready); f.tick(); await f.drain();
+  assert.equal(ready, 0); assert.match(reference.error, /restore its original AI/);
+  assert.equal(f.forms.get(id).deleted, true);
+});
+
+test('a native enable no-op retires the failed spawn instead of reporting readiness', async () => {
+  const f = fixture(), reference = f.lifetime.claim(id); let ready = 0;
+  f.spawn(reference, () => ++ready); f.tick(); await f.complete(); f.tick();
+  assert.equal(f.jobs[0].name, 'enable'); await f.complete({ apply: false }); f.tick(); await f.drain();
+  assert.equal(ready, 0); assert.match(reference.error, /enable did not take effect/);
+  assert.equal(f.forms.get(id).deleted, true);
+});
+
+test('an actor that refuses the requested death state times out without acknowledging readiness', async () => {
+  const f = fixture(), reference = f.lifetime.claim(id); let ready = 0;
+  f.forms.get(id).dead = false;
+  f.sp.Actor.from = value => value ? { ...value, killSilent() {} } : null;
+  f.spawn(reference, () => ++ready, null, undefined, true); f.tick(); await f.drain();
+  assert.equal(ready, 0); f.advance(31000); await f.drain();
+  assert.match(reference.error, /deadline/); assert.equal(f.forms.get(id).deleted, true); assert.equal(ready, 0);
+});
+
+test('cancelling during model observation prevents a later loaded model from reporting ready', async () => {
+  const f = fixture(), reference = f.lifetime.claim(id); let ready = 0;
+  f.forms.get(id).loaded = false; f.spawn(reference, () => ++ready); f.tick(); await f.drain();
+  f.lifetime.retire(reference); f.forms.get(id).loaded = true; await f.drain();
+  assert.equal(ready, 0); assert.equal(f.forms.get(id).deleted, true); assert.equal(f.errors.length, 0);
 });
 
 test('new-save generation prevents old completion or deletion against a matching FormID and handle', async () => {
@@ -202,6 +287,7 @@ function worldFixture() {
     constructor() { this.resizes = []; this.updates = []; arrays.push(this); }
     resize(size) { this.resizes.push(size); }
     updateAll(model) { this.updates.push(model.forms.length); }
+    getSpawnReadiness() { return { ready: true, pending: [], failed: [], outsideWorld: 0 }; }
   }
   class SinglePlayerService {} class RemoteServer {} class NetworkingService {}
   const { WorldView } = load('view/worldView.ts', {
@@ -244,6 +330,20 @@ test('a pending game-time wait cannot reopen views after an explicit phase gate'
   const f = worldFixture(); f.tick(); f.view.setFormViewUpdateAllowed(false);
   await f.finishWait(); f.tick(); assert.equal(f.arrays[0].updates.at(-1), 0);
   f.view.setFormViewUpdateAllowed(true); f.tick(); assert.equal(f.arrays[0].updates.at(-1), 1);
+});
+
+test('world readiness requires the current loaded world, view gate, self model, and connection', () => {
+  const f = worldFixture(), model = { playerCharacterFormIdx: 0, forms: [{ movement: { worldOrCell: 60 } }] };
+  assert.equal(f.view.getSpawnReadiness(model).ready, false);
+  f.view.setFormViewUpdateAllowed(true); assert.equal(f.view.getSpawnReadiness(model).ready, true);
+  model.forms[0].movement.worldOrCell = 61; assert.equal(f.view.getSpawnReadiness(model).ready, false);
+  model.forms[0].movement.worldOrCell = 60;
+  f.setConnected(false); assert.equal(f.view.getSpawnReadiness(model).ready, false);
+  f.setConnected(true); f.setSinglePlayer(true); assert.equal(f.view.getSpawnReadiness(model).ready, false);
+  f.setSinglePlayer(false); f.native('preLoadGame'); assert.equal(f.view.getSpawnReadiness(model).ready, false);
+  f.event('gameLoad', {}); f.view.setFormViewUpdateAllowed(true);
+  assert.equal(f.view.getSpawnReadiness(model).ready, true);
+  f.sp.storage.view = {}; assert.equal(f.view.getSpawnReadiness(model).ready, false);
 });
 
 test('an explicit gate survives startup, game loads, and reconnects until the caller releases it', async () => {
@@ -316,15 +416,18 @@ function formViewFixture() {
   f.sp.Game.getFormEx = formId => formId === 123 ? base : resolve(formId);
   f.sp.Game.getPlayer = () => ({ placeAtMe() {
     if (nullSpawn) return null;
-    const newId = nextId++; f.forms.set(newId, { handle: newId - id + 1, base: 123, deleted: false });
+    const newId = nextId++; f.forms.set(newId,
+      { handle: newId - id + 1, base: 123, deleted: false, dead: false, disabled: true, loaded: true, position: [0, 0, 0] });
     return resolve(newId);
   } });
   Object.assign(f.sp, { getReferenceHandle: f.adapter.identity, ActorBase: { from: () => null },
     FormType: { NPC: 43 }, printConsole() {}, storage: {} });
-  class OwnedReferenceService {} class WorldCleanerService {} class GamemodeUpdateService {}
+  class OwnedReferenceService {} class WorldCleanerService {} class GamemodeUpdateService {} class NativeReferenceOperationService {}
+  let nativeBusy = false;
   const protections = [], visible = [];
   const controller = { emitter: new EventEmitter(), lookupListener(type) {
     if (type === OwnedReferenceService) return { references: f.lifetime };
+    if (type === NativeReferenceOperationService) return { operations: { isBusy: () => nativeBusy } };
     if (type === WorldCleanerService) return { modWcProtection: (...args) => protections.push(args) };
     if (type === GamemodeUpdateService) return { updateNeighbor: ref => visible.push(ref.getFormID()) };
     throw Error('Unexpected lookup');
@@ -342,12 +445,14 @@ function formViewFixture() {
     '../services/services/worldCleanerService': { WorldCleanerService },
     '../services/services/gamemodeUpdateService': { GamemodeUpdateService },
     '../services/services/ownedReferenceService': { OwnedReferenceService },
+    '../services/services/nativeReferenceOperationService': { NativeReferenceOperationService },
   });
   const view = new FormView(id + 123);
   // This fixture targets lifecycle, not combat/rendering or model application.
   view.applyAll = () => {};
   const model = { baseId: 123, refrId: id + 123, movement: { worldOrCell: 60, pos: [1, 2, 3], rot: [0, 0, 0] } };
-  return { ...f, view, protections, visible, update: () => view.update(model), setNullSpawn(value) { nullSpawn = value; } };
+  return { ...f, view, model, protections, visible, update: () => view.update(model),
+    setNativeBusy(value) { nativeBusy = value; }, setNullSpawn(value) { nullSpawn = value; } };
 }
 
 test('FormView destruction is idempotent and a canceled old spawn cannot make a new view ready', async () => {
@@ -359,8 +464,8 @@ test('FormView destruction is idempotent and a canceled old spawn cannot make a 
   assert.deepEqual(f.visible, [], 'Old completion must not mark the replacement spawn ready');
   // Resolve whichever native jobs complete first; each reference must retain
   // its own chain and old cleanup must not delete the replacement actor.
-  for (let i = 0; i < 12 && !f.visible.length; ++i) {
-    if (f.jobs.length) await f.complete(); f.tick(); f.update();
+  for (let i = 0; i < 24 && !f.visible.length; ++i) {
+    if (f.jobs.length) await f.complete(); await Promise.resolve(); f.tick(); f.update();
   }
   assert.deepEqual(f.visible, [id + 1]);
   assert.equal(f.forms.get(id).deleted, true); assert.equal(f.forms.get(id + 1).deleted, false);
@@ -371,6 +476,54 @@ test('FormView handles a native null spawn without dereferencing it or creating 
   const f = formViewFixture(); f.setNullSpawn(true); f.update(); f.tick();
   assert.equal(f.view.getLocalRefrId(), 0); assert.equal(f.lifetime.state.references.size, 0);
   assert.equal(f.calls.length, 0);
+});
+
+test('FormView spawns an initially dead model and never applies the live-actor immortality override', async () => {
+  const f = formViewFixture(); f.model.isDead = true; f.update(); f.tick(); await f.drain(); f.update();
+  assert.equal(f.forms.get(id).dead, true); assert.notEqual(f.forms.get(id).deferredKill, true);
+  assert.equal(f.view.getSpawnReadiness(f.model).state, 'ready'); assert.deepEqual(f.visible, [id]);
+  f.setNativeBusy(true); assert.equal(f.view.getSpawnReadiness(f.model).state, 'pending');
+  f.setNativeBusy(false); f.forms.get(id).handle = 999;
+  assert.equal(f.view.getSpawnReadiness(f.model).state, 'pending', 'Reused local identity cannot certify readiness');
+});
+
+test('a changed death state supersedes an unfinished FormView spawn without losing the new corpse', async () => {
+  const f = formViewFixture(); f.update(); f.tick(); f.model.isDead = true; f.update();
+  assert.equal(f.view.getLocalRefrId(), id + 1); await f.drain(32); f.update();
+  assert.equal(f.forms.get(id).deleted, true); assert.equal(f.forms.get(id + 1).dead, true);
+  assert.equal(f.view.getSpawnReadiness(f.model).state, 'ready'); assert.deepEqual(f.visible, [id + 1]);
+});
+
+test('spawn readiness exposes a failed owned spawn and never accepts another remote identity', async () => {
+  const f = formViewFixture(); f.update(); f.tick();
+  await f.complete({ error: Error('position rejected') }); f.tick();
+  const result = f.view.getSpawnReadiness(f.model);
+  assert.equal(result.state, 'failed'); assert.match(result.error, /position rejected/);
+  assert.equal(f.view.getSpawnReadiness({ ...f.model, refrId: 1234 }).state, 'pending');
+});
+
+test('array readiness checks all in-world remote identities and distinguishes pending, failed, and out-of-world forms', () => {
+  class FormView {
+    constructor(remote) { this.remote = remote; this.state = 'ready'; }
+    getRemoteRefrId() { return this.remote; }
+    getSpawnReadiness() { return { state: this.state, error: 'native failed' }; }
+    destroy() {} update() {}
+  }
+  const { FormViewArray } = load('view/formViewArray.ts', {
+    './formView': { FormView }, '../services/spApiInteractor': {}, '../services/services/gamemodeUpdateService': {},
+  });
+  const views = new FormViewArray();
+  const model = { playerCharacterFormIdx: 0, forms: [
+    { refrId: 1 }, { refrId: 2, movement: { worldOrCell: 60 } },
+    { refrId: 3, movement: { worldOrCell: 61 } }, { refrId: 4, movement: { worldOrCell: 60 } },
+  ] };
+  views.updateForm(model.forms[1], 1);
+  let result = views.getSpawnReadiness(model, 60);
+  assert.equal(result.ready, false); assert.deepEqual(Array.from(result.pending), [4]); assert.equal(result.outsideWorld, 1);
+  views.updateForm(model.forms[3], 3); assert.equal(views.getSpawnReadiness(model, 60).ready, true);
+  views.getNthFormView(3).state = 'failed'; result = views.getSpawnReadiness(model, 60);
+  assert.equal(result.ready, false); assert.equal(result.failed[0].remoteId, 4);
+  model.forms[1].refrId = 99; assert.deepEqual(Array.from(views.getSpawnReadiness(model, 60).pending), [99]);
 });
 
 test('a reused model array slot retires the previous remote identity', () => {

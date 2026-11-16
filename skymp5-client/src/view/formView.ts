@@ -17,6 +17,13 @@ import { WorldCleanerService } from "../services/services/worldCleanerService";
 import { GamemodeUpdateService } from "../services/services/gamemodeUpdateService";
 import { OwnedReferenceService } from '../services/services/ownedReferenceService';
 import { OwnedReference } from '../campaign/ownedReferenceLifetime';
+import { NativeReferenceOperationService } from '../services/services/nativeReferenceOperationService';
+
+export interface FormSpawnReadiness {
+  state: 'pending' | 'ready' | 'failed';
+  localId: number;
+  error?: string;
+}
 
 export interface ScreenResolution {
   width: number;
@@ -65,11 +72,11 @@ export class FormView {
 
 
 
-    // Don't spawn dead actors if not already
-    if (model.isDead) {
-      if (this.refrId === 0) {
-        return;
-      }
+    // A corpse is part of the authoritative world, including on first entry.
+    // A different death state during spawn supersedes that entire spawn.
+    const desiredDead = model.isDead ?? model.movement?.isDead ?? false;
+    if (this.ownedReference && !this.ready && this.spawnDead !== desiredDead) {
+      this.destroy();
     }
 
     // Players with different worldOrCell should be invisible
@@ -227,6 +234,7 @@ export class FormView {
         this.animState = this.getDefaultAnimState();
 
         this.ready = false;
+        this.spawnDead = desiredDead;
 
         let spawnPos;
         if (model.movement) {
@@ -243,7 +251,7 @@ export class FormView {
             if (this.ownedReference !== reference || !this.lifetime.isCurrent(reference)) return;
             this.ready = true;
             this.spawnMoment = Date.now();
-          }, base.getType() === FormType.NPC ? undefined : model.movement.rot);
+          }, model.movement.rot, desiredDead);
         } else {
           printConsole("Unable to triggerSpawnProcess for null refr");
         }
@@ -263,7 +271,7 @@ export class FormView {
     const refr = ObjectReference.from(Game.getFormEx(this.refrId));
     if (refr) {
       const actor = Actor.from(refr);
-      if (actor && !this.localImmortal) {
+      if (actor && !actor.isDead() && !this.localImmortal) {
         actor.startDeferredKill();
         actor.setActorValue("health", 1000000);
         actor.setActorValue("magicka", 1000000);
@@ -297,6 +305,26 @@ export class FormView {
 
   private ownedReference?: OwnedReference;
   private generation = 0;
+  private spawnDead = false;
+
+  // Called on native update, after the coordinator has selected this model's
+  // world. This proves spawn/identity only, not inventory or quest projection.
+  getSpawnReadiness(model: FormModel): FormSpawnReadiness {
+    const result: FormSpawnReadiness = { state: 'pending', localId: this.refrId };
+    if (this.remoteRefrId !== model.refrId) return result;
+    const owned = this.ownedReference;
+    if (owned?.error) return { ...result, state: 'failed', error: owned.error };
+    if (!this.ready || !this.refrId || (owned && (!this.lifetime.isCurrent(owned) ||
+      getReferenceHandle(owned.id) !== owned.handle || !!owned.operation || owned.work.length > 0))) return result;
+    const reference = ObjectReference.from(Game.getFormEx(this.refrId));
+    if (!reference || reference.isDeleted() || reference.isDisabled() || !reference.is3DLoaded()) return result;
+    if (model.movement && ObjectReferenceEx.getWorldOrCell(reference) !== model.movement.worldOrCell) return result;
+    const actor = Actor.from(reference);
+    if (actor && actor.isDead() !== (model.isDead ?? model.movement?.isDead ?? false)) return result;
+    const operations = SpApiInteractor.getControllerInstance().lookupListener(NativeReferenceOperationService).operations;
+    if (operations.isBusy(this.refrId)) return result;
+    return { ...result, state: 'ready' };
+  }
 
   private captureLifetime(): () => boolean {
     const id = this.refrId, reference = this.ownedReference, generation = this.generation;

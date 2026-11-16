@@ -21,6 +21,19 @@ const create = (idx = 1, refrId = 0xff000001, isMe = true) => ({
   props: {}, customPropsJsonDumps: [],
 });
 
+for (const inProps of [false, true]) test(`initial corpse state from ${inProps ? 'props' : 'main record'} survives movement hints and changes only with authority`, () => {
+  const f = fixture(), message = create(1, 0xff000001, false);
+  if (inProps) message.props.isDead = true; else message.isDead = true;
+  f.create(message);
+  const model = f.server.getWorldModel().forms[0];
+  assert.equal(model.isDead, true); assert.equal(model.movement.isDead, true);
+  const movement = { ...model.movement, isDead: false };
+  f.event('updateMovementMessage', { idx: 1, data: movement });
+  assert.equal(model.movement.isDead, true); assert.equal(movement.isDead, false, 'Do not mutate the incoming packet');
+  f.event('updatePropertyMessage', { idx: 1, propName: 'isDead', data: false });
+  assert.equal(model.movement.isDead, false); assert.equal(model.isDead, false);
+});
+
 function fixture(storage = {}) {
   const events = new EventEmitter(), emitter = new EventEmitter(), calls = [], ragdolls = [], guards = [];
   let connected = true, platformLoad = false, handle = 20, frame = 0, menu = false, now = 10000;

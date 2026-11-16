@@ -399,6 +399,11 @@ export class RemoteServer extends ClientListener {
       (form as Record<string, unknown>)[element.propName] = parsed;
     });
 
+    // Reliable death state is authoritative over movement's animation hint.
+    // In particular, a dead baseline must not immediately resurrect its copy
+    // through the synthetic initial movement record.
+    if (form.movement && typeof form.isDead === 'boolean') form.movement.isDead = form.isDead;
+
     if (msg.isMe) {
       this.worldModel.playerCharacterFormIdx = i;
       this.worldModel.playerCharacterRefrId = msg.refrId || 0;
@@ -459,7 +464,7 @@ export class RemoteServer extends ClientListener {
       return;
     }
 
-    form.movement = msg.data;
+    form.movement = typeof form.isDead === 'boolean' ? { ...msg.data, isDead: form.isDead } : msg.data;
     if (!form.numMovementChanges) {
       form.numMovementChanges = 0;
     }
@@ -552,7 +557,10 @@ export class RemoteServer extends ClientListener {
     }
     const i = this.getIdManager().getId(msg.idx);
     const form = this.worldModel.forms[i];
-    if (form) (form as Record<string, unknown>)[msg.propName] = msgData;
+    if (form) {
+      (form as Record<string, unknown>)[msg.propName] = msgData;
+      if (msg.propName === 'isDead' && typeof msgData === 'boolean' && form.movement) form.movement.isDead = msgData;
+    }
   }
 
   private onDeathStateContainerMessage(event: ConnectionMessage<DeathStateContainerMessage>): void {

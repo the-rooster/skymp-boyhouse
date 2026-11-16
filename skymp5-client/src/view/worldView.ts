@@ -65,6 +65,17 @@ export class WorldView extends ClientListener {
     return this.state.formViews;
   }
 
+  getSpawnReadiness(model: WorldModel) {
+    const player = this.sp.Game.getPlayer();
+    const world = (player?.getWorldSpace() || player?.getParentCell())?.getFormID() || 0;
+    const result = this.state.formViews.getSpawnReadiness(model, world);
+    const self = model.forms[model.playerCharacterFormIdx];
+    return { ...result, ready: result.ready && !!world && self?.movement?.worldOrCell === world &&
+      !this.loading && this.state.allowUpdate && this.sp.storage['view'] === this &&
+      !this.controller.lookupListener(SinglePlayerService).isSinglePlayer &&
+      this.controller.lookupListener(NetworkingService).isConnected() };
+  }
+
   private onUpdate() {
     if (this.loading) return;
     const singlePlayerService = this.controller.lookupListener(SinglePlayerService);

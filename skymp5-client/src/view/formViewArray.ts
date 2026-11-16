@@ -113,5 +113,21 @@ export class FormViewArray {
     return this.formViews.length;
   }
 
+  getSpawnReadiness(model: WorldModel, worldOrCell: number): {
+    ready: boolean; pending: number[]; failed: { remoteId: number; error: string }[]; outsideWorld: number;
+  } {
+    const pending: number[] = [], failed: { remoteId: number; error: string }[] = [];
+    let outsideWorld = 0;
+    model.forms.forEach((form, index) => {
+      if (!form || index === model.playerCharacterFormIdx) return;
+      if (form.movement && form.movement.worldOrCell !== worldOrCell) { ++outsideWorld; return; }
+      const view = this.formViews[index], remoteId = form.refrId || 0;
+      const state = view?.getRemoteRefrId() === remoteId ? view.getSpawnReadiness(form) : undefined;
+      if (state?.state === 'failed') failed.push({ remoteId, error: state.error || 'Native spawn failed' });
+      else if (state?.state !== 'ready') pending.push(remoteId);
+    });
+    return { ready: pending.length === 0 && failed.length === 0, pending, failed, outsideWorld };
+  }
+
   private formViews = new Array<FormView | undefined>();
 }
