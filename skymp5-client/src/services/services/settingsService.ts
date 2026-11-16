@@ -139,15 +139,21 @@ export class SettingsService extends ClientListener {
   }
 
   public async getServerMods(): Promise<Mod[]> {
-    const masterApiClient = this.makeMasterApiClient();
-
+    // Private servers expose /manifest.json themselves and need no master API.
+    // Keep this explicit: the game transport may use a separate forwarded port.
+    const serverHttpUrl = this.sp.settings['skymp5-client']['server-http-url'];
+    const direct = typeof serverHttpUrl === 'string' && serverHttpUrl.length > 0;
+    const manifestClient = direct
+      ? new HttpClient(this.normalizeUrl(serverHttpUrl))
+      : this.makeMasterApiClient();
     const masterKey = this.getServerMasterKey();
+    const manifestPath = direct ? '/manifest.json' : `/api/servers/${masterKey}/manifest.json`;
     printConsole(masterKey);
 
     for (let attempt = 0; attempt < 5; ++attempt) {
       try {
         printConsole(`Trying to get server mods, attempt ${attempt}`);
-        const res = await masterApiClient.get(`/api/servers/${masterKey}/manifest.json`);
+        const res = await manifestClient.get(manifestPath);
         if (res.status != 200) {
           throw new Error(`status code ${res.status}, error ${res.error}`);
         }

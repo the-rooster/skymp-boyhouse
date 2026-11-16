@@ -263,24 +263,34 @@ export class SendInputsService extends ClientListener {
           return;
         }
         if (this.equipmentChanged) {
-            this.equipmentChanged = false;
-
-            ++this.numEquipmentChanges;
-
             const eq = getEquipment(
                 this.sp.Game.getPlayer() as Actor,
-                this.numEquipmentChanges,
+                this.numEquipmentChanges + 1,
             );
+            // Initial inventory application can temporarily leave signed removal
+            // deltas in the engine snapshot. The wire contract uses uint32
+            // counts. Keep the change pending until a complete snapshot exists;
+            // filtering entries would publish a different equipment state.
+            if (eq.inv.entries.some(e => !Number.isInteger(e.count) || e.count <= 0 || e.count > 0xffffffff)) {
+                return;
+            }
             const message: MessageWithRefrId<UpdateEquipmentMessage> = {
                 t: MsgType.UpdateEquipment,
                 data: eq,
                 _refrId
             };
 
-            this.controller.emitter.emit("sendMessageWithRefrId", {
-                message,
-                reliability: "reliable"
-            });
+            this.equipmentChanged = false;
+            try {
+                this.controller.emitter.emit("sendMessageWithRefrId", {
+                    message,
+                    reliability: "reliable"
+                });
+                this.numEquipmentChanges = eq.numChanges;
+            } catch (error) {
+                this.equipmentChanged = true;
+                throw error;
+            }
         }
     }
 

@@ -1,32 +1,23 @@
 #pragma once
-#include <BS_thread_pool.hpp>
 #include <cstdint>
+#include <functional>
+#include <future>
 #include <memory>
-#include <mutex>
 
 class ThreadPoolWrapper
 {
 public:
-  ThreadPoolWrapper(int32_t numThreads_ = 1)
-    : numThreads(numThreads_)
-  {
-  }
+  ThreadPoolWrapper(int32_t numThreads = 1);
+  ~ThreadPoolWrapper();
 
-  std::future<void> Push(const std::function<void()>& task)
-  {
-    {
-      std::lock_guard l(initMutex);
-      if (!pool) {
-        pool = std::make_unique<BS::light_thread_pool>(numThreads);
-      }
-    }
-    return pool->submit_task(task);
-  }
+  std::future<void> Push(const std::function<void()>& task);
 
   void PushAndWait(const std::function<void()>& task) { Push(task).wait(); }
 
 private:
-  std::unique_ptr<BS::light_thread_pool> pool;
-  const int32_t numThreads;
-  std::mutex initMutex;
+  // BS_thread_pool changes its layout with C++23's move_only_function. Keep
+  // its definition out of this header: CommonLib consumers use C++23 while
+  // platform_lib uses C++20, so inline pool code violated the ODR and crashed.
+  struct Impl;
+  std::unique_ptr<Impl> pImpl;
 };

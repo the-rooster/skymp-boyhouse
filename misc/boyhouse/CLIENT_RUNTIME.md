@@ -4,8 +4,9 @@ Updated 2026-11-16 UTC. **Experimental port; multiplayer gameplay is unverified.
 The installed Steam runtime is 1.7.104.0. The locally built SKSE 2.3.1 and
 Skyrim Platform implementation now load a generated test world and execute native
 JavaScript/Papyrus bridge calls. A clean restart reproduced this result. No
-personal save was loaded or changed. The full multiplayer client is not installed,
-and no real game client has connected to the server yet.
+personal save was loaded or changed. The full multiplayer client has now logged
+into the private staging server and loaded its generated character. Movement,
+multiple real players, campaign projection and quest playthroughs remain unverified.
 
 ## Implemented port
 
@@ -119,10 +120,72 @@ and invalid font were removed, and original display preferences were restored
 byte-for-byte. Native dependencies remain installed. No game assets, binaries,
 Address Library files, personal saves, or crash dumps are committed.
 
-This test did not validate movement input or multiplayer. Automated menu clicks
+This diagnostic did not validate movement input or multiplayer. Automated menu clicks
 still did not dismiss the Survival Mode prompt. The observed load order also
 includes Fishing and Saints & Seducers masters plus ESL content beyond the five
 server masters; content/load-order alignment is required before multiplayer.
+
+## Full client connection and startup fixes
+
+The locally built full client logged into the frozen `a28e633` staging server,
+received its self `CreateActor`, and loaded world 60. Server logs independently
+record the offline test profile login. The five installed master hashes match
+`content-baseline.json`. A temporary loopback UDP-over-SSH transport enabled this
+test without changing the server's loopback-only port publication. It is a
+diagnostic transport, not a latency or performance benchmark. Browser rendering
+remained disabled. Character creation opened, but automated menu input did not
+finish it; movement and interaction are not established by this result.
+
+The first connection exposed these defects:
+
+- Private servers need their own manifest endpoint. Set the client's optional
+  `server-http-url` to the server HTTP origin (for this forwarded test,
+  `http://127.0.0.1:17778`). It then requests `/manifest.json`; existing master
+  API routing remains the default. The direct request succeeded in-game.
+- Inventory setup briefly exposed negative removal deltas to the unsigned
+  equipment packet codec. The client now retains the pending equipment change
+  until counts are serializable, and retries after a native send exception.
+  It does not remove entries from the reported equipment to hide the failure.
+- HTTP startup crashed inside `BS::thread_pool<0>::create_threads`. The dump and
+  matching PDB located the fault in the thread pool's array replacement.
+  `platform_lib` compiles as C++20, while CommonLib consumers compile as C++23;
+  the header selects different `move_only_function` types and object layouts.
+  `ThreadPoolWrapper` now hides the library behind an implementation compiled
+  in one translation unit. The previously crashing reconnect subsequently
+  completed the HTTP request and world load.
+- `getContainer(baseFormId)` mistakenly required a `TESObjectREFR`. NPC/container
+  base records are different types, so that lookup discarded their inventory.
+  It now resolves the form first, then checks its `TESContainer` component.
+  In-game reads matched eight entries from an owned container record and one
+  entry from an owned NPC record; both previously resolved to an empty array.
+
+The mixed-standard regression explicitly links C++20 and C++23 consumers, runs
+1,500 tasks with concurrent lazy initialization, checks task exception delivery,
+and destroys the pools. Run it independently of the server unit executable:
+
+```powershell
+cmake --build build --config Release --target platform_thread_pool_smoke
+./build/skyrim-platform/_platform_lib/Release/platform_thread_pool_smoke.exe
+node --test misc/boyhouse/clientStartup.test.cjs
+```
+
+The full Node regression set passes 63 tests, and the client webpack build and
+native Release build pass. The native pool regression also passes. Evidence and
+the private crash dump are under ignored `artifacts/full-client-*` directories.
+The final implementation DLL SHA-256 is
+`8aea716775f3bbbc819fbdac4f477a87edd1700268f6dbeebfa0c5875f25e89f`.
+The full-client test manifest is under
+`artifacts/game-backups/20261116T163507Z/full-client-test/`. After testing, the
+full client/observer plugins were removed, Skyrim was closed, the SSH transport
+ended, and both INIs were restored byte-for-byte. That restoration also reversed
+the existing client's forced difficulty setting of 5. All four personal save
+hashes remained unchanged, and no generated test saves remained. Native fixes
+and prerequisites stay installed. Background testing used a backed-up temporary
+`bAlwaysActive=1` setting and did not require focus after that change.
+
+The new character currently receives starter gear before character creation
+finishes; the one-time helmet unequip races with inventory application. That
+join-flow issue remains open. None of these checks certify any quest.
 
 ## Remaining acceptance
 

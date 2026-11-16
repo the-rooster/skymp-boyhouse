@@ -212,7 +212,9 @@ Napi::Value InventoryApi::GetExtraContainerChanges(
 Napi::Value InventoryApi::GetContainer(const Napi::CallbackInfo& info)
 {
   auto formID = NapiHelper::ExtractUInt32(info[0], "formId");
-  auto form = RE::TESForm::LookupByID<RE::TESObjectREFR>(formID);
+  // This API takes an NPC/container base form, not a placed reference. A typed
+  // TESObjectREFR lookup rejects those bases and loses their inventory counts.
+  auto form = RE::TESForm::LookupByID(formID);
 
   if (!form) {
     return Napi::Array::New(info.Env(), 0);
