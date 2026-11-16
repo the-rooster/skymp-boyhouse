@@ -35,10 +35,11 @@ public:
     uint8_t leveledItemFlags = 0;
     uint32_t chanceNoneGlobalId = 0;
     uint8_t numEntries = 0;
-    const Entry* entries = nullptr;
+    // LVLO fields need not be contiguous (COED can follow an entry).
+    std::vector<Entry> entries;
   };
 
-  Data GetData(CompressedFieldsCache& compressedFieldsCache) const noexcept;
+  Data GetData(CompressedFieldsCache& compressedFieldsCache) const;
 };
 
 static_assert(sizeof(LeveledListBase) == sizeof(RecordHeader));

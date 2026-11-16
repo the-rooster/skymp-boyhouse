@@ -118,7 +118,7 @@ Implement shared capabilities, then rerun this report and the regression suites.
 
 ## Reproducibility
 
-Capability registry SHA-256: 5de45723355f9fa0cc020982b34886dfbc617965ad80bf608623d39d7ff6cdd3
+Capability registry SHA-256: 6f26a1c724edfa8dbafa24a8c92c7951edf32dd54af067bf4f13bf45beb80aa0
 
 - Skyrim.esm: e198c3b85e5e48e0c92a6580d8f66e644256b68d812ee32b61735cf9b753df73
 - Update.esm: b298b0f65fa0127fd13c1f5ef6bb30eaf9d21fd19f5e6f8f91f829c9007d3280

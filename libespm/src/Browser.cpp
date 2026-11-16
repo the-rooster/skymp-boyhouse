@@ -50,6 +50,7 @@ struct Browser::Impl
   std::vector<const RecordHeader*> quests;
   std::vector<const RecordHeader*> worlds;
   std::vector<const RecordHeader*> cells;
+  std::vector<const RecordHeader*> leveledItems, leveledActors, leveledSpells;
 
   GroupStack grStack;
   std::vector<std::unique_ptr<GroupStack>> grStackCopies;
@@ -139,9 +140,16 @@ const std::vector<const RecordHeader*>& Browser::GetRecordsByType(
   if (!std::strcmp(type, espm::CELL::kType)) {
     return pImpl->cells;
   }
-  throw std::runtime_error("GetRecordsByType currently supports only REFR, "
-                           "COBJ, KYWD, LCTN, FACT, QUST, WRLD and CELL "
-                           "records");
+  if (!std::strcmp(type, "LVLI"))
+    return pImpl->leveledItems;
+  if (!std::strcmp(type, "LVLN"))
+    return pImpl->leveledActors;
+  if (!std::strcmp(type, "LVSP"))
+    return pImpl->leveledSpells;
+  throw std::runtime_error(
+    "GetRecordsByType currently supports only REFR, "
+    "COBJ, KYWD, LCTN, FACT, QUST, WRLD, CELL, LVLI, LVLN and LVSP "
+    "records");
 }
 
 const std::vector<const RecordHeader*>& Browser::GetRecordsAtPos(
@@ -232,6 +240,12 @@ bool Browser::ReadAny(const GroupStack* parentGrStack)
     pImpl->recById[recHeader->id] = recHeader;
 
     Type t = recHeader->GetType();
+    if (t == "LVLI")
+      pImpl->leveledItems.push_back(recHeader);
+    if (t == "LVLN")
+      pImpl->leveledActors.push_back(recHeader);
+    if (t == "LVSP")
+      pImpl->leveledSpells.push_back(recHeader);
     if (utils::Is<espm::REFR>(t) || utils::Is<espm::ACHR>(t)) {
       pImpl->objectReferences.push_back(recHeader);
       const auto refr = reinterpret_cast<const REFR*>(recHeader);

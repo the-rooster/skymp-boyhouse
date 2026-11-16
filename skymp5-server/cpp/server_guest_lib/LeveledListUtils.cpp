@@ -1,225 +1,246 @@
 #include "LeveledListUtils.h"
-#include "EvaluateTemplate.h"
+#include "libespm/RecordHeaderAccess.h"
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <limits>
 #include <optional>
-#include <random>
-#include <spdlog/spdlog.h>
+#include <set>
 #include <stdexcept>
 
 namespace {
-bool IsLeveledType(const espm::LookupResult& lookupRes) noexcept
+bool IsLeveledType(const espm::LookupResult& record)
 {
-  espm::Type type = lookupRes.rec->GetType();
-  return type == espm::LVLI::kType || type == espm::LVLN::kType ||
-    type == "LVSP" /* for the future leveled spell implementation */;
-}
-}
-
-std::vector<LeveledListUtils::Entry> LeveledListUtils::EvaluateList(
-  const espm::CombineBrowser& br, const espm::LookupResult& lookupRes,
-  uint32_t pcLevel, uint8_t* chanceNoneOverride)
-{
-  espm::CompressedFieldsCache dummyCache;
-
-  const espm::LeveledListBase* leveledList = nullptr;
-  if (IsLeveledType(lookupRes)) {
-    leveledList =
-      reinterpret_cast<const espm::LeveledListBase*>(lookupRes.rec);
-  }
-  if (!leveledList) {
-    return {};
-  }
-  auto data = leveledList->GetData(dummyCache);
-
-  std::vector<Entry> res;
-
-  int chanceNone = data.chanceNoneGlobalId ? 100 : data.chanceNone;
-  if (chanceNoneOverride) {
-    chanceNone = *chanceNoneOverride;
-  }
-
-  std::uniform_real_distribution<double> dist(0.0, 100.0);
-
-  std::random_device rd;
-  std::mt19937 mt(rd());
-  bool none = dist(mt) < chanceNone;
-  if (!none) {
-    std::vector<const espm::LeveledListBase::Entry*> entriesAllowed;
-    for (size_t i = 0; i < data.numEntries; ++i) {
-      if (!pcLevel || data.entries[i].level <= pcLevel) {
-        entriesAllowed.push_back(&data.entries[i]);
-      }
-    }
-
-    bool useRandomEntry =
-      !(data.leveledItemFlags & espm::LeveledListBase::UseAll);
-    if (useRandomEntry && !entriesAllowed.empty()) {
-      std::uniform_int_distribution<int> dist(0, entriesAllowed.size() - 1);
-      auto entry = entriesAllowed[dist(mt)];
-
-      uint32_t formId = lookupRes.ToGlobalId(entry->formId);
-      res.push_back({ formId, entry->count });
-    } else {
-      for (auto entry : entriesAllowed) {
-        uint32_t formId = lookupRes.ToGlobalId(entry->formId);
-        res.push_back({ formId, entry->count });
-      }
-    }
-  }
-  return res;
+  return record.rec &&
+    (record.rec->GetType() == "LVLI" || record.rec->GetType() == "LVLN" ||
+     record.rec->GetType() == "LVSP");
 }
 
-std::map<uint32_t, uint32_t> LeveledListUtils::EvaluateListRecurse(
-  const espm::CombineBrowser& br, const espm::LookupResult& lookupRes,
-  uint32_t countMult, uint32_t pcLevel, uint8_t* chanceNoneOverride)
+std::mt19937& Random(const LeveledListUtils::Options* options)
 {
-  espm::CompressedFieldsCache dummyCache;
-
-  const espm::LeveledListBase* leveledList = nullptr;
-  if (IsLeveledType(lookupRes)) {
-    leveledList =
-      reinterpret_cast<const espm::LeveledListBase*>(lookupRes.rec);
-  }
-
-  bool calcForEach = leveledList &&
-    (leveledList->GetData(dummyCache).leveledItemFlags &
-     espm::LeveledListBase::Each);
-
-  if (calcForEach && countMult != 1) {
-    std::map<uint32_t, uint32_t> res;
-    for (uint32_t i = 0; i < countMult; ++i) {
-      auto stepRes = EvaluateListRecurse(br, lookupRes, 1, pcLevel);
-      for (auto& p : stepRes) {
-        res[p.first] += p.second;
-      }
-    }
-    return res;
-  }
-
-  std::map<uint32_t, uint32_t> res;
-  auto firstEvalRes = EvaluateList(br, lookupRes, pcLevel, chanceNoneOverride);
-  for (auto& e : firstEvalRes) {
-    auto eLookupRes = br.LookupById(e.formId);
-    if (!eLookupRes.rec) {
-      continue;
-    }
-    if (IsLeveledType(eLookupRes)) {
-      auto childRes = EvaluateListRecurse(br, eLookupRes, 1, pcLevel);
-      for (auto& p : childRes) {
-        res[p.first] += p.second;
-      }
-
-    } else {
-      res[e.formId] += e.count;
-    }
-  }
-
-  if (countMult != 1 && !calcForEach) {
-    for (auto& p : res) {
-      p.second *= countMult;
-    }
-  }
-
-  return res;
+  if (options && options->random)
+    return *options->random;
+  thread_local std::mt19937 random(std::random_device{}());
+  return random;
 }
 
-std::vector<uint32_t> LeveledListUtils::EvaluateTemplateChain(
-  const espm::CombineBrowser& browser, const espm::LookupResult& headNpc,
-  uint32_t pcLevel)
+float GlobalDefault(const espm::CombineBrowser& browser, uint32_t id,
+                    espm::CompressedFieldsCache& cache)
 {
-  std::vector<uint32_t> result;
-  auto npcCursor = ConvertToNpc(headNpc);
-  if (!npcCursor) {
-    spdlog::error("EvaluateTemplateChain: NPC_ expected");
+  const auto record = browser.LookupById(id);
+  if (!record.rec || record.rec->IsDeleted() ||
+      record.rec->GetType() != "GLOB")
+    throw std::runtime_error("Invalid leveled list chance global");
+  std::optional<float> result;
+  espm::RecordHeaderAccess::IterateFields(
+    record.rec,
+    [&](const char* tag, uint32_t size, const char* data) {
+      if (std::memcmp(tag, "FLTV", 4))
+        return;
+      if (result || size != sizeof(float))
+        throw std::runtime_error("Malformed leveled list chance global");
+      float value;
+      std::memcpy(&value, data, sizeof(value));
+      result = value;
+    },
+    cache);
+  if (!result)
+    throw std::runtime_error("Missing leveled list chance global");
+  return *result;
+}
+
+uint32_t Product(uint32_t left, uint32_t right)
+{
+  const auto product = uint64_t(left) * right;
+  if (product > std::numeric_limits<uint32_t>::max())
+    throw std::overflow_error("Leveled list count overflow");
+  return static_cast<uint32_t>(product);
+}
+
+void Add(std::map<uint32_t, uint32_t>& output, uint32_t id, uint32_t count)
+{
+  if (!count)
+    return;
+  auto& previous = output[id];
+  if (count > std::numeric_limits<uint32_t>::max() - previous)
+    throw std::overflow_error("Leveled list count overflow");
+  previous += count;
+}
+
+class Evaluation
+{
+public:
+  Evaluation(const espm::CombineBrowser& browser_, uint32_t level_,
+             const LeveledListUtils::Options* options_)
+    : browser(browser_)
+    , level(level_)
+    , options(options_)
+  {
+  }
+
+  std::vector<LeveledListUtils::Entry> Select(const espm::LookupResult& record,
+                                              uint8_t* chanceOverride)
+  {
+    if (!IsLeveledType(record))
+      return {};
+    const auto& data = Data(record);
+    float chance = data.chanceNone;
+    if (chanceOverride) {
+      chance = *chanceOverride;
+    } else if (data.chanceNoneGlobalId) {
+      const auto id = record.ToGlobalId(data.chanceNoneGlobalId);
+      const auto global = browser.LookupById(id);
+      if (!global.rec || global.rec->IsDeleted() ||
+          global.rec->GetType() != "GLOB")
+        throw std::runtime_error("Invalid leveled list chance global");
+      chance = options && options->readGlobal
+        ? options->readGlobal(id)
+        : GlobalDefault(browser, id, cache);
+    }
+    if (!std::isfinite(chance))
+      throw std::runtime_error("Non-finite leveled list chance");
+    chance = std::clamp(chance, 0.f, 100.f);
+    if (chance >= 100.f ||
+        (chance > 0.f &&
+         std::uniform_real_distribution<float>(0.f, 100.f)(Random(options)) <
+           chance))
+      return {};
+
+    std::vector<const espm::LeveledListBase::Entry*> eligible;
+    uint32_t highest = 0;
+    for (const auto& entry : data.entries) {
+      if (!level || entry.level <= level) {
+        highest = std::max(highest, entry.level);
+        eligible.push_back(&entry);
+      }
+    }
+    const bool useAll = data.leveledItemFlags & espm::LeveledListBase::UseAll;
+    if (level && !useAll &&
+        !(data.leveledItemFlags & espm::LeveledListBase::AllLevels)) {
+      std::erase_if(
+        eligible, [&](const auto* entry) { return entry->level != highest; });
+    }
+    if (!useAll && !eligible.empty()) {
+      const auto chosen = eligible[std::uniform_int_distribution<size_t>(
+        0, eligible.size() - 1)(Random(options))];
+      eligible.assign(1, chosen);
+    }
+    std::vector<LeveledListUtils::Entry> selected;
+    for (const auto* entry : eligible) {
+      if (!entry->formId)
+        throw std::runtime_error("Null leveled list entry");
+      if (entry->count)
+        selected.push_back({ record.ToGlobalId(entry->formId), entry->count });
+    }
+    return selected;
+  }
+
+  std::map<uint32_t, uint32_t> Expand(const espm::LookupResult& record,
+                                      uint32_t count, uint8_t* chanceOverride,
+                                      size_t depth = 0)
+  {
+    if (!count)
+      return {};
+    if (!record.rec || record.rec->IsDeleted())
+      throw std::runtime_error("Missing leveled list entry record");
+    if (depth >= 128 || ++work > 100000)
+      throw std::runtime_error("Leveled list expansion budget exceeded");
+    const auto id = record.ToGlobalId(record.rec->GetId());
+    if (!IsLeveledType(record))
+      return { { id, count } };
+    if (!active.insert(id).second)
+      throw std::runtime_error("Cyclic leveled list");
+    const auto& data = Data(record);
+    const bool each = data.leveledItemFlags & espm::LeveledListBase::Each;
+    const uint32_t rolls = each ? count : 1;
+    if (rolls > 100000 - work)
+      throw std::runtime_error("Leveled list expansion budget exceeded");
+    std::map<uint32_t, uint32_t> result;
+    for (uint32_t roll = 0; roll < rolls; ++roll) {
+      if (++work > 100000)
+        throw std::runtime_error("Leveled list expansion budget exceeded");
+      for (const auto& selected : Select(record, chanceOverride)) {
+        // The parent's LVLO count belongs to the child list too. Overrides
+        // apply only to this root, including every Each roll, not descendants.
+        for (const auto& [child, amount] :
+             Expand(browser.LookupById(selected.formId), selected.count,
+                    nullptr, depth + 1))
+          Add(result, child, Product(amount, each ? 1 : count));
+      }
+    }
+    active.erase(id);
     return result;
   }
 
-  uint32_t cursorFileIdx = headNpc.fileIdx;
-  result.push_back(headNpc.ToGlobalId(headNpc.rec->GetId()));
+private:
+  const espm::LeveledListBase::Data& Data(const espm::LookupResult& record)
+  {
+    if (record.rec->IsDeleted())
+      throw std::runtime_error("Deleted leveled list");
+    const auto found = parsed.find(record.rec);
+    if (found != parsed.end())
+      return found->second;
+    return parsed
+      .emplace(record.rec,
+               reinterpret_cast<const espm::LeveledListBase*>(record.rec)
+                 ->GetData(cache))
+      .first->second;
+  }
+  const espm::CombineBrowser& browser;
+  uint32_t level;
+  const LeveledListUtils::Options* options;
+  espm::CompressedFieldsCache cache;
+  std::map<const espm::RecordHeader*, espm::LeveledListBase::Data> parsed;
+  std::set<uint32_t> active;
+  size_t work = 0;
+};
+}
 
+std::vector<LeveledListUtils::Entry> LeveledListUtils::EvaluateList(
+  const espm::CombineBrowser& browser, const espm::LookupResult& record,
+  uint32_t level, uint8_t* chanceOverride, const Options* options)
+{
+  return Evaluation(browser, level, options).Select(record, chanceOverride);
+}
+
+std::map<uint32_t, uint32_t> LeveledListUtils::EvaluateListRecurse(
+  const espm::CombineBrowser& browser, const espm::LookupResult& record,
+  uint32_t count, uint32_t level, uint8_t* chanceOverride,
+  const Options* options)
+{
+  return Evaluation(browser, level, options)
+    .Expand(record, count, chanceOverride);
+}
+
+std::vector<uint32_t> LeveledListUtils::EvaluateTemplateChain(
+  const espm::CombineBrowser& browser, const espm::LookupResult& head,
+  uint32_t level, const Options* options)
+{
+  uint32_t cursorId = head.rec ? head.ToGlobalId(head.rec->GetId()) : 0;
+  std::set<uint32_t> seen;
+  std::vector<uint32_t> result;
+  espm::CompressedFieldsCache cache;
   while (true) {
-    uint32_t templateId = GetBaseTemplateId(npcCursor, cursorFileIdx, browser);
-    if (templateId == 0) {
-      break; // End if no base template
-    }
-
-    espm::LookupResult templateResult = browser.LookupById(templateId);
-
-    if (!templateResult.rec) {
-      spdlog::error("EvaluateTemplateChain: Not found template record");
+    const auto cursor = browser.LookupById(cursorId);
+    const auto* npc = espm::Convert<espm::NPC_>(cursor.rec);
+    if (!npc || cursor.rec->IsDeleted())
+      throw std::runtime_error("Invalid NPC template record");
+    const auto id = cursor.ToGlobalId(cursor.rec->GetId());
+    if (!seen.insert(id).second || result.size() >= 128)
+      throw std::runtime_error("Cyclic or excessive NPC template chain");
+    result.push_back(id);
+    const auto data = npc->GetData(cache);
+    if (!data.baseTemplate)
       return result;
+    cursorId = cursor.ToGlobalId(data.baseTemplate);
+    const auto next = browser.LookupById(cursorId);
+    if (next.rec && next.rec->GetType() == "LVLN") {
+      const auto selected =
+        EvaluateListRecurse(browser, next, 1, level, nullptr, options);
+      if (selected.size() != 1 || selected.begin()->second != 1)
+        throw std::runtime_error(
+          "NPC template must resolve to exactly one actor");
+      cursorId = selected.begin()->first;
     }
-
-    UpdateCursorAndResult(templateId, templateResult, npcCursor, cursorFileIdx,
-                          result, browser, pcLevel);
   }
-
-  return result;
-}
-
-const espm::NPC_* LeveledListUtils::ConvertToNpc(
-  const espm::LookupResult& lookupResult)
-{
-  return espm::Convert<espm::NPC_>(lookupResult.rec);
-}
-
-uint32_t LeveledListUtils::GetBaseTemplateId(
-  const espm::NPC_* cursor, uint32_t fileIdx,
-  const espm::CombineBrowser& browser)
-{
-  espm::CompressedFieldsCache dummyCache;
-  auto data = cursor->GetData(dummyCache);
-  if (!data.baseTemplate) {
-    return 0; // Indicates there's no base template
-  }
-
-  auto lookupRes = espm::LookupResult(&browser, cursor, fileIdx);
-  return lookupRes.ToGlobalId(data.baseTemplate);
-}
-
-void LeveledListUtils::UpdateCursorAndResult(
-  uint32_t templateId, espm::LookupResult& templateResult,
-  const espm::NPC_*& cursor, uint32_t& cursorFileIdx,
-  std::vector<uint32_t>& result, const espm::CombineBrowser& browser,
-  uint32_t pcLevel)
-{
-  if (auto npc = espm::Convert<espm::NPC_>(templateResult.rec)) {
-    result.push_back(templateId);
-    cursor = npc;
-    cursorFileIdx = templateResult.fileIdx;
-  } else if (auto lvln = espm::Convert<espm::LVLN>(templateResult.rec)) {
-    auto selectedNpcId =
-      EvaluateAndSelectNpcId(browser, templateResult, pcLevel);
-    if (selectedNpcId == 0) {
-      return;
-    }
-
-    auto npcLookupRes = browser.LookupById(selectedNpcId);
-    cursor = espm::Convert<espm::NPC_>(npcLookupRes.rec);
-    result.push_back(selectedNpcId);
-    cursorFileIdx = npcLookupRes.fileIdx;
-  } else {
-    spdlog::error("EvaluateTemplateChain: Not found template record");
-  }
-}
-
-uint32_t LeveledListUtils::EvaluateAndSelectNpcId(
-  const espm::CombineBrowser& browser,
-  const espm::LookupResult& templateResult, uint32_t pcLevel)
-{
-  auto countByFormId =
-    LeveledListUtils::EvaluateListRecurse(browser, templateResult, 1, pcLevel);
-
-  if (countByFormId.empty()) {
-    spdlog::error(
-      "EvaluateTemplateChain: EvaluateListRecurse returned empty map");
-    return 0;
-  }
-
-  if (countByFormId.size() > 1) {
-    spdlog::warn("EvaluateTemplateChain: EvaluateListRecurse returned more "
-                 "than 1 result, omitting other results");
-  }
-
-  // Return the id of the first npc in the map
-  return countByFormId.begin()->first;
 }

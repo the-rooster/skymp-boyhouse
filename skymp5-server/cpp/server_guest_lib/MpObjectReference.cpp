@@ -5,6 +5,7 @@
 #include "FormCallbacks.h"
 #include "GetWeightFromRecord.h"
 #include "Inventory.h"
+#include "InventoryDefaults.h"
 #include "LeveledListUtils.h"
 #include "MathUtils.h"
 #include "MessageBase.h"
@@ -32,6 +33,7 @@
 #include <TimeUtils.h>
 #include <antigo/Context.h>
 #include <antigo/ResolvedContext.h>
+#include <limits>
 #include <map>
 #include <numeric>
 #include <optional>
@@ -1987,7 +1989,10 @@ std::vector<espm::CONT::ContainerObject> GetInventoryObjects(
 
   auto baseContainer = espm::Convert<espm::CONT>(lookupRes.rec);
   if (baseContainer) {
-    return baseContainer->GetData(compressedFieldsCache).objects;
+    auto objects = baseContainer->GetData(compressedFieldsCache).objects;
+    for (auto& entry : objects)
+      entry.formId = lookupRes.ToGlobalId(entry.formId);
+    return objects;
   }
 
   auto baseNpc = espm::Convert<espm::NPC_>(lookupRes.rec);
@@ -1995,7 +2000,12 @@ std::vector<espm::CONT::ContainerObject> GetInventoryObjects(
     auto baseId = lookupRes.ToGlobalId(lookupRes.rec->GetId());
     return EvaluateTemplate<espm::NPC_::UseInventory>(
       worldState, baseId, templateChain,
-      [](const auto&, const auto& npcData) { return npcData.objects; });
+      [](const auto& source, const auto& npcData) {
+        auto objects = npcData.objects;
+        for (auto& entry : objects)
+          entry.formId = source.ToGlobalId(entry.formId);
+        return objects;
+      });
   }
 
   return {};
@@ -2005,19 +2015,26 @@ void MpObjectReference::AddContainerObject(
   const espm::CONT::ContainerObject& entry,
   std::map<uint32_t, uint32_t>* itemsToAdd)
 {
+  if (!entry.count)
+    return;
+  const auto add = [&](uint32_t base, uint32_t count) {
+    auto& previous = (*itemsToAdd)[base];
+    if (count > std::numeric_limits<uint32_t>::max() - previous)
+      throw std::overflow_error("Container inventory count overflow");
+    previous += count;
+  };
   auto& espm = GetParent()->GetEspm();
   auto formLookupRes = espm.GetBrowser().LookupById(entry.formId);
   auto leveledItem = espm::Convert<espm::LVLI>(formLookupRes.rec);
   if (leveledItem) {
-    constexpr uint32_t kCountMult = 1;
     auto map = LeveledListUtils::EvaluateListRecurse(
-      espm.GetBrowser(), formLookupRes, kCountMult, kPlayerCharacterLevel,
+      espm.GetBrowser(), formLookupRes, entry.count, kPlayerCharacterLevel,
       chanceNoneOverride.get());
     for (auto& p : map) {
-      (*itemsToAdd)[p.first] += p.second;
+      add(p.first, p.second);
     }
   } else {
-    (*itemsToAdd)[entry.formId] += entry.count;
+    add(entry.formId, entry.count);
   }
 }
 
@@ -2049,8 +2066,12 @@ void MpObjectReference::EnsureBaseContainerAdded(espm::Loader& espm)
 
   auto outfitObjects = GetOutfitObjects(GetParent(), templateChain, lookupRes);
   for (auto& entry : outfitObjects) {
-    AddContainerObject(entry, &itemsToAdd);
     AddContainerObject(entry, &itemsToEquip);
+  }
+  for (const auto& [base, count] : itemsToEquip) {
+    if (count > std::numeric_limits<uint32_t>::max() - itemsToAdd[base])
+      throw std::overflow_error("Outfit inventory count overflow");
+    itemsToAdd[base] += count;
   }
   if (actor) {
     Equipment eq;

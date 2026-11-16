@@ -124,6 +124,28 @@ until campaign timer recovery is implemented. Automatic reference creation,
 complete quest startup, trigger/activation/combat events and ordinary player inventory
 events still need implementation; no vanilla adapter is enabled.
 
+### Inventory defaults for private reference allocation
+
+The shared spawn helpers now preserve nested leveled-entry quantities, apply
+the nearest eligible level tier unless all lower tiers are requested, and read
+chance-none globals instead of treating a global as an unconditional empty roll.
+Callers can supply campaign globals and an allocation RNG. Recursive expansion
+rejects cycles, missing records, count overflow and excessive work; NPC template
+chains reject cycles and empty or multiple-actor selections instead of hanging.
+
+Leveled records are decoded field by field, including lists with interleaved
+ownership metadata and empty lists without a count field. Container and inherited
+NPC inventory IDs use the supplying plugin's load-order mapping. An outfit is
+rolled once and the result is reused for inventory and equipment.
+
+These are allocation prerequisites, not automatic private-world creation.
+Allocation rolls, campaign encounter levels and respawns still need their own
+persistent lifecycle. Special-loot formulas and ownership metadata semantics are
+not implemented; UseAll level behavior still needs comparison with the engine.
+An empty leveled NPC template currently fails explicitly rather than silently
+choosing a different actor. The scoped Papyrus inventory API still rejects
+leveled-item arguments. No additional quest is enabled by these changes.
+
 ### Transaction-generated inventory events
 
 Transaction-generated `OnItemAdded`/`OnItemRemoved` events run on the logical
