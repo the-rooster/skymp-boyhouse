@@ -2,6 +2,8 @@ import { ClientListener, CombinedController, Sp } from "./clientListener";
 import { ChangeFormNpc } from "skyrimPlatform";
 
 export class LoadGameService extends ClientListener {
+    get isLoadingPlatformSave(): boolean { return this._isCausedBySkyrimPlatform; }
+
     constructor(private sp: Sp, private controller: CombinedController) {
         super();
         this.controller.on("loadGame", () => this.onLoadGame());

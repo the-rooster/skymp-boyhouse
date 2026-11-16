@@ -6,9 +6,7 @@ import {
   ObjectReference,
   TESModPlatform,
   Ui,
-  Utility,
   WorldSpace,
-  once, // TODO: use this.controller.once instead
   storage, // TODO: use this.sp.storage instead
 } from 'skyrimPlatform';
 
@@ -55,6 +53,7 @@ import { logTrace, logError } from '../../logging';
 import { SpellCastMessage } from '../messages/spellCastMessage';
 import { UpdateAnimVariablesMessage } from '../messages/updateAnimVariablesMessage';
 import { PlayerSpawnService } from './playerSpawnService';
+import { LoadGameService } from './loadGameService';
 
 export const getPcInventory = (): Inventory | undefined => {
   const res = storage['pcInv'];
@@ -67,6 +66,27 @@ export const getPcInventory = (): Inventory | undefined => {
 export class RemoteServer extends ClientListener {
   constructor(private sp: Sp, private controller: CombinedController) {
     super();
+    const key = 'boyhouseRemoteWorldLifetime';
+    const old = sp.storage[key] as { generation: number } | undefined;
+    this.lifetime = { generation: (old?.generation || 0) + 1 };
+    sp.storage[key] = this.lifetime;
+    const originalState = sp.storage['boyhouseRemoteOriginals'] as { version: number; references: Map<number, { idx: number }> } | undefined;
+    this.originals = originalState?.version === 1 ? originalState.references : new Map();
+    sp.storage['boyhouseRemoteOriginals'] = { version: 1, references: this.originals };
+    const ids = sp.storage['idManager'] as IdManager | undefined;
+    if (ids?.version !== 2) sp.storage['idManager'] = new IdManager(this.worldModel.forms.map(form => form?.idx));
+    controller.on('preLoadGame', () => {
+      this.loading = true;
+      // Initial server packets target the generated world being loaded. A
+      // personal save must discard them before its first native update.
+      if (!controller.lookupListener(LoadGameService).isLoadingPlatformSave) this.resetWorldModel();
+    });
+    controller.emitter.on('gameLoad', event => {
+      this.loading = false;
+      if (!event.isCausedBySkyrimPlatform) this.resetWorldModel();
+    });
+    for (const event of ['connectionDisconnect', 'connectionDenied', 'connectionFailed'] as const)
+      controller.emitter.on(event, () => this.resetWorldModel());
 
     this.controller.emitter.on("hostStartMessage", (e) => this.onHostStartMessage(e));
     this.controller.emitter.on("hostStopMessage", (e) => this.onHostStopMessage(e));
@@ -89,6 +109,52 @@ export class RemoteServer extends ClientListener {
     this.controller.emitter.on("updateAnimVariablesMessage", (e) => this.onUpdateAnimVariablesMessage(e));
 
   }
+
+  // Called before installing another authoritative baseline. It invalidates
+  // queued native effects as well as model, index and hosting state.
+  resetWorldModel(): void {
+    ++this.lifetime.generation;
+    this.originals.clear();
+    this.sp.storage['worldModel'] = { forms: [], playerCharacterFormIdx: -1, playerCharacterRefrId: 0 };
+    this.sp.storage['idManager'] = new IdManager();
+    this.sp.storage['hosted'] = [];
+    this.controller.lookupListener(PlayerSpawnService).cancel();
+    this.controller.emitter.emit('worldModelReset');
+  }
+
+  private capture(): () => boolean {
+    const generation = this.lifetime.generation;
+    return () => this.sp.storage['boyhouseRemoteWorldLifetime'] === this.lifetime &&
+      generation === this.lifetime.generation && this.sp.mpClientPlugin.isConnected();
+  }
+
+  private captureActor(idx: number): () => boolean {
+    const current = this.capture(), id = this.getIdManager().getId(idx), form = this.worldModel.forms[id];
+    return () => current() && !!form && this.getIdManager().getId(idx) === id && this.worldModel.forms[id] === form;
+  }
+
+  private captureOriginal(refrId: number): () => boolean {
+    const current = this.capture(), identity = this.originals.get(refrId);
+    return () => current() && !!identity && this.originals.get(refrId) === identity;
+  }
+
+  private defer(callback: () => void, current = this.capture()): void {
+    this.controller.once('update', () => {
+      if (!current()) return;
+      if (this.loading) this.defer(callback, current);
+      else callback();
+    });
+  }
+
+  private captureRemote(refrId: number): () => boolean {
+    const form = refrId === 0x14 ? this.worldModel.forms[this.getMyActorIndex()] :
+      this.worldModel.forms.find(form => form?.refrId === refrId || form?.refrId === refrId + 0x100000000);
+    return form?.idx !== undefined ? this.captureActor(form.idx) : this.captureOriginal(refrId);
+  }
+
+  private lifetime: { generation: number };
+  private loading = false;
+  private originals = new Map<number, { idx: number }>();
 
   private onHostStartMessage(event: ConnectionMessage<HostStartMessage>) {
     const msg = event.message;
@@ -119,115 +185,88 @@ export class RemoteServer extends ClientListener {
   }
 
   private onOpenContainerMessage(event: ConnectionMessage<OpenContainerMessage>): void {
-    once('update', async () => {
-      await Utility.wait(0.1); // Give a chance to update inventory
-
-      const remoteId = event.message.target;
-      const localId = remoteIdToLocalId(remoteId);
-      const refr = ObjectReference.from(Game.getFormEx(localId));
-
-      if (refr === null) {
-        logError(this, 'onOpenContainerMessage - refr not found', 'remoteId', remoteId.toString(16), 'localId', localId.toString(16));
-        return;
-      }
-
-      refr.activate(Game.getPlayer(), true);
-
-      const baseObject = refr.getBaseObject();
-      const baseType = baseObject?.getType();
-
-      let functionChecker: (() => boolean) | null = null;
-      let factName = "";
-      let delaySeconds = -1.0;
-      if (baseType === FormType.Container) {
-        functionChecker = () => Ui.isMenuOpen("ContainerMenu");
-        factName = "'ContainerMenu open'";
-        delaySeconds = 0.0;
-      } else if (baseType === FormType.Furniture) {
-        functionChecker = () => !!Game.getPlayer()?.getFurnitureReference();
-        factName = "'getFurnitureReference not null'";
-        delaySeconds = 1.0;
-      }
-
-      if (functionChecker === null) {
-        logTrace(this, "onOpenContainerMesage - not a container or furniture", baseType);
-        return;
-      }
-
-      // In SkyMP containers have 2-nd, closing activation under the hood.
-      // This differs from Skyrim's behavior, where it's just one activation.
-
-      (async () => {
-        logTrace(this, "onOpenContainerMesage - waiting for", factName, "to be true");
-        while (!functionChecker()) await Utility.wait(0.1);
-
-        logTrace(this, "onOpenContainerMesage - waiting for", factName, "to be false");
-        while (functionChecker()) await Utility.wait(0.1);
-
-        logTrace(this, "onOpenContainerMesage - menu closed", factName);
-
-        const message: ActivateMessage = {
-          t: messages.MsgType.Activate,
-          data: {
-            caster: 0x14, target: event.message.target, isSecondActivation: true
-          }
-        };
-
-        logTrace(this, "onOpenContainerMesage - waiting", delaySeconds, "seconds before sending ActivateMessage");
-
-        Utility.waitMenuMode(delaySeconds).then(() => {
-          this.controller.emitter.emit("sendMessage", {
-            message: message,
-            reliability: "reliable"
-          });
-
-          logTrace(this, "onOpenContainerMesage - sent ActivateMessage", message);
-        });
-      })();
-    });
+    const msg = event.message, epoch = this.captureRemote(event.message.target);
+    const request = ++this.openRequest;
+    const current = () => epoch() && request === this.openRequest;
+    const activateAfter = Date.now() + 100; // Let preceding inventory updates apply.
+    const activate = () => {
+      if (Date.now() < activateAfter) { this.defer(activate, current); return; }
+      const localId = remoteIdToLocalId(msg.target);
+      const handle = this.sp.getReferenceHandle(localId);
+      const reference = ObjectReference.from(Game.getFormEx(localId));
+      if (!reference || !handle) return;
+      const sameReference = () => current() && remoteIdToLocalId(msg.target) === localId &&
+        this.sp.getReferenceHandle(localId) === handle;
+      const type = reference.getBaseObject()?.getType();
+      reference.activate(Game.getPlayer(), true);
+      if (!current() || (type !== FormType.Container && type !== FormType.Furniture)) return;
+      const started = Date.now();
+      let observedOpen = false, nextCheck = 0;
+      const poll = () => {
+        if (!sameReference()) return;
+        const now = Date.now();
+        if (now >= nextCheck) {
+          nextCheck = now + 100;
+          const open = type === FormType.Container ? Ui.isMenuOpen('ContainerMenu') :
+            Game.getPlayer()?.getFurnitureReference()?.getFormID() === localId;
+          if (open) observedOpen = true;
+          else if (observedOpen) {
+            this.controller.emitter.emit('sendMessage', {
+              message: { t: messages.MsgType.Activate,
+                data: { caster: 0x14, target: msg.target, isSecondActivation: true } },
+              reliability: 'reliable',
+            });
+            return;
+          } else if (now - started > 10000) return;
+        }
+        this.defer(poll, current);
+      };
+      this.defer(poll, current);
+    };
+    this.defer(activate, current);
   }
+
+  private openRequest = 0;
 
   private onTeleportMessage(event: ConnectionMessage<TeleportMessage> | ConnectionMessage<TeleportMessage2>): void {
     const msg = event.message;
-    once('update', () => {
-      const id = ("idx" in msg && typeof msg.idx === "number") ? this.getIdManager().getId(msg.idx) : this.getMyActorIndex();
-      const refr = id === this.getMyActorIndex() ? Game.getPlayer() : getObjectReference(id);
-      logTrace(this,
-        `Teleporting id`, id, `refrId`, refr?.getFormID().toString(16), `...`,
-        msg.pos,
-        'cell/world is',
-        msg.worldOrCell.toString(16),
-      );
-      const ragdollService = this.controller.lookupListener(RagdollService);
-
-      const refrId = refr?.getFormID();
-
-      const removeRagdollCallback = () => {
-        TESModPlatform.moveRefrToPosition(
-          ObjectReference.from(Game.getFormEx(refrId || 0)),
-          Cell.from(Game.getFormEx(msg.worldOrCell)),
-          WorldSpace.from(Game.getFormEx(msg.worldOrCell)),
-          msg.pos[0],
-          msg.pos[1],
-          msg.pos[2],
-          msg.rot[0],
-          msg.rot[1],
-          msg.rot[2],
-        );
+    const idx = 'idx' in msg && typeof msg.idx === 'number' ? msg.idx : this.worldModel.forms[this.getMyActorIndex()]?.idx;
+    if (idx === undefined) return;
+    const current = this.captureActor(idx);
+    this.defer(() => {
+      const id = this.getIdManager().getId(idx);
+      const reference = id === this.getMyActorIndex() ? Game.getPlayer() : getObjectReference(id);
+      const localId = reference?.getFormID();
+      const handle = localId ? this.sp.getReferenceHandle(localId) : 0;
+      if (!reference || !localId || !handle) return;
+      const move = () => {
+        if (!current() || this.sp.getReferenceHandle(localId) !== handle) return;
+        const fresh = ObjectReference.from(Game.getFormEx(localId));
+        if (!fresh) return;
+        TESModPlatform.moveRefrToPosition(fresh, Cell.from(Game.getFormEx(msg.worldOrCell)),
+          WorldSpace.from(Game.getFormEx(msg.worldOrCell)), msg.pos[0], msg.pos[1], msg.pos[2],
+          msg.rot[0], msg.rot[1], msg.rot[2]);
       };
-      const actor = Actor.from(refr);
-      if (actor /*&& actor.getFormID() === 0x14*/) {
-        ragdollService.safeRemoveRagdollFromWorld(actor, removeRagdollCallback);
-      } else {
-        removeRagdollCallback();
-      }
-    });
+      const actor = Actor.from(reference);
+      if (actor) this.controller.lookupListener(RagdollService).safeRemoveRagdollFromWorld(actor,
+        () => this.defer(move, current));
+      else move();
+    }, current);
   }
 
   private onCreateActorMessage(event: ConnectionMessage<CreateActorMessage>): void {
     const msg = event.message;
+    this.originals.forEach((entry, id) => { if (entry.idx === msg.idx) this.originals.delete(id); });
+    const previous = this.getIdManager().getId(msg.idx);
+    if (previous >= 0) getViewFromStorage()?.getFormViews().destroyForm(previous);
     if (this.skipFormViewCreation(msg)) {
+      if (previous >= 0) {
+        this.worldModel.forms[previous] = undefined;
+        this.getIdManager().freeIdFor(msg.idx);
+      }
       const refrId = msg.refrId!;
+      this.originals.set(refrId, { idx: msg.idx });
+      const current = this.captureOriginal(refrId);
       this.onceLoad(refrId, (refr: ObjectReference) => {
         if (refr) {
           ObjectReferenceEx.dealWithRef(refr, refr.getBaseObject() as Form);
@@ -236,10 +275,7 @@ export class RemoteServer extends ClientListener {
               ModelApplyUtils.applyModelInventory(refr, msg.props.inventory);
             }
             ModelApplyUtils.applyModelIsOpen(refr, !!msg.props['isOpen']);
-            ModelApplyUtils.applyModelIsHarvested(
-              refr,
-              !!msg.props['isHarvested'],
-            );
+            ModelApplyUtils.applyModelIsHarvested(refr, !!msg.props['isHarvested'], current);
 
             ModelApplyUtils.applyModelNodeScale(refr, msg.props.setNodeScale);
 
@@ -252,16 +288,17 @@ export class RemoteServer extends ClientListener {
             if (typeof animation === "string") {
               const refrid = refr.getFormID();
 
-              (async () => {
-                for (let i = 0; i < 5; i++) {
-                  // retry. pillars in bleakfalls are not reliable for some reason
-                  let res2 = ObjectReference.from(Game.getFormEx(refrid))?.playAnimation(animation);
-                  if (res2) {
-                    break;
-                  }
-                  await Utility.wait(2);
+              const handle = this.sp.getReferenceHandle(refrid);
+              let attempts = 0, nextAttempt = 0;
+              const play = () => {
+                if (!current() || this.sp.getReferenceHandle(refrid) !== handle) return;
+                if (Date.now() >= nextAttempt) {
+                  ++attempts; nextAttempt = Date.now() + 2000;
+                  if (ObjectReference.from(Game.getFormEx(refrid))?.playAnimation(animation) || attempts >= 5) return;
                 }
-              })();
+                this.defer(play, current);
+              };
+              this.defer(play, current);
             }
 
 
@@ -285,7 +322,7 @@ export class RemoteServer extends ClientListener {
         } else {
           logError(this, 'Failed to apply model to', refrId.toString(16));
         }
-      });
+      }, 120, current);
       return;
     }
 
@@ -378,7 +415,9 @@ export class RemoteServer extends ClientListener {
   private onDestroyActorMessage(event: ConnectionMessage<DestroyActorMessage>): void {
     const msg = event.message;
 
+    this.originals.forEach((entry, id) => { if (entry.idx === msg.idx) this.originals.delete(id); });
     const i = this.getIdManager().getId(msg.idx);
+    if (i < 0) return;
     this.worldModel.forms[i] = undefined;
     getViewFromStorage()?.syncFormArray(this.worldModel);
 
@@ -399,7 +438,10 @@ export class RemoteServer extends ClientListener {
       this.worldModel.playerCharacterRefrId = 0;
 
       // TODO: move to a separate module
-      once('update', () => Game.quitToMainMenu());
+      const current = this.capture();
+      this.defer(() => {
+        if (this.getMyActorIndex() === -1) Game.quitToMainMenu();
+      }, current);
     }
 
     this.getIdManager().freeIdFor(msg.idx);
@@ -460,10 +502,11 @@ export class RemoteServer extends ClientListener {
     const newAppearance = msg.data;
 
     if (i === this.getMyActorIndex() && newAppearance) {
-      this.controller.once("update", () => {
-        applyAppearanceToPlayer(newAppearance);
+      const current = this.captureActor(msg.idx);
+      this.defer(() => {
+        applyAppearanceToPlayer(newAppearance, current);
         logTrace(this, "Applied appearance to the player");
-      });
+      }, current);
     }
   }
 
@@ -487,8 +530,9 @@ export class RemoteServer extends ClientListener {
     const msgData = this.extractUpdatePropertyMessageData(msg);
 
     if (this.skipFormViewCreation(msg)) {
-      const refrId = msg.refrId;
-      once('update', () => {
+      const refrId = msg.refrId!;
+      const current = this.captureOriginal(refrId);
+      this.defer(() => {
         const refr = ObjectReference.from(Game.getFormEx(refrId));
         if (!refr) {
           logError(this, 'UpdateProperty: refr not found');
@@ -499,16 +543,16 @@ export class RemoteServer extends ClientListener {
         } else if (msg.propName === 'isOpen') {
           ModelApplyUtils.applyModelIsOpen(refr, !!msgData);
         } else if (msg.propName === 'isHarvested') {
-          ModelApplyUtils.applyModelIsHarvested(refr, !!msgData);
+          ModelApplyUtils.applyModelIsHarvested(refr, !!msgData, current);
         } else if (msg.propName === 'disabled') {
           ModelApplyUtils.applyModelIsDisabled(refr, !!msgData);
         }
-      });
+      }, current);
       return;
     }
     const i = this.getIdManager().getId(msg.idx);
     const form = this.worldModel.forms[i];
-    (form as Record<string, unknown>)[msg.propName] = msgData;
+    if (form) (form as Record<string, unknown>)[msg.propName] = msgData;
   }
 
   private onDeathStateContainerMessage(event: ConnectionMessage<DeathStateContainerMessage>): void {
@@ -538,13 +582,14 @@ export class RemoteServer extends ClientListener {
     if (msg.tChangeValues) {
       this.onChangeValuesMessage({ message: msg.tChangeValues });
     }
-    once('update', () => this.onUpdatePropertyMessage({ message: msg.tIsDead }));
+    const current = this.captureActor(msg.tIsDead.idx);
+    this.defer(() => this.onUpdatePropertyMessage({ message: msg.tIsDead }), current);
 
     if (msg.tTeleport) {
       this.onTeleportMessage({ message: msg.tTeleport });
     }
 
-    once('update', () => {
+    this.defer(() => {
       const actor =
         id === this.getWorldModel().playerCharacterFormIdx
           ? Game.getPlayer()!
@@ -557,28 +602,27 @@ export class RemoteServer extends ClientListener {
           });
         } catch (e) {
           if (e instanceof RespawnNeededError) {
-            actor.disableNoWait(false);
-            actor.delete();
+            // The view owns temporary-reference cleanup. Never delete an
+            // original reference (or the player) from a late death callback.
+            if (id !== this.getMyActorIndex()) getViewFromStorage()?.getFormViews().destroyForm(id);
           } else {
             throw e;
           }
         }
       }
-    });
+    }, current);
   }
 
   private handleConnectionAccepted(): void {
-    this.worldModel.forms = [];
-    this.worldModel.playerCharacterFormIdx = -1;
-    this.worldModel.playerCharacterRefrId = 0;
+    this.resetWorldModel();
 
     logTrace(this, "Handle connection accepted");
   }
 
   private onChangeValuesMessage(event: ConnectionMessage<ChangeValuesMessage>): void {
-    const msg = event.message;
+    const msg = event.message, current = this.captureActor(event.message.idx);
 
-    once('update', () => {
+    this.defer(() => {
       const id = this.getIdManager().getId(msg.idx);
       const refr = id === this.getMyActorIndex() ? Game.getPlayer() : getObjectReference(id);
       const ac = Actor.from(refr);
@@ -596,7 +640,7 @@ export class RemoteServer extends ClientListener {
       if (typeof magicka === "number") {
         setActorValuePercentage(ac, 'magicka', magicka);
       }
-    });
+    }, current);
   }
 
   /** Packet handlers end **/
@@ -618,14 +662,14 @@ export class RemoteServer extends ClientListener {
   }
 
   private get worldModel(): WorldModel {
-    if (typeof storage["worldModel"] === "function") {
+    if (!storage['worldModel'] || typeof storage['worldModel'] !== 'object') {
       storage["worldModel"] = { forms: [], playerCharacterFormIdx: -1, playerCharacterRefrId: 0 };
     }
     return storage["worldModel"] as WorldModel;
   }
 
   private get idManager_(): IdManager {
-    if (typeof storage["idManager"] === "function") {
+    if (!storage['idManager'] || typeof storage['idManager'] !== 'object') {
       // Note: full IdManager object preserved across hot-reloads, including methods.
       storage["idManager"] = new IdManager();
     }
@@ -636,20 +680,21 @@ export class RemoteServer extends ClientListener {
     refrId: number,
     callback: (refr: ObjectReference) => void,
     maxAttempts: number = 120,
+    current = this.capture(),
   ) {
-    once('update', () => {
+    this.defer(() => {
       const refr = ObjectReference.from(Game.getFormEx(refrId));
       if (refr) {
         callback(refr);
       } else {
         maxAttempts--;
         if (maxAttempts > 0) {
-          once('update', () => this.onceLoad(refrId, callback, maxAttempts));
+          this.defer(() => this.onceLoad(refrId, callback, maxAttempts, current), current);
         } else {
           logError(this, 'Failed to load object reference ' + refrId.toString(16));
         }
       }
-    });
+    }, current);
   };
 
   private skipFormViewCreation(
@@ -680,8 +725,9 @@ export class RemoteServer extends ClientListener {
 
   private onSpellCastMessage(event: ConnectionMessage<SpellCastMessage>): void {
     const msg = event.message;
+    const current = this.captureRemote(msg.data.caster);
 
-    once('update', () => {
+    this.defer(() => {
       const ac = Actor.from(Game.getFormEx(remoteIdToLocalId(msg.data.caster)));
       if (!ac) {
         return;
@@ -703,13 +749,14 @@ export class RemoteServer extends ClientListener {
         castSpellImmediate(ac.getFormID(), msg.data.castingSource, spell.getFormID(), remoteIdToLocalId(msg.data.target),
           msg.data.aimAngle, msg.data.aimHeading, actorAnimationVariables);
       }
-    });
+    }, current);
   }
 
   private onUpdateAnimVariablesMessage(event: ConnectionMessage<UpdateAnimVariablesMessage>): void {
     const msg = event.message;
+    const current = this.captureRemote(msg.data.actorRemoteId);
 
-    once('update', () => {
+    this.defer(() => {
       const ac = Actor.from(Game.getFormEx(remoteIdToLocalId(msg.data.actorRemoteId)));
       if (!ac) {
         return;
@@ -726,7 +773,7 @@ export class RemoteServer extends ClientListener {
       if (!isApplyed) {
         logError(this, 'Failed apply AnimationVariables to actor with id: ' + ac.getFormID().toString(16));
       }
-    });
+    }, current);
   }
 
 }

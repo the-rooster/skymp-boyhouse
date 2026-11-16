@@ -44,6 +44,7 @@ import { NicknameDestroyEvent } from "./nicknameDestroyEvent";
 
 type EventTypes = {
     'gameLoad': [GameLoadEvent],
+    'worldModelReset': [],
 
     'sendMessage': [SendMessageEvent<AnyMessage>],
     'sendRawMessage': [SendRawMessageEvent],

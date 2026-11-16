@@ -6,7 +6,8 @@ node --experimental-strip-types --test misc/boyhouse/partyInstances.test.cjs \
   misc/boyhouse/questJournalReplica.test.cjs misc/boyhouse/worldProjection.test.cjs \
   misc/boyhouse/campaignPacketChannel.test.cjs misc/boyhouse/clientStartup.test.cjs \
   misc/boyhouse/playerLoadout.test.cjs misc/boyhouse/referenceSuppression.test.cjs \
-  misc/boyhouse/ownedReferenceLifetime.test.cjs misc/boyhouse/playerSpawn.test.cjs
+  misc/boyhouse/ownedReferenceLifetime.test.cjs misc/boyhouse/playerSpawn.test.cjs \
+  misc/boyhouse/remoteWorldLifetime.test.cjs
 python3 -m unittest discover -s misc/boyhouse -p 'test_*.py'
 # Static coverage remains untested; reports never enable quest adapters.
 python3 misc/boyhouse/quest_dependencies.py --data-dir /game-data \

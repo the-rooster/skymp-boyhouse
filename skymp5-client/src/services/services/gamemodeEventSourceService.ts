@@ -27,6 +27,19 @@ export class GamemodeEventSourceService extends ClientListener {
         }
 
         this.controller.emitter.on("updateGamemodeDataMessage", (e) => this.onUpdateGamemodeDataMessage(e));
+        this.controller.emitter.on('worldModelReset', () => {
+            this.expireSources();
+            delete this.sp.storage['GamemodeEventSourceService_sawEventSources'];
+        });
+    }
+
+    private expireSources(): void {
+        const contexts = this.sp.storage['eventSourceContexts'];
+        if (Array.isArray(contexts)) contexts.forEach((ctx: Record<string, unknown>) => {
+            ctx._expired = true;
+            ctx.sendEvent = () => {};
+        });
+        this.sp.storage['eventSourceContexts'] = [];
     }
 
     private onUpdateGamemodeDataMessage(event: ConnectionMessage<UpdateGamemodeDataMessage>) {
@@ -40,14 +53,7 @@ export class GamemodeEventSourceService extends ClientListener {
             this.sp.storage['GamemodeEventSourceService_sawEventSources'] = true;
         }
 
-        if (!Array.isArray(this.sp.storage['eventSourceContexts'])) {
-            this.sp.storage['eventSourceContexts'] = [];
-        } else {
-            this.sp.storage['eventSourceContexts'].forEach((ctx: Record<string, unknown>) => {
-                ctx.sendEvent = () => { };
-                ctx._expired = true;
-            });
-        }
+        this.expireSources();
 
         let eventSourcesRecord: Record<string, string | undefined> = {};
         event.message.eventSources.forEach(pair => eventSourcesRecord[pair.name] = pair.content);
@@ -95,6 +101,7 @@ export class GamemodeEventSourceService extends ClientListener {
 
                     sp: skyrimPlatform,
                     sendEvent: (...args: unknown[]) => {
+                        if (ctx._expired) return;
                         const message: CustomEventMessage = {
                             t: MsgType.CustomEvent,
                             argsJsonDumps: args.map(arg => JSON.stringify(arg)),
@@ -128,6 +135,7 @@ export class GamemodeEventSourceService extends ClientListener {
 
     private setupEventSource = (ctx: any) => {
         this.controller.once('update', () => {
+            if (ctx._expired) return;
             try {
                 ctx._fn(ctx);
                 logTrace(this, `'eventSources`, ctx._eventName, `- Added`);

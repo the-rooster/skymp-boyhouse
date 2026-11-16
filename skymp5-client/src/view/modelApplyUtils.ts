@@ -1,4 +1,4 @@
-import { ObjectReference, Actor, Game, FormType, TextureSet, NetImmerse } from "skyrimPlatform";
+import { ObjectReference, Actor, Game, FormType, TextureSet, NetImmerse, getReferenceHandle, once } from "skyrimPlatform";
 import { Inventory, applyInventory } from "../sync/inventory";
 import { logError, logTrace } from "../logging";
 import { SetNodeScaleEntry, SetNodeTextureSetEntry } from "src/services/messages/createActorMessage";
@@ -47,7 +47,7 @@ export class ModelApplyUtils {
     }
   }
 
-  static applyModelIsHarvested(refr: ObjectReference, isHarvested: boolean) {
+  static applyModelIsHarvested(refr: ObjectReference, isHarvested: boolean, isCurrent: () => boolean = () => true) {
     const base = refr.getBaseObject();
     if (base) {
       const t = base.getType();
@@ -73,11 +73,15 @@ export class ModelApplyUtils {
           } else {
             refr.setHarvested(isHarvested);
             const id = refr.getFormID();
+            const handle = getReferenceHandle(id);
             refr.disable(false).then(() => {
-              const restoredRefr = ObjectReference.from(Game.getFormEx(id));
-              if (restoredRefr) {
-                restoredRefr.enable(false);
-              }
+              // Promise completion is not a native update context. Never
+              // revive another world/view or a reused reference identity.
+              once('update', () => {
+                if (!isCurrent() || !handle || getReferenceHandle(id) !== handle) return;
+                const restoredRefr = ObjectReference.from(Game.getFormEx(id));
+                if (restoredRefr && !restoredRefr.isDeleted()) restoredRefr.enable(false);
+              });
             });
           }
         }
@@ -85,14 +89,9 @@ export class ModelApplyUtils {
         const wasHarvested = refr.isDisabled();
         if (isHarvested != wasHarvested) {
           if (isHarvested) {
-            const id = refr.getFormID();
-            refr.disable(false).then(() => {
-              const restoredRefr = ObjectReference.from(Game.getFormEx(id));
-              if (restoredRefr && !restoredRefr.isDisabled()) {
-                restoredRefr.delete();
-                // Deletion takes time, so in practice this would be called a lot of times
-              }
-            });
+            // Harvesting changes visibility. It must never permanently delete
+            // an authored reference needed by another campaign history.
+            refr.disable(false);
           } else {
             refr.enable(true);
           }

@@ -183,6 +183,13 @@ test('NetworkingService gates every outgoing API and unwraps frames before ordin
   assert.deepEqual(h.errors, []);
 });
 
+test('explicit closure notifies world cleanup after destroying transport without reconnecting', () => {
+  const h = harness(); let notifications = 0;
+  h.emitter.on('connectionDisconnect', () => { ++notifications; assert.equal(h.destroyed, 1); });
+  h.service.close();
+  assert.equal(notifications, 1); assert.equal(h.created, 0);
+});
+
 test('NetworkingService preserves legacy dispatch and requires the epoch-capable native codec', () => {
   const h = harness('2.0.0'), received = [];
   h.emitter.on('updateMovementMessage', e => received.push(e.message));

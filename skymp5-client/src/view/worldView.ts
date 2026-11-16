@@ -22,6 +22,7 @@ export class WorldView extends ClientListener {
     this.oldView = typeof oldView === "object" ? oldView as WorldView : undefined;
 
     this.sp.storage["view"] = this;
+    controller.emitter.on('worldModelReset', () => this.destroy());
     controller.on('preLoadGame', () => { this.loading = true; this.destroy(); });
     controller.emitter.on('gameLoad', () => {
       this.loading = false;

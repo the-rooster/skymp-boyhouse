@@ -277,6 +277,7 @@ export class FormView {
   }
 
   destroy(): void {
+    ++this.generation;
     this.isOnScreen = false;
     this.spawnMoment = 0;
     if (this.ownedReference) this.lifetime.retire(this.ownedReference);
@@ -295,6 +296,7 @@ export class FormView {
   }
 
   private ownedReference?: OwnedReference;
+  private generation = 0;
 
   private lastHarvestedApply = 0;
   private lastOpenApply = 0;
@@ -311,7 +313,10 @@ export class FormView {
     const now = Date.now();
     if (now - this.lastHarvestedApply > 666) {
       this.lastHarvestedApply = now;
-      ModelApplyUtils.applyModelIsHarvested(refr, !!model.isHarvested);
+      const id = this.refrId, reference = this.ownedReference, generation = this.generation;
+      ModelApplyUtils.applyModelIsHarvested(refr, !!model.isHarvested,
+        () => this.generation === generation && this.refrId === id && this.ready && this.ownedReference === reference &&
+          (!reference || this.lifetime.isCurrent(reference)));
     }
     if (now - this.lastOpenApply > 133) {
       this.lastOpenApply = now;

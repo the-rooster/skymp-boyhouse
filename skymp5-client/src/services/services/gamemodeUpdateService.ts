@@ -24,6 +24,24 @@ export class GamemodeUpdateService extends ClientListener {
 
         this.controller.emitter.on("updateGamemodeDataMessage", (e) => this.onUpdateGamemodeDataMessage(e));
         this.controller.emitter.on("createActorMessage", (e) => this.onCreateActorMessage(e));
+        this.controller.emitter.on('worldModelReset', () => {
+            ++this.generation;
+            this.sp.storage['ownerModelSet'] = false;
+            delete this.sp.storage['ownerModel'];
+            this.updateOwnerCtx.state = {};
+            this.updateOwnerCtx._model = undefined;
+            this.updateOwnerCtx.refr = undefined;
+            this.updateNeighborCtx._model = undefined;
+            this.updateNeighborCtx.refr = undefined;
+            this.updateNeighborCtx._view = undefined;
+            for (const key of ['updateOwnerFunctions', 'updateNeighborFunctions']) {
+                this.sp.storage[key] = {};
+                this.sp.storage[`${key}_keys`] = [];
+            }
+            this.updateNeighborFunctionsKeys = [];
+            this.updateNeighborFunctions = {};
+            delete this.sp.storage['GamemodeUpdateService_sawUpdateFunctions'];
+        });
 
         this.controller.on("tick", () => this.onTick());
         this.controller.on("update", () => this.onUpdate());
@@ -143,7 +161,9 @@ export class GamemodeUpdateService extends ClientListener {
         }
 
         // Otherwise worldModel.playerCharacterFormIdx may be unassigned
+        const generation = this.generation;
         this.controller.once("tick", () => {
+            if (generation !== this.generation) return;
 
             const remoteServer = this.controller.lookupListener(RemoteServer);
 
@@ -151,7 +171,7 @@ export class GamemodeUpdateService extends ClientListener {
 
             const myFormModel: FormModel | undefined = worldModel.forms[worldModel.playerCharacterFormIdx];
 
-            if (!myFormModel) {
+            if (!myFormModel || myFormModel.idx !== event.message.idx) {
                 logError(this, `Unable to find formModel with index`, worldModel.playerCharacterFormIdx);
                 return;
             }
@@ -265,6 +285,7 @@ export class GamemodeUpdateService extends ClientListener {
     }
 
     private updateOwnerCtx: GamemodeApiCtx;
+    private generation = 0;
 
     private updateNeighborCtx: GamemodeApiCtx;
     private updateNeighborFunctionsKeys: string[];

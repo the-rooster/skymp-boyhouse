@@ -394,6 +394,58 @@ mutations, original-reference restoration, and real multi-client quest play
 remain open. The staging projection flag and quest certification counts are
 unchanged.
 
+## Remote-world replacement and delayed packet effects
+
+`RemoteServer.resetWorldModel()` now invalidates delayed work and replaces the
+world model, index manager and hosting list. It cancels the pending player spawn
+and emits `worldModelReset`, which retires world views, expires gamemode event
+sources, and clears owner/neighbor functions and their model context. Disconnect,
+failed/denied connections and personal-save loading use this path. Explicit
+transport closure now emits the cleanup notification without redialing.
+Generated-world loading preserves its initial packet work but suspends native
+application until the matching loaded event.
+
+Remote packet callbacks carry a world generation, and actor-specific callbacks
+also retain the identity of the model they target. Reusing an index or replacing
+a plugin cannot make an old callback act on the new model. Late ragdoll teleport
+completion additionally checks the engine reference handle. Container polling
+and animation retries use fresh update callbacks and stop when their request or
+reference is replaced. Unknown destroy messages no longer schedule a menu exit;
+a newer self model cancels a queued exit. Duplicate index allocation is
+idempotent, sparse remote indices use a Map, and upgrading a retained index
+manager reconstructs existing model slots without shifting them.
+
+Harvest refreshes now reacquire references on update and verify the original
+engine handle and caller generation before enabling them. The ordinary-object
+harvest branch no longer deletes authored references. Death recovery delegates
+temporary-view deletion to its lifetime owner rather than directly deleting
+whatever actor a callback resolves.
+
+All 184 Node regressions pass, including 25 new remote-world/index/harvest/
+gamemode cases and an explicit-close transport case. The client build passes.
+A full-client startup regression against the unchanged private staging server
+passed on runtime 1.7.104.0: connected, correctly positioned and loaded player,
+then five unequipped character-menu samples, completing in 11.3 seconds after
+the observer started. There were no native callback exceptions. This live test
+checks normal connection/reset/bootstrap integration; cancellation, index reuse,
+harvest and gamemode replacement are covered by the automated tests, not native
+phase-transition certification. The final 100 ms container activation grace and
+explicit-close notification were tested and rebuilt after that live run; the
+live fixture does not exercise those paths.
+
+Evidence is in ignored `artifacts/remote-world-runtime/`, with backup manifest
+`artifacts/game-backups/20261116T191246Z/player-spawn/`. The test game and relay
+exited, diagnostic files were removed, all three INIs were restored byte-for-byte,
+and the four personal save hashes were unchanged.
+
+This cancels delayed follow-up work; it does not cancel a native operation already
+submitted. A phase coordinator still needs to track/drain those operations before
+acknowledgement and restore original-reference state. Native ragdoll global
+settings, death-service timers, arbitrary trusted gamemode native callbacks,
+other FormView mutations and full save/reload recovery need further lifetime
+work. The baseline coordinator, native journal projection and quest execution
+remain unfinished; staging projection stays disabled and no quests are certified.
+
 ## Remaining acceptance
 
 The packet-epoch transport adds a separate `MpClientPlugin` codec version 2.1.0.

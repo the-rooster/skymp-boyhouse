@@ -107,6 +107,9 @@ export class NetworkingService extends ClientListener {
     ++this.connectionGeneration;
     this.campaignPackets.clear();
     this.sp.mpClientPlugin.destroyClient();
+    // Explicit closure must invalidate world work too. Reconnection belongs
+    // to the native disconnect handler, so this notification does not redial.
+    this.controller.emitter.emit('connectionDisconnect', {});
   }
 
   isConnected() {
