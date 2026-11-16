@@ -172,13 +172,38 @@ participate in that transaction. Notifications still precede asynchronous disk
 commit; see [the storage contract](STORAGE.md).
 
 This does not yet project original-to-copy replacement into Skyrim or make a
-location playable. Automatic entry, client transition acknowledgement, cross-area migration,
+location playable. Automatic entry, engine-side transition application, cross-area migration,
 enable-parent change propagation, scale/ownership/lock overlays, NPC auto-calculated
 stats, respawns and durable lifecycle delivery remain unfinished. The factory
 currently copies the relevant world indexes during a batch; this needs measurement
 and optimization before a 16–32 player rollout. Requests are bounded to 4,096
 references, a radius of 65,536 units, and a 100,000-entry/8 MiB owner ledger;
 streaming and ledger partitioning are required for a full world.
+
+### Reference projection handshake (experimental)
+
+`mp.get(actorId, "campaignReferences")` returns a read-only, versioned manifest
+of the current campaign's original-to-copy bindings, base IDs, reference kinds,
+and disabled/deleted state. Shared space returns an empty manifest. It validates
+saved allocations and campaign identity without creating or repairing them, and
+never includes private VM or inventory data.
+
+With `boyhouseInstances.projection: true`, each connection starts with native
+incoming gameplay blocked. The server sends a bounded manifest in 128-reference
+chunks and accepts an acknowledgement only for that connection's session,
+sequence and unpredictable token. It rechecks the current native manifest before
+releasing gameplay. Phase changes close the gate before changing the instance;
+timeouts and reported application failures quarantine the character. A host
+awaiting application cannot admit new guests. Existing guests remain admitted
+while their host refreshes the same phase.
+
+The pure client replica validates and assembles chunks, but acknowledges only
+when an engine adapter explicitly reports application complete. The protocol
+smoke uses real native bot packets and simulates that engine completion. It is
+not an in-game test. Incoming gameplay gating does not freeze server simulation
+or outgoing replication. The Skyrim engine adapter, replication fencing and
+reference restoration are still unfinished. Keep the flag unset in staging and
+normal clients until those are implemented and tested. No quests are certified.
 
 ### Inventory defaults for private reference allocation
 
@@ -271,12 +296,13 @@ The next execution slice needs area-entry/client integration for materialized re
 
 ```sh
 # Node 24: includes TypeScript replica tests
-node --test misc/boyhouse/partyInstances.test.cjs misc/boyhouse/instanceCommand.test.cjs misc/boyhouse/questJournalFeed.test.cjs misc/boyhouse/questJournalReplica.test.cjs
+node --test misc/boyhouse/partyInstances.test.cjs misc/boyhouse/instanceCommand.test.cjs misc/boyhouse/questJournalFeed.test.cjs misc/boyhouse/questJournalReplica.test.cjs misc/boyhouse/worldProjection.test.cjs
 
 # Linux builder with owned masters mounted at /game-data
 ./build/unit/unit '[Quest]'
 node misc/boyhouse/native-smoke.cjs
 node misc/boyhouse/protocol-smoke.cjs
+node misc/boyhouse/protocol-smoke.cjs --projection
 ```
 
 The native suite also parses every owned quest's VMAD and every PEX in the owned vanilla script archive, executes original MQ102/DA04 fragments, and checks shared-heap persistence, old-save migration, reset collection, conditional guest execution, nested same/cross-quest stage calls, failure rollback and instruction budgets. Alias regressions cover owned metadata, host/guest identities, target and script-variable persistence, reset, stopped/cross-quest boundaries, invalid saves and dynamic lookup rejection. The addon smoke exercises original-fragment execution through the public server binding. Protocol bots exercise the full server login/party flow and rejected client writes. None of these substitutes for an in-game quest playthrough.

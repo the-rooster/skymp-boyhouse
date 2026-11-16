@@ -65,14 +65,15 @@ struct Allocation
   LeveledListUtils::Options options;
 
   Allocation(MpActor& actor, const std::string& destination,
-             uint32_t encounterLevel)
+             uint32_t encounterLevel, bool readVm = true)
     : owner(actor)
     , world(*actor.GetParent())
     , browser(world.GetEspm().GetBrowser())
     , identity(Identity(actor.GetDynamicFields()))
     , instance(destination)
     , level(encounterLevel)
-    , vm(QuestJournal::PersonalScriptState(actor), {}, {})
+    , vm(readVm ? QuestJournal::PersonalScriptState(actor) : Json::object(),
+         {}, {})
   {
     const auto& saved = owner.GetDynamicFields().GetValueDump(
       CampaignReferenceFactory::kAllocations);
@@ -348,6 +349,56 @@ struct Allocation
     return result;
   }
 };
+}
+
+Json CampaignReferenceFactory::Snapshot(MpActor& actor)
+{
+  if (!actor.GetParent() || actor.IsDeleted() ||
+      actor.GetParent()->LookupFormByIdNoLoad(actor.GetFormId()).get() !=
+        &actor)
+    throw std::runtime_error("Invalid campaign projection actor");
+  auto& owner = QuestJournal::Owner(actor);
+  const auto& instance = actor.GetWorldInstance();
+  Json result{ { "schemaVersion", 1 },
+               { "actor", actor.GetFormId() },
+               { "campaignOwner", owner.GetFormId() },
+               { "instance", instance },
+               { "contextEpoch",
+                 std::to_string(actor.GetWorldInstanceEpoch()) + ":" +
+                   std::to_string(owner.GetWorldInstanceEpoch()) },
+               { "identity", "" },
+               { "references", Json::array() } };
+  if (instance.empty())
+    return result;
+  const auto& fields = owner.GetDynamicFields();
+  if (fields.GetValueDump(kAllocations) == "null") {
+    if (fields.GetValueDump(kIdentity) != "null")
+      result["identity"] = Identity(fields);
+    return result;
+  }
+  // Never generate an identity in response to a read. A nonempty allocation
+  // ledger without its original identity is corrupt, not a new campaign.
+  if (fields.GetValueDump(kIdentity) == "null")
+    throw std::runtime_error("Campaign allocation identity is missing");
+  Allocation allocation(owner, instance, 1, false);
+  result["identity"] = allocation.identity;
+  for (const auto& [key, target] : allocation.ledger.at("copies").items()) {
+    const auto original =
+      FormDesc::FromString(key).ToFormId(allocation.world.espmFiles);
+    auto* copy = allocation.Existing(original, false);
+    if (!copy || copy->GetWorldInstance() != instance)
+      continue;
+    auto& references = result["references"];
+    if (references.size() == 4096)
+      throw std::runtime_error("Campaign projection exceeds area limit");
+    references.push_back({ { "original", original },
+                           { "copy", copy->GetFormId() },
+                           { "baseId", copy->GetBaseId() },
+                           { "kind", copy->AsActor() ? "actor" : "object" },
+                           { "disabled", copy->IsDisabled() },
+                           { "deleted", copy->IsDeleted() } });
+  }
+  return result;
 }
 
 std::vector<uint32_t> CampaignReferenceFactory::Ensure(

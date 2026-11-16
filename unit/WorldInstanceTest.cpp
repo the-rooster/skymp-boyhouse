@@ -1,7 +1,10 @@
 #include "ActionListener.h"
 #include "DestroyActorMessage.h"
+#include "MessageSerializerFactory.h"
+#include "PacketParser.h"
 #include "TestUtils.hpp"
 #include <algorithm>
+#include <slikenet/BitStream.h>
 
 namespace {
 MpActor& AddPlayer(PartOne& server, uint32_t id, Networking::UserId user)
@@ -208,4 +211,77 @@ TEST_CASE("Script inventory transfers do not bypass instance isolation",
   REQUIRE_THROWS(source.RemoveItem(0xf, 5, &target));
   REQUIRE(source.GetInventory().GetItemCount(0xf) == 10);
   REQUIRE(target.GetInventory().GetItemCount(0xf) == 0);
+}
+
+TEST_CASE("Projection gate blocks binary and JSON gameplay without losing the "
+          "connection",
+          "[Instance][Projection]")
+{
+  PartOne server;
+  auto& actor = AddPlayer(server, 0xff000001, 0);
+  AddPlayer(server, 0xff000002, 1);
+  auto& listener = server.GetActionListener();
+  server.serverState.userInfo[0]->gameplayBlocked = true;
+  for (int type = 0; type < 128; ++type)
+    REQUIRE(listener.IsMessageAllowed(0, static_cast<MsgType>(type)) ==
+            (static_cast<MsgType>(type) == MsgType::CustomPacket));
+  REQUIRE(listener.IsMessageAllowed(1, MsgType::UpdateMovement));
+  server.Messages().clear();
+  DoUpdateMovement(server, actor.GetFormId(), 0);
+  REQUIRE(server.Messages().empty());
+  UpdateMovementMessage movement;
+  movement.idx = actor.GetIdx();
+  movement.data.worldOrCell = 0x3c;
+  movement.data.pos = { 1, 2, 3 };
+  movement.data.rot = { 0, 0, 0 };
+  SLNet::BitStream stream;
+  MessageSerializerFactory::CreateMessageSerializer()->Serialize(movement,
+                                                                 stream);
+  PacketParser parser;
+  parser.TransformPacketIntoAction(0, stream.GetData(),
+                                   stream.GetNumberOfBytesUsed(), listener);
+  REQUIRE(server.Messages().empty());
+  REQUIRE(server.serverState.IsConnected(0));
+  REQUIRE(server.GetUserActor(0) == actor.GetFormId());
+  server.serverState.userInfo[0]->gameplayBlocked = false;
+  DoUpdateMovement(server, actor.GetFormId(), 0);
+  REQUIRE_FALSE(server.Messages().empty());
+  server.serverState.userInfo[0]->gameplayBlocked = true;
+  DoDisconnect(server, 0);
+  DoConnect(server, 0);
+  REQUIRE_FALSE(server.serverState.userInfo[0]->gameplayBlocked);
+}
+
+TEST_CASE(
+  "A blocked connection accepts projection control and initial login only",
+  "[Instance][Projection]")
+{
+  PartOne server;
+  DoConnect(server, 0);
+  auto events = FakeListener::New();
+  server.AddListener(events);
+  server.serverState.userInfo[0]->gameplayBlocked = true;
+  const auto send = [&](const std::string& type) {
+    DoMessage(server, 0,
+              { { "t", MsgType::CustomPacket },
+                { "contentJsonDump",
+                  nlohmann::json({ { "customPacketType", type } }).dump() } });
+  };
+  send("boyhouse.instance");
+  send("boyhouse.questJournal");
+  send("arbitrary-game-action");
+  REQUIRE(events->str().empty());
+  send("loginWithSkympIo");
+  REQUIRE_FALSE(events->str().empty());
+  events->clear();
+  server.CreateActor(0xff000001, { 1, 2, 3 }, 0, 0x3c);
+  server.SetUserActor(0, 0xff000001);
+  send("loginWithSkympIo");
+  REQUIRE(events->str().empty());
+  send("boyhouse.projection");
+  REQUIRE_FALSE(events->str().empty());
+  events->clear();
+  server.serverState.userInfo[0]->gameplayBlocked = false;
+  send("boyhouse.instance");
+  REQUIRE_FALSE(events->str().empty());
 }

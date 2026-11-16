@@ -406,3 +406,75 @@ TEST_CASE("An authored area can be prepared and restored before admission",
   REQUIRE(owner.GetWorldInstance().empty());
   REQUIRE(owner.IsDisabled());
 }
+
+TEST_CASE("Projection manifests include hidden originals only from the "
+          "current campaign area",
+          "[Quest][CampaignAllocation][Projection]")
+{
+  AllocationWorld f;
+  auto& world = f.server.worldState;
+  const auto ids =
+    CampaignReferenceFactory::Ensure(*f.owner, { 0x1a677, 0x8a986 }, 5);
+  CampaignReferenceFactory::Prepare(*f.owner, "elsewhere", { 0xe4cf6 }, 5);
+  const auto otherIds =
+    CampaignReferenceFactory::Ensure(*f.other, { 0x1a677 }, 5);
+  world.GetFormAt<MpActor>(ids[0]).Disable();
+  world.GetFormAt<MpObjectReference>(ids[1]).Delete();
+  const auto manifest = CampaignReferenceFactory::Snapshot(*f.owner);
+  REQUIRE(manifest.at("schemaVersion") == 1);
+  REQUIRE(manifest.at("actor") == f.owner->GetFormId());
+  REQUIRE(manifest.at("campaignOwner") == f.owner->GetFormId());
+  REQUIRE(manifest.at("instance") == f.owner->GetWorldInstance());
+  REQUIRE(manifest.at("identity").get<std::string>().size() == 32);
+  const auto& refs = manifest.at("references");
+  REQUIRE(refs.size() == 2);
+  REQUIRE(refs[0].at("original") == 0x1a677);
+  REQUIRE(refs[0].at("copy") == ids[0]);
+  REQUIRE(refs[0].at("baseId") == 0x13bbd);
+  REQUIRE(refs[0].at("kind") == "actor");
+  REQUIRE(refs[0].at("disabled") == true);
+  REQUIRE(refs[1].at("deleted") == true);
+  REQUIRE(refs[1].at("kind") == "object");
+  REQUIRE_FALSE(manifest.contains("vm"));
+  f.other->SetWorldInstance(f.owner->GetWorldInstance());
+  const auto guest = CampaignReferenceFactory::Snapshot(*f.other);
+  REQUIRE(guest.at("actor") == f.other->GetFormId());
+  REQUIRE(guest.at("campaignOwner") == f.owner->GetFormId());
+  REQUIRE(guest.at("identity") == manifest.at("identity"));
+  REQUIRE(guest.at("references") == refs);
+  REQUIRE(otherIds.front() != guest.at("references")[0].at("copy"));
+  f.other->SetWorldInstance("");
+  const auto shared = CampaignReferenceFactory::Snapshot(*f.other);
+  REQUIRE(shared.at("references").empty());
+  REQUIRE(shared.at("identity") == "");
+  REQUIRE(shared.at("campaignOwner") == f.other->GetFormId());
+  REQUIRE(shared.at("contextEpoch") != guest.at("contextEpoch"));
+}
+
+TEST_CASE("Projection reads neither create identities nor silently repair "
+          "corrupt bindings",
+          "[Quest][CampaignAllocation][Projection]")
+{
+  AllocationWorld f;
+  const auto before = MpChangeForm::ToJson(f.owner->GetChangeForm());
+  REQUIRE(
+    CampaignReferenceFactory::Snapshot(*f.owner).at("references").empty());
+  REQUIRE(CampaignReferenceFactory::Snapshot(*f.owner).at("identity") == "");
+  REQUIRE(MpChangeForm::ToJson(f.owner->GetChangeForm()) == before);
+  CampaignReferenceFactory::Ensure(*f.owner, { 0x1a677 }, 5);
+  SECTION("missing identity")
+  {
+    f.owner->SetPropertyValueDump("private.boyhouse.campaignIdentity", "null",
+                                  false, false);
+  }
+  SECTION("missing allocation")
+  {
+    f.owner->SetPropertyValueDump(
+      CampaignReferenceFactory::kAllocations,
+      R"({"schemaVersion":1,"copies":{"1a677:Skyrim.esm":"fefefe"}})", false,
+      false);
+  }
+  const auto corrupt = MpChangeForm::ToJson(f.owner->GetChangeForm());
+  REQUIRE_THROWS(CampaignReferenceFactory::Snapshot(*f.owner));
+  REQUIRE(MpChangeForm::ToJson(f.owner->GetChangeForm()) == corrupt);
+}

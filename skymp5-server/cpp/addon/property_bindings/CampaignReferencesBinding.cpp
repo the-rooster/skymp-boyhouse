@@ -2,6 +2,13 @@
 #include "CampaignReferenceFactory.h"
 #include "NapiHelper.h"
 
+Napi::Value CampaignReferencesBinding::Get(Napi::Env env, ScampServer& server,
+                                           uint32_t id)
+{
+  auto& actor = server.GetPartOne()->worldState.GetFormAt<MpActor>(id);
+  return NapiHelper::ParseJson(env, CampaignReferenceFactory::Snapshot(actor));
+}
+
 void CampaignReferencesBinding::Set(Napi::Env env, ScampServer& server,
                                     uint32_t id, Napi::Value command)
 {

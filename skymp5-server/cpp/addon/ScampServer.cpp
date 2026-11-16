@@ -102,6 +102,8 @@ Napi::Object ScampServer::Init(Napi::Env env, Napi::Object exports)
       InstanceMethod("getUserByActor", &ScampServer::GetUserByActor),
       InstanceMethod("getUserIp", &ScampServer::GetUserIp),
       InstanceMethod("kick", &ScampServer::Kick),
+      InstanceMethod("setGameplayBlocked", &ScampServer::SetGameplayBlocked),
+      InstanceMethod("getGameplayBlocked", &ScampServer::GetGameplayBlocked),
 
       InstanceMethod("getLocalizedString", &ScampServer::GetLocalizedString),
       InstanceMethod("getServerSettings", &ScampServer::GetServerSettings),
@@ -697,17 +699,37 @@ Napi::Value ScampServer::CreateBot(const Napi::CallbackInfo& info)
       "Expected server to be instance of Networking::ServerCombined");
   }
 
+  if (info.Length() && !info[0].IsBoolean())
+    throw Napi::TypeError::New(info.Env(),
+                               "captureCustomPackets must be boolean");
   auto pair = this->serverMock->CreateClient();
-  auto bot = std::make_shared<Bot>(pair.first);
+  auto bot = std::make_shared<Bot>(
+    pair.first, info.Length() && info[0].As<Napi::Boolean>().Value());
 
   auto jBot = Napi::Object::New(info.Env());
+
+  jBot.Set(
+    "pollCustomPackets",
+    Napi::Function::New(info.Env(), [bot](const Napi::CallbackInfo& info) {
+      try {
+        const auto packets = bot->PollCustomPackets();
+        auto result = Napi::Array::New(info.Env(), packets.size());
+        for (uint32_t i = 0; i < packets.size(); ++i)
+          result.Set(i, Napi::String::New(info.Env(), packets[i]));
+        return result;
+      } catch (const std::exception& error) {
+        throw Napi::Error::New(info.Env(), error.what());
+      }
+    }));
 
   jBot.Set(
     "getUserId",
     Napi::Function::New(
       // Capture only the ID: retaining pair.first keeps the mock client alive
       // after bot.destroy(), so no disconnect event can be delivered.
-      info.Env(), [childUserId = pair.second, serverCombined](const Napi::CallbackInfo& info) {
+      info.Env(),
+      [childUserId = pair.second,
+       serverCombined](const Napi::CallbackInfo& info) {
         try {
           Networking::UserId realUserId = childUserId;
           return Napi::Number::New(
@@ -781,6 +803,35 @@ Napi::Value ScampServer::GetUserIp(const Napi::CallbackInfo& info)
     return Napi::String::New(info.Env(), server->GetIp(userId));
   } catch (std::exception& e) {
     throw Napi::Error::New(info.Env(), std::string(e.what()));
+  }
+}
+
+Napi::Value ScampServer::SetGameplayBlocked(const Napi::CallbackInfo& info)
+{
+  try {
+    const auto id = NapiHelper::ExtractUInt32(info[0], "userId");
+    if (id >= partOne->serverState.userInfo.size() ||
+        !partOne->serverState.userInfo[id] || !info[1].IsBoolean())
+      throw std::invalid_argument("Invalid gameplay gate request");
+    partOne->serverState.userInfo[id]->gameplayBlocked =
+      info[1].As<Napi::Boolean>().Value();
+  } catch (const std::exception& error) {
+    throw Napi::Error::New(info.Env(), error.what());
+  }
+  return info.Env().Undefined();
+}
+
+Napi::Value ScampServer::GetGameplayBlocked(const Napi::CallbackInfo& info)
+{
+  try {
+    const auto id = NapiHelper::ExtractUInt32(info[0], "userId");
+    if (id >= partOne->serverState.userInfo.size() ||
+        !partOne->serverState.userInfo[id])
+      throw std::invalid_argument("Invalid gameplay gate user");
+    return Napi::Boolean::New(
+      info.Env(), partOne->serverState.userInfo[id]->gameplayBlocked);
+  } catch (const std::exception& error) {
+    throw Napi::Error::New(info.Env(), error.what());
   }
 }
 

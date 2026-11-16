@@ -28,6 +28,7 @@ public:
 
   virtual void OnCustomPacket(const RawMessageData& rawMsgData,
                               const CustomPacketMessage& msg);
+  bool IsMessageAllowed(Networking::UserId userId, MsgType type) const;
 
   virtual void OnUpdateMovement(const RawMessageData& rawMsgData,
                                 const UpdateMovementMessage& msg);

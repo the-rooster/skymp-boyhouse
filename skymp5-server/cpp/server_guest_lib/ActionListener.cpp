@@ -108,11 +108,29 @@ MpActor* ActionListener::SendToNeighbours(uint32_t idx,
                           rawMsgData.unparsedLength, reliable);
 }
 
+bool ActionListener::IsMessageAllowed(Networking::UserId userId,
+                                      MsgType type) const
+{
+  const auto& users = partOne.serverState.userInfo;
+  return userId >= users.size() || !users[userId] ||
+    !users[userId]->gameplayBlocked || type == MsgType::CustomPacket;
+}
+
 void ActionListener::OnCustomPacket(const RawMessageData& rawMsgData,
                                     const CustomPacketMessage& msg)
 {
   simdjson::dom::parser parser;
   auto content = parser.parse(msg.contentJsonDump).value();
+  const auto& users = partOne.serverState.userInfo;
+  if (rawMsgData.userId < users.size() && users[rawMsgData.userId] &&
+      users[rawMsgData.userId]->gameplayBlocked) {
+    std::string_view type;
+    if (content["customPacketType"].get(type) != simdjson::SUCCESS ||
+        (type != "boyhouse.projection" &&
+         (type != "loginWithSkympIo" ||
+          partOne.serverState.ActorByUser(rawMsgData.userId))))
+      return;
+  }
   for (auto& listener : partOne.GetListeners()) {
     listener->OnCustomPacket(rawMsgData.userId, content);
   }

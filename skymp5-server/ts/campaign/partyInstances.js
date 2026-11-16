@@ -49,11 +49,12 @@ class PartyInstances {
     this.adapter.disable(actor);
   }
 
-  hostAvailable(owner, areaId) {
+  hostAvailable(owner, areaId, requireReady = false) {
     const visit = this.visits.get(owner);
     return this.adapter.exists(owner) && visit?.owner === owner && visit.area === areaId &&
       this.adapter.getInstance(owner) === this.key(owner, areaId) &&
-      this.adapter.isInside(owner, this.areas.get(areaId));
+      this.adapter.isInside(owner, this.areas.get(areaId)) &&
+      (!requireReady || !this.adapter.isReady || this.adapter.isReady(owner));
   }
 
   transition(actor, owner, areaId) {
@@ -135,7 +136,7 @@ class PartyInstances {
     if (!area) throw new Error("Area is not enabled for instancing");
     if (actor !== owner && !this.sameParty(actor, owner)) throw new Error("Party membership required");
     if (!this.adapter.isInside(actor, area)) throw new Error("Character is outside the instance boundary");
-    if (actor !== owner && !this.hostAvailable(owner, areaId)) {
+    if (actor !== owner && !this.hostAvailable(owner, areaId, true)) {
       throw new Error("Campaign owner is not in that instance");
     }
     try { this.transition(actor, owner, areaId); }

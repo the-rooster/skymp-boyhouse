@@ -249,3 +249,15 @@ test("invalid saved owner identities are quarantined, not normalized", () => {
     assert.ok(f.disabled.has(1));
   }
 });
+
+test("guests cannot enter a host whose client projection is pending", () => {
+  const f = fixture(), a = f.authority;
+  let ready = false;
+  f.adapter.isReady = () => ready;
+  a.invite(1, 2); a.accept(2, 1); a.enter(1, 1, "town");
+  assert.throws(() => a.enter(2, 1, "town"), /owner is not/);
+  ready = true; a.enter(2, 1, "town");
+  ready = false;
+  assert.deepEqual(a.reconcile(), [], "An existing guest is not revoked during a same-phase host refresh");
+  assert.equal(f.scopes.get(2), f.scopes.get(1));
+});

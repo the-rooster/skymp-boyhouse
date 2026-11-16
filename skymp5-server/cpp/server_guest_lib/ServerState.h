@@ -42,6 +42,10 @@ struct DeferredMessage
 struct UserInfo
 {
   bool isDisconnecting = false;
+  // Connection-local handshake gate. Never persisted or inherited by a reused
+  // user slot. Trusted server code releases it after projection
+  // acknowledgement.
+  bool gameplayBlocked = false;
 
   bool isPacketHistoryRecording = false;
   PacketHistory packetHistory;

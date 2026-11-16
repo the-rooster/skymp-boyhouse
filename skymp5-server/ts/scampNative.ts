@@ -3,6 +3,7 @@ const scampNativeNode = require(process.cwd() + "/scam_native.node");
 export declare interface Bot {
   destroy(): void;
   send(msg: Record<string, unknown>): void;
+  pollCustomPackets(): string[];
 }
 
 export type SendChatMessageFn = (
@@ -40,10 +41,12 @@ export interface ScampServer {
   sendCustomPacket(userId: number, jsonContent: string): void;
   setEnabled(actorId: number, enabled: boolean): void;
   getActorsByProfileId(profileId: number): number[];
-  createBot(): Bot;
+  createBot(captureCustomPackets?: boolean): Bot;
   getUserByActor(formId: number): number;
   getUserIp(userId: number): string;
   kick(userId: number): void;
+  setGameplayBlocked(userId: number, blocked: boolean): void;
+  getGameplayBlocked(userId: number): boolean;
 
   executeJavaScriptOnChakra(src: string): void;
   clear(): void;

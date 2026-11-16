@@ -1,16 +1,18 @@
 import { Settings } from "../settings";
 import { System, SystemContext, Content } from "./system";
 import { PartyInstances } from "../campaign/partyInstances";
+import { ProjectionFeed } from "../campaign/projectionFeed";
 
 export class CampaignInstances implements System {
   systemName = "CampaignInstances";
   private authority: PartyInstances | undefined;
+  private projection: ProjectionFeed | undefined;
   private lastAction = new Map<number, number>();
 
   async initAsync(ctx: SystemContext): Promise<void> {
     const settings = await Settings.get();
     const config = settings.allSettings?.boyhouseInstances as
-      { experimental?: boolean; areas?: unknown[] } | undefined;
+      { experimental?: boolean; projection?: boolean; areas?: unknown[] } | undefined;
     if (config?.experimental !== true) return;
     const api = ctx.svr as any;
     this.authority = new PartyInstances({
@@ -23,7 +25,15 @@ export class CampaignInstances implements System {
           instanceArea: area.id, encounterLevel: area.encounterLevel,
           area: { worldOrCell: area.worldOrCell, center: area.center, radius: area.radius },
         }),
-      setInstance: (id: number, key: string) => api.set(id, "worldInstance", key),
+      setInstance: (id: number, key: string) => {
+        this.projection?.pauseActor(id);
+        api.set(id, "worldInstance", key);
+      },
+      isReady: (id: number) => {
+        if (!this.projection) return true;
+        const user = ctx.svr.getUserByActor(id);
+        return ctx.svr.isConnected(user) && !ctx.svr.getGameplayBlocked(user);
+      },
       disable: (id: number) => {
         // Disabled objects are hidden, but native packet handlers still resolve
         // an assigned actor. Remove that authority before closing the socket.
@@ -39,13 +49,32 @@ export class CampaignInstances implements System {
           pos.reduce((sum: number, n: number, i: number) => sum + (n - area.center[i]) ** 2, 0) <= area.radius ** 2;
       },
     }, config.areas ?? []);
+    if (config.projection === true) this.projection = new ProjectionFeed({
+      connected: (user: number) => ctx.svr.isConnected(user),
+      actor: (user: number) => ctx.svr.getUserActor(user),
+      instance: (actor: number) => api.get(actor, "worldInstance"),
+      read: (actor: number) => api.get(actor, "campaignReferences"),
+      block: (user: number, blocked: boolean) => ctx.svr.setGameplayBlocked(user, blocked),
+      send: (user: number, packet: unknown) => ctx.svr.sendCustomPacket(user, JSON.stringify(packet)),
+      close: (user: number, error: unknown) => {
+        console.error("Campaign projection failed", user, error);
+        const actor = ctx.svr.getUserActor(user);
+        if (actor) {
+          this.authority?.quarantine(actor);
+          this.authority?.reconcile();
+        } else ctx.svr.kick(user);
+      },
+    });
     // Spawn emits this before enabling or subscribing a saved character.
     ctx.gm.on("beforeSpawn", (actor: number) => this.authority?.recover(actor));
   }
 
+  connect(userId: number): void { this.projection?.connect(userId); }
+
   async updateAsync(ctx: SystemContext): Promise<void> {
     await new Promise(resolve => setTimeout(resolve, 250));
     for (const actor of this.authority?.reconcile() ?? []) this.sendState(actor, ctx);
+    this.projection?.poll();
   }
 
   private sendState(actor: number, ctx: SystemContext): void {
@@ -56,6 +85,7 @@ export class CampaignInstances implements System {
   }
 
   customPacket(userId: number, type: string, content: Content, ctx: SystemContext): void {
+    if (type === "boyhouse.projection") { this.projection?.packet(userId, content); return; }
     if (type !== "boyhouse.instance" || !this.authority) return;
     const actor = ctx.svr.getUserActor(userId);
     if (!actor) return;
@@ -92,6 +122,7 @@ export class CampaignInstances implements System {
   }
 
   disconnect(userId: number, ctx: SystemContext): void {
+    this.projection?.disconnect(userId);
     this.lastAction.delete(userId);
     const actor = ctx.svr.getUserActor(userId);
     if (actor && this.authority) {

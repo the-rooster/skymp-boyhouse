@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <nlohmann/json_fwd.hpp>
 #include <string>
 #include <vector>
 
@@ -12,6 +13,9 @@ class CampaignReferenceFactory
 {
 public:
   static constexpr auto kAllocations = "private.boyhouse.referenceAllocations";
+  // Read-only projection manifest for the actor's current campaign. Includes
+  // hidden/deleted originals, which never produce ordinary stream-in messages.
+  static nlohmann::json Snapshot(MpActor& actor);
   static std::vector<uint32_t> Ensure(MpActor& owner,
                                       const std::vector<uint32_t>& originals,
                                       uint32_t encounterLevel);

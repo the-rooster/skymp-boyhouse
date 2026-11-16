@@ -49,8 +49,8 @@
     "skymp5-server/cpp/server_guest_lib/LeveledListUtils.h": "aecd1c2abd94d5733ce3d2459c108a65072e12db94566d5f82b99ad2e4818bcd",
     "skymp5-server/cpp/server_guest_lib/LeveledListUtils.cpp": "c27d0b4e6ae8cdad3d5a5f4cb71108184ecc5c1663016729a490f299fc50a55e",
     "skymp5-server/cpp/server_guest_lib/InventoryDefaults.h": "9c746f3353072177207b0644e247bf5d135bcc2144aeaa601c6e214d25a1cb24",
-    "skymp5-server/cpp/server_guest_lib/CampaignReferenceFactory.cpp": "b5a73c855c726bd715562537268cd981093581ea9ac1dd6d095472803b087e3c",
-    "skymp5-server/cpp/server_guest_lib/CampaignReferenceFactory.h": "58d07e9639f0f3eb3e994b6635510771d01f2b3e2f89eda2301d9c23c0a8d173",
+    "skymp5-server/cpp/server_guest_lib/CampaignReferenceFactory.cpp": "e79df5c51303e4220e8288517cdbc6db12420f053835f5a9f8aa99ad21bc0e9d",
+    "skymp5-server/cpp/server_guest_lib/CampaignReferenceFactory.h": "ea92f61ecf8b3b7c95d1375c3c7d101bff2e9bd0ec2545634d207c068f4cc759",
     "libespm/src/NPC_.cpp": "6f311d368dd90b165cf2dc2ee48954ebae00ff740b16496c310f63e030ef80ef"
   },
   "nativeSubsets": [
