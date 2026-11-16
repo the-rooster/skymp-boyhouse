@@ -203,15 +203,7 @@ bool QuestJournal::Apply(MpActor& actor, const nlohmann::json& command)
       command.at("expectedRevision") != ledger.at("revision")) {
     throw std::runtime_error("Stale quest revision");
   }
-  // This gate prevents us from silently claiming that setting a number runs
-  // vanilla aliases, conditions, fragments, scenes, rewards, or story events.
-  const auto enabled =
-    Json::parse(owner.GetDynamicFields().GetValueDump(kEnabled));
-  if (!enabled.is_array() ||
-      std::find(enabled.begin(), enabled.end(), def.key) == enabled.end()) {
-    throw std::runtime_error(
-      "Quest execution adapter is not enabled for this campaign");
-  }
+  RequireAdapter(actor, id);
   const auto before = ledger;
   auto& quest = ledger["quests"][def.key];
   if (quest.is_null())
@@ -356,4 +348,16 @@ void QuestJournal::SetScriptState(MpActor& actor, const nlohmann::json& state)
     throw std::overflow_error("Quest revision exhausted");
   transaction->ledger["vm"] = state;
   transaction->ledger["revision"] = revision + 1;
+}
+
+void QuestJournal::RequireAdapter(MpActor& actor, uint32_t questId)
+{
+  auto& owner = Owner(actor);
+  const auto def = Lookup(owner, questId);
+  const auto enabled =
+    Json::parse(owner.GetDynamicFields().GetValueDump(kEnabled));
+  if (!enabled.is_array() ||
+      std::find(enabled.begin(), enabled.end(), def.key) == enabled.end())
+    throw std::runtime_error(
+      "Quest execution adapter is not enabled for this campaign");
 }

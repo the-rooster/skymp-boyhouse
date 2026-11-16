@@ -43,7 +43,7 @@ stage(guest, 20);
 assert.equal(progress(owner).quests[key].stage, 20);
 assert.deepEqual(progress(stranger).quests, {});
 const beforeFragment = progress(owner);
-assert.throws(() => server.set(guest, "questExecuteStage", { quest, stage: 30 }), /WhiterunMapMarker/);
+assert.throws(() => server.set(guest, "questExecuteStage", { quest, stage: 30 }), /Method not found - 'AddToMap'/);
 assert.deepEqual(progress(owner), beforeFragment);
 assert.throws(() => server.set(guest, "questExecuteStage", { quest, stage: 100, expectedRevision: 0 }), /Stale quest revision/);
 assert.throws(() => server.set(guest, "questExecuteStage", { quest, stage: 10.5 }), /Invalid quest stage/);

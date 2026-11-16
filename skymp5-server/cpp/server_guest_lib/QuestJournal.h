@@ -16,6 +16,7 @@ public:
   static MpActor& Owner(MpActor& actor);
   static nlohmann::json Snapshot(MpActor& actor);
   static nlohmann::json Get(MpActor& actor, uint32_t questId);
+  static void RequireAdapter(MpActor& actor, uint32_t questId);
   static bool Apply(MpActor& actor, const nlohmann::json& command);
   // Synchronous quest-only transaction. External effects and latent natives
   // must not be registered by callers until they have transactional adapters.

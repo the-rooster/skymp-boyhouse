@@ -2,18 +2,36 @@
   "schemaVersion": 1,
   "scope": "Audited isolated campaign fragment runner only; all entries are partial implementations, not quest certification",
   "sourceHashes": {
-    "skymp5-server/cpp/server_guest_lib/QuestScriptRuntime.cpp": "29c3a37dcc0b6d21da1b2ec7132f00f68d991386281a85bff3ed3dc2a9ee314e",
-    "skymp5-server/cpp/server_guest_lib/script_classes/PapyrusQuest.cpp": "85b17221763600d66214b711691e47093e17f3d4e05f7ac10751ee5ba563a823"
+    "skymp5-server/cpp/server_guest_lib/QuestScriptRuntime.cpp": "abcf704f8cbd2b0b6a140169e405fd2b8772d47b622817f2c04874dc08f75f8a",
+    "skymp5-server/cpp/server_guest_lib/script_classes/PapyrusQuest.cpp": "85b17221763600d66214b711691e47093e17f3d4e05f7ac10751ee5ba563a823",
+    "libespm/src/QuestAliasData.cpp": "4cf16635f74b63707a9f7b46d1003779f354289b29b327137877e996cd18def4",
+    "libespm/include/libespm/QuestAliasData.h": "481593ca4c17423f6a2c3cd9d60a9f79d38cd75a6f1c801759e4a342ff38da95",
+    "skymp5-server/cpp/server_guest_lib/QuestVmState.cpp": "f5ab8f083db61fb77bf03b250a4aa68e014e6b1c0df2d1e09ccac32053d37062",
+    "skymp5-server/cpp/server_guest_lib/script_objects/CampaignFormObject.cpp": "1ca39d9e1fe55d271bd5c8db4f95527e1805337ce6bf44e280f548a815c92350",
+    "skymp5-server/cpp/server_guest_lib/script_objects/CampaignAliasObject.cpp": "7f44ea3e92f14570c8af9ecfe14f33e0a4f00d22e0fc8240dc7c52dc504c1393",
+    "libespm/src/RecordHeader.cpp": "c24cf36071d45938a3be09fc7fe69259a3a347fc237b75fa13a6aeed4ac9d333",
+    "skymp5-server/cpp/server_guest_lib/script_objects/CampaignFormObject.h": "7af4c0a94de45776ca3a272489e0d43215a2c7ea6acec1c62c8d181ae8f14f13",
+    "skymp5-server/cpp/server_guest_lib/script_objects/CampaignAliasObject.h": "f105aa8c970bb466190aa2e8a0308bfc578958da3a62ea40ca7aff3aa15f65f8"
   },
   "nativeSubsets": [
+    "actor.getactorbase",
+    "alias.getid",
+    "alias.getname",
+    "alias.getowningquest",
+    "form.getformid",
+    "game.getform",
+    "game.getplayer",
     "globalvariable.getvalue",
     "globalvariable.getvalueint",
     "globalvariable.mod",
     "globalvariable.setvalue",
     "globalvariable.setvalueint",
+    "locationalias.getlocation",
+    "objectreference.getbaseobject",
     "quest.completeallobjectives",
     "quest.completequest",
     "quest.failallobjectives",
+    "quest.getalias",
     "quest.getcurrentstageid",
     "quest.getstage",
     "quest.getstagedone",
@@ -30,7 +48,11 @@
     "quest.setobjectivecompleted",
     "quest.setobjectivedisplayed",
     "quest.setobjectivefailed",
-    "quest.setstage"
+    "quest.setstage",
+    "referencealias.getactorref",
+    "referencealias.getactorreference",
+    "referencealias.getref",
+    "referencealias.getreference"
   ],
   "conditionSubsets": [
     "56",
@@ -43,7 +65,11 @@
     "Quest lifecycle Start/Stop/Reset are explicitly rejected by the runner.",
     "Journal operations, nested stages, and globals are subsets; engine lifecycle, world effects and client projection remain open.",
     "Condition support is limited to stage-log contexts and specific flags/run-on types.",
-    "Do not infer campaign support from other global VM native registrations."
+    "Do not infer campaign support from other global VM native registrations.",
+    "Campaign forms are logical owner/form identities, not materialized world overlays; mutable world natives remain absent.",
+    "Alias getters support deterministic forced reference/location, unambiguous unique actor, and external-alias targets only. Conditions, runtime fills, creation, propagation, lifecycle, reservations and alias effects remain unsupported.",
+    "Alias script variables and resolved bindings persist transactionally in VM schema 4. Getter support does not imply alias lifecycle or quest support.",
+    "Game.GetForm resolves owned static forms; dynamic forms require campaign allocation and are explicitly rejected."
   ],
   "conditionNames": {
     "0": "GetWantBlocking",

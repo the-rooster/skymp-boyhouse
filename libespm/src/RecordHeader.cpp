@@ -94,3 +94,8 @@ uint32_t RecordHeader::GetFieldsSizeSum() const noexcept
 }
 
 }
+
+bool espm::RecordHeader::IsDeleted() const noexcept
+{
+  return flags & 0x20;
+}

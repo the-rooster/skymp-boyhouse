@@ -21,6 +21,7 @@ public:
   // Please use for tests only
   // Do not rely on Skyrim record flags format
   uint32_t GetFlags() const noexcept;
+  bool IsDeleted() const noexcept;
   uint32_t GetId() const noexcept;
   uint16_t GetVersion() const noexcept;
 

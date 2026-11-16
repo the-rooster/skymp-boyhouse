@@ -111,7 +111,7 @@ TEST_CASE("Legacy inline quest arrays migrate without merging equal values",
   REQUIRE(a.pArray != b.pArray);
   REQUIRE(static_cast<int>((*a.pArray)[0]) == 7);
   REQUIRE(static_cast<int>(migrated.Decode(values["count"])) == 4);
-  REQUIRE(migrated.Save()["schemaVersion"] == 3);
+  REQUIRE(migrated.Save()["schemaVersion"] == 4);
   REQUIRE(old["quest/a"]["values"]["a"].contains("value"));
 }
 
@@ -254,6 +254,45 @@ TEST_CASE("Heap schema two migrates without changing shared allocations",
   const auto values = migrated.GetScript("quest/a")["values"];
   REQUIRE(migrated.Decode(values["a"]).pArray ==
           migrated.Decode(values["b"]).pArray);
-  REQUIRE(migrated.Save()["schemaVersion"] == 3);
+  REQUIRE(migrated.Save()["schemaVersion"] == 4);
   REQUIRE(migrated.Save()["globals"].empty());
+}
+
+TEST_CASE("Alias bindings distinguish unresolved from empty and reset only "
+          "their quest",
+          "[Quest][QuestVM][QuestHeap]")
+{
+  auto heap = Heap();
+  REQUIRE_FALSE(heap.GetAliasBinding("a:Skyrim.esm/alias:1"));
+  heap.SetAliasBinding("a:Skyrim.esm/alias:1", "14:Skyrim.esm");
+  heap.SetAliasBinding("b:Skyrim.esm/alias:2", nullptr);
+  auto saved = heap.Save();
+  auto restarted = Heap(saved);
+  REQUIRE(*restarted.GetAliasBinding("a:Skyrim.esm/alias:1") ==
+          "14:Skyrim.esm");
+  REQUIRE(restarted.GetAliasBinding("b:Skyrim.esm/alias:2")->is_null());
+  QuestVmState::ResetQuest(saved, "a:Skyrim.esm/");
+  REQUIRE(saved["aliases"].size() == 1);
+  REQUIRE(saved["aliases"].contains("b:Skyrim.esm/alias:2"));
+  QuestVmState::ResetQuest(saved, "b:Skyrim.esm/");
+  REQUIRE(saved.empty());
+  REQUIRE_THROWS(heap.SetAliasBinding("", nullptr));
+  REQUIRE_THROWS(heap.SetAliasBinding("a", 17));
+}
+
+TEST_CASE("Schema three migrates globals without inventing alias bindings",
+          "[Quest][QuestVM][QuestHeap]")
+{
+  auto heap = Heap();
+  heap.SetGlobal("17424:Skyrim.esm", 3);
+  auto old = heap.Save();
+  old["schemaVersion"] = 3;
+  old.erase("aliases");
+  const auto saved = Heap(old).Save();
+  REQUIRE(saved["schemaVersion"] == 4);
+  REQUIRE(saved["globals"]["17424:Skyrim.esm"] == 3);
+  REQUIRE(saved["aliases"].empty());
+  auto bad = saved;
+  bad["aliases"]["quest/alias:1"] = Json::array();
+  REQUIRE_THROWS(Heap(bad));
 }

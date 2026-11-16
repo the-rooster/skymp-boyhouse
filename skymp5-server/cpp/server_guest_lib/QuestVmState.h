@@ -22,6 +22,8 @@ public:
   Json Save();
   std::optional<float> GetGlobal(const std::string& key) const;
   void SetGlobal(const std::string& key, double value);
+  std::optional<Json> GetAliasBinding(const std::string& key) const;
+  void SetAliasBinding(const std::string& key, Json value);
   static void ResetQuest(Json& saved, const std::string& prefix);
 
 private:

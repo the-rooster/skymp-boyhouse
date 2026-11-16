@@ -19,7 +19,16 @@ The [catalog analyzer](misc/boyhouse/DEPENDENCIES.md) scans all five owned maste
 
 Persistent personal/host journals, 23 Papyrus Quest state methods, four quest condition predicates, expired-context guards, and a read-only client journal feed are implemented. The new `questExecuteStage` trusted server API loads original PEX fragments into a campaign-scoped VM and commits journal changes and script variables together. It remains gated by experimental per-quest adapters; no complete vanilla quest is enabled. `mp "bh journal"` displays the diagnostic projection. See [the implementation contract and remaining gates](misc/boyhouse/QUESTS.md).
 
-## Current server verification on 2026-11-16 UTC
+## Current alias/form verification on 2026-11-16 UTC
+
+- Linux Release server/addon build and full native suite passed: **331 cases, 565,315 assertions**. Combined instance/quest suite: **77 cases, 89,430 assertions**.
+- Campaign form/player identities and alias VM objects now resolve inside the isolated runner. Deterministic forced reference/location, unique actor and external-alias targets are a partial implementation; no live NPC/reference clones are created.
+- Alias bindings and attached alias-script variables persist in VM schema 4, migrate older saves, stay with the host during guest play, and roll back with the journal on failure. Quest reset removes its own bindings and variables.
+- The bounded parser reads all owned alias definitions: **14,514 reference aliases and 1,237 location aliases**. Parsing includes conditions and effects that the runtime does not implement yet.
+- **25 JavaScript/TypeScript tests and 31 Python tests passed**. Native addon and full-server protocol smoke checks passed. The full catalog report was regenerated against the audited runtime sources; all 2,274 quest records remain untested.
+- **Zero quests have certified multiplayer playthroughs.** World overlays/effects, complete alias filling and lifecycle, dialogue/scenes, latent persistence and a compatible tested native client remain required.
+
+## Earlier globals verification on 2026-11-16 UTC
 
 - Linux Release server/addon build and full native suite passed: **311 cases, 519,173 assertions**. Focused quest suite: **48 cases, 41,984 assertions**.
 - Nested stage calls across quests now execute in the same campaign transaction and share the instruction budget. Failures roll back all affected stages and variables.
@@ -58,7 +67,7 @@ Persistent personal/host journals, 23 Papyrus Quest state methods, four quest co
 
 ## What this does not implement yet
 
-This is not full campaign multiplayer or a finished instancing engine. Vanilla static references are not cloned per campaign. General quest execution, aliases, dialogue scenes, story events, native client journals, branch ownership, world overlays, transactions spanning inventory/world effects, transition acknowledgements, automatic boundary crossing, guest progression rules, and client reset/rebinding remain to be built and tested. Entering an experimental instance can hide shared NPCs and interactive references until overlays exist. Use the empty boundary laboratory only.
+This is not full campaign multiplayer or a finished instancing engine. Vanilla static references are not cloned per campaign. General quest execution, complete alias filling/effects, dialogue scenes, story events, native client journals, branch ownership, world overlays, transactions spanning inventory/world effects, transition acknowledgements, automatic boundary crossing, guest progression rules, and client reset/rebinding remain to be built and tested. Entering an experimental instance can hide shared NPCs and interactive references until overlays exist. Use the empty boundary laboratory only.
 
 The full-release target is every quest in Skyrim, Update, Dawnguard, HearthFires, and Dragonborn. Completion requires evidence per quest and important branch; it is not guaranteed by adding synchronization primitives. The local owned files contain 2,274 distinct QUST records including internal helper quests. **Zero quests have been certified for this fork.** Creation Club and arbitrary quest mods are separate compatibility packs.
 

@@ -2,6 +2,8 @@
 #include "QuestJournal.h"
 #include "TestUtils.hpp"
 #include "papyrus-vm/Reader.h"
+#include "script_objects/CampaignAliasObject.h"
+#include "script_objects/CampaignFormObject.h"
 #include "script_objects/CampaignQuestObject.h"
 #include "script_storages/BsaArchiveScriptStorage.h"
 #include <fstream>
@@ -22,6 +24,7 @@ struct Fixture
   espm::QuestScriptData metadata;
   std::shared_ptr<PexScript> fixture = std::make_shared<PexScript>();
   std::shared_ptr<PexScript> quest = std::make_shared<PexScript>();
+  std::vector<std::shared_ptr<PexScript>> extraScripts;
   Fixture()
   {
     server.AttachEspm(&GetEspmLoader());
@@ -64,10 +67,12 @@ struct Fixture
   }
   bool Run(MpActor& actor, uint16_t stage = 10, uint32_t questId = kQuest)
   {
-    const std::vector<PexScript::Lazy> scripts = {
+    std::vector<PexScript::Lazy> scripts = {
       { fixture->source, [pex = fixture] { return pex; } },
       { quest->source, [pex = quest] { return pex; } }
     };
+    for (const auto& script : extraScripts)
+      scripts.push_back({ script->source, [script] { return script; } });
     return QuestScriptRuntime::ExecuteStage(actor, questId, stage, metadata,
                                             scripts);
   }
@@ -364,7 +369,7 @@ TEST_CASE(
   const auto before = QuestJournal::Snapshot(actor);
   REQUIRE_THROWS_WITH(
     QuestScriptRuntime::ExecuteStage(actor, kQuest, 10),
-    Catch::Matchers::ContainsSubstring("RiverwoodMapMarker"));
+    Catch::Matchers::ContainsSubstring("adapter is not enabled"));
   REQUIRE(QuestJournal::Snapshot(actor) == before);
   const auto record =
     f.server.worldState.GetEspm().GetBrowser().LookupById(kQuest);
@@ -857,4 +862,446 @@ TEST_CASE(
   REQUIRE(QuestJournal::Get(owner, quest)["completed"] == true);
   guest.SetWorldInstance("");
   REQUIRE(QuestJournal::ScriptState(guest).empty());
+}
+
+namespace {
+void BaseScripts(Fixture& f)
+{
+  f.quest->objectTable[0].parentClassName = "Form";
+  for (const auto& [name, parent] :
+       std::vector<std::pair<std::string, std::string>>{
+         { "Form", "" },
+         { "ObjectReference", "Form" },
+         { "Actor", "ObjectReference" },
+         { "ActorBase", "Form" },
+         { "Alias", "" },
+         { "ReferenceAlias", "Alias" },
+         { "LocationAlias", "Alias" },
+         { "Location", "Form" } }) {
+    auto script = std::make_shared<PexScript>();
+    script->source = name;
+    Object object;
+    object.NameIndex = name;
+    object.parentClassName = parent;
+    script->objectTable.push_back(object);
+    f.extraScripts.push_back(script);
+  }
+}
+void AddOwnedScript(Fixture& f, const std::string& name)
+{
+  BsaArchiveScriptStorage storage(
+    (std::filesystem::path(GetDataDir()) / "Skyrim - Misc.bsa")
+      .string()
+      .c_str());
+  storage.ListScripts(false);
+  auto scripts = Reader(std::vector<std::vector<uint8_t>>{
+                          storage.GetScriptPex(name.c_str()) })
+                   .GetSourceStructures();
+  REQUIRE(scripts.size() == 1);
+  scripts.front()->source = name;
+  f.extraScripts.push_back(scripts.front());
+}
+void AliasProperty(Fixture& f, uint32_t quest = kQuest, uint16_t alias = 4)
+{
+  BaseScripts(f);
+  espm::QuestScriptValue value;
+  value.type = 1;
+  value.formId = quest;
+  value.alias = alias;
+  f.metadata.scripts[0].properties.push_back({ "Target", 1, value });
+  f.fixture->objectTable[0].variables.push_back(
+    { "::Target_var", "ReferenceAlias", 0, VarValue::None() });
+  f.fixture->objectTable[0].variables.push_back(
+    { "bound", "ObjectReference", 0, VarValue::None() });
+  f.Fragment().code.instructions = {
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("GetReference"), Id("::Target_var"), Id("bound"),
+        VarValue(0) } },
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("GetFormID"), Id("bound"), Id("counter"), VarValue(0) } },
+    { FunctionCode::kOp_Return, { VarValue::None() } }
+  };
+}
+int32_t Counter(MpActor& actor)
+{
+  return QuestJournal::ScriptState(actor)["scripts"][kStateKey]["values"]
+                                         ["boyhousefixture/counter"]["value"]
+                                           .get<int32_t>();
+}
+void RestoreCharacter(MpActor& from, MpActor& to)
+{
+  const auto dump = MpChangeForm::ToJson(from.GetChangeForm()).dump();
+  simdjson::dom::parser parser;
+  auto parsed = parser.parse(dump).value();
+  to.ApplyChangeForm(MpChangeForm::JsonToChangeForm(parsed));
+}
+}
+
+TEST_CASE(
+  "Campaign forms and aliases have symmetric owner-specific identities",
+  "[Quest][QuestAliases]")
+{
+  const auto record = GetEspmLoader().GetBrowser().LookupById(0x1a677);
+  CampaignFormObject a(record, 1, 0x1a677), same(record, 1, 0x1a677),
+    other(record, 2, 0x1a677), player({}, 1, 0x14), guestPlayer({}, 2, 0x14);
+  EspmGameObject shared(record);
+  REQUIRE(a.EqualsByValue(same));
+  REQUIRE_FALSE(a.EqualsByValue(other));
+  REQUIRE_FALSE(other.EqualsByValue(a));
+  REQUIRE_FALSE(a.EqualsByValue(shared));
+  REQUIRE_FALSE(shared.EqualsByValue(a));
+  REQUIRE_FALSE(player.EqualsByValue(guestPlayer));
+  REQUIRE(std::string(player.GetParentNativeScript()) == "actor");
+  espm::QuestAliasDefinition def;
+  def.id = 4;
+  CampaignAliasObject first(1, kQuest, def), identical(1, kQuest, def),
+    guest(2, kQuest, def), differentQuest(1, 0x2d512, def);
+  REQUIRE(first.EqualsByValue(identical));
+  REQUIRE_FALSE(first.EqualsByValue(guest));
+  REQUIRE_FALSE(guest.EqualsByValue(first));
+  REQUIRE_FALSE(first.EqualsByValue(differentQuest));
+  REQUIRE(std::string(first.GetStringID()) != guest.GetStringID());
+}
+
+TEST_CASE(
+  "Alias reflection and VMAD properties resolve the same campaign object",
+  "[Quest][QuestAliases]")
+{
+  Fixture f;
+  auto& actor = f.Add(0xff000001);
+  AliasProperty(f);
+  f.fixture->objectTable[0].variables.push_back(
+    { "equal", "Bool", 0, VarValue(false) });
+  f.Fragment().locals.push_back({ "lookup", "Alias" });
+  f.Fragment().code.instructions = {
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("GetAlias"), Id("self"), Id("lookup"), VarValue(1),
+        VarValue(4) } },
+    { FunctionCode::kOp_CompareEQ,
+      { Id("equal"), Id("lookup"), Id("::Target_var") } },
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("GetID"), Id("lookup"), Id("counter"), VarValue(0) } },
+    { FunctionCode::kOp_Return, { VarValue::None() } }
+  };
+  REQUIRE(f.Run(actor));
+  REQUIRE(Counter(actor) == 4);
+  const auto saved = QuestJournal::ScriptState(actor);
+  REQUIRE(
+    saved["scripts"][kStateKey]["values"]["boyhousefixture/equal"]["value"] ==
+    true);
+  REQUIRE(saved["scripts"][kStateKey]["values"]["boyhousefixture/::target_var"]
+               ["value"]["kind"] == "alias");
+  REQUIRE(saved["aliases"].empty()); // Reflection does not fill an alias.
+  REQUIRE_FALSE(QuestJournal::Snapshot(actor).contains("vm"));
+}
+
+TEST_CASE(
+  "Unique actor aliases persist host bindings and stable form references",
+  "[Quest][QuestAliases]")
+{
+  Fixture f;
+  auto& host = f.Add(0xff000001);
+  auto& guest = f.Add(0xff000002);
+  AliasProperty(f);
+  const auto instance =
+    "campaign:" + std::to_string(host.GetFormId()) + ":fixture";
+  host.SetWorldInstance(instance);
+  guest.SetWorldInstance(instance);
+  REQUIRE(f.Run(guest));
+  REQUIRE(Counter(host) == 0x1a677);
+  REQUIRE(
+    QuestJournal::ScriptState(host)["aliases"]["4e50d:Skyrim.esm/alias:4"] ==
+    "1a677:Skyrim.esm");
+  guest.SetWorldInstance("");
+  REQUIRE(QuestJournal::ScriptState(guest).empty());
+  REQUIRE(f.Run(guest));
+  REQUIRE(Counter(guest) == 0x1a677);
+
+  Fixture restart;
+  auto& restored = restart.Add(host.GetFormId());
+  restored.SetWorldInstance(instance);
+  RestoreCharacter(host, restored);
+  AliasProperty(restart);
+  REQUIRE(restart.Run(restored, 20));
+  REQUIRE(Counter(restored) == 0x1a677);
+  REQUIRE(QuestJournal::ScriptState(restored)["schemaVersion"] == 4);
+}
+
+TEST_CASE("Alias binding failures roll back and unsupported optional fills "
+          "stay explicit",
+          "[Quest][QuestAliases]")
+{
+  Fixture f;
+  auto& actor = f.Add(0xff000001);
+  AliasProperty(f);
+  auto& code = f.Fragment().code.instructions;
+  code.insert(code.end() - 1,
+              { FunctionCode::kOp_CallMethod,
+                { VarValue("UnsupportedNative"), Id("self"), Id("temp"),
+                  VarValue(0) } });
+  const auto before =
+    actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty);
+  REQUIRE_THROWS(f.Run(actor));
+  REQUIRE(actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
+          before);
+  REQUIRE(QuestJournal::ScriptState(actor).empty());
+  code.erase(code.end() - 2);
+  REQUIRE(f.Run(actor));
+  REQUIRE(
+    QuestJournal::Apply(actor, { { "quest", kQuest }, { "op", "reset" } }));
+  REQUIRE(QuestJournal::ScriptState(actor).empty());
+  // Optional FactionFriend is a runtime-filled alias. Unknown is not None.
+  f.metadata.scripts[0].properties[0].value.alias = 1;
+  REQUIRE_THROWS_WITH(
+    f.Run(actor),
+    Catch::Matchers::ContainsSubstring("Alias fill is unresolved"));
+  REQUIRE(QuestJournal::ScriptState(actor).empty());
+}
+
+TEST_CASE("Forced reference aliases bind from owned data without using shared "
+          "live objects",
+          "[Quest][QuestAliases]")
+{
+  Fixture f;
+  auto& actor = f.Add(0xff000001);
+  AliasProperty(f, 0x4a37b, 1);
+  AddOwnedScript(f, "DA08WhisperingDoorScript");
+  actor.SetPropertyValueDump(QuestJournal::kEnabled,
+                             "[\"4e50d:Skyrim.esm\",\"4a37b:Skyrim.esm\"]",
+                             false, false);
+  REQUIRE(
+    QuestJournal::Apply(actor, { { "quest", 0x4a37b }, { "op", "start" } }));
+  REQUIRE(f.Run(actor));
+  REQUIRE(Counter(actor) == 0x4a38c);
+  REQUIRE(
+    QuestJournal::ScriptState(actor)["aliases"]["4a37b:Skyrim.esm/alias:1"] ==
+    "4a38c:Skyrim.esm");
+  REQUIRE_FALSE(f.server.worldState.LookupFormByIdNoLoad(0x4a38c));
+}
+
+TEST_CASE(
+  "Alias reads respect stopped quests and cross-quest adapter boundaries",
+  "[Quest][QuestAliases]")
+{
+  Fixture f;
+  auto& actor = f.Add(0xff000001);
+  AliasProperty(f, 0x4a37b, 1);
+  AddOwnedScript(f, "DA08WhisperingDoorScript");
+  f.Fragment().code.instructions.erase(f.Fragment().code.instructions.begin() +
+                                       1);
+  REQUIRE(f.Run(actor)); // A not-yet-started target quest has no filled alias.
+  REQUIRE(QuestJournal::ScriptState(actor)["aliases"].empty());
+  REQUIRE(
+    QuestJournal::ScriptState(
+      actor)["scripts"][kStateKey]["values"]["boyhousefixture/bound"]["value"]
+      .is_null());
+  actor.SetPropertyValueDump(QuestJournal::kEnabled,
+                             "[\"4e50d:Skyrim.esm\",\"4a37b:Skyrim.esm\"]",
+                             false, false);
+  REQUIRE(
+    QuestJournal::Apply(actor, { { "quest", 0x4a37b }, { "op", "start" } }));
+  actor.SetPropertyValueDump(QuestJournal::kEnabled, "[\"4e50d:Skyrim.esm\"]",
+                             false, false);
+  const auto before =
+    actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty);
+  REQUIRE_THROWS_WITH(
+    f.Run(actor, 20),
+    Catch::Matchers::ContainsSubstring("adapter is not enabled"));
+  REQUIRE(actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
+          before);
+}
+
+TEST_CASE("Campaign player and base forms survive reload without exposing a "
+          "guest identity",
+          "[Quest][QuestAliases]")
+{
+  Fixture f;
+  auto& host = f.Add(0xff000001);
+  auto& guest = f.Add(0xff000002);
+  BaseScripts(f);
+  f.fixture->objectTable[0].variables.push_back(
+    { "player", "Actor", 0, VarValue::None() });
+  f.Fragment().code.instructions = {
+    { FunctionCode::kOp_CallStatic,
+      { VarValue("Game"), VarValue("GetPlayer"), Id("player"), VarValue(0) } },
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("GetFormID"), Id("player"), Id("counter"), VarValue(0) } },
+    { FunctionCode::kOp_Return, { VarValue::None() } }
+  };
+  const auto instance =
+    "campaign:" + std::to_string(host.GetFormId()) + ":fixture";
+  host.SetWorldInstance(instance);
+  guest.SetWorldInstance(instance);
+  REQUIRE(f.Run(guest));
+  REQUIRE(Counter(host) == 0x14);
+  REQUIRE(QuestJournal::ScriptState(host)["scripts"][kStateKey]["values"]
+                                         ["boyhousefixture/player"]["value"] ==
+          "14:Skyrim.esm");
+  guest.SetWorldInstance("");
+  REQUIRE(QuestJournal::ScriptState(guest).empty());
+  Fixture restart;
+  auto& restored = restart.Add(host.GetFormId());
+  RestoreCharacter(host, restored);
+  restart.fixture = f.fixture;
+  BaseScripts(restart);
+  restart.extraScripts = f.extraScripts;
+  restart.Fragment().code.instructions.erase(
+    restart.Fragment().code.instructions.begin());
+  REQUIRE(restart.Run(restored, 20));
+  REQUIRE(Counter(restored) == 0x14);
+}
+
+TEST_CASE(
+  "Forced location aliases retain location identity in the host campaign",
+  "[Quest][QuestAliases]")
+{
+  Fixture f;
+  auto& actor = f.Add(0xff000001);
+  AliasProperty(f, 0xe3163, 4);
+  f.fixture->objectTable[0].variables[1].typeName = "LocationAlias";
+  f.fixture->objectTable[0].variables[2].typeName = "Location";
+  f.Fragment().code.instructions[0].args[0] = VarValue("GetLocation");
+  actor.SetPropertyValueDump(QuestJournal::kEnabled,
+                             "[\"4e50d:Skyrim.esm\",\"e3163:Skyrim.esm\"]",
+                             false, false);
+  REQUIRE(
+    QuestJournal::Apply(actor, { { "quest", 0xe3163 }, { "op", "start" } }));
+  REQUIRE(f.Run(actor));
+  REQUIRE(Counter(actor) == 0x19189);
+  REQUIRE(
+    QuestJournal::ScriptState(actor)["aliases"]["e3163:Skyrim.esm/alias:4"] ==
+    "19189:Skyrim.esm");
+}
+
+TEST_CASE("Campaign references resolve their owned base records",
+          "[Quest][QuestAliases]")
+{
+  Fixture f;
+  auto& actor = f.Add(0xff000001);
+  AliasProperty(f);
+  f.Fragment().locals.push_back({ "base", "Form" });
+  f.Fragment().code.instructions.insert(
+    f.Fragment().code.instructions.begin() + 1,
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("GetBaseObject"), Id("bound"), Id("base"), VarValue(0) } });
+  f.Fragment().code.instructions[2].args[1] = Id("base");
+  REQUIRE(f.Run(actor));
+  REQUIRE(Counter(actor) == 0x13bbd);
+}
+
+TEST_CASE("Alias scripts persist separate variables and owning quest identity",
+          "[Quest][QuestAliases]")
+{
+  Fixture f;
+  auto& host = f.Add(0xff000001);
+  auto& guest = f.Add(0xff000002);
+  AliasProperty(f);
+  espm::QuestScriptData::Alias binding;
+  binding.object.type = 1;
+  binding.object.formId = kQuest;
+  binding.object.alias = 4;
+  binding.version = 5;
+  binding.objectFormat = 2;
+  binding.scripts.push_back({ "AliasFixture", 0, {} });
+  f.metadata.aliases.push_back(binding);
+  auto script = std::make_shared<PexScript>();
+  script->source = "AliasFixture";
+  Object object;
+  object.NameIndex = script->source;
+  object.parentClassName = "ReferenceAlias";
+  object.variables.push_back({ "visits", "Int", 0, VarValue(0) });
+  FunctionInfo method;
+  method.valid = true;
+  method.returnType = "Int";
+  method.locals.push_back({ "owner", "Quest" });
+  method.code.instructions = {
+    { FunctionCode::kOp_IAdd, { Id("visits"), Id("visits"), VarValue(1) } },
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("GetOwningQuest"), Id("self"), Id("owner"), VarValue(0) } },
+    { FunctionCode::kOp_Return, { Id("visits") } }
+  };
+  object.states.push_back({ "", { { "Visit", method } } });
+  script->objectTable.push_back(object);
+  f.extraScripts.push_back(script);
+  f.Fragment().code.instructions = {
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("Visit"), Id("::Target_var"), Id("counter"), VarValue(0) } },
+    { FunctionCode::kOp_Return, { VarValue::None() } }
+  };
+  const auto instance =
+    "campaign:" + std::to_string(host.GetFormId()) + ":fixture";
+  host.SetWorldInstance(instance);
+  guest.SetWorldInstance(instance);
+  REQUIRE(f.Run(guest));
+  REQUIRE(f.Run(guest, 20));
+  REQUIRE(Counter(host) == 2);
+  const auto saved = QuestJournal::ScriptState(host);
+  REQUIRE(saved["scripts"]["4e50d:Skyrim.esm/alias:4/aliasfixture"]["values"]
+               ["aliasfixture/visits"]["value"] == 2);
+  REQUIRE(saved["aliases"].empty()); // The script did not request a target.
+  guest.SetWorldInstance("");
+  REQUIRE(QuestJournal::ScriptState(guest).empty());
+  REQUIRE(f.Run(guest));
+  REQUIRE(Counter(guest) == 1);
+}
+
+TEST_CASE("Invalid saved aliases and dynamic form lookups cannot cross the "
+          "campaign boundary",
+          "[Quest][QuestAliases]")
+{
+  Fixture f;
+  auto& actor = f.Add(0xff000001);
+  AliasProperty(f);
+  REQUIRE(f.Run(actor));
+  auto ledger = nlohmann::json::parse(
+    actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty));
+  ledger["vm"]["scripts"][kStateKey]["values"]["boyhousefixture/::target_var"]
+        ["value"]["id"] = -1;
+  actor.SetPropertyValueDump(QuestJournal::kProperty, ledger.dump(), false,
+                             false);
+  const auto before =
+    actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty);
+  REQUIRE_THROWS_WITH(f.Run(actor, 20),
+                      Catch::Matchers::ContainsSubstring(
+                        "Invalid saved campaign alias identity"));
+  REQUIRE(actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
+          before);
+  REQUIRE(
+    QuestJournal::Apply(actor, { { "quest", kQuest }, { "op", "reset" } }));
+  f.Fragment().code.instructions = {
+    { FunctionCode::kOp_CallStatic,
+      { VarValue("Game"), VarValue("GetForm"), Id("bound"), VarValue(1),
+        VarValue(static_cast<int32_t>(0xff000002)) } },
+    { FunctionCode::kOp_Return, { VarValue::None() } }
+  };
+  REQUIRE_THROWS_WITH(
+    f.Run(actor),
+    Catch::Matchers::ContainsSubstring("campaign reference allocation"));
+  REQUIRE(QuestJournal::ScriptState(actor).empty());
+}
+
+TEST_CASE("Invalid saved targets cannot empty or retype required aliases",
+          "[Quest][QuestAliases]")
+{
+  for (const auto& target :
+       { nlohmann::json(nullptr), nlohmann::json("13bbd:Skyrim.esm") }) {
+    Fixture f;
+    auto& actor = f.Add(0xff000001);
+    AliasProperty(f);
+    REQUIRE(f.Run(actor));
+    auto ledger = nlohmann::json::parse(
+      actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty));
+    ledger["vm"]["aliases"]["4e50d:Skyrim.esm/alias:4"] = target;
+    actor.SetPropertyValueDump(QuestJournal::kProperty, ledger.dump(), false,
+                               false);
+    const auto before =
+      actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty);
+    REQUIRE_THROWS_WITH(f.Run(actor, 20),
+                        Catch::Matchers::ContainsSubstring(
+                          target.is_null()
+                            ? "Required alias has an empty saved binding"
+                            : "Alias target type mismatch"));
+    REQUIRE(actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
+            before);
+  }
 }

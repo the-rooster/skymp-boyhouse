@@ -6,10 +6,13 @@
 #include "WorldState.h"
 #include "condition_functions/ConditionFunctionFactory.h"
 #include "libespm/CTDA.h"
+#include "libespm/QuestAliasData.h"
 #include "libespm/RecordHeaderAccess.h"
 #include "papyrus-vm/Reader.h"
 #include "script_classes/PapyrusQuest.h"
 #include "script_compatibility_policies/HeuristicPolicy.h"
+#include "script_objects/CampaignAliasObject.h"
+#include "script_objects/CampaignFormObject.h"
 #include "script_objects/CampaignQuestObject.h"
 #include "script_storages/IScriptStorage.h"
 #include <cmath>
@@ -92,16 +95,42 @@ private:
   std::function<float(uint32_t)> read;
 };
 
+uint32_t ReferenceBase(const espm::LookupResult& record, WorldState& world)
+{
+  if (!record.rec ||
+      (record.rec->GetType() != "REFR" && record.rec->GetType() != "ACHR"))
+    throw std::invalid_argument("Expected placed reference");
+  std::optional<uint32_t> base;
+  espm::RecordHeaderAccess::IterateFields(
+    record.rec,
+    [&](const char* tag, uint32_t size, const char* bytes) {
+      if (std::memcmp(tag, "NAME", 4))
+        return;
+      if (base || size != 4)
+        throw std::runtime_error("Malformed reference base record");
+      uint32_t value;
+      std::memcpy(&value, bytes, 4);
+      base = record.ToGlobalId(value);
+    },
+    world.GetEspmCache());
+  if (!base || !*base)
+    throw std::runtime_error("Reference has no base object");
+  return *base;
+}
+
 class Variables : public IVariablesHolder
 {
 public:
   using Resolve = std::function<std::shared_ptr<IGameObject>(uint32_t)>;
+  using ResolveAlias =
+    std::function<std::shared_ptr<IGameObject>(uint32_t, uint32_t)>;
   Variables(espm::QuestScript script_, espm::LookupResult record_, Json saved_,
-            Resolve resolve_, QuestVmState& heap_)
+            Resolve resolve_, ResolveAlias resolveAlias_, QuestVmState& heap_)
     : script(std::move(script_))
     , record(record_)
     , saved(std::move(saved_))
     , resolve(std::move(resolve_))
+    , resolveAlias(std::move(resolveAlias_))
     , heap(heap_)
   {
     if (!saved.is_object())
@@ -189,8 +218,8 @@ private:
         if (!value.formId)
           return VarValue::None();
         if (value.alias != 0xffff)
-          throw std::runtime_error(
-            "Quest alias property requires an alias adapter");
+          return VarValue(
+            resolveAlias(record.ToGlobalId(value.formId), value.alias).get());
         return VarValue(resolve(record.ToGlobalId(value.formId)).get());
       case 2:
         return VarValue(value.text);
@@ -214,6 +243,7 @@ private:
   espm::LookupResult record;
   Json saved;
   Resolve resolve;
+  ResolveAlias resolveAlias;
   QuestVmState& heap;
   std::map<std::string, VarValue> values;
 };
@@ -343,9 +373,30 @@ bool QuestScriptRuntime::ExecuteStage(
     std::map<uint32_t, std::shared_ptr<IGameObject>> objects;
     std::map<std::string, std::shared_ptr<Variables>> variables;
     std::function<std::shared_ptr<IGameObject>(uint32_t)> resolve;
+    std::function<std::shared_ptr<IGameObject>(uint32_t, uint32_t)>
+      resolveAlias;
+    std::map<uint32_t, espm::QuestAliasData> aliasDefinitions;
+    std::map<std::pair<uint32_t, uint32_t>,
+             std::shared_ptr<CampaignAliasObject>>
+      aliases;
     QuestVmState state(
       QuestJournal::ScriptState(actor),
       [&](IGameObject* value) -> Json {
+        if (auto* alias = dynamic_cast<CampaignAliasObject*>(value)) {
+          if (alias->OwnerId() != owner)
+            throw std::runtime_error("Alias belongs to another campaign");
+          return { { "kind", "alias" },
+                   { "quest",
+                     FormDesc::FromFormId(alias->QuestId(), world.espmFiles)
+                       .ToString() },
+                   { "id", alias->Definition().id } };
+        }
+        if (auto* reference = dynamic_cast<CampaignFormObject*>(value)) {
+          if (reference->OwnerId() != owner)
+            throw std::runtime_error("Form belongs to another campaign");
+          return FormDesc::FromFormId(reference->FormId(), world.espmFiles)
+            .ToString();
+        }
         const EspmGameObject* form = nullptr;
         if (auto* quest = dynamic_cast<CampaignQuestObject*>(value)) {
           if (quest->OwnerId() == owner)
@@ -362,6 +413,19 @@ bool QuestScriptRuntime::ExecuteStage(
           .ToString();
       },
       [&](const Json& value) -> VarValue {
+        if (value.is_object()) {
+          if (value.size() != 3 || value.at("kind") != "alias" ||
+              !value.at("quest").is_string() ||
+              !value.at("id").is_number_integer() ||
+              value.at("id").get<int64_t>() < 0 ||
+              value.at("id").get<uint64_t>() > INT32_MAX)
+            throw std::runtime_error("Invalid saved campaign alias identity");
+          return VarValue(resolveAlias(FormDesc::FromString(
+                                         value.at("quest").get<std::string>())
+                                         .ToFormId(world.espmFiles),
+                                       value.at("id").get<uint32_t>())
+                            .get());
+        }
         return VarValue(resolve(FormDesc::FromString(value.get<std::string>())
                                   .ToFormId(world.espmFiles))
                           .get());
@@ -371,15 +435,19 @@ bool QuestScriptRuntime::ExecuteStage(
       if (objects.count(id))
         return objects.at(id);
       const auto rec = world.GetEspm().GetBrowser().LookupById(id);
+      if (id != 0x14 && (!rec.rec || rec.rec->IsDeleted()))
+        throw std::runtime_error("Missing or deleted campaign form");
       if (rec.rec && rec.rec->GetType() == "GLOB") {
         auto global = std::make_shared<CampaignGlobalObject>(rec, owner);
         objects[id] = global;
         return global;
       }
 
-      if (!rec.rec || rec.rec->GetType() != "QUST")
-        throw std::runtime_error(
-          "World reference properties require a campaign overlay adapter");
+      if (id == 0x14 || rec.rec->GetType() != "QUST") {
+        auto form = std::make_shared<CampaignFormObject>(rec, owner, id);
+        objects[id] = form;
+        return form;
+      }
       auto object = std::make_shared<CampaignQuestObject>(rec, owner);
       objects[id] = object;
       const auto data = id == questId
@@ -400,13 +468,332 @@ bool QuestScriptRuntime::ExecuteStage(
         if (variables.count(key))
           throw std::runtime_error("Duplicate quest script binding");
         auto holder = std::make_shared<Variables>(
-          script, rec, state.GetScript(key), resolve, state);
+          script, rec, state.GetScript(key), resolve, resolveAlias, state);
         variables[key] = holder;
         bindings.push_back({ script.name, holder });
       }
       vm.AddObject(object, bindings);
       return object;
     };
+
+    auto questKey = [&](uint32_t id) {
+      return FormDesc::FromFormId(id, world.espmFiles).ToString();
+    };
+    auto definitions = [&](uint32_t id) -> const espm::QuestAliasData& {
+      auto it = aliasDefinitions.find(id);
+      if (it == aliasDefinitions.end()) {
+        const auto rec = world.GetEspm().GetBrowser().LookupById(id);
+        it = aliasDefinitions
+               .emplace(
+                 id, espm::QuestAliasData::Read(rec.rec, world.GetEspmCache()))
+               .first;
+      }
+      return it->second;
+    };
+    resolveAlias = [&](uint32_t id,
+                       uint32_t aliasId) -> std::shared_ptr<IGameObject> {
+      const auto key = std::make_pair(id, aliasId);
+      if (aliases.count(key))
+        return aliases.at(key);
+      const auto* definition = definitions(id).Find(aliasId);
+      if (!definition)
+        throw std::runtime_error("Quest alias does not exist");
+      auto object =
+        std::make_shared<CampaignAliasObject>(owner, id, *definition);
+      aliases.emplace(key, object);
+      const auto rec = world.GetEspm().GetBrowser().LookupById(id);
+      const auto data = id == questId
+        ? metadata
+        : espm::QuestScriptData::Read(rec.rec, world.GetEspmCache());
+      std::vector<VirtualMachine::ScriptInfo> bindings;
+      for (const auto& binding : data.aliases) {
+        if (binding.object.alias != aliasId)
+          continue;
+        if (rec.ToGlobalId(binding.object.formId) != id)
+          throw std::runtime_error("Alias script is bound to another quest");
+        for (const auto& script : binding.scripts) {
+          if (script.status == 3)
+            continue;
+          const auto pex = vm.GetPexByName(script.name);
+          if (!pex.fn)
+            throw std::runtime_error("Missing alias script: " + script.name);
+          pex.fn();
+          const auto stateKey = questKey(id) +
+            "/alias:" + std::to_string(aliasId) + "/" + Lower(script.name);
+          if (variables.count(stateKey))
+            throw std::runtime_error("Duplicate alias script binding");
+          auto holder =
+            std::make_shared<Variables>(script, rec, state.GetScript(stateKey),
+                                        resolve, resolveAlias, state);
+          variables[stateKey] = holder;
+          bindings.push_back({ script.name, holder });
+        }
+      }
+      vm.AddObject(object, bindings);
+      return object;
+    };
+
+    auto aliasSelf = [&](const VarValue& self) -> CampaignAliasObject& {
+      if (self.GetType() != VarValue::kType_Object)
+        throw std::invalid_argument("Expected campaign alias");
+      auto* object =
+        dynamic_cast<CampaignAliasObject*>(static_cast<IGameObject*>(self));
+      if (!object || object->OwnerId() != owner)
+        throw std::runtime_error("Alias belongs to another campaign");
+      return *object;
+    };
+    auto formId = [&](const VarValue& self) -> uint32_t {
+      if (self.GetType() != VarValue::kType_Object)
+        throw std::invalid_argument("Expected campaign form");
+      auto* object = static_cast<IGameObject*>(self);
+      if (const auto* form = dynamic_cast<CampaignFormObject*>(object)) {
+        if (form->OwnerId() == owner)
+          return form->FormId();
+      }
+      const EspmGameObject* result = nullptr;
+      if (const auto* quest = dynamic_cast<CampaignQuestObject*>(object)) {
+        if (quest->OwnerId() == owner)
+          result = quest;
+      } else if (const auto* global =
+                   dynamic_cast<CampaignGlobalObject*>(object)) {
+        if (global->OwnerId() == owner)
+          result = global;
+      }
+      if (!result)
+        throw std::runtime_error(
+          "Form belongs to another campaign or is an alias");
+      return result->record.ToGlobalId(result->record.rec->GetId());
+    };
+    vm.RegisterFunction("Form", "GetFormID", FunctionType::Method,
+                        [&](VarValue self, std::vector<VarValue> args) {
+                          if (!args.empty())
+                            throw std::invalid_argument(
+                              "GetFormID takes no arguments");
+                          return VarValue(static_cast<int32_t>(formId(self)));
+                        });
+    vm.RegisterFunction("Game", "GetPlayer", FunctionType::GlobalFunction,
+                        [&](VarValue, std::vector<VarValue> args) {
+                          if (!args.empty())
+                            throw std::invalid_argument(
+                              "GetPlayer takes no arguments");
+                          return VarValue(resolve(0x14).get());
+                        });
+    vm.RegisterFunction(
+      "Game", "GetForm", FunctionType::GlobalFunction,
+      [&](VarValue, std::vector<VarValue> args) {
+        if (args.size() != 1 || args[0].GetType() != VarValue::kType_Integer)
+          throw std::invalid_argument("GetForm needs one form ID");
+        const auto id = static_cast<uint32_t>(static_cast<int32_t>(args[0]));
+        if (id >= 0xff000000)
+          throw std::runtime_error(
+            "Dynamic form lookup requires campaign reference allocation");
+        const auto rec = world.GetEspm().GetBrowser().LookupById(id);
+        if (id != 0x14 && (!rec.rec || rec.rec->IsDeleted()))
+          return VarValue::None();
+        return VarValue(resolve(id).get());
+      });
+    auto baseObject = [&](VarValue self, std::vector<VarValue> args) {
+      if (!args.empty())
+        throw std::invalid_argument("Base object getter takes no arguments");
+      const auto id = formId(self);
+      const auto base = id == 0x14
+        ? QuestJournal::Owner(actor).GetBaseId()
+        : ReferenceBase(world.GetEspm().GetBrowser().LookupById(id), world);
+      return VarValue(resolve(base).get());
+    };
+    vm.RegisterFunction("ObjectReference", "GetBaseObject",
+                        FunctionType::Method, baseObject);
+    vm.RegisterFunction("Actor", "GetActorBase", FunctionType::Method,
+                        baseObject);
+
+    vm.RegisterFunction(
+      "Quest", "GetAlias", FunctionType::Method,
+      [&](VarValue self, std::vector<VarValue> args) {
+        const auto id = formId(self);
+        const auto rec = world.GetEspm().GetBrowser().LookupById(id);
+        if (!rec.rec || rec.rec->GetType() != "QUST" || args.size() != 1 ||
+            args[0].GetType() != VarValue::kType_Integer)
+          throw std::invalid_argument(
+            "GetAlias needs a quest and one alias ID");
+        const auto aliasId = static_cast<int32_t>(args[0]);
+        if (aliasId < 0 ||
+            !definitions(id).Find(static_cast<uint32_t>(aliasId)))
+          return VarValue::None();
+        return VarValue(
+          resolveAlias(id, static_cast<uint32_t>(aliasId)).get());
+      });
+    for (const auto* cls : { "Alias", "ReferenceAlias", "LocationAlias" }) {
+      vm.RegisterFunction(
+        cls, "GetOwningQuest", FunctionType::Method,
+        [&](VarValue self, std::vector<VarValue> args) {
+          if (!args.empty())
+            throw std::invalid_argument("GetOwningQuest takes no arguments");
+          return VarValue(resolve(aliasSelf(self).QuestId()).get());
+        });
+      vm.RegisterFunction(
+        cls, "GetID", FunctionType::Method,
+        [&](VarValue self, std::vector<VarValue> args) {
+          if (!args.empty())
+            throw std::invalid_argument("GetID takes no arguments");
+          return VarValue(
+            static_cast<int32_t>(aliasSelf(self).Definition().id));
+        });
+      vm.RegisterFunction(cls, "GetName", FunctionType::Method,
+                          [&](VarValue self, std::vector<VarValue> args) {
+                            if (!args.empty())
+                              throw std::invalid_argument(
+                                "GetName takes no arguments");
+                            return VarValue(aliasSelf(self).Definition().name);
+                          });
+    }
+
+    std::optional<std::map<uint32_t, std::vector<uint32_t>>> actorReferences;
+    std::set<std::pair<uint32_t, uint32_t>> resolvingAliases;
+    std::function<VarValue(CampaignAliasObject&)> aliasTarget;
+    aliasTarget = [&](CampaignAliasObject& object) -> VarValue {
+      const auto& def = object.Definition();
+      const auto id = object.QuestId();
+      // A stopped/unstarted quest has no active alias instance.
+      if (QuestJournal::Get(actor, id).at("running") != true)
+        return VarValue::None();
+      QuestJournal::RequireAdapter(actor, id);
+      const auto stateKey = questKey(id) + "/alias:" + std::to_string(def.id);
+      auto validateTarget = [&](uint32_t target) {
+        auto resolved = resolve(target);
+        const auto* form = dynamic_cast<CampaignFormObject*>(resolved.get());
+        if (!form)
+          throw std::runtime_error(
+            "Alias target is not a campaign reference/location");
+        const bool location =
+          form->record.rec && form->record.rec->GetType() == "LCTN";
+        const bool reference = form->IsPlayer() ||
+          (form->record.rec &&
+           (form->record.rec->GetType() == "ACHR" ||
+            form->record.rec->GetType() == "REFR"));
+        if ((def.kind == espm::QuestAliasDefinition::Kind::Location &&
+             !location) ||
+            (def.kind == espm::QuestAliasDefinition::Kind::Reference &&
+             !reference))
+          throw std::runtime_error("Alias target type mismatch");
+        return VarValue(resolved.get());
+      };
+      if (const auto saved = state.GetAliasBinding(stateKey)) {
+        if (saved->is_null()) {
+          if (!(def.flags & 2))
+            throw std::runtime_error(
+              "Required alias has an empty saved binding");
+          return VarValue::None();
+        }
+        return validateTarget(FormDesc::FromString(saved->get<std::string>())
+                                .ToFormId(world.espmFiles));
+      }
+      const auto identity = std::make_pair(id, def.id);
+      if (resolvingAliases.size() >= 128 ||
+          !resolvingAliases.insert(identity).second)
+        throw std::runtime_error("Alias resolution cycle or depth limit");
+      struct Guard
+      {
+        std::set<std::pair<uint32_t, uint32_t>>& active;
+        std::pair<uint32_t, uint32_t> key;
+        ~Guard() { active.erase(key); }
+      } guard{ resolvingAliases, identity };
+      if (!def.conditions.empty() || !def.unknownFields.empty() ||
+          def.Has("ALFI") || def.Has("ALFA") || def.Has("ALCO") ||
+          def.Has("ALFE") || def.Has("ALNA"))
+        throw std::runtime_error(
+          "Alias fill requires lifecycle, world-query or creation support");
+      const auto record = world.GetEspm().GetBrowser().LookupById(id);
+      std::optional<uint32_t> target;
+      const auto forced = def.Unsigned(
+        def.kind == espm::QuestAliasDefinition::Kind::Location ? "ALFL"
+                                                               : "ALFR");
+      const auto unique = def.Unsigned("ALUA");
+      const auto external = def.Unsigned("ALEQ");
+      if (int(bool(forced)) + int(bool(unique)) + int(bool(external)) != 1)
+        throw std::runtime_error(
+          "Alias fill is unresolved or has conflicting selectors");
+      if (forced) {
+        target = record.ToGlobalId(*forced);
+      } else if (unique) {
+        if (def.kind != espm::QuestAliasDefinition::Kind::Reference)
+          throw std::runtime_error("Unique actor used for location alias");
+        const auto base = record.ToGlobalId(*unique);
+        if (base == 0x7) {
+          target = 0x14;
+        } else {
+          if (!actorReferences) {
+            actorReferences.emplace();
+            for (const auto& candidate :
+                 world.GetEspm().GetBrowser().GetDistinctRecordsByType(
+                   "REFR")) {
+              // The browser stores ACHR and REFR in its REFR index.
+              if (candidate.rec->GetType() == "ACHR" &&
+                  !candidate.rec->IsDeleted())
+                (*actorReferences)[ReferenceBase(candidate, world)].push_back(
+                  candidate.ToGlobalId(candidate.rec->GetId()));
+            }
+          }
+          const auto it = actorReferences->find(base);
+          if (it != actorReferences->end()) {
+            if (it->second.size() != 1)
+              throw std::runtime_error(
+                "Unique actor alias has multiple reference candidates");
+            target = it->second.front();
+          }
+        }
+      } else {
+        const auto aliasId = def.Signed("ALEA");
+        if (!aliasId || *aliasId < 0)
+          throw std::runtime_error("External alias has no valid alias ID");
+        const auto other =
+          std::dynamic_pointer_cast<CampaignAliasObject>(resolveAlias(
+            record.ToGlobalId(*external), static_cast<uint32_t>(*aliasId)));
+        const auto value = aliasTarget(*other);
+        if (static_cast<IGameObject*>(value))
+          target = formId(value);
+      }
+      if (!target || !*target) {
+        if (!(def.flags & 2))
+          throw std::runtime_error("Required alias has no target");
+        state.SetAliasBinding(stateKey, nullptr);
+        return VarValue::None();
+      }
+      const auto result = validateTarget(*target);
+      state.SetAliasBinding(stateKey, questKey(*target));
+      return result;
+    };
+    for (const auto* method :
+         { "GetReference", "GetRef", "GetActorReference", "GetActorRef" }) {
+      const std::string name(method);
+      vm.RegisterFunction(
+        "ReferenceAlias", name, FunctionType::Method,
+        [&, name](VarValue self, std::vector<VarValue> args) {
+          auto& object = aliasSelf(self);
+          if (!args.empty() ||
+              object.Definition().kind !=
+                espm::QuestAliasDefinition::Kind::Reference)
+            throw std::invalid_argument("Expected reference alias getter");
+          const auto value = aliasTarget(object);
+          if (name == "GetActorReference" || name == "GetActorRef") {
+            const auto* form = dynamic_cast<CampaignFormObject*>(
+              static_cast<IGameObject*>(value));
+            if (!form ||
+                (!form->IsPlayer() && form->record.rec->GetType() != "ACHR"))
+              return VarValue::None();
+          }
+          return value;
+        });
+    }
+    vm.RegisterFunction("LocationAlias", "GetLocation", FunctionType::Method,
+                        [&](VarValue self, std::vector<VarValue> args) {
+                          auto& object = aliasSelf(self);
+                          if (!args.empty() ||
+                              object.Definition().kind !=
+                                espm::QuestAliasDefinition::Kind::Location)
+                            throw std::invalid_argument(
+                              "Expected location alias getter");
+                          return aliasTarget(object);
+                        });
 
     auto globalObject = [&](const VarValue& self) -> CampaignGlobalObject& {
       if (self.GetType() != VarValue::kType_Object)

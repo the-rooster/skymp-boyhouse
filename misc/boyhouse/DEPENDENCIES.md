@@ -65,6 +65,9 @@ loose/archive inputs before using a report for a release.
 
 The capability registry audits **only the isolated campaign fragment runner**.
 Native APIs available elsewhere in SkyMP do not imply campaign support.
+Logical campaign form and alias getters are now audited subsets; the broader
+alias/world feature gates remain missing until filling, effects and lifecycle
+are implemented.
 Implemented APIs are labeled `implemented-subset`; the report never calls a
 quest supported. SHA-256 guards on the audited runtime sources force a review
 when the implementation changes. Condition names are identifiers extracted from
