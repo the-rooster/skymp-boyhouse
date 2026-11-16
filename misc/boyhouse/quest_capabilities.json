@@ -20,7 +20,11 @@
     "libespm/include/libespm/QuestScriptData.h": "faeb2181e1112a1bec2ea29206b948635da6a50cf8ab0668a975d0a046ce1070",
     "libespm/src/QuestScriptData.cpp": "bd58715132c976f30f602f36dc954c47a996def8f3c5bb7262457676efd92b22",
     "skymp5-server/cpp/server_guest_lib/CampaignReferenceScripts.cpp": "9a6cc1f0b95e8826781f4f203c47ea4e42f4263dca8289d714bf1b2d56736fff",
-    "skymp5-server/cpp/server_guest_lib/CampaignReferenceScripts.h": "093bb2e1b5fb406f621c77014e7265f4debf485759a3f395d971bfed98b62e94"
+    "skymp5-server/cpp/server_guest_lib/CampaignReferenceScripts.h": "093bb2e1b5fb406f621c77014e7265f4debf485759a3f395d971bfed98b62e94",
+    "papyrus-vm/include/papyrus-vm/ActivePexInstance.h": "85557cad970b2bc1161516c642ae0845c424b03891e74bbb87e2e661d807250e",
+    "papyrus-vm/include/papyrus-vm/VirtualMachine.h": "d135eb9f719fbee9fc4f2b4100f57e0e2038175e3be37dd282ecda1ee1a131f1",
+    "papyrus-vm/src/papyrus-vm-lib/ActivePexInstance.cpp": "68b2c405ca57dee1867f0ed0630ed1fc820f458f6a68c5ae98d9ecbfe6d60a6e",
+    "papyrus-vm/src/papyrus-vm-lib/VirtualMachine.cpp": "ebc6bf4b67e7426844756917223c048aa4f4ead991580a8c3f4b8d355023ee96"
   },
   "nativeSubsets": [
     "actor.getactorbase",
@@ -85,7 +89,8 @@
     "Scene/TopicInfo.GetOwningQuest resolve owned metadata into the active campaign; dialogue/scene selection, execution and effects remain unsupported.",
     "GetVMQuestVariable uses owned CIS2 and conditional PEX declarations in an adapter-enabled running quest. It reads private live/persisted numeric state; it does not initialize scripts or support dialogue/alias contexts.",
     "UseGlobal comparisons resolve campaign globals before each stage log. Other special flags remain unsupported; all existing non-stage evaluation gates remain missing.",
-    "Placed-reference bindings merge owned base/reference script properties with per-source FormID mapping and deterministic NPC script templates. Variables persist in campaign reference roots; lifecycle/events, leveled templates, PlayerRef base bindings and live world projection remain unsupported."
+    "Placed-reference bindings merge owned base/reference script properties with per-source FormID mapping and deterministic NPC script templates. Variables persist in campaign reference roots; lifecycle/events, leveled templates, PlayerRef base bindings and live world projection remain unsupported.",
+    "Strict method dispatch scopes self, typed receivers and Parent to the matching script chain. Missing native implementations, invalid inheritance and ambiguous script bindings fail. Unique ancestor casts are supported; dynamic script-handle identity, general lifecycle/events and durable latent calls remain incomplete."
   ],
   "conditionNames": {
     "0": "GetWantBlocking",

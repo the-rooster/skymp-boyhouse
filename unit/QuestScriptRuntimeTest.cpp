@@ -1869,3 +1869,406 @@ TEST_CASE(
   REQUIRE(QuestJournal::Get(actor, kQuest)["stages"].empty());
   REQUIRE(QuestJournal::ScriptState(actor).empty());
 }
+
+namespace {
+FunctionInfo Returns(int value)
+{
+  FunctionInfo fn;
+  fn.valid = true;
+  fn.returnType = "Int";
+  fn.code.instructions = { { FunctionCode::kOp_Return, { VarValue(value) } } };
+  return fn;
+}
+std::shared_ptr<PexScript> MethodScript(Fixture& f, const char* name,
+                                        const char* parent, bool attach)
+{
+  auto pex = std::make_shared<PexScript>();
+  pex->source = name;
+  Object object;
+  object.NameIndex = name;
+  object.parentClassName = parent;
+  object.states.push_back({ "", {} });
+  pex->objectTable.push_back(object);
+  f.extraScripts.push_back(pex);
+  if (attach)
+    f.metadata.scripts.insert(f.metadata.scripts.begin(), { name, 0, {} });
+  return pex;
+}
+int MethodResult(MpActor& actor)
+{
+  return QuestJournal::ScriptState(actor)["scripts"][kStateKey]["values"]
+                                         ["boyhousefixture/counter"]["value"]
+                                           .get<int>();
+}
+void CallFixture(Fixture& f, const char* name, const char* receiver = "self")
+{
+  f.Fragment().code.instructions = {
+    { FunctionCode::kOp_CallMethod,
+      { VarValue(name), Id(receiver), Id("counter"), VarValue(0) } },
+    { FunctionCode::kOp_Return, { VarValue::None() } }
+  };
+}
+}
+
+TEST_CASE("Campaign method calls select the receiver script instead of the "
+          "first attachment",
+          "[Quest][QuestVM][MethodDispatch]")
+{
+  Fixture f;
+  auto sibling = MethodScript(f, "OtherBinding", "Quest", true);
+  sibling->objectTable[0].states[0].functions.push_back(
+    { "Read", Returns(99) });
+  f.fixture->objectTable[0].states[0].functions.push_back(
+    { "Read", Returns(7) });
+  SECTION("self remains in its own binding")
+  {
+    CallFixture(f, "Read");
+  }
+  SECTION("typed reference selects its binding case insensitively")
+  {
+    espm::QuestScriptValue target;
+    target.type = 1;
+    target.formId = kQuest;
+    target.alias = 0xffff;
+    f.metadata.scripts.back().properties.push_back({ "Target", 1, target });
+    f.fixture->objectTable[0].variables.push_back(
+      { "::Target_var", "BOYHOUSEFIXTURE", 0, VarValue::None() });
+    CallFixture(f, "rEAd", "::Target_var");
+  }
+  auto& actor = f.Add(0xff000001);
+  REQUIRE(f.Run(actor));
+  REQUIRE(MethodResult(actor) == 7);
+}
+
+TEST_CASE("Campaign inherited methods preserve virtual self and explicit "
+          "parent dispatch",
+          "[Quest][QuestVM][MethodDispatch]")
+{
+  Fixture f;
+  auto sibling = MethodScript(f, "OtherBinding", "Quest", true);
+  sibling->objectTable[0].states[0].functions.push_back(
+    { "Read", Returns(99) });
+  auto parent = MethodScript(f, "MethodParent", "Quest", false);
+  parent->objectTable[0].states[0].functions.push_back(
+    { "Read", Returns(13) });
+  f.fixture->objectTable[0].parentClassName = "MethodParent";
+  f.fixture->objectTable[0].states[0].functions.push_back(
+    { "Read", Returns(7) });
+  int expected = 0;
+  SECTION("inherited body calls the child's override through self")
+  {
+    FunctionInfo indirect = Returns(0);
+    indirect.locals.push_back({ "result", "Int" });
+    indirect.code.instructions = {
+      { FunctionCode::kOp_CallMethod,
+        { VarValue("Read"), Id("self"), Id("result"), VarValue(0) } },
+      { FunctionCode::kOp_Return, { Id("result") } }
+    };
+    parent->objectTable[0].states[0].functions.push_back(
+      { "Indirect", indirect });
+    CallFixture(f, "Indirect");
+    expected = 7;
+  }
+  SECTION("parent bypasses the child and unrelated attachments")
+  {
+    f.Fragment().code.instructions = {
+      { FunctionCode::kOp_CallParent,
+        { VarValue("Read"), Id("counter"), VarValue(0) } },
+      { FunctionCode::kOp_Return, { VarValue::None() } }
+    };
+    expected = 13;
+  }
+  SECTION("a cast to an unattached ancestor still dispatches virtually")
+  {
+    f.fixture->objectTable[0].variables.push_back(
+      { "parentRef", "MethodParent", 0, VarValue::None() });
+    CallFixture(f, "Read", "parentRef");
+    f.Fragment().code.instructions.insert(
+      f.Fragment().code.instructions.begin(),
+      { FunctionCode::kOp_Cast, { Id("parentRef"), Id("self") } });
+    expected = 7;
+  }
+  auto& actor = f.Add(0xff000001);
+  REQUIRE(f.Run(actor));
+  REQUIRE(MethodResult(actor) == expected);
+}
+
+TEST_CASE("Campaign native declarations execute registered implementations or "
+          "roll back",
+          "[Quest][QuestVM][MethodDispatch]")
+{
+  Fixture f;
+  FunctionInfo native = Returns(99);
+  native.flags = 2;
+  f.quest->objectTable[0].states.push_back({ "", { { "GetStage", native } } });
+  auto& actor = f.Add(0xff000001);
+  SECTION("registered inherited native returns real journal state")
+  {
+    CallFixture(f, "GetStage");
+    REQUIRE(f.Run(actor));
+    REQUIRE(MethodResult(actor) == 10);
+  }
+  SECTION("shared engine helpers use the registered implementation once")
+  {
+    MethodScript(f, "OtherBinding", "Quest", true);
+    f.quest->objectTable[0].states[0].functions[0].function.flags = 0;
+    espm::QuestScriptValue target;
+    target.type = 1;
+    target.formId = kQuest;
+    target.alias = 0xffff;
+    f.metadata.scripts.back().properties.push_back({ "Target", 1, target });
+    f.fixture->objectTable[0].variables.push_back(
+      { "::Target_var", "Quest", 0, VarValue::None() });
+    CallFixture(f, "GetStage", "::Target_var");
+    REQUIRE(f.Run(actor));
+    REQUIRE(MethodResult(actor) == 10);
+  }
+  SECTION("missing native cannot execute an empty or forged body")
+  {
+    f.fixture->objectTable[0].states[0].functions.push_back(
+      { "Missing", native });
+    auto& code = f.Fragment().code.instructions;
+    code.insert(
+      code.end() - 1,
+      { FunctionCode::kOp_CallMethod,
+        { VarValue("Missing"), Id("self"), Id("temp"), VarValue(0) } });
+    const auto before = QuestJournal::Snapshot(actor);
+    REQUIRE_THROWS_WITH(
+      f.Run(actor),
+      Catch::Matchers::ContainsSubstring("Unimplemented native"));
+    REQUIRE(QuestJournal::Snapshot(actor) == before);
+    REQUIRE(QuestJournal::ScriptState(actor).empty());
+  }
+  SECTION("custom native declaration cannot fall through to the engine base")
+  {
+    f.fixture->objectTable[0].states[0].functions.push_back(
+      { "GetStage", native });
+    CallFixture(f, "GetStage");
+    REQUIRE_THROWS_WITH(f.Run(actor),
+                        Catch::Matchers::ContainsSubstring(
+                          "Unimplemented native: BoyhouseFixture.GetStage"));
+    REQUIRE(QuestJournal::Get(actor, kQuest)["stages"].empty());
+  }
+  SECTION("native method arguments must match its declaration")
+  {
+    native.params.push_back({ "unexpected", "Int" });
+    f.quest->objectTable[0].states[0].functions[0].function = native;
+    CallFixture(f, "GetStage");
+    REQUIRE_THROWS_WITH(
+      f.Run(actor),
+      Catch::Matchers::ContainsSubstring("argument count mismatch"));
+    REQUIRE(QuestJournal::ScriptState(actor).empty());
+  }
+}
+
+TEST_CASE("Ambiguous or invalid campaign method targets never choose an "
+          "unrelated script",
+          "[Quest][QuestVM][MethodDispatch]")
+{
+  Fixture f;
+  auto sibling = MethodScript(f, "OtherBinding", "Quest", true);
+  sibling->objectTable[0].states[0].functions.push_back(
+    { "Read", Returns(99) });
+  f.fixture->objectTable[0].states[0].functions.push_back(
+    { "Read", Returns(7) });
+  espm::QuestScriptValue target;
+  target.type = 1;
+  target.formId = kQuest;
+  target.alias = 0xffff;
+  f.metadata.scripts.back().properties.push_back({ "Target", 1, target });
+  f.fixture->objectTable[0].variables.push_back(
+    { "::Target_var", "Quest", 0, VarValue::None() });
+  CallFixture(f, "Read", "::Target_var");
+  std::string error = "Ambiguous Papyrus method binding";
+  SECTION("two unqualified implementations")
+  {
+  }
+  SECTION("unattached custom receiver")
+  {
+    f.fixture->objectTable[0].variables.back().typeName = "MissingBinding";
+    error = "receiver has no matching script binding";
+  }
+  SECTION("None remains None")
+  {
+    f.metadata.scripts.back().properties[0].value.formId = 0;
+    error = "Method called on None";
+  }
+  SECTION("a malformed nonobject target cannot become a pointer")
+  {
+    f.metadata.scripts.back().properties[0].value.type = 3;
+    f.metadata.scripts.back().properties[0].value.integer = 1;
+    error = "method target is not an object";
+  }
+  SECTION("malformed state cannot become a string pointer")
+  {
+    CallFixture(f, "Read");
+    f.Fragment().code.instructions.insert(
+      f.Fragment().code.instructions.begin(),
+      { FunctionCode::kOp_Assign, { Id("::State"), VarValue(1) } });
+    error = "Invalid Papyrus instance state";
+  }
+  SECTION("global function cannot be invoked as a method")
+  {
+    f.fixture->objectTable[0].variables.back().typeName = "BoyhouseFixture";
+    f.fixture->objectTable[0].states[0].functions.back().function.flags = 1;
+    error = "Global Papyrus function called as a method";
+  }
+  auto& actor = f.Add(0xff000001);
+  REQUIRE_THROWS_WITH(f.Run(actor), Catch::Matchers::ContainsSubstring(error));
+  REQUIRE(QuestJournal::ScriptState(actor).empty());
+}
+
+TEST_CASE("Campaign method state and state events are scoped to the receiver",
+          "[Quest][QuestVM][MethodDispatch]")
+{
+  Fixture f;
+  f.fixture->objectTable[0].autoStateName = "BUSY";
+  f.fixture->objectTable[0].states[0].functions.push_back(
+    { "Read", Returns(1) });
+  auto stateEvent = Returns(0);
+  stateEvent.returnType = "None";
+  stateEvent.code.instructions = {
+    { FunctionCode::kOp_Assign, { Id("counter"), VarValue(9) } },
+    { FunctionCode::kOp_Return, { VarValue::None() } }
+  };
+  f.fixture->objectTable[0].states.push_back(
+    { "Busy", { { "Read", Returns(8) }, { "OnBeginState", stateEvent } } });
+  auto sibling = MethodScript(f, "OtherBinding", "Quest", true);
+  sibling->objectTable[0].variables.push_back(
+    { "counter", "Int", 0, VarValue(0) });
+  stateEvent.code.instructions[0].args[1] = VarValue(99);
+  sibling->objectTable[0].states[0].functions.push_back(
+    { "OnBeginState", stateEvent });
+  int expected = 0;
+  bool changedSibling = false;
+  SECTION("state names and methods ignore case")
+  {
+    CallFixture(f, "rEAd");
+    expected = 8;
+  }
+  SECTION("explicit state event targets self only")
+  {
+    CallFixture(f, "ONBEGINSTATE");
+    f.Fragment().code.instructions[0].args[2] = Id("temp");
+    expected = 9;
+  }
+  SECTION("state event targets another receiver")
+  {
+    espm::QuestScriptValue target;
+    target.type = 1;
+    target.formId = kQuest;
+    target.alias = 0xffff;
+    f.metadata.scripts.back().properties.push_back({ "Target", 1, target });
+    f.fixture->objectTable[0].variables.push_back(
+      { "::Target_var", "OtherBinding", 0, VarValue::None() });
+    CallFixture(f, "OnBeginState", "::Target_var");
+    f.Fragment().code.instructions[0].args[2] = Id("temp");
+    changedSibling = true;
+  }
+  SECTION("inherited implementations use the derived instance state")
+  {
+    auto parent = MethodScript(f, "MethodParent", "Quest", false);
+    f.fixture->objectTable[0].parentClassName = "MethodParent";
+    parent->objectTable[0].states[0].functions.push_back(
+      { "ReadParent", Returns(20) });
+    parent->objectTable[0].states.push_back(
+      { "Busy", { { "ReadParent", Returns(21) } } });
+    CallFixture(f, "ReadParent");
+    expected = 21;
+  }
+  SECTION("parent state writes update the same derived instance")
+  {
+    auto parent = MethodScript(f, "MethodParent", "Quest", false);
+    f.fixture->objectTable[0].parentClassName = "MethodParent";
+    f.fixture->objectTable[0].states.push_back(
+      { "Idle", { { "Read", Returns(16) } } });
+    FunctionInfo change = Returns(0);
+    change.code.instructions.insert(
+      change.code.instructions.begin(),
+      { FunctionCode::kOp_Assign, { Id("::State"), VarValue("idle") } });
+    parent->objectTable[0].states[0].functions.push_back({ "Change", change });
+    CallFixture(f, "Read");
+    f.Fragment().code.instructions.insert(
+      f.Fragment().code.instructions.begin(),
+      { FunctionCode::kOp_CallParent,
+        { VarValue("Change"), Id("temp"), VarValue(0) } });
+    expected = 16;
+  }
+  f.Fragment().code.instructions.insert(
+    f.Fragment().code.instructions.end() - 1,
+    { FunctionCode::kOp_IAdd, { Id("counter"), Id("counter"), VarValue(0) } });
+  auto& actor = f.Add(0xff000001);
+  REQUIRE(f.Run(actor));
+  REQUIRE(MethodResult(actor) == expected);
+  const auto state = QuestJournal::ScriptState(actor);
+  const auto& values =
+    state["scripts"]["4e50d:Skyrim.esm/otherbinding"]["values"];
+  if (changedSibling)
+    REQUIRE(values["otherbinding/counter"]["value"] == 99);
+  else
+    REQUIRE_FALSE(values.contains("otherbinding/counter"));
+}
+
+TEST_CASE(
+  "Invalid campaign inheritance and ambiguous casts fail before commit",
+  "[Quest][QuestVM][MethodDispatch]")
+{
+  Fixture f;
+  auto parent = MethodScript(f, "MethodParent", "Quest", false);
+  f.fixture->objectTable[0].parentClassName = "MethodParent";
+  std::string error;
+  SECTION("cyclic inheritance cannot overflow the server stack")
+  {
+    parent->objectTable[0].parentClassName = "BoyhouseFixture";
+    error = "inheritance cycle/depth exceeded";
+  }
+  SECTION("missing parent cannot be silently dropped")
+  {
+    parent->objectTable[0].parentClassName = "MissingParent";
+    error = "Unable to find parent script";
+  }
+  SECTION("an ambiguous custom ancestor requires an explicit binding")
+  {
+    MethodScript(f, "OtherBinding", "MethodParent", true);
+    f.fixture->objectTable[0].variables.push_back(
+      { "parentRef", "MethodParent", 0, VarValue::None() });
+    f.Fragment().code.instructions.insert(
+      f.Fragment().code.instructions.begin(),
+      { FunctionCode::kOp_Cast, { Id("parentRef"), Id("self") } });
+    error = "Ambiguous Papyrus script cast";
+  }
+  auto& actor = f.Add(0xff000001);
+  REQUIRE_THROWS_WITH(f.Run(actor), Catch::Matchers::ContainsSubstring(error));
+  REQUIRE(QuestJournal::ScriptState(actor).empty());
+}
+
+TEST_CASE(
+  "Resolved self property operands preserve the executing script binding",
+  "[Quest][QuestVM][MethodDispatch]")
+{
+  Fixture f;
+  auto sibling = MethodScript(f, "OtherBinding", "Quest", true);
+  Object::PropInfo property;
+  property.name = "Count";
+  property.type = "Int";
+  property.flags = 7;
+  property.autoVarName = "counter";
+  f.fixture->objectTable[0].properties.push_back(property);
+  sibling->objectTable[0].properties.push_back(property);
+  sibling->objectTable[0].variables.push_back(
+    { "counter", "Int", 0, VarValue(99) });
+  f.Fragment().code.instructions = {
+    { FunctionCode::kOp_PropSet,
+      { VarValue("Count"), Id("self"), VarValue(17) } },
+    { FunctionCode::kOp_PropGet,
+      { VarValue("Count"), Id("self"), Id("counter") } },
+    { FunctionCode::kOp_Return, { VarValue::None() } }
+  };
+  auto& actor = f.Add(0xff000001);
+  REQUIRE(f.Run(actor));
+  REQUIRE(MethodResult(actor) == 17);
+  const auto state = QuestJournal::ScriptState(actor);
+  REQUIRE_FALSE(
+    state["scripts"]["4e50d:Skyrim.esm/otherbinding"]["values"].contains(
+      "otherbinding/counter"));
+}

@@ -56,6 +56,23 @@ permit ordinary global-VM world mutations. PlayerRef base bindings and
 active-magic-effect instances remain unimplemented. Content migration and
 reference retirement still need explicit lifecycle handling.
 
+The strict campaign VM scopes method calls to their declared receiver and
+executing attachment. Inherited calls retain virtual `self` dispatch; explicit
+`Parent` calls stay within that attachment's parent chain. Native declarations
+must reach a registered implementation, never execute an empty PEX body. State
+is shared with inherited methods in the same attachment. Shared engine helpers
+such as `Quest.SetStage` use their registered campaign implementation when several
+attachments inherit the same declaration; distinct script implementations remain
+ambiguous. State and method names are case insensitive, and explicit state
+callbacks use their actual receiver. Resolved `self` property operands retain
+their attachment too.
+Inheritance cycles, missing parents, invalid calls and ambiguous bindings fail
+the transaction. Casts can reach a unique attached custom-script ancestor.
+Dynamic script-handle identity across casts/assignments is not persisted yet;
+ambiguous sibling inheritance remains unsupported rather than choosing by
+attachment order. These changes do not add lifecycle/event scheduling or durable
+latent execution.
+
 `Quest.GetAlias`, alias `GetOwningQuest`/`GetID`/`GetName`, reference alias getters and `LocationAlias.GetLocation` are available. VMAD alias properties and `GetAlias` share one object identity. Attached alias scripts load from owned PEX and persist separately from quest scripts. Resolving an object does not dispatch initialization, fill or other lifecycle events.
 
 For an adapter-enabled running quest, target getters can resolve forced references/locations, unique actors with exactly one winning nondeleted reference, and external aliases. Resolved targets persist as stable plugin/form keys; explicit empty bindings remain distinct from unresolved aliases. Stopped/unstarted quests return None. Unknown fills, conditions, creation, propagation, ambiguous actor references and cycles fail the transaction. Reflection alone does not fill aliases. Alias flags, reservations, factions, inventory, spells, packages and other lifecycle effects are retained as metadata but **are not applied**. These APIs remain inside the existing experimental adapter boundary, with no vanilla adapters enabled.

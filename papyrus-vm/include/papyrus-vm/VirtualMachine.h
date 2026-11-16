@@ -100,7 +100,8 @@ public:
                       std::vector<VarValue>& arguments,
                       std::shared_ptr<StackData> stackData = nullptr,
                       const std::vector<std::shared_ptr<ActivePexInstance>>*
-                        activePexInstancesOverride = nullptr);
+                        activePexInstancesOverride = nullptr,
+                      const char* receiverType = nullptr);
 
   VarValue CallStatic(const std::string& className,
                       const std::string& functionName,

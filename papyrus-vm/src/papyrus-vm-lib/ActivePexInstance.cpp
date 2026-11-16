@@ -61,7 +61,9 @@ FunctionInfo ActivePexInstance::GetFunctionByName(const char* name,
   FunctionInfo function;
   for (auto& object : sourcePex.fn()->objectTable) {
     for (auto& state : object.states) {
-      if (state.name == stateName) {
+      if (state.name == stateName ||
+          (parentVM->IsStrictExecution() &&
+           !Utils::stricmp(state.name.c_str(), stateName.c_str()))) {
         for (auto& func : state.functions) {
           if (!Utils::stricmp(func.name.data(), name)) {
             // return func; ???
@@ -81,7 +83,13 @@ std::string ActivePexInstance::GetActiveStateName() const
   VarValue* var = nullptr;
 
   try {
-    var = variables->GetVariableByName("::State", *sourcePex.fn());
+    const auto* instance = this;
+    if (parentVM->IsStrictExecution())
+      instance = GetAttachedRoot().get();
+    if (!instance->variables)
+      throw std::runtime_error("Missing Papyrus script variables");
+    var = instance->variables->GetVariableByName("::State",
+                                                 *instance->sourcePex.fn());
   } catch (std::exception& e) {
     if (parentVM->IsStrictExecution())
       throw;
@@ -99,6 +107,10 @@ std::string ActivePexInstance::GetActiveStateName() const
     return "";
   }
 
+  if (parentVM->IsStrictExecution() &&
+      (!var || var->GetType() != VarValue::kType_String ||
+       !static_cast<const char*>(*var)))
+    throw std::runtime_error("Invalid Papyrus instance state");
   if (!var) {
     spdlog::error("ActivePexInstance::GetActiveStateName - ::State variable "
                   "doesn't exist in ActivePexInstance");
@@ -210,12 +222,27 @@ bool ActivePexInstance::EnsureCallResultIsSynchronous(
   return false;
 }
 
+std::shared_ptr<ActivePexInstance> ActivePexInstance::GetAttachedRoot() const
+{
+  auto* object = static_cast<IGameObject*>(activeInstanceOwner);
+  if (object)
+    for (const auto& root : object->ListActivePexInstances())
+      for (auto instance = root; instance && instance->IsValid();
+           instance = instance->GetParentInstance())
+        if (instance.get() == this)
+          return root;
+  throw std::runtime_error("Papyrus method has no attached script instance");
+}
+
 void ActivePexInstance::ExecuteStrictProperty(
   ExecutionContext* ctx, uint8_t op, const std::vector<VarValue*>& args)
 {
   const bool write = op == OpcodesImplementation::Opcodes::op_PropSet;
-  const bool self = IsSelfStr(*args.at(1));
+  const bool self =
+    args.at(1) == &activeInstanceOwner || IsSelfStr(*args.at(1));
   const auto& target = self ? activeInstanceOwner : *args.at(1);
+  if (target.GetType() != VarValue::kType_Object)
+    throw std::runtime_error("Invalid Papyrus property target type");
   auto* object = static_cast<IGameObject*>(target);
   const char* name = static_cast<const char*>(*args.at(0));
   if (!object || !name)
@@ -413,7 +440,11 @@ void ActivePexInstance::ExecuteOpCode(ExecutionContext* ctx, uint8_t op,
 
       std::vector<std::shared_ptr<ActivePexInstance>>
         activePexInstancesForCallParent;
-      if (gameObject) {
+      if (parentVM->IsStrictExecution()) {
+        if (!parentInstance || !parentInstance->IsValid())
+          throw std::runtime_error("Papyrus Parent has no script instance");
+        activePexInstancesForCallParent.push_back(parentInstance);
+      } else if (gameObject) {
         activePexInstancesForCallParent = gameObject->ListActivePexInstances();
 
         std::string toFind = sourcePex.source;
@@ -445,6 +476,9 @@ void ActivePexInstance::ExecuteOpCode(ExecutionContext* ctx, uint8_t op,
     } break;
     case OpcodesImplementation::Opcodes::op_CallMethod: {
       VarValue* object = IsSelfStr(*args[1]) ? &activeInstanceOwner : args[1];
+      if (parentVM->IsStrictExecution() &&
+          object->GetType() != VarValue::kType_Object)
+        throw std::runtime_error("Papyrus method target is not an object");
 
       // BYOHRelationshipAdoptionPetDoorTrigger in Skyrim Legendary Edition
       if (args[0]->GetType() != VarValue::kType_String &&
@@ -461,23 +495,24 @@ void ActivePexInstance::ExecuteOpCode(ExecutionContext* ctx, uint8_t op,
       static const std::string nameOnBeginState = "onBeginState";
       static const std::string nameOnEndState = "onEndState";
 
-      if (functionName == nameOnBeginState || functionName == nameOnEndState) {
-        if (parentVM->IsStrictExecution()) {
-          const auto event =
-            GetFunctionByName(functionName.c_str(), GetActiveStateName());
-          if (event.valid)
-            StartFunction(event, argsForCall, ctx->stackData);
-          break;
-        }
+      if (!parentVM->IsStrictExecution() &&
+          (functionName == nameOnBeginState ||
+           functionName == nameOnEndState)) {
         // TODO: consider using CallMethod here. I'm afraid that this event
         // will pollute other scripts attached to an object
         parentVM->SendEvent(this, functionName.c_str(), argsForCall);
         break;
       } else {
         auto nullableGameObject = static_cast<IGameObject*>(*object);
-        auto res =
-          parentVM->CallMethod(nullableGameObject, functionName.c_str(),
-                               argsForCall, ctx->stackData);
+        std::vector<std::shared_ptr<ActivePexInstance>> roots;
+        const bool scopedSelf = parentVM->IsStrictExecution() &&
+          (args[1] == &activeInstanceOwner || IsSelfStr(*args[1]));
+        if (scopedSelf)
+          roots.push_back(GetAttachedRoot());
+        auto res = parentVM->CallMethod(
+          nullableGameObject, functionName.c_str(), argsForCall,
+          ctx->stackData, scopedSelf ? &roots : nullptr,
+          scopedSelf ? nullptr : object->objectType.c_str());
         spdlog::trace("callmethod object={} funcName={} result={}",
                       object->ToString(), functionName, res.ToString());
         if (EnsureCallResultIsSynchronous(res, ctx)) {
@@ -963,6 +998,10 @@ VarValue ActivePexInstance::StartFunction(const FunctionInfo& function,
     return VarValue::None();
   }
 
+  if (parentVM->IsStrictExecution() && function.IsNative())
+    throw std::runtime_error(
+      "Native Papyrus function requires a registered implementation");
+
   thread_local StackDepthHolder g_stackDepthHolder;
   if (parentVM->IsStrictExecution() &&
       arguments.size() != function.params.size())
@@ -1187,10 +1226,17 @@ VarValue ActivePexInstance::TryCastToBaseClass(
 
   std::string scriptName = object->GetParentNativeScript();
   outClassesStack.push_back(scriptName);
+  std::set<CIString> visited;
   while (true) {
     if (scriptName.empty()) {
       break;
     }
+
+    if (vm.IsStrictExecution() &&
+        (!visited.insert(CIString{ scriptName.begin(), scriptName.end() })
+            .second ||
+         visited.size() > 128))
+      throw std::runtime_error("Papyrus cast class cycle/depth exceeded");
 
     if (!Utils::stricmp(resultTypeName.data(), scriptName.data())) {
       return *scriptToCastOwner;
@@ -1227,6 +1273,21 @@ VarValue ActivePexInstance::TryCastMultipleInheritance(
   // i.e. X extends Y, in script Z we cast smth to X while it is Y
   // Current code would fail in this case. I guess it'd be better to find such
   // cases in game, then implement.
+  if (vm.IsStrictExecution()) {
+    size_t matches = 0;
+    for (const auto& root : object->ListActivePexInstances()) {
+      for (auto entry = root; entry && entry->IsValid();
+           entry = entry->GetParentInstance()) {
+        if (!Utils::stricmp(entry->GetSourcePexName().c_str(),
+                            resultTypeName.c_str())) {
+          if (++matches > 1)
+            throw std::runtime_error("Ambiguous Papyrus script cast");
+          break;
+        }
+      }
+    }
+    return matches ? *scriptToCastOwner : VarValue::None();
+  }
   for (auto& script : object->ListActivePexInstances()) {
     if (Utils::stricmp(script->GetSourcePexName().data(),
                        resultTypeName.data()) == 0) {
@@ -1287,8 +1348,21 @@ bool ActivePexInstance::HasChild(ActivePexInstance* script,
 VarValue& ActivePexInstance::GetVariableValueByName(std::vector<Local>* locals,
                                                     std::string name)
 {
-  if (name == "self") {
+  if (name == "self" ||
+      (parentVM->IsStrictExecution() &&
+       !Utils::stricmp(name.c_str(), "self"))) {
     return activeInstanceOwner;
+  }
+
+  if (parentVM->IsStrictExecution() &&
+      !Utils::stricmp(name.c_str(), "::State")) {
+    const auto root = GetAttachedRoot();
+    if (!root->variables)
+      throw std::runtime_error("Missing Papyrus script variables");
+    if (auto value =
+          root->variables->GetVariableByName("::State", *root->sourcePex.fn()))
+      return *value;
+    throw std::runtime_error("Missing Papyrus instance state variable");
   }
 
   if (locals)

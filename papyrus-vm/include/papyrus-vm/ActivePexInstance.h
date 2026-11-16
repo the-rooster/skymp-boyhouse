@@ -81,6 +81,8 @@ private:
   void ExecuteStrictProperty(ExecutionContext* ctx, uint8_t op,
                              const std::vector<VarValue*>& arguments);
 
+  std::shared_ptr<ActivePexInstance> GetAttachedRoot() const;
+
   bool EnsureCallResultIsSynchronous(const VarValue& callResult,
                                      ExecutionContext* ctx);
 

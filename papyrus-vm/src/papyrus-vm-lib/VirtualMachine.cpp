@@ -2,6 +2,7 @@
 #include "papyrus-vm/Utils.h"
 #include <algorithm>
 #include <cassert>
+#include <cstring>
 #include <spdlog/spdlog.h>
 #include <sstream>
 #include <stdexcept>
@@ -263,7 +264,8 @@ VarValue VirtualMachine::CallMethod(
   IGameObject* selfObj, const char* methodName,
   std::vector<VarValue>& arguments, std::shared_ptr<StackData> stackData,
   const std::vector<std::shared_ptr<ActivePexInstance>>*
-    activePexInstancesOverride)
+    activePexInstancesOverride,
+  const char* receiverType)
 {
   if (!stackData) {
     stackData.reset(new StackData{ StackIdHolder{ *this } });
@@ -279,32 +281,128 @@ VarValue VirtualMachine::CallMethod(
     ? *activePexInstancesOverride
     : selfObj->ListActivePexInstances();
 
-  // TODO: in theory we shouldn't iterate over all scripts, but only use the
-  // current one
-  for (auto& activeScript : instances) {
-    // TODO: const& (ref/optional)
-    FunctionInfo functionInfo;
+  std::string declaredNative;
+  if (strictExecution) {
+    const bool stateFunction = !Utils::stricmp(methodName, "GotoState") ||
+      !Utils::stricmp(methodName, "GetState");
+    const bool stateEvent = !Utils::stricmp(methodName, "OnBeginState") ||
+      !Utils::stricmp(methodName, "OnEndState");
+    std::shared_ptr<ActivePexInstance> selected;
+    FunctionInfo function;
+    bool sharedEngineHelper = false;
+    bool matchingType = !receiverType || !receiverType[0];
+    for (const auto& root : instances) {
+      if (!root || !root->IsValid())
+        throw std::runtime_error("Invalid Papyrus method script instance");
+      bool matches = !receiverType || !receiverType[0];
+      for (auto entry = root; entry && entry->IsValid();
+           entry = entry->GetParentInstance())
+        matches |= receiverType &&
+          !Utils::stricmp(entry->GetSourcePexName().c_str(), receiverType);
+      if (!matches)
+        continue;
+      matchingType = true;
+      const auto state = stateFunction ? "" : root->GetActiveStateName();
+      for (auto entry = root; entry && entry->IsValid();
+           entry = entry->GetParentInstance()) {
+        auto candidate = entry->GetFunctionByName(methodName, state);
+        if (!candidate.valid && !state.empty())
+          candidate = entry->GetFunctionByName(methodName, "");
+        if (!candidate.valid)
+          continue;
+        if (selected) {
+          const bool sameDeclaration =
+            !Utils::stricmp(selected->GetSourcePexName().c_str(),
+                            entry->GetSourcePexName().c_str());
+          // Several attachments can inherit the same native declaration or
+          // engine wrapper (e.g. Quest.SetStage). Use its registered campaign
+          // implementation once; never choose an arbitrary attachment for a
+          // script body that could read private variables or dispatch self.
+          if (sameDeclaration &&
+              nativeFunctions[entry->GetSourcePexName().c_str()][methodName])
+            sharedEngineHelper = true;
+          else if (!(sameDeclaration && function.IsNative() &&
+                     candidate.IsNative()))
+            throw std::runtime_error(
+              std::string("Ambiguous Papyrus method binding: ") + methodName);
+        }
+        selected = entry;
+        function = candidate;
+        break;
+      }
+    }
+    if (!matchingType) {
+      // Native objects can have no attached scripts. A custom receiver must
+      // resolve to a binding; it must never fall through to another script.
+      std::string base = selfObj->GetParentNativeScript();
+      std::set<CIString> visited;
+      while (!base.empty()) {
+        if (!visited.insert(CIString{ base.begin(), base.end() }).second ||
+            visited.size() > 128)
+          throw std::runtime_error(
+            "Papyrus native class cycle/depth exceeded");
+        if (!Utils::stricmp(base.c_str(), receiverType)) {
+          matchingType = true;
+          break;
+        }
+        const auto pex = GetPexByName(base);
+        if (!pex.fn)
+          break;
+        base = pex.fn()->objectTable.at(0).parentClassName;
+      }
+      if (!matchingType)
+        throw std::runtime_error(
+          "Papyrus receiver has no matching script binding");
+    }
+    if (selected) {
+      if (function.IsGlobal())
+        throw std::runtime_error("Global Papyrus function called as a method");
+      if (function.IsNative() || sharedEngineHelper) {
+        if (arguments.size() != function.params.size())
+          throw std::runtime_error("Papyrus native argument count mismatch");
+        declaredNative = selected->GetSourcePexName();
+      } else
+        return selected->StartFunction(function, arguments, stackData);
+    } else if (stateEvent) {
+      if (!arguments.empty())
+        throw std::runtime_error(
+          "Papyrus state event argument count mismatch");
+      return VarValue::None(); // The implicit state events have empty
+                               // defaults.
+    }
+  } else
+    for (auto& activeScript : instances) {
+      // TODO: const& (ref/optional)
+      FunctionInfo functionInfo;
 
-    if (!Utils::stricmp(methodName, "GotoState") ||
-        !Utils::stricmp(methodName, "GetState")) {
-      functionInfo = activeScript->GetFunctionByName(methodName, "");
-    } else {
-      functionInfo = activeScript->GetFunctionByName(
-        methodName, activeScript->GetActiveStateName());
-      if (!functionInfo.valid)
+      if (!Utils::stricmp(methodName, "GotoState") ||
+          !Utils::stricmp(methodName, "GetState")) {
         functionInfo = activeScript->GetFunctionByName(methodName, "");
-    }
+      } else {
+        functionInfo = activeScript->GetFunctionByName(
+          methodName, activeScript->GetActiveStateName());
+        if (!functionInfo.valid)
+          functionInfo = activeScript->GetFunctionByName(methodName, "");
+      }
 
-    if (functionInfo.valid) {
-      return activeScript->StartFunction(functionInfo, arguments, stackData);
+      if (functionInfo.valid) {
+        return activeScript->StartFunction(functionInfo, arguments, stackData);
+      }
     }
-  }
 
   // natives have to be after non-natives (Bethesda overrides native functions
   // in some scripts)
-  const char* nativeClass = selfObj->GetParentNativeScript();
+  const char* nativeClass = declaredNative.empty()
+    ? selfObj->GetParentNativeScript()
+    : declaredNative.c_str();
   const char* base = nativeClass;
+  std::set<CIString> nativeVisited;
   while (1) {
+    if (strictExecution &&
+        (!nativeVisited.insert(CIString{ base, base + std::strlen(base) })
+            .second ||
+         nativeVisited.size() > 128))
+      throw std::runtime_error("Papyrus native class cycle/depth exceeded");
     if (auto f = nativeFunctions[base][methodName]) {
       auto self = VarValue(selfObj);
       self.SetMetaStackIdHolder(stackData->stackIdHolder);
@@ -332,6 +430,9 @@ VarValue VirtualMachine::CallMethod(
         return VarValue::None();
       }
     }
+    if (strictExecution && !declaredNative.empty())
+      throw std::runtime_error("Unimplemented native: " + declaredNative +
+                               "." + methodName);
     auto it = allLoadedScripts.find(base);
     if (it == allLoadedScripts.end())
       break;
@@ -454,6 +555,20 @@ std::shared_ptr<ActivePexInstance> VirtualMachine::CreateActivePexInstance(
   auto it = allLoadedScripts.find(
     CIString{ pexScriptName.begin(), pexScriptName.end() });
   if (it != allLoadedScripts.end()) {
+    if (strictExecution) {
+      std::set<CIString> visited;
+      auto parent = pexScriptName;
+      while (!parent.empty()) {
+        if (!visited.insert(CIString{ parent.begin(), parent.end() }).second ||
+            visited.size() > 128)
+          throw std::runtime_error("Papyrus inheritance cycle/depth exceeded");
+        const auto pex = GetPexByName(parent);
+        if (!pex.fn)
+          throw std::runtime_error("Unable to find parent script '" + parent +
+                                   "'");
+        parent = pex.fn()->objectTable.at(0).parentClassName;
+      }
+    }
     ActivePexInstance scriptInstance(it->second, mapForFillProperties, this,
                                      activeInstanceOwner, childrenName);
     return std::make_shared<ActivePexInstance>(scriptInstance);

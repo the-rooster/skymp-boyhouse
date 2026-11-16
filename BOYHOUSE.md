@@ -19,7 +19,14 @@ The [catalog analyzer](misc/boyhouse/DEPENDENCIES.md) scans all five owned maste
 
 Persistent personal/host journals, 23 Papyrus Quest state methods, four quest condition predicates, expired-context guards, and a read-only client journal feed are implemented. The new `questExecuteStage` trusted server API loads original PEX fragments into a campaign-scoped VM and commits journal changes and script variables together. It remains gated by experimental per-quest adapters; no complete vanilla quest is enabled. `mp "bh journal"` displays the diagnostic projection. See [the implementation contract and remaining gates](misc/boyhouse/QUESTS.md).
 
-## Campaign reference script verification on 2026-11-16 UTC
+## Campaign method routing verification on 2026-11-16 UTC
+
+- Linux Release server/addon build and full native suite passed: **355 cases, 565,735 assertions**. Focused method routing: **7 cases, 57 assertions**.
+- Typed receivers, resolved `self`, inherited methods and explicit `Parent` calls stay within the intended attachment. Inherited state is shared with the derived instance. Native declarations require registered implementations; shared engine helpers use their audited campaign implementation. Ambiguous bindings, malformed targets and inheritance cycles roll back.
+- The suite exposed and now covers original MQ102's shared `Quest.SetStage` helper. Original-fragment execution and full-server protocol smoke passed against the final binary. These are execution checks, not quest playthroughs.
+- All **25 JavaScript/TypeScript tests**, **39 Python tests**, and the full **2,274-quest/14,026-PEX** dependency scan passed. **Zero quests are certified playable.** Dynamic script-handle identity, world overlays, lifecycle/events and native client projection remain incomplete.
+
+## Earlier campaign reference script verification on 2026-11-16 UTC
 
 - Linux Release server/addon build and full native suite passed: **348 cases, 566,493 assertions**. The new reference-script suite passed **11 cases, 211 assertions**; combined instance/quest checks passed **94 cases, 89,738 assertions**.
 - Placed references now merge original base/reference VMAD bindings, per-source property FormIDs, removal flags and deterministic NPC script templates. Variables persist privately across quests, character reload and quest reset, and roll back with failed fragments. Leveled template selection fails explicitly until campaign allocation is implemented.
@@ -109,6 +116,13 @@ docker compose -f misc/boyhouse/compose.yaml logs --tail=50 staging
 ```
 
 Staging binds UDP 17777 and HTTP 17778 to host loopback only. Offline development authentication is unsuitable for public exposure. The five masters mount read-only outside the public `data` directory. No game assets belong in this repository or a client download. Saves/settings/logs live in the private state directory, separate from source. Stop staging with `docker compose -f misc/boyhouse/compose.yaml stop staging`; back up the state directory while stopped before migrating saves. Initialization preserves existing settings.
+
+The boyhouse deployment now points `dist_back` and `scam_native.node` at a private
+`releases/<git revision>/` snapshot, with artifact hashes in `release.json`.
+Build outputs must be copied only after verification, then switched while staging
+is stopped. This keeps later builds from changing the binary an automatic restart
+would load. The initializer preserves these existing links; a fresh laboratory
+still starts with links to the build directory until its first verified snapshot.
 
 Pure checks (Node 24 for native TypeScript stripping):
 
