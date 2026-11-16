@@ -16,7 +16,19 @@ public:
   const char* GetParentNativeScript() override;
   bool EqualsByValue(const IGameObject& object) const override;
 
+protected:
+  const std::vector<std::shared_ptr<ActivePexInstance>>&
+  ListActivePexInstances() const override
+  {
+    return scripts;
+  }
+  void AddScript(std::shared_ptr<ActivePexInstance> script) noexcept override
+  {
+    scripts.push_back(std::move(script));
+  }
+
 private:
   uint32_t ownerId, formId;
   std::string identity;
+  std::vector<std::shared_ptr<ActivePexInstance>> scripts;
 };

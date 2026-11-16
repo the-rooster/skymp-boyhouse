@@ -1,4 +1,5 @@
 #include "QuestScriptRuntime.h"
+#include "CampaignReferenceScripts.h"
 #include "QuestJournal.h"
 #include "QuestVmState.h"
 #include "TestUtils.hpp"
@@ -1661,4 +1662,210 @@ TEST_CASE("Owned civil war conditions compare private variables and globals",
     REQUIRE(actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
             stopped);
   }
+}
+
+namespace {
+constexpr uint32_t kScriptedReference = 0x6debb;
+const char* kReferenceState =
+  "reference:6debb:Skyrim.esm/defaultsetstagetrigscript";
+void ReferenceFixture(Fixture& f)
+{
+  BaseScripts(f);
+  espm::QuestScriptValue target;
+  target.type = 1;
+  target.formId = kScriptedReference;
+  target.alias = 0xffff;
+  f.metadata.scripts[0].properties.push_back({ "Target", 1, target });
+  f.fixture->objectTable[0].variables.push_back(
+    { "::Target_var", "ObjectReference", 0, VarValue::None() });
+  f.fixture->objectTable[0].variables.push_back(
+    { "scripted", "defaultSetStageTRIGScript", 0, VarValue::None() });
+  auto script = std::make_shared<PexScript>();
+  script->source = "defaultSetStageTRIGScript";
+  Object object;
+  object.NameIndex = script->source;
+  object.parentClassName = "ObjectReference";
+  object.variables = { { "counter", "Int", 0, VarValue(0) },
+                       { "::stage_var", "Int", 0, VarValue::None() } };
+  FunctionInfo step;
+  step.valid = true;
+  step.returnType = "Int";
+  step.code.instructions = { { FunctionCode::kOp_IAdd,
+                               { Id("counter"), Id("counter"),
+                                 Id("::stage_var") } },
+                             { FunctionCode::kOp_Return, { Id("counter") } } };
+  object.states.push_back({ "", { { "Step", step } } });
+  script->objectTable.push_back(object);
+  f.extraScripts.push_back(script);
+  f.Fragment().code.instructions = {
+    { FunctionCode::kOp_Cast, { Id("scripted"), Id("::Target_var") } },
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("Step"), Id("scripted"), Id("counter"), VarValue(0) } },
+    { FunctionCode::kOp_Return, { VarValue::None() } }
+  };
+}
+int SavedReferenceCounter(MpActor& actor)
+{
+  return QuestJournal::ScriptState(
+           actor)["scripts"][kReferenceState]["values"]
+                 ["defaultsetstagetrigscript/counter"]["value"]
+                   .get<int>();
+}
+}
+
+TEST_CASE("Reference bindings merge owned base and placed properties once",
+          "[Quest][ReferenceScripts]")
+{
+  Fixture f;
+  const auto bindings = CampaignReferenceScripts::Read(
+    f.server.worldState,
+    GetEspmLoader().GetBrowser().LookupById(kScriptedReference));
+  REQUIRE(bindings.size() == 1);
+  const auto& props = bindings[0].properties;
+  const auto quest =
+    std::find_if(props.begin(), props.end(),
+                 [](const auto& prop) { return prop.name == "myQuest"; });
+  REQUIRE(quest != props.end());
+  REQUIRE(quest->value.formId == 0x36191);
+  const auto stage =
+    std::find_if(props.begin(), props.end(),
+                 [](const auto& prop) { return prop.name == "stage"; });
+  REQUIRE(stage != props.end());
+  REQUIRE(stage->value.integer == 170);
+}
+
+TEST_CASE("NPC reference scripts follow deterministic template inheritance",
+          "[Quest][ReferenceScripts]")
+{
+  Fixture f;
+  const auto& browser = GetEspmLoader().GetBrowser();
+  // The placed NPC inherits UseScript through 3763a -> 8a1c9.
+  const auto bindings = CampaignReferenceScripts::Read(
+    f.server.worldState, browser.LookupById(0x8767a));
+  REQUIRE(bindings.size() == 1);
+  auto name = bindings[0].name;
+  for (auto& c : name)
+    if (c >= 'A' && c <= 'Z')
+      c += 'a' - 'A';
+  REQUIRE(name == "masterambushscript");
+  // This chain reaches LVLN. Selecting a random NPC would break replay.
+  REQUIRE_THROWS_WITH(CampaignReferenceScripts::Read(
+                        f.server.worldState, browser.LookupById(0x29d87)),
+                      Catch::Matchers::ContainsSubstring(
+                        "campaign leveled actor template selection"));
+}
+
+TEST_CASE(
+  "Reference script variables follow the campaign and survive quest reset",
+  "[Quest][QuestVM][ReferenceScripts]")
+{
+  Fixture f;
+  ReferenceFixture(f);
+  auto& host = f.Add(0xff000001);
+  auto& guest = f.Add(0xff000002);
+  REQUIRE(f.Run(guest));
+  REQUIRE(SavedReferenceCounter(guest) == 170);
+  const auto personal = QuestJournal::ScriptState(guest);
+  const auto instance =
+    "campaign:" + std::to_string(host.GetFormId()) + ":fixture";
+  host.SetWorldInstance(instance);
+  guest.SetWorldInstance(instance);
+  REQUIRE(f.Run(guest));
+  REQUIRE(f.Run(guest, 20));
+  REQUIRE(SavedReferenceCounter(host) == 340);
+  REQUIRE(
+    QuestJournal::Apply(guest, { { "quest", kQuest }, { "op", "reset" } }));
+  REQUIRE(SavedReferenceCounter(host) == 340);
+  REQUIRE(f.Run(guest));
+  REQUIRE(SavedReferenceCounter(host) == 510);
+  guest.SetWorldInstance("");
+  REQUIRE(QuestJournal::ScriptState(guest) == personal);
+  REQUIRE(f.Run(guest, 20));
+  REQUIRE(SavedReferenceCounter(guest) == 340);
+  REQUIRE(SavedReferenceCounter(host) == 510);
+}
+
+TEST_CASE(
+  "Reference script roots reload and later failure rolls back their writes",
+  "[Quest][QuestVM][ReferenceScripts]")
+{
+  Fixture f;
+  ReferenceFixture(f);
+  auto& actor = f.Add(0xff000001);
+  REQUIRE(f.Run(actor));
+  Fixture restarted;
+  ReferenceFixture(restarted);
+  auto& restored = restarted.Add(actor.GetFormId());
+  const auto dump = MpChangeForm::ToJson(actor.GetChangeForm()).dump();
+  simdjson::dom::parser parser;
+  auto parsed = parser.parse(dump).value();
+  restored.ApplyChangeForm(MpChangeForm::JsonToChangeForm(parsed));
+  SECTION("reload preserves state")
+  {
+    REQUIRE(restarted.Run(restored, 20));
+    REQUIRE(SavedReferenceCounter(restored) == 340);
+  }
+  SECTION("later failure rolls back")
+  {
+    const auto before =
+      restored.GetDynamicFields().GetValueDump(QuestJournal::kProperty);
+    auto& code = restarted.Fragment().code.instructions;
+    code.insert(code.end() - 1,
+                { FunctionCode::kOp_CallStatic,
+                  { VarValue("Utility"), VarValue("Wait"), Id("temp"),
+                    VarValue(1), VarValue(1.0) } });
+    REQUIRE_THROWS(restarted.Run(restored, 20));
+    REQUIRE(restored.GetDynamicFields().GetValueDump(
+              QuestJournal::kProperty) == before);
+  }
+}
+
+TEST_CASE(
+  "Different quests share one campaign reference script instance state",
+  "[Quest][QuestVM][ReferenceScripts]")
+{
+  Fixture f;
+  ReferenceFixture(f);
+  f.metadata.fragments.push_back({ 5, 0, 1, "BoyhouseFixture", "Fragment" });
+  auto& actor = f.Add(0xff000001);
+  actor.SetPropertyValueDump(QuestJournal::kEnabled,
+                             "[\"4e50d:Skyrim.esm\",\"2d512:Skyrim.esm\"]",
+                             false, false);
+  REQUIRE(f.Run(actor));
+  REQUIRE(SavedReferenceCounter(actor) == 170);
+  REQUIRE(f.Run(actor, 5, 0x2d512));
+  REQUIRE(SavedReferenceCounter(actor) == 340);
+  const auto state = QuestJournal::ScriptState(actor);
+  REQUIRE(state["scripts"][kStateKey]["values"]["boyhousefixture/counter"]
+               ["value"] == 170);
+  REQUIRE(state["scripts"]["2d512:Skyrim.esm/boyhousefixture"]["values"]
+               ["boyhousefixture/counter"]["value"] == 340);
+}
+
+TEST_CASE(
+  "Unavailable reference code and removed quest attachments cannot execute",
+  "[Quest][QuestVM][ReferenceScripts]")
+{
+  Fixture f;
+  auto& actor = f.Add(0xff000001);
+  SECTION("missing reference script fails explicitly")
+  {
+    ReferenceFixture(f);
+    f.extraScripts.pop_back();
+    REQUIRE_THROWS_WITH(
+      f.Run(actor),
+      Catch::Matchers::ContainsSubstring("Missing campaign reference script"));
+  }
+  SECTION("removed local quest script")
+  {
+    f.metadata.scripts[0].status = 2;
+    REQUIRE_THROWS(f.Run(actor));
+  }
+  SECTION("removed inherited quest script")
+  {
+    f.metadata.scripts[0].status = 3;
+    REQUIRE_THROWS(f.Run(actor));
+  }
+  REQUIRE(QuestJournal::Get(actor, kQuest)["stages"].empty());
+  REQUIRE(QuestJournal::ScriptState(actor).empty());
 }

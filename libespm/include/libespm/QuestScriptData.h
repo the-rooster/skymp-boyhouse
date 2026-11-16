@@ -61,8 +61,13 @@ struct QuestScriptData
   std::vector<Alias> aliases;
 
   // Layout: TES5Edit Core/wbDefinitionsTES5.pas, wbVMADFragmentedQUST.
-  static QuestScriptData Parse(const uint8_t* bytes, size_t size);
+  static QuestScriptData Parse(const uint8_t* bytes, size_t size,
+                               bool allowQuestFragments = true);
   static QuestScriptData Read(const RecordHeader* quest,
                               CompressedFieldsCache& cache);
+  // References/base objects have the common VMAD header and script list,
+  // without a quest/scene/dialogue fragment tail. Never discard such a tail.
+  static QuestScriptData ReadSimple(const RecordHeader* record,
+                                    CompressedFieldsCache& cache);
 };
 }

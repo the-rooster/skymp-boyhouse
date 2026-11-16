@@ -65,6 +65,8 @@ public:
     QuestScriptValue value;
     value.type = type;
     switch (type) {
+      case 0:
+        break; // Removed property with no payload; retained as metadata.
       case 1:
         return Object(format);
       case 2:
@@ -108,12 +110,18 @@ public:
       QuestScript script;
       script.name = String();
       script.status = Read<uint8_t>();
+      if (script.status > 3)
+        Fail("unsupported script flags");
       const auto properties = Read<uint16_t>();
       for (uint32_t p = 0; p < properties; ++p) {
         QuestScriptProperty prop;
         prop.name = String();
         const auto type = Read<uint8_t>();
         prop.status = Read<uint8_t>();
+        if (prop.status > 3)
+          Fail("unsupported property flags");
+        if (!type && prop.status != 3)
+          Fail("active property has no type");
         prop.value = Value(type, format);
         script.properties.push_back(std::move(prop));
       }
@@ -128,7 +136,8 @@ private:
 };
 }
 
-QuestScriptData QuestScriptData::Parse(const uint8_t* bytes, size_t size)
+QuestScriptData QuestScriptData::Parse(const uint8_t* bytes, size_t size,
+                                       bool allowQuestFragments)
 {
   if (!bytes || size > 64 * 1024 * 1024)
     throw std::runtime_error("Invalid VMAD buffer");
@@ -140,6 +149,8 @@ QuestScriptData QuestScriptData::Parse(const uint8_t* bytes, size_t size)
   result.scripts = cursor.Scripts(result.objectFormat);
   if (!cursor.Remaining())
     return result;
+  if (!allowQuestFragments)
+    cursor.Fail("unexpected fragment tail on a simple binding");
   result.hasFragments = true;
   result.bindVersion = cursor.Read<uint8_t>();
   if (result.bindVersion != 2)
@@ -186,6 +197,29 @@ QuestScriptData QuestScriptData::Read(const RecordHeader* quest,
         throw std::runtime_error("Duplicate quest VMAD field");
       found = true;
       result = Parse(reinterpret_cast<const uint8_t*>(data), size);
+    },
+    cache);
+  return result;
+}
+
+QuestScriptData QuestScriptData::ReadSimple(const RecordHeader* record,
+                                            CompressedFieldsCache& cache)
+{
+  if (!record || record->GetType() == "QUST" || record->GetType() == "INFO" ||
+      record->GetType() == "SCEN" || record->GetType() == "PACK" ||
+      record->GetType() == "PERK")
+    throw std::invalid_argument("Expected a nonfragmented script record");
+  QuestScriptData result;
+  bool found = false;
+  RecordHeaderAccess::IterateFields(
+    record,
+    [&](const char* tag, uint32_t size, const char* data) {
+      if (std::memcmp(tag, "VMAD", 4))
+        return;
+      if (found)
+        throw std::runtime_error("Duplicate object VMAD field");
+      found = true;
+      result = Parse(reinterpret_cast<const uint8_t*>(data), size, false);
     },
     cache);
   return result;

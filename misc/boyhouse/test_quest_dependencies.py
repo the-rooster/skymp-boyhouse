@@ -107,6 +107,26 @@ def summary(typ="QUST", form=42, values=(), groups=(), flags=0):
 
 
 class FormatTests(unittest.TestCase):
+    def test_removed_script_flags_and_payload_free_removed_properties(self):
+        for status in (2, 3):
+            data = make_vmad([vmad_script("removed", status=status),
+                              vmad_script("live", [("old", 0, 3, b"")])])
+            parsed = vmad(data, "REFR")
+            self.assertEqual(parsed["scripts"], [{"name": "live", "properties": []}])
+        for data in (make_vmad([vmad_script("bad", status=4)]),
+                     make_vmad([vmad_script("bad", [("active", 0, 1, b"")])])):
+            with self.assertRaises(ValueError):
+                vmad(data, "REFR")
+
+    def test_selected_reference_bodies_keep_group_and_compression_checks(self):
+        body = field(b"VMAD", make_vmad([vmad_script("reference")]))
+        packed = struct.pack("<I", len(body)) + zlib.compress(body)
+        data = group(record(b"REFR", 42, packed, 0x40000), 6, 100)
+        self.assertEqual(list(plugin_records(io.BytesIO(data), len(data)))[0][3], [])
+        parsed = list(plugin_records(io.BytesIO(data), len(data), extra_types=(b"REFR",)))
+        self.assertEqual(parsed[0][3], [(b"VMAD", make_vmad([vmad_script("reference")]))])
+        self.assertEqual(parsed[0][4], ((6, 100),))
+
     def test_vmad_aliases_and_object_array_in_both_layouts(self):
         for fmt in (1, 2):
             script = vmad_script("Root", [

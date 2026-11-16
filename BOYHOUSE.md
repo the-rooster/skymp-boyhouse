@@ -19,7 +19,14 @@ The [catalog analyzer](misc/boyhouse/DEPENDENCIES.md) scans all five owned maste
 
 Persistent personal/host journals, 23 Papyrus Quest state methods, four quest condition predicates, expired-context guards, and a read-only client journal feed are implemented. The new `questExecuteStage` trusted server API loads original PEX fragments into a campaign-scoped VM and commits journal changes and script variables together. It remains gated by experimental per-quest adapters; no complete vanilla quest is enabled. `mp "bh journal"` displays the diagnostic projection. See [the implementation contract and remaining gates](misc/boyhouse/QUESTS.md).
 
-## Conditional quest state verification on 2026-11-16 UTC
+## Campaign reference script verification on 2026-11-16 UTC
+
+- Linux Release server/addon build and full native suite passed: **348 cases, 566,493 assertions**. The new reference-script suite passed **11 cases, 211 assertions**; combined instance/quest checks passed **94 cases, 89,738 assertions**.
+- Placed references now merge original base/reference VMAD bindings, per-source property FormIDs, removal flags and deterministic NPC script templates. Variables persist privately across quests, character reload and quest reset, and roll back with failed fragments. Leveled template selection fails explicitly until campaign allocation is implemented.
+- Every owned placed-reference VMAD parses. Controlled script fixtures test host/guest separation and persistence; these checks do not instantiate NPCs, run world events or play quests.
+- All **25 JavaScript/TypeScript tests**, **39 Python tests**, native addon smoke and full server protocol smoke passed. Full catalog analysis remains **2,274 quests, 14,026 PEX files and zero certified quests**. Reference/asset graph traversal and script-instance dispatch still require further work.
+
+## Earlier conditional quest state verification on 2026-11-16 UTC
 
 - Linux Release server/addon build and full native suite passed: **337 cases, 566,162 assertions**. The new conditional-variable suite passed **5 cases, 77 assertions**.
 - Stage log conditions read numeric conditional quest variables through owned CIS2 names and PEX flags, including inherited declarations, private host/guest state and character reload. Global comparisons see uncommitted changes from earlier log fragments. Invalid or unsupported state rolls back the transaction.

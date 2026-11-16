@@ -86,7 +86,10 @@ Unused functions and alternative branches can contribute dependencies.
 Declared receiver types cannot prove actual runtime dispatch. The JSON
 separates unresolved static links from sites whose runtime receiver may differ.
 
-World-reference and asset script bindings are not traversed yet; dynamic alias
+The runtime now binds placed-reference scripts, but the dependency analyzer
+does not traverse world-reference and asset script bindings yet. Its optional
+`plugin_records(..., extra_types=...)` input supports focused reference audits
+without silently widening the catalog's claimed analysis scope. Dynamic alias
 fills, runtime-created forms, computed IDs, native-engine behavior and external
 events require additional discovery and traces. Other non-script record
 relationships are also incomplete. These are global analysis gaps even when a

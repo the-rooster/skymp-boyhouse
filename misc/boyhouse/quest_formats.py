@@ -49,11 +49,12 @@ def inflate(data, expected):
     return result
 
 
-def plugin_records(stream, end, groups=()):
+def plugin_records(stream, end, groups=(), *, extra_types=()):
     """All record headers; selected bodies only. INFO retains its parent group."""
     from quest_catalog import fields
     detailed = {b"TES4", b"QUST", b"DIAL", b"INFO", b"SCEN", b"PACK",
                 b"SMQN", b"SMBN", b"SMEN"}
+    detailed.update(extra_types)
     while stream.tell() < end:
         start = stream.tell()
         header = stream.read(24)
@@ -67,7 +68,8 @@ def plugin_records(stream, end, groups=()):
             if len(groups) > 32:
                 raise ValueError("Plugin group depth exceeded")
             label, kind = struct.unpack_from("<Ii", header, 8)
-            yield from plugin_records(stream, limit, groups + ((kind, label),))
+            yield from plugin_records(stream, limit, groups + ((kind, label),),
+                                      extra_types=extra_types)
         else:
             values = []
             if tag in detailed:
@@ -106,6 +108,8 @@ def vmad(data, record_type="QUST"):
         return {"form": form, "alias": alias}
 
     def value(kind, fmt):
+        if kind == 0:
+            return []
         if kind == 1:
             return [obj(fmt)]
         if kind == 2:
@@ -131,13 +135,17 @@ def vmad(data, record_type="QUST"):
         result = []
         for _ in range(c.number("H")):
             name, status = c.string(), c.number("B")
+            if status > 3:
+                raise ValueError("Unsupported VMAD script flags")
             props = []
             for _ in range(c.number("H")):
                 pname, kind, pstatus = c.string(), c.number("B"), c.number("B")
+                if pstatus > 3 or (kind == 0 and pstatus != 3):
+                    raise ValueError("Unsupported VMAD property flags/type")
                 refs = value(kind, fmt)
                 if pstatus != 3:
                     props.append({"name": pname, "type": kind, "references": refs})
-            if status != 3:
+            if not status & 2:
                 result.append({"name": name.lower(), "properties": props})
         return result
 

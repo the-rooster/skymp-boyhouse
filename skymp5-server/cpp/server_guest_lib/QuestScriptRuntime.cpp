@@ -1,4 +1,5 @@
 #include "QuestScriptRuntime.h"
+#include "CampaignReferenceScripts.h"
 #include "ConditionsEvaluator.h"
 #include "MpActor.h"
 #include "QuestJournal.h"
@@ -220,13 +221,15 @@ public:
   using ResolveAlias =
     std::function<std::shared_ptr<IGameObject>(uint32_t, uint32_t)>;
   Variables(espm::QuestScript script_, espm::LookupResult record_, Json saved_,
-            Resolve resolve_, ResolveAlias resolveAlias_, QuestVmState& heap_)
+            Resolve resolve_, ResolveAlias resolveAlias_, QuestVmState& heap_,
+            bool globalPropertyIds_ = false)
     : script(std::move(script_))
     , record(record_)
     , saved(std::move(saved_))
     , resolve(std::move(resolve_))
     , resolveAlias(std::move(resolveAlias_))
     , heap(heap_)
+    , globalPropertyIds(globalPropertyIds_)
   {
     if (!saved.is_object())
       throw std::runtime_error("Invalid saved script variables");
@@ -314,8 +317,8 @@ private:
           return VarValue::None();
         if (value.alias != 0xffff)
           return VarValue(
-            resolveAlias(record.ToGlobalId(value.formId), value.alias).get());
-        return VarValue(resolve(record.ToGlobalId(value.formId)).get());
+            resolveAlias(PropertyId(value.formId), value.alias).get());
+        return VarValue(resolve(PropertyId(value.formId)).get());
       case 2:
         return VarValue(value.text);
       case 3:
@@ -334,12 +337,17 @@ private:
         return array;
     }
   }
+  uint32_t PropertyId(uint32_t raw) const
+  {
+    return globalPropertyIds ? raw : record.ToGlobalId(raw);
+  }
   espm::QuestScript script;
   espm::LookupResult record;
   Json saved;
   Resolve resolve;
   ResolveAlias resolveAlias;
   QuestVmState& heap;
+  bool globalPropertyIds;
   std::map<std::string, VarValue> values;
 };
 
@@ -581,6 +589,27 @@ bool QuestScriptRuntime::ExecuteStage(
       if (id == 0x14 || rec.rec->GetType() != "QUST") {
         auto form = std::make_shared<CampaignFormObject>(rec, owner, id);
         objects[id] = form;
+        if (id != 0x14 &&
+            (rec.rec->GetType() == "REFR" || rec.rec->GetType() == "ACHR")) {
+          std::vector<VirtualMachine::ScriptInfo> bindings;
+          for (const auto& script :
+               CampaignReferenceScripts::Read(world, rec)) {
+            const auto pex = vm.GetPexByName(script.name);
+            if (!pex.fn)
+              throw std::runtime_error("Missing campaign reference script: " +
+                                       script.name);
+            pex.fn();
+            const auto key = "reference:" +
+              FormDesc::FromFormId(id, world.espmFiles).ToString() + "/" +
+              Lower(script.name);
+            auto holder =
+              std::make_shared<Variables>(script, rec, state.GetScript(key),
+                                          resolve, resolveAlias, state, true);
+            variables.emplace(key, holder);
+            bindings.push_back({ script.name, holder });
+          }
+          vm.AddObject(form, bindings);
+        }
         return form;
       }
       auto object = std::make_shared<CampaignQuestObject>(rec, owner);
@@ -590,7 +619,7 @@ bool QuestScriptRuntime::ExecuteStage(
         : espm::QuestScriptData::Read(rec.rec, world.GetEspmCache());
       std::vector<VirtualMachine::ScriptInfo> bindings;
       for (const auto& script : data.scripts) {
-        if (script.status == 3)
+        if (script.status & 2)
           continue;
         // AddObject used to silently ignore missing scripts. Verify each
         // binding.
@@ -647,7 +676,7 @@ bool QuestScriptRuntime::ExecuteStage(
         if (rec.ToGlobalId(binding.object.formId) != id)
           throw std::runtime_error("Alias script is bound to another quest");
         for (const auto& script : binding.scripts) {
-          if (script.status == 3)
+          if (script.status & 2)
             continue;
           const auto pex = vm.GetPexByName(script.name);
           if (!pex.fn)
@@ -1022,7 +1051,7 @@ bool QuestScriptRuntime::ExecuteStage(
       std::shared_ptr<PexScript> conditionalScript;
       std::shared_ptr<Variables> holder;
       for (const auto& script : data.scripts) {
-        if (script.status == 3)
+        if (script.status & 2)
           continue;
         const auto pex = vm.GetPexByName(script.name).fn();
         if (!Conditional(*pex, pex->objectTable.at(0).userFlags))

@@ -39,6 +39,23 @@ VM save schema 4 separates script roots, a campaign-local array heap, campaign g
 
 The isolated runner represents static forms as `(campaign owner, original FormID)` and aliases as `(campaign owner, quest, alias ID)`. These are logical Papyrus objects, **not live NPC/reference clones**. `Game.GetPlayer` binds canonical PlayerRef to the campaign owner even when a guest triggers execution. `Game.GetForm`, `Form.GetFormID`, `ObjectReference.GetBaseObject` and `Actor.GetActorBase` read owned static identities; dynamic form lookup is rejected until campaign allocation exists.
 
+Placed reference objects now bind their original base/reference scripts to the
+campaign VM. Reference properties override base properties, with every object or
+array element mapped through the plugin that supplied it. Both removed-script
+flags and removed properties are honored. NPC `UseScript` inheritance follows
+deterministic NPC templates; leveled template selection, cycles and invalid
+bindings fail. Missing attached PEX is an error, including when encountered
+while resolving a reference property.
+
+Reference script variables and arrays persist under `reference:<FormDesc>/<script>`
+roots in the same transaction as the journal. Different quests in one campaign
+share that reference's state; resetting a quest preserves it. Host/guest histories
+stay separate, character reload retains it, and fragment failure rolls it back.
+These bindings do not instantiate NPCs, dispatch initialization/world events, or
+permit ordinary global-VM world mutations. PlayerRef base bindings and
+active-magic-effect instances remain unimplemented. Content migration and
+reference retirement still need explicit lifecycle handling.
+
 `Quest.GetAlias`, alias `GetOwningQuest`/`GetID`/`GetName`, reference alias getters and `LocationAlias.GetLocation` are available. VMAD alias properties and `GetAlias` share one object identity. Attached alias scripts load from owned PEX and persist separately from quest scripts. Resolving an object does not dispatch initialization, fill or other lifecycle events.
 
 For an adapter-enabled running quest, target getters can resolve forced references/locations, unique actors with exactly one winning nondeleted reference, and external aliases. Resolved targets persist as stable plugin/form keys; explicit empty bindings remain distinct from unresolved aliases. Stopped/unstarted quests return None. Unknown fills, conditions, creation, propagation, ambiguous actor references and cycles fail the transaction. Reflection alone does not fill aliases. Alias flags, reservations, factions, inventory, spells, packages and other lifecycle effects are retained as metadata but **are not applied**. These APIs remain inside the existing experimental adapter boundary, with no vanilla adapters enabled.
