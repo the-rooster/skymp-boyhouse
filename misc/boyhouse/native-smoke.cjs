@@ -23,14 +23,35 @@ const authority = new PartyInstances({
   isInside: () => true,
 }, [{ id: "fixture", worldOrCell: 0x3c, center: [10000, 10000, 10000], radius: 100 }]);
 const [owner, guest, stranger] = ids;
+const quest = 0x4e50d, key = "4e50d:Skyrim.esm";
+const progress = id => server.get(id, "questJournal");
+const stage = (id, index) => server.set(id, "questCommand", { quest, op: "setStage", index });
+assert.throws(() => stage(owner, 10), /adapter is not enabled/);
+for (const id of ids) server.set(id, "private.boyhouse.questAdapters", [key]);
+stage(owner, 10); stage(guest, 5);
+const guestPersonal = progress(guest).quests;
+assert.throws(() => server.set(owner, "questJournal", {}), /not implemented/);
 authority.enter(owner, owner, "fixture");
 assert.throws(() => authority.enter(stranger, owner, "fixture"), /Party membership/);
 authority.invite(owner, guest); authority.accept(guest, owner);
 authority.enter(guest, owner, "fixture");
 assert.equal(server.get(owner, "worldInstance"), server.get(guest, "worldInstance"));
 assert.notEqual(server.get(stranger, "worldInstance"), server.get(guest, "worldInstance"));
+assert.equal(progress(guest).campaignOwner, owner);
+stage(guest, 20);
+assert.equal(progress(owner).quests[key].stage, 20);
+assert.deepEqual(progress(stranger).quests, {});
+const { QuestJournalFeed } = require("../../skymp5-server/ts/campaign/questJournalFeed.js");
+const packets = [];
+const feed = new QuestJournalFeed({ connected: () => true, actor: user => ids[user], read: progress,
+  send: (user, packet) => packets.push({ user, packet }) });
+feed.subscribe(1, { action: "subscribe", subscriptionId: "native-smoke", actor: stranger });
+assert.equal(packets[0].packet.journal.campaignOwner, owner);
 authority.kick(owner, guest);
+feed.poll();
+assert.equal(packets[1].packet.journal.campaignOwner, guest);
+assert.deepEqual(packets[1].packet.journal.quests, guestPersonal);
 assert.notEqual(server.get(owner, "worldInstance"), server.get(guest, "worldInstance"));
 assert.throws(() => server.set(owner, "worldInstance", 42));
-console.log("Native server + party authority smoke test passed (owned game masters loaded)");
+console.log("Native server + party + quest journal/feed smoke passed (record validation, not vanilla quest execution)");
 process.exit(0);

@@ -20,6 +20,7 @@
 #include "PercentagesBinding.h"
 #include "PosBinding.h"
 #include "ProfileIdBinding.h"
+#include "QuestJournalBinding.h"
 #include "RespawnPercentagesBinding.h"
 #include "SpawnDelayBinding.h"
 #include "SpawnPointBinding.h"
@@ -52,6 +53,8 @@ PropertyBindingFactory::CreateStandardPropertyBindings()
   result["type"] = std::make_shared<TypeBinding>();
   result["worldOrCellDesc"] = std::make_shared<WorldOrCellDescBinding>();
   result["worldInstance"] = std::make_shared<WorldInstanceBinding>();
+  result["questJournal"] = std::make_shared<QuestJournalBinding>();
+  result["questCommand"] = std::make_shared<QuestCommandBinding>();
   result["idx"] = std::make_shared<IdxBinding>();
   result["consoleCommandsAllowed"] =
     std::make_shared<ConsoleCommandsAllowedBinding>();

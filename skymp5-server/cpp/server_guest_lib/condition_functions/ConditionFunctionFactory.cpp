@@ -11,6 +11,7 @@
 #include "IsInInterior.h"
 #include "IsWeaponMagicOut.h"
 #include "IsWeaponOut.h"
+#include "QuestCondition.h"
 #include "SpellHasKeyword.h"
 #include "WornApparelHasKeywordCount.h"
 #include "WornHasKeyword.h"
@@ -22,6 +23,12 @@
 ConditionFunctionMap ConditionFunctionFactory::CreateConditionFunctions()
 {
   ConditionFunctionMap res;
+  using QuestCondition = ConditionFunctions::QuestCondition;
+  for (const auto kind :
+       { QuestCondition::Kind::Running, QuestCondition::Kind::Stage,
+         QuestCondition::Kind::StageDone, QuestCondition::Kind::Completed }) {
+    res.RegisterConditionFunction(std::make_shared<QuestCondition>(kind));
+  }
 
   res.RegisterConditionFunction(
     std::make_shared<ConditionFunctions::GetEquipped>());

@@ -16,6 +16,7 @@ public:
                            int32_t stackId) const override;
 
   WorldState* GetWorldState() const override;
+  MpActor* GetQuestActor(int32_t stackId) const override;
 
   void SetDefaultActor(int32_t stackId, MpActor* actor) override;
 
@@ -28,6 +29,11 @@ private:
   {
     MpActor* ac = nullptr;
     const char* currentEventName = "";
+    uint32_t actorId = 0;
+    uint64_t instanceEpoch = 0;
+    std::weak_ptr<MpForm> actorLifetime;
+    std::weak_ptr<MpForm> ownerLifetime;
+    uint64_t ownerEpoch = 0;
   };
   std::vector<StackInfo> stackInfo;
   WorldState* const worldState;

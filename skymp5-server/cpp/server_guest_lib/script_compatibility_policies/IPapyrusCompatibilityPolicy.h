@@ -18,6 +18,11 @@ public:
   virtual MpActor* GetDefaultActor(const char* className, const char* funcName,
                                    int32_t stackId) const = 0;
 
+  virtual MpActor* GetQuestActor(int32_t stackId) const
+  {
+    return GetDefaultActor("Quest", "campaign context", stackId);
+  }
+
   virtual WorldState* GetWorldState() const { return nullptr; }
 
   virtual void SetDefaultActor(int32_t stackId, MpActor* actor) = 0;

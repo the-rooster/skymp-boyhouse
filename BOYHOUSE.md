@@ -1,6 +1,6 @@
 # Boyhouse SkyMP fork
 
-Experimental work on personal campaigns in a shared Skyrim world. Upstream baseline: `2849e676fe008925384b26f34476e382a30bd877`. Target: 16â€“32 players; the laboratory uses four slots and has not been load-tested.
+Experimental work on personal campaigns in a shared Skyrim world. Upstream baseline: `2849e676fe008925384b26f34476e382a30bd877`. Target: 16-32 players; the laboratory uses four slots and has not been load-tested.
 
 ## Implemented boundary prototype
 
@@ -11,7 +11,19 @@ Experimental work on personal campaigns in a shared Skyrim world. Upstream basel
 - Development console commands in the forked client; no polished party UI yet.
 - Owned-master quest inventory scanner with overrides, compressed records, source hashes, and an explicit untested status.
 
-## Verification recorded on 2026-11-16 UTC
+## Quest journal foundation
+
+Persistent personal/host journals, 23 Papyrus Quest state methods, four quest condition predicates, expired-context guards, and a read-only client journal feed are now implemented. `mp "bh journal"` displays the diagnostic projection. Vanilla quest execution remains disabled until an execution adapter exists. See [the implementation contract and remaining gates](misc/boyhouse/QUESTS.md).
+
+## Quest milestone verification on 2026-11-16 UTC
+
+- Linux Release server/addon and server TypeScript build passed; the client webpack/typecheck also passed.
+- Full native suite: 271 cases and 476,285 assertions passed. The focused instance/quest suite passed 17 cases and 115 assertions, including 8 new quest cases.
+- 25 JavaScript/TypeScript tests and 4 Python catalog tests passed.
+- Native addon/party/journal-feed integration and full-server protocol smoke passed, including rejected forged quest writes, host-only progress, guest removal, and journal reconnect.
+- Quest coverage remains zero certified playthroughs. MQ102 appears only as a record-index fixture; its vanilla scripts, dialogue, and rewards were not executed. The ESM hash and distribution-content tests self-skip outside CI.
+
+## Earlier boundary milestone verification
 
 - Linux Release server and addon build completed on boyhouse.
 - Full native suite: 263 cases, 476,977 assertions passed; includes 9 new instance cases with 40 assertions.
@@ -23,7 +35,7 @@ Experimental work on personal campaigns in a shared Skyrim world. Upstream basel
 
 ## What this does not implement yet
 
-This is not full campaign multiplayer or a finished instancing engine. Vanilla static references are not cloned per campaign. Quest VM isolation, aliases, dialogue scenes, story events, journals, branch ownership, world overlays, scoped persistence transactions, transition acknowledgements/epochs, automatic boundary crossing, guest progression rules, and client reset/rebinding remain to be built and tested. Entering an experimental instance can hide shared NPCs and interactive references until overlays exist. Use the empty boundary laboratory only.
+This is not full campaign multiplayer or a finished instancing engine. Vanilla static references are not cloned per campaign. Quest VM isolation, aliases, dialogue scenes, story events, native client journals, branch ownership, world overlays, scoped persistence transactions, transition acknowledgements/epochs, automatic boundary crossing, guest progression rules, and client reset/rebinding remain to be built and tested. Entering an experimental instance can hide shared NPCs and interactive references until overlays exist. Use the empty boundary laboratory only.
 
 The full-release target is every quest in Skyrim, Update, Dawnguard, HearthFires, and Dragonborn. Completion requires evidence per quest and important branch; it is not guaranteed by adding synchronization primitives. The local owned files contain 2,274 distinct QUST records including internal helper quests. **Zero quests have been certified for this fork.** Creation Club and arbitrary quest mods are separate compatibility packs.
 
@@ -64,7 +76,7 @@ Once a compatible fork client is installed, open the Skyrim console and use `mp 
 ## Next acceptance gates
 
 1. Confirm native Windows support for the installed runtime and pass a three-client in-game disappear/reappear, party entry, kick, reconnect, and delayed-packet test.
-2. Add transition epochs, reference identity `(campaign, original form)`, per-campaign vanilla overlays, and durable personal story storage; test a tiny scripted fixture before expanding content.
+2. Add transition epochs, reference identity `(campaign, original form)`, per-campaign vanilla overlays, and world-state transactions around the implemented personal journal; test a tiny scripted fixture before expanding content.
 3. Implement quest VM/API, dialogue/scene/alias and story-manager coverage; validate a first real quest with solo, party, divergent-history, restart, and late-join runs.
 4. Expand the evidence-backed quest matrix to all scoped content, then pass 16/32-client load and recovery tests. Never convert an inventory entry to supported without recorded evidence.
 

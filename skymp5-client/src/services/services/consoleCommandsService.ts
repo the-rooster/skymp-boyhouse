@@ -1,4 +1,5 @@
 import { parseInstanceCommand } from "../../campaign/instanceCommand";
+import { CampaignQuestService } from "./campaignQuestService";
 import { logError, logTrace } from "../../logging";
 import { MsgType } from "../../messages";
 
@@ -100,6 +101,10 @@ export class ConsoleCommandsService extends ClientListener {
             }
 
             // Development console bridge; permission checks remain on the server.
+            if (commandName === "mp" && typeof args[1] === "string" && args[1].trim() === "bh journal") {
+                this.controller.lookupListener(CampaignQuestService).printJournal();
+                return false;
+            }
             if (commandName === "mp" && typeof args[1] === "string" && /^bh(?:\s|$)/.test(args[1])) {
                 try {
                     this.controller.emitter.emit("sendMessage", {

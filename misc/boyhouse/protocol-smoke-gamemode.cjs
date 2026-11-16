@@ -19,6 +19,11 @@ async function login(profileId) {
 }
 (async () => {
   const owner = await login(1001), guest = await login(1002), stranger = await login(1003);
+  const quest = 0x4e50d, key = "4e50d:Skyrim.esm";
+  const journal = player => server.get(player.actor, "questJournal");
+  for (const player of [owner, guest]) server.set(player.actor, "private.boyhouse.questAdapters", [key]);
+  server.set(guest.actor, "questCommand", { quest, op: "setStage", index: 5 });
+  const personal = journal(guest).quests;
   const scope = player => server.get(player.actor, "worldInstance");
   await command(owner.bot, { action: "enter", area: "fixture" });
   assert.equal(scope(owner), `campaign:${owner.actor}:fixture`);
@@ -29,10 +34,19 @@ async function login(profileId) {
   await command(guest.bot, { action: "accept", leader: owner.actor });
   await command(guest.bot, { action: "enter", owner: owner.actor, area: "fixture" });
   assert.equal(scope(guest), scope(owner));
+  const beforeForgery = journal(owner);
+  packet(stranger.bot, { customPacketType: "boyhouse.questJournal", action: "setStage", actor: owner.actor, quest, index: 200 });
+  packet(guest.bot, { customPacketType: "boyhouse.questJournal", action: "setStage", quest, index: 200 });
+  await sleep(250);
+  assert.deepEqual(journal(owner), beforeForgery, "Clients cannot mutate quests even while admitted as a guest");
+  server.set(guest.actor, "questCommand", { quest, op: "setStage", index: 10 });
+  assert.equal(journal(owner).quests[key].stage, 10);
+  assert.equal(journal(guest).campaignOwner, owner.actor);
   await command(stranger.bot, { action: "kick", actor: owner.actor, target: guest.actor });
   assert.equal(scope(guest), scope(owner));
   await command(owner.bot, { action: "kick", target: guest.actor });
   assert.equal(scope(guest), `campaign:${guest.actor}:fixture`);
+  assert.deepEqual(journal(guest).quests, personal, "Kick restores the guest's own story");
   await command(owner.bot, { action: "invite", target: guest.actor });
   await command(guest.bot, { action: "accept", leader: owner.actor });
   await command(guest.bot, { action: "enter", owner: owner.actor, area: "fixture" });
@@ -45,8 +59,9 @@ async function login(profileId) {
   const returning = await login(1002);
   assert.equal(returning.actor, guest.actor);
   assert.equal(scope(returning), `campaign:${guest.actor}:fixture`);
+  assert.deepEqual(journal(returning).quests, personal, "Reconnect preserves personal quest state");
   // Existing console output is routed to native logs; stdout here stays visible.
-  require("node:fs").writeSync(1, "Full server protocol smoke passed: login, forged sender, invite, join, kick, disconnect, reconnect\n");
+  require("node:fs").writeSync(1, "Full server protocol smoke passed: login, forged sender/quest writes, party sharing, kick, disconnect, journal reconnect\n");
   process.exit(0);
 })().catch(error => {
   require("node:fs").writeSync(2, `${error.stack}\n`);

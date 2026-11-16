@@ -20,6 +20,7 @@ import { System } from "./systems/system";
 import { MasterClient } from "./systems/masterClient";
 import { Spawn } from "./systems/spawn";
 import { CampaignInstances } from "./systems/campaignInstances";
+import { CampaignQuests } from "./systems/campaignQuests";
 import { Login } from "./systems/login";
 import { DiscordBanSystem } from "./systems/discordBanSystem";
 import { MasterApiBalanceSystem } from "./systems/masterApiBalanceSystem";
@@ -195,6 +196,7 @@ const main = async () => {
     new MetricsSystem(),
     new MasterClient(log, port, master, maxPlayers, name, masterKey, 5000, offlineMode),
     new CampaignInstances(),
+    new CampaignQuests(),
     new Spawn(log),
     new Login(log, maxPlayers, master, port, masterKey, offlineMode),
     new DiscordBanSystem(),

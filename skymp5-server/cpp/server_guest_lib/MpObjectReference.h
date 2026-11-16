@@ -96,6 +96,7 @@ public:
   const NiPoint3& GetAngle() const;
   const FormDesc& GetCellOrWorld() const;
   const std::string& GetWorldInstance() const;
+  uint64_t GetWorldInstanceEpoch() const { return worldInstanceEpoch; }
   bool SharesWorldInstance(const MpObjectReference& other) const;
   void SetWorldInstance(const std::string& instance);
   const uint32_t& GetBaseId() const;
@@ -263,6 +264,7 @@ private:
   std::optional<std::chrono::system_clock::duration> relootTimeOverride;
   std::unique_ptr<uint8_t> chanceNoneOverride;
   bool activationBlocked = false;
+  uint64_t worldInstanceEpoch = 0;
 
   struct Impl;
   std::shared_ptr<Impl> pImpl;

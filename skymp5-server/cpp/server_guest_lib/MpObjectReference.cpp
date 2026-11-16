@@ -690,6 +690,7 @@ void MpObjectReference::SetWorldInstance(const std::string& instance)
   if (instance == GetWorldInstance()) {
     return;
   }
+  ++worldInstanceEpoch;
   EditChangeForm([&](MpChangeForm& form) { form.worldInstance = instance; });
   if (auto world = GetParent()) {
     // Revoke leases in both directions before accepting further packets.
