@@ -19,7 +19,14 @@ The [catalog analyzer](misc/boyhouse/DEPENDENCIES.md) scans all five owned maste
 
 Persistent personal/host journals, 23 Papyrus Quest state methods, four quest condition predicates, expired-context guards, and a read-only client journal feed are implemented. The new `questExecuteStage` trusted server API loads original PEX fragments into a campaign-scoped VM and commits journal changes and script variables together. It remains gated by experimental per-quest adapters; no complete vanilla quest is enabled. `mp "bh journal"` displays the diagnostic projection. See [the implementation contract and remaining gates](misc/boyhouse/QUESTS.md).
 
-## Campaign method routing verification on 2026-11-16 UTC
+## Transactional save verification on 2026-11-16 UTC
+
+- Added the opt-in SQLite driver: one save batch commits all change forms together, or rolls them all back. Failed writes retain the batch for the existing retry path. Reads use a consistent snapshot; invalid saves and unknown database formats fail explicitly.
+- Linux Release build and full native suite passed: **363 cases, 565,640 assertions**; the focused database suite passed **8 cases, 86 assertions**. Tests cover a failed middle write, retry, concurrent reads, uncommitted crash recovery and committed recovery after `SIGKILL`.
+- A native server process saved **32 disposable characters**, including inventories, private campaign journals, original fragment VM state and party phases. After a forced stop, a new server restored them and returned the guest to their own history. This is a persistence check, not a 32-client performance test or a quest playthrough.
+- All **25 JavaScript/TypeScript tests**, **39 Python tests**, both existing server smokes and the new restart smoke passed. The full catalog still reports **zero certified quests**. See the [storage contract](misc/boyhouse/STORAGE.md); transaction staging across live world effects and durable client acknowledgements remain unfinished.
+
+## Earlier campaign method routing verification on 2026-11-16 UTC
 
 - Linux Release server/addon build and full native suite passed: **355 cases, 565,735 assertions**. Focused method routing: **7 cases, 57 assertions**.
 - Typed receivers, resolved `self`, inherited methods and explicit `Parent` calls stay within the intended attachment. Inherited state is shared with the derived instance. Native declarations require registered implementations; shared engine helpers use their audited campaign implementation. Ambiguous bindings, malformed targets and inheritance cycles roll back.
@@ -116,6 +123,8 @@ docker compose -f misc/boyhouse/compose.yaml logs --tail=50 staging
 ```
 
 Staging binds UDP 17777 and HTTP 17778 to host loopback only. Offline development authentication is unsuitable for public exposure. The five masters mount read-only outside the public `data` directory. No game assets belong in this repository or a client download. Saves/settings/logs live in the private state directory, separate from source. Stop staging with `docker compose -f misc/boyhouse/compose.yaml stop staging`; back up the state directory while stopped before migrating saves. Initialization preserves existing settings.
+
+New laboratory settings use SQLite (`databaseDriver: "sqlite"`, `databaseName: "./world.sqlite3"`). Existing settings keep their selected driver. Changing a populated file database requires a verified migration; changing the setting alone does not import saves. See [storage and backups](misc/boyhouse/STORAGE.md).
 
 The boyhouse deployment now points `dist_back` and `scam_native.node` at a private
 `releases/<git revision>/` snapshot, with artifact hashes in `release.json`.

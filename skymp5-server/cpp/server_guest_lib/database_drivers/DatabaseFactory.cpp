@@ -6,6 +6,7 @@
 
 #include "FileDatabase.h"
 #include "MigrationDatabase.h"
+#include "SqliteDatabase.h"
 #include "ZipDatabase.h"
 #include <database_drivers/MongoDatabase.h>
 
@@ -34,6 +35,13 @@ DatabaseFactory::Create(nlohmann::json settings,
     auto databaseUri = settings["databaseUri"].get<std::string>();
     logger->info("Using mongodb with name '" + databaseName + "'");
     return std::make_shared<MongoDatabase>(databaseUri, databaseName);
+  }
+
+  if (databaseDriver == "sqlite") {
+    const auto file =
+      settings.value("databaseName", std::string("world.sqlite3"));
+    logger->info("Using transactional SQLite database '{}'", file);
+    return std::make_shared<SqliteDatabase>(file);
   }
 
   if (databaseDriver == "migration") {

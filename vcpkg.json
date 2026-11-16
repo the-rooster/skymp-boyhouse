@@ -11,6 +11,7 @@
     "spdlog",
     "catch2",
     "simdjson",
+    "sqlite3",
     "robin-hood-hashing",
     "simpleini",
     "bshoshany-thread-pool",

@@ -21,6 +21,7 @@ createOnce("server-settings.json", JSON.stringify({
   master: "http://127.0.0.1", dataDir: "./data",
   loadOrder: masters.map(name => `/game-data/${name}`),
   npcEnabled: false, logLevel: "info", gamemodePath: "./gamemode.js",
+  databaseDriver: "sqlite", databaseName: "./world.sqlite3",
   startPoints: [{ pos: [133857, -61130, 14662], worldOrCell: "0x3c", angleZ: 72 }],
   boyhouseInstances: { experimental: true, areas: [{
     id: "boundary_test", worldOrCell: 60, center: [133857, -61130, 14662], radius: 512

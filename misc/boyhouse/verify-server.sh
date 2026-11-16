@@ -9,6 +9,7 @@ python3 -m unittest discover -s misc/boyhouse -p 'test_*.py'
 python3 misc/boyhouse/quest_dependencies.py --data-dir /game-data \
   --archive '/game-data/Skyrim - Misc.bsa' \
   --output /src/build/quest-dependencies.json --markdown /src/build/quest-backlog.md
-./build/unit/unit '[Instance],[Quest]'
+./build/unit/unit '[Instance],[Quest],[SQLite]'
 node misc/boyhouse/native-smoke.cjs
 node misc/boyhouse/protocol-smoke.cjs
+node misc/boyhouse/storage-smoke.cjs

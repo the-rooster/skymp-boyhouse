@@ -98,6 +98,8 @@ get_filename_component(JSON_INCLUDE_DIR ${JSON_INCLUDE_DIR} DIRECTORY)
 find_package(spdlog CONFIG REQUIRED)
 
 find_package(simdjson CONFIG REQUIRED)
+find_package(unofficial-sqlite3 CONFIG REQUIRED)
+target_link_libraries(server_guest_lib PUBLIC unofficial::sqlite3::sqlite3)
 
 find_package(slikenet CONFIG REQUIRED)
 
