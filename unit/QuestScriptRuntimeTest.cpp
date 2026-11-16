@@ -1,5 +1,6 @@
 #include "QuestScriptRuntime.h"
 #include "QuestJournal.h"
+#include "QuestVmState.h"
 #include "TestUtils.hpp"
 #include "papyrus-vm/Reader.h"
 #include "script_objects/CampaignAliasObject.h"
@@ -1365,5 +1366,299 @@ TEST_CASE("Scene and dialogue ownership resolves the host campaign quest",
     REQUIRE_THROWS(f.Run(guest, 20));
     REQUIRE(guest.GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
             before);
+  }
+}
+
+namespace {
+constexpr uint32_t kConditionalQuest =
+  0x3372b; // MQ101's original log branches.
+const char* kConditionalState = "3372b:Skyrim.esm/boyhousefixture";
+void ConditionalFixture(Fixture& f, int path)
+{
+  // Use a nonstandard bit index: names in the PEX table define user flags.
+  f.fixture->userFlagTable.push_back({ "Conditional", 4 });
+  auto& object = f.fixture->objectTable[0];
+  object.userFlags = 16;
+  object.variables.push_back({ "::FactionPath_var", "Int", 16, VarValue(0) });
+  auto setter = f.Fragment(), one = setter, two = setter;
+  setter.code.instructions = {
+    { FunctionCode::kOp_Assign, { Id("::FactionPath_var"), VarValue(path) } },
+    { FunctionCode::kOp_Return, { VarValue::None() } }
+  };
+  one.code.instructions = {
+    { FunctionCode::kOp_Assign, { Id("counter"), VarValue(11) } },
+    { FunctionCode::kOp_Return, { VarValue::None() } }
+  };
+  two.code.instructions = {
+    { FunctionCode::kOp_Assign, { Id("counter"), VarValue(22) } },
+    { FunctionCode::kOp_Return, { VarValue::None() } }
+  };
+  object.states[0].functions = { { "Setter", setter },
+                                 { "One", one },
+                                 { "Two", two } };
+  f.metadata.fragments = { { 250, 0, 1, "BoyhouseFixture", "Setter" },
+                           { 250, 1, 1, "BoyhouseFixture", "One" },
+                           { 250, 2, 1, "BoyhouseFixture", "Two" },
+                           { 255, 1, 1, "BoyhouseFixture", "One" },
+                           { 255, 2, 1, "BoyhouseFixture", "Two" } };
+}
+void EnableConditional(MpActor& actor)
+{
+  actor.SetPropertyValueDump(QuestJournal::kEnabled, "[\"3372b:Skyrim.esm\"]",
+                             false, false);
+}
+int ConditionalCounter(MpActor& actor)
+{
+  return QuestJournal::ScriptState(
+           actor)["scripts"][kConditionalState]["values"]
+                 ["boyhousefixture/counter"]["value"]
+                   .get<int>();
+}
+}
+
+TEST_CASE("Owned conditional branches see earlier fragment writes in the host",
+          "[Quest][QuestVM][QuestVariableConditions]")
+{
+  const auto path = GENERATE(1, 2);
+  Fixture f;
+  ConditionalFixture(f, path);
+  auto& host = f.Add(0xff000001);
+  auto& guest = f.Add(0xff000002);
+  EnableConditional(host);
+  EnableConditional(guest);
+  // Give the guest a different personal branch before joining the host.
+  auto& setter = f.fixture->objectTable[0].states[0].functions[0].function;
+  setter.code.instructions[0].args[1] = VarValue(3 - path);
+  REQUIRE(f.Run(guest, 250, kConditionalQuest));
+  const auto personal = QuestJournal::ScriptState(guest);
+  setter.code.instructions[0].args[1] = VarValue(path);
+  const auto instance =
+    "campaign:" + std::to_string(host.GetFormId()) + ":fixture";
+  host.SetWorldInstance(instance);
+  guest.SetWorldInstance(instance);
+  REQUIRE(f.Run(guest, 250, kConditionalQuest));
+  REQUIRE(ConditionalCounter(host) == path * 11);
+  REQUIRE(ConditionalCounter(guest) == path * 11);
+  REQUIRE_FALSE(QuestJournal::Snapshot(guest).contains("vm"));
+  guest.SetWorldInstance("");
+  REQUIRE(QuestJournal::ScriptState(guest) == personal);
+  REQUIRE(f.Run(guest, 255, kConditionalQuest));
+  REQUIRE(ConditionalCounter(guest) == (3 - path) * 11);
+  REQUIRE(ConditionalCounter(host) == path * 11);
+}
+
+TEST_CASE("Quest variable conditions survive character reload and inheritance",
+          "[Quest][QuestVM][QuestVariableConditions]")
+{
+  Fixture f;
+  ConditionalFixture(f, 2);
+  SECTION("declared on the attached script")
+  {
+  }
+  SECTION("declared on a conditional parent")
+  {
+    auto parent = std::make_shared<PexScript>();
+    parent->source = "ConditionalParent";
+    parent->userFlagTable = f.fixture->userFlagTable;
+    Object object;
+    object.NameIndex = parent->source;
+    object.parentClassName = "Quest";
+    object.userFlags = 16;
+    object.variables.push_back(f.fixture->objectTable[0].variables.back());
+    object.states.push_back({ "", { { "SetPath", f.Fragment() } } });
+    parent->objectTable.push_back(object);
+    f.fixture->objectTable[0].variables.pop_back();
+    f.fixture->objectTable[0].parentClassName = parent->source;
+    // A compiled child calls a parent method/property; it cannot directly
+    // address a parent's private backing variable in its own frame.
+    f.Fragment().code.instructions = {
+      { FunctionCode::kOp_CallParent,
+        { VarValue("SetPath"), Id("temp"), VarValue(0) } },
+      { FunctionCode::kOp_Return, { VarValue::None() } }
+    };
+    f.extraScripts.push_back(parent);
+  }
+  auto& actor = f.Add(0xff000001);
+  EnableConditional(actor);
+  REQUIRE(f.Run(actor, 250, kConditionalQuest));
+  Fixture restarted;
+  restarted.fixture = f.fixture;
+  restarted.metadata = f.metadata;
+  restarted.extraScripts = f.extraScripts;
+  auto& restored = restarted.Add(actor.GetFormId());
+  const auto dump = MpChangeForm::ToJson(actor.GetChangeForm()).dump();
+  simdjson::dom::parser parser;
+  auto parsed = parser.parse(dump).value();
+  restored.ApplyChangeForm(MpChangeForm::JsonToChangeForm(parsed));
+  REQUIRE(restarted.Run(restored, 255, kConditionalQuest));
+  REQUIRE(ConditionalCounter(restored) == 22);
+}
+
+TEST_CASE("Conditional reads use numeric types and case insensitive names",
+          "[Quest][QuestVM][QuestVariableConditions]")
+{
+  Fixture f;
+  ConditionalFixture(f, 1);
+  // No setter at stage 255: read the PEX default directly.
+  auto& variable = f.fixture->objectTable[0].variables.back();
+  variable.name = "::factionpath_VAR";
+  SECTION("float")
+  {
+    variable.typeName = "Float";
+    variable.value = VarValue(1.0);
+  }
+  SECTION("boolean")
+  {
+    variable.typeName = "Bool";
+    variable.value = VarValue(true);
+  }
+  SECTION("integer")
+  {
+    variable.value = VarValue(1);
+  }
+  auto& actor = f.Add(0xff000001);
+  EnableConditional(actor);
+  REQUIRE(f.Run(actor, 255, kConditionalQuest));
+  REQUIRE(ConditionalCounter(actor) == 11);
+}
+
+TEST_CASE("Invalid conditional variables roll back preceding fragments",
+          "[Quest][QuestVM][QuestVariableConditions]")
+{
+  Fixture f;
+  ConditionalFixture(f, 1);
+  auto& object = f.fixture->objectTable[0];
+  SECTION("script is not conditional")
+  {
+    object.userFlags = 0;
+  }
+  SECTION("variable is not conditional")
+  {
+    object.variables.back().userFlags = 0;
+  }
+  SECTION("variable declaration is nonnumeric")
+  {
+    object.variables.back().typeName = "String";
+  }
+  SECTION("variable does not exist")
+  {
+    object.variables.back().name = "DifferentVariable";
+    f.Fragment().code.instructions[0].args[0] = Id("counter");
+  }
+  SECTION("ambiguous conditional scripts")
+  {
+    auto other = std::make_shared<PexScript>();
+    other->source = "OtherConditional";
+    other->userFlagTable = f.fixture->userFlagTable;
+    other->objectTable.push_back(object);
+    other->objectTable[0].NameIndex = other->source;
+    f.extraScripts.push_back(other);
+    f.metadata.scripts.push_back({ other->source, 0, {} });
+  }
+  auto& actor = f.Add(0xff000001);
+  EnableConditional(actor);
+  const auto before =
+    actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty);
+  REQUIRE_THROWS(f.Run(actor, 250, kConditionalQuest));
+  REQUIRE(actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
+          before);
+  REQUIRE(QuestJournal::ScriptState(actor).empty());
+}
+
+TEST_CASE("Owned civil war conditions compare private variables and globals",
+          "[Quest][QuestVM][QuestVariableConditions]")
+{
+  Fixture f;
+  ConditionalFixture(f, 1);
+  constexpr uint32_t objective = 0x29940, civilWar = 0x19e53;
+  for (const auto* script :
+       { "CWHoldManagerScript", "QF_CW_00019E53", "CWScript" })
+    AddOwnedScript(f, script);
+  // CWObj stage 1 has two original GetVMQuestVariable/UseGlobal branches.
+  f.metadata.fragments = { { 1, 0, 1, "BoyhouseFixture", "One" },
+                           { 1, 1, 1, "BoyhouseFixture", "Two" } };
+  auto& actor = f.Add(0xff000001);
+  actor.SetPropertyValueDump(QuestJournal::kEnabled,
+                             "[\"29940:Skyrim.esm\",\"19e53:Skyrim.esm\"]",
+                             false, false);
+  REQUIRE(
+    QuestJournal::Apply(actor, { { "quest", civilWar }, { "op", "start" } }));
+  QuestJournal::Atomic(actor, [&] {
+    QuestVmState vm(nlohmann::json::object(), {}, {});
+    vm.SetScript("19e53:Skyrim.esm/cwscript",
+                 { { "schemaVersion", 1 },
+                   { "values",
+                     { { "cwscript/::playerallegiance_var",
+                         { { "type", 3 }, { "value", 9 } } } } } });
+    // Distinct from the masters' defaults. Only the first comparison matches.
+    vm.SetGlobal("73f10:Skyrim.esm", 9);
+    vm.SetGlobal("73f11:Skyrim.esm", 10);
+    QuestJournal::SetScriptState(actor, vm.Save());
+  });
+  const auto before =
+    actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty);
+  SECTION("reads the current campaign")
+  {
+    REQUIRE(f.Run(actor, 1, objective));
+    REQUIRE(QuestJournal::ScriptState(
+              actor)["scripts"]["29940:Skyrim.esm/boyhousefixture"]["values"]
+                    ["boyhousefixture/counter"]["value"] == 11);
+  }
+  SECTION("later logs see earlier uncommitted comparison-global writes")
+  {
+    espm::QuestScriptValue global;
+    global.type = 1;
+    global.alias = 0xffff;
+    global.formId = 0x73f11;
+    f.metadata.scripts[0].properties.push_back({ "Comparison", 1, global });
+    f.fixture->objectTable[0].variables.push_back(
+      { "::Comparison_var", "GlobalVariable", 0, VarValue::None() });
+    auto& one = f.fixture->objectTable[0].states[0].functions[1].function;
+    one.code.instructions.insert(
+      one.code.instructions.begin(),
+      { FunctionCode::kOp_CallMethod,
+        { VarValue("SetValue"), Id("::Comparison_var"), Id("temp"),
+          VarValue(1), VarValue(9.0) } });
+    SECTION("both matching logs commit")
+    {
+      REQUIRE(f.Run(actor, 1, objective));
+      const auto saved = QuestJournal::ScriptState(actor);
+      REQUIRE(saved["globals"]["73f11:Skyrim.esm"] == 9.0);
+      REQUIRE(saved["scripts"]["29940:Skyrim.esm/boyhousefixture"]["values"]
+                   ["boyhousefixture/counter"]["value"] == 22);
+    }
+    SECTION("later failure rolls back globals and earlier fragment effects")
+    {
+      auto& two = f.fixture->objectTable[0].states[0].functions[2].function;
+      two.code.instructions.insert(
+        two.code.instructions.begin(),
+        { FunctionCode::kOp_CallStatic,
+          { VarValue("Utility"), VarValue("Wait"), Id("temp"), VarValue(1),
+            VarValue(1.0) } });
+      REQUIRE_THROWS(f.Run(actor, 1, objective));
+      REQUIRE(actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
+              before);
+    }
+  }
+  SECTION("cross quest adapter is required")
+  {
+    actor.SetPropertyValueDump(QuestJournal::kEnabled,
+                               "[\"29940:Skyrim.esm\"]", false, false);
+    REQUIRE_THROWS(f.Run(actor, 1, objective));
+    REQUIRE(actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
+            before);
+  }
+  SECTION(
+    "stopped script state is not treated as an initialized running quest")
+  {
+    REQUIRE(
+      QuestJournal::Apply(actor, { { "quest", civilWar }, { "op", "stop" } }));
+    const auto stopped =
+      actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty);
+    REQUIRE_THROWS_WITH(
+      f.Run(actor, 1, objective),
+      Catch::Matchers::ContainsSubstring("requires a running quest"));
+    REQUIRE(actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
+            stopped);
   }
 }

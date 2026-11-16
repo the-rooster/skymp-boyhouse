@@ -155,13 +155,16 @@ def summarize_record(typ, flags, form, values, groups, origins, plugin):
             index = struct.unpack_from("<H", data, 8)[0]
             run_on, reference = struct.unpack_from("<II", data, 20)
             feature(f"condition:{index}", where)
-            if op & 0x1e or op >> 5 > 5:
-                feature("condition.flags-or-global-comparison", where)
+            if op & 0x1a or op >> 5 > 5:
+                feature("condition.flags", where)
+            if op & 4:
+                feature("condition.global-comparison", where)
+                ref(struct.unpack_from("<I", data, 4)[0], where)
             if run_on != 0 and not (run_on == 2 and stable_form(reference, origins) == "Skyrim.esm:000014"):
                 feature(f"condition.run-on:{run_on}", where)
             if not context.startswith("stage:") or typ != "QUST":
                 feature("condition.non-stage-evaluation", where)
-            if index in (56, 58, 59, 74, 543) and not op & 0x0a:
+            if index in (56, 58, 59, 74, 543, 629) and not op & 0x0a:
                 ref(struct.unpack_from("<I", data, 12)[0], where)
         elif tag == b"QSDT" and typ == "QUST":
             if len(data) != 1:
@@ -381,6 +384,8 @@ def load_scripts(archives, loose_dirs=()):
 
 
 def capability_status(cap, registry):
+    if cap in registry.get("featureSubsets", []):
+        return "implemented-subset"
     if cap.startswith("native:"):
         return "implemented-subset" if cap[7:] in registry["nativeSubsets"] else "missing"
     if cap.startswith("condition:"):
@@ -498,7 +503,7 @@ def analyze(index, objects, registry, parse_failures=None):
         label = cap
         if cap.startswith("condition:"):
             number = int(cap[10:])
-            label = f"{registry.get("conditionNames", {}).get(str(number), 'Condition')} ({number})"
+            label = f"{registry.get('conditionNames', {}).get(str(number), 'Condition')} ({number})"
         ranked.append({"id": cap, "label": label, "family": family(cap), "status": status,
                        "questCount": len(quests), "quests": sorted(quests)})
     ranked.sort(key=lambda r: (r["status"] != "missing", -r["questCount"], r["id"]))

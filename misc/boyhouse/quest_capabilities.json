@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "scope": "Audited isolated campaign fragment runner only; all entries are partial implementations, not quest certification",
   "sourceHashes": {
-    "skymp5-server/cpp/server_guest_lib/QuestScriptRuntime.cpp": "eee222c6e3861075d9c2fd3bafb674ba6e084e886eca3c3310e20a00d897f099",
+    "skymp5-server/cpp/server_guest_lib/QuestScriptRuntime.cpp": "d7e10d6879ce3da706e3c505c598ef67df795042f5a5f06b7257357b45184bb7",
     "skymp5-server/cpp/server_guest_lib/script_classes/PapyrusQuest.cpp": "85b17221763600d66214b711691e47093e17f3d4e05f7ac10751ee5ba563a823",
     "libespm/src/QuestAliasData.cpp": "4cf16635f74b63707a9f7b46d1003779f354289b29b327137877e996cd18def4",
     "libespm/include/libespm/QuestAliasData.h": "481593ca4c17423f6a2c3cd9d60a9f79d38cd75a6f1c801759e4a342ff38da95",
@@ -11,7 +11,12 @@
     "skymp5-server/cpp/server_guest_lib/script_objects/CampaignAliasObject.cpp": "7f44ea3e92f14570c8af9ecfe14f33e0a4f00d22e0fc8240dc7c52dc504c1393",
     "libespm/src/RecordHeader.cpp": "c24cf36071d45938a3be09fc7fe69259a3a347fc237b75fa13a6aeed4ac9d333",
     "skymp5-server/cpp/server_guest_lib/script_objects/CampaignFormObject.h": "7af4c0a94de45776ca3a272489e0d43215a2c7ea6acec1c62c8d181ae8f14f13",
-    "skymp5-server/cpp/server_guest_lib/script_objects/CampaignAliasObject.h": "f105aa8c970bb466190aa2e8a0308bfc578958da3a62ea40ca7aff3aa15f65f8"
+    "skymp5-server/cpp/server_guest_lib/script_objects/CampaignAliasObject.h": "f105aa8c970bb466190aa2e8a0308bfc578958da3a62ea40ca7aff3aa15f65f8",
+    "skymp5-server/cpp/server_guest_lib/Condition.cpp": "a2dc04ac1e318d064a2b85e3fc847effa8594f367dd04037b97f472185a55e17",
+    "skymp5-server/cpp/server_guest_lib/ConditionsEvaluator.cpp": "d03b263dc939e48161796e19839e5ef00555de12d0a1473962bfcb555cca5a7d",
+    "skymp5-server/cpp/server_guest_lib/ConditionsEvaluator.h": "fe2e476b0198da7f2289e0d8ec35be648af7d7e4b86b64fa2b89398fbbe6ce19",
+    "skymp5-server/cpp/server_guest_lib/condition_functions/ConditionFunction.cpp": "7d54ed9900fac03a3a59ef6ac896c21ac053d8ed5c5826366d7a8c6bf342dde9",
+    "skymp5-server/cpp/server_guest_lib/condition_functions/ConditionFunction.h": "f3c2f656e62e182d3e71d3241184afb7f4814a0217188c602590aa5b5ec47a72"
   },
   "nativeSubsets": [
     "actor.getactorbase",
@@ -61,7 +66,8 @@
     "58",
     "59",
     "74",
-    "543"
+    "543",
+    "629"
   ],
   "notes": [
     "Quest lifecycle Start/Stop/Reset are explicitly rejected by the runner.",
@@ -72,7 +78,9 @@
     "Alias getters support deterministic forced reference/location, unambiguous unique actor, and external-alias targets only. Conditions, runtime fills, creation, propagation, lifecycle, reservations and alias effects remain unsupported.",
     "Alias script variables and resolved bindings persist transactionally in VM schema 4. Getter support does not imply alias lifecycle or quest support.",
     "Game.GetForm resolves owned static forms; dynamic forms require campaign allocation and are explicitly rejected.",
-    "Scene/TopicInfo.GetOwningQuest resolve owned metadata into the active campaign; dialogue/scene selection, execution and effects remain unsupported."
+    "Scene/TopicInfo.GetOwningQuest resolve owned metadata into the active campaign; dialogue/scene selection, execution and effects remain unsupported.",
+    "GetVMQuestVariable uses owned CIS2 and conditional PEX declarations in an adapter-enabled running quest. It reads private live/persisted numeric state; it does not initialize scripts or support dialogue/alias contexts.",
+    "UseGlobal comparisons resolve campaign globals before each stage log. Other special flags remain unsupported; all existing non-stage evaluation gates remain missing."
   ],
   "conditionNames": {
     "0": "GetWantBlocking",
@@ -481,5 +489,8 @@
   "conditionNameSource": {
     "url": "https://raw.githubusercontent.com/TES5Edit/TES5Edit/dev-4.1.6/Core/wbDefinitionsTES5.pas",
     "sha256": "99f5f4ac8415c33a78d42fdef3ddcd91d72f7a8bad60f2bd96d1a937fa10988e"
-  }
+  },
+  "featureSubsets": [
+    "condition.global-comparison"
+  ]
 }

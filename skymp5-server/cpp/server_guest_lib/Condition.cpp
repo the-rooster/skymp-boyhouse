@@ -77,6 +77,8 @@ std::string ConvertFunctionIndexToString(uint16_t functionIndex)
   // in-transaction globals, never with process-wide mutable values.
   if (functionIndex == 74)
     return "GetGlobalValue";
+  if (functionIndex == 629)
+    return "GetVMQuestVariable";
   static auto g_conditionFunctionMap =
     ConditionFunctionFactory::CreateConditionFunctions();
 

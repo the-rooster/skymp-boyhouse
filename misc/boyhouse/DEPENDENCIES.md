@@ -68,6 +68,10 @@ Native APIs available elsewhere in SkyMP do not imply campaign support.
 Logical campaign form and alias getters are now audited subsets; the broader
 alias/world feature gates remain missing until filling, effects and lifecycle
 are implemented.
+Quest-variable conditions now contribute their target-quest dependency, and
+global comparisons contribute their GLOB dependency. Comparison globals have
+their own audited subset; unsupported flags and non-stage evaluation remain
+separate missing capabilities.
 Implemented APIs are labeled `implemented-subset`; the report never calls a
 quest supported. SHA-256 guards on the audited runtime sources force a review
 when the implementation changes. Condition names are identifiers extracted from

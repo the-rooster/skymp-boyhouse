@@ -19,7 +19,7 @@ Generated static analysis. Counts include internal/helper quests and potential d
 | world.campaign-references | 1796 |
 | engine.story-manager | 1424 |
 | alias.fill.unique-actor | 1378 |
-| engine.scenes | 1308 |
+| engine.scenes | 1309 |
 | engine.events | 1296 |
 | alias.fill.event | 1180 |
 | condition.run-on:7 | 1062 |
@@ -30,10 +30,10 @@ Generated static analysis. Counts include internal/helper quests and potential d
 | alias.fill.forced-reference | 547 |
 | alias.fill.matching-or-script | 520 |
 | alias.location | 486 |
-| condition.flags-or-global-comparison | 403 |
 | alias.fill.created-reference | 384 |
 | condition.run-on:5 | 277 |
 | alias.fill.location-or-alias | 265 |
+| condition.flags | 255 |
 | condition.run-on:1 | 164 |
 | condition.run-on:2 | 154 |
 | alias.fill.specific-location | 142 |
@@ -91,11 +91,10 @@ Generated static analysis. Counts include internal/helper quests and potential d
 | GetIsAliasRef (566) | 416 |
 | GetEventData (576) | 393 |
 | GetInCell (67) | 351 |
-| GetVMQuestVariable (629) | 304 |
 | GetDistance (1) | 244 |
 | GetIsVoiceType (426) | 242 |
 | LocationHasKeyword (562) | 219 |
-| IsSceneActionComplete (550) | 198 |
+| IsSceneActionComplete (550) | 199 |
 | GetItemCount (47) | 179 |
 | GetDead (46) | 173 |
 | HasRefType (561) | 169 |
@@ -104,6 +103,7 @@ Generated static analysis. Counts include internal/helper quests and potential d
 | GetInCurrentLocAlias (360) | 118 |
 | IsLinkedTo (650) | 117 |
 | GetPCIsSex (131) | 105 |
+| GetInWorldspace (310) | 100 |
 
 ## Limits and next steps
 
@@ -118,7 +118,7 @@ Implement shared capabilities, then rerun this report and the regression suites.
 
 ## Reproducibility
 
-Capability registry SHA-256: 26c6a4a12332e7256c6ea64864d7a681602d0c842eed2d11ebb218a6f8882c64
+Capability registry SHA-256: b612ed30529b1a6dc7980d9e858c40abbee63c7ee1652f49f24462b08b90a2b3
 
 - Skyrim.esm: e198c3b85e5e48e0c92a6580d8f66e644256b68d812ee32b61735cf9b753df73
 - Update.esm: b298b0f65fa0127fd13c1f5ef6bb30eaf9d21fd19f5e6f8f91f829c9007d3280

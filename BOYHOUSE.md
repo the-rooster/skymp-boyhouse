@@ -19,12 +19,19 @@ The [catalog analyzer](misc/boyhouse/DEPENDENCIES.md) scans all five owned maste
 
 Persistent personal/host journals, 23 Papyrus Quest state methods, four quest condition predicates, expired-context guards, and a read-only client journal feed are implemented. The new `questExecuteStage` trusted server API loads original PEX fragments into a campaign-scoped VM and commits journal changes and script variables together. It remains gated by experimental per-quest adapters; no complete vanilla quest is enabled. `mp "bh journal"` displays the diagnostic projection. See [the implementation contract and remaining gates](misc/boyhouse/QUESTS.md).
 
-## Dialogue/scene owner lookup verification on 2026-11-16 UTC
+## Conditional quest state verification on 2026-11-16 UTC
+
+- Linux Release server/addon build and full native suite passed: **337 cases, 566,162 assertions**. The new conditional-variable suite passed **5 cases, 77 assertions**.
+- Stage log conditions read numeric conditional quest variables through owned CIS2 names and PEX flags, including inherited declarations, private host/guest state and character reload. Global comparisons see uncommitted changes from earlier log fragments. Invalid or unsupported state rolls back the transaction.
+- Tests use the original MQ101 and CWObj condition records with controlled fragments. They do not play those quests. Target quests must be running and adapter-enabled; other condition contexts and lifecycle remain unfinished.
+- All **25 JavaScript/TypeScript tests**, **37 Python tests**, native addon smoke and full server protocol smoke passed. The full 2,274-quest/14,026-PEX analysis still reports **zero certified quests**. It now distinguishes global comparisons from unsupported condition flags and tracks their form dependencies.
+
+## Earlier dialogue/scene owner lookup verification on 2026-11-16 UTC
 
 - Scene and TopicInfo `GetOwningQuest` resolve to the active campaign, including guest-triggered objective changes. Package-action fields and parent-topic ownership are handled separately. Dialogue/scene execution remains unfinished.
 - Release build, **78 instance/quest cases with 89,450 assertions**, 25 JavaScript/TypeScript tests, 31 Python tests and both server smoke checks passed. The catalog report was regenerated; no quest status changed.
 
-## Current alias/form verification on 2026-11-16 UTC
+## Earlier alias/form verification on 2026-11-16 UTC
 
 - Linux Release server/addon build and full native suite passed: **331 cases, 565,315 assertions**. Combined instance/quest suite: **77 cases, 89,430 assertions**.
 - Campaign form/player identities and alias VM objects now resolve inside the isolated runner. Deterministic forced reference/location, unique actor and external-alias targets are a partial implementation; no live NPC/reference clones are created.

@@ -56,7 +56,8 @@ validated outputs before any save was loaded.
 Game saves, INIs, and local load-order files were backed up under ignored
 `artifacts/game-backups/20261116T084838Z/`. Its `skse-install/manifest.json` records
 every installed path/hash and whether an original file was backed up. The game
-was switched to 1280x720 windowed mode for testing; the original INI is backed up.
+was switched to 1280x720 windowed mode for testing; the original INI was restored
+after the test and its hash matches the backup. Skyrim is closed.
 Automated menu inputs did not produce reliable game input, including in vanilla.
 This is a test-control limitation, not evidence of a multiplayer regression.
 

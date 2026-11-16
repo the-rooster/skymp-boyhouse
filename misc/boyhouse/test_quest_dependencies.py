@@ -282,6 +282,33 @@ class DependencyTests(unittest.TestCase):
         self.assertEqual(caps["condition.run-on:5"], "missing")
         self.assertEqual(caps["condition.non-stage-evaluation"], "missing")
 
+    def test_quest_variable_and_global_comparison_dependencies_are_distinct(self):
+        condition = bytearray(32)
+        condition[0] = 4
+        struct.pack_into("<I", condition, 4, 43)
+        struct.pack_into("<H", condition, 8, 629)
+        struct.pack_into("<I", condition, 12, 44)
+        q = summary(values=[(b"CTDA", bytes(condition)),
+                            (b"CIS2", b"::choice_var\0")])
+        target = summary(form=44)
+        global_ = summary("GLOB", form=43)
+        registry = {**REGISTRY, "conditionSubsets": ["629"],
+                    "featureSubsets": ["condition.global-comparison"]}
+        result = analyze({r["id"]: r for r in (q, target, global_)}, {}, registry)
+        row = next(r for r in result["quests"] if r["id"] == q["id"])
+        caps = {c["id"]: c["status"] for c in row["capabilities"]}
+        self.assertEqual(caps["condition:629"], "implemented-subset")
+        self.assertEqual(caps["condition.global-comparison"], "implemented-subset")
+        self.assertEqual(caps["condition.non-stage-evaluation"], "missing")
+        self.assertNotIn("condition.flags", caps)
+        self.assertIn(target["id"], row["questDependencies"])
+        self.assertIn(global_["id"], row["referencedRecords"])
+        condition[0] |= 0x10
+        swapped = summary(values=[(b"CTDA", bytes(condition))])
+        result = analyze({swapped["id"]: swapped}, {}, registry)
+        caps = {c["id"]: c["status"] for c in result["capabilities"]}
+        self.assertEqual(caps["condition.flags"], "missing")
+
     def test_transitive_calls_parent_cycles_and_native_subsets(self):
         objects = {}
         objects.update(pex(make_pex("root", "base", funcs=[{

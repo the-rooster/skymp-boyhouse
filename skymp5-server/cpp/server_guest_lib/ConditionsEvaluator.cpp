@@ -238,9 +238,6 @@ std::pair<bool, float> ConditionsEvaluator::EvaluateCondition(
   const MpActor& aggressor, const MpActor& target,
   const ConditionEvaluatorContext& context)
 {
-  uint32_t parameter1 = ExtractParameter(condition.parameter1);
-  uint32_t parameter2 = ExtractParameter(condition.parameter2);
-
   auto conditionFunction =
     conditionFunctionMap.GetConditionFunction(condition.function.data());
 
@@ -273,7 +270,7 @@ std::pair<bool, float> ConditionsEvaluator::EvaluateCondition(
   }
 
   const float conditionFunctionResult =
-    conditionFunction->Execute(*runsOn, parameter1, parameter2, context);
+    conditionFunction->Execute(*runsOn, condition, context);
 
   float valueToCompareWith = condition.value;
   const std::string& comparison = condition.comparison;
@@ -309,22 +306,4 @@ bool ConditionsEvaluator::CompareFloats(float a, float b,
     return a > b - kEpsilon || std::fabs(a - b) < kEpsilon;
   }
   return false;
-}
-
-uint32_t ConditionsEvaluator::ExtractParameter(const std::string& parameter)
-{
-  const char* str = parameter.c_str();
-  char* end;
-  int base = 10;
-
-  if (parameter.length() > 2 && str[0] == '0') {
-    if (str[1] == 'x' || str[1] == 'X') {
-      base = 16;
-    } else if (str[1] == 'b' || str[1] == 'B') {
-      base = 2;
-      str += 2; // strtoul doesn't skip 0b automatically
-    }
-  }
-
-  return static_cast<uint32_t>(std::strtoul(str, &end, base));
 }
