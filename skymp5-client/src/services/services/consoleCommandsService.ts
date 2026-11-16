@@ -1,3 +1,4 @@
+import { parseInstanceCommand } from "../../campaign/instanceCommand";
 import { logError, logTrace } from "../../logging";
 import { MsgType } from "../../messages";
 
@@ -21,6 +22,14 @@ export class ConsoleCommandsService extends ClientListener {
         this.schemas = ConsoleCommandsService.createSchemas();
         this.setupMpCommand();
         this.setupVanilaCommands();
+        this.controller.emitter.on("customPacketMessage", event => {
+            try {
+                const content = JSON.parse(event.message.contentJsonDump);
+                if (content?.customPacketType === "boyhouse.instance") {
+                    this.sp.printConsole(`[Boyhouse] ${JSON.stringify(content)}`);
+                }
+            } catch { /* Other services handle their own packet formats. */ }
+        });
     }
 
     private static createSchemas() {
@@ -88,6 +97,19 @@ export class ConsoleCommandsService extends ClientListener {
                     logError(this, `Bad argument type in command`, commandName, `argument index`, i);
                     return false;
                 }
+            }
+
+            // Development console bridge; permission checks remain on the server.
+            if (commandName === "mp" && typeof args[1] === "string" && /^bh(?:\s|$)/.test(args[1])) {
+                try {
+                    this.controller.emitter.emit("sendMessage", {
+                        message: { t: MsgType.CustomPacket, contentJsonDump: JSON.stringify(parseInstanceCommand(args[1])) },
+                        reliability: "reliable"
+                    });
+                } catch (error) {
+                    this.sp.printConsole(`[Boyhouse] ${error instanceof Error ? error.message : error}`);
+                }
+                return false;
             }
 
             this.controller.emitter.emit("sendMessage", {

@@ -1,3 +1,5 @@
+> **Boyhouse fork:** implementation status, build commands, and remaining campaign work are in [BOYHOUSE.md](BOYHOUSE.md). This is an experimental instance-boundary prototype.
+
 # SkyMP
 
 [![Discord Chat](https://img.shields.io/discord/699653182946803722?label=Discord&logo=Discord)](https://discord.gg/k39uQ9Yudt) 

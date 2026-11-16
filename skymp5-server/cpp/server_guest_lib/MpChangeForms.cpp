@@ -31,6 +31,7 @@ nlohmann::json MpChangeForm::ToJson(const MpChangeForm& changeForm)
   res["angle"] = { changeForm.angle[0], changeForm.angle[1],
                    changeForm.angle[2] };
   res["worldOrCellDesc"] = changeForm.worldOrCellDesc.ToString();
+  res["worldInstance"] = changeForm.worldInstance;
   res["inv"] = changeForm.inv.ToJson();
   res["isHarvested"] = changeForm.isHarvested;
   res["isOpen"] = changeForm.isOpen;
@@ -184,6 +185,14 @@ MpChangeForm MpChangeForm::JsonToChangeForm(simdjson::dom::element& element)
 
   ReadEx(element, worldOrCellDesc, &tmp);
   res.worldOrCellDesc = FormDesc::FromString(tmp);
+  // Old saves predate instancing and belong to the shared realm.
+  auto instanceValue = element.at_key("worldInstance");
+  if (instanceValue.error() != simdjson::NO_SUCH_FIELD) {
+    ReadEx(element, JsonPointer("worldInstance"), &res.worldInstance);
+    if (res.worldInstance.size() > 128) {
+      throw std::runtime_error("worldInstance exceeds 128 bytes");
+    }
+  }
 
   ReadEx(element, inv, &jTmp);
   res.inv = Inventory::FromJson(jTmp);

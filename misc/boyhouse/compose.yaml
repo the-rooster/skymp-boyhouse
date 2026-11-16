@@ -1,0 +1,42 @@
+name: boyhouse-skymp
+x-common: &common
+  image: skymp/skymp-vcpkg-deps@sha256:31da377a08790891335582f8951ab076621591b838fe7306013d344a45982ea5
+  user: "${BOYHOUSE_UID:-1000}:${BOYHOUSE_GID:-1000}"
+  cpus: 3
+  mem_limit: 4g
+  memswap_limit: 4g
+  environment:
+    VCPKG_MAX_CONCURRENCY: "3"
+    VCPKG_DEFAULT_BINARY_CACHE: /src/.vcpkg-cache
+  volumes:
+    - ../..:/src
+    - ${BOYHOUSE_GAME_DATA:?Set BOYHOUSE_GAME_DATA to owned game files}:/game-data:ro
+    - ${BOYHOUSE_STATE:?Set BOYHOUSE_STATE to a private staging directory}:/state
+  working_dir: /src
+services:
+  build:
+    <<: *common
+    profiles: [tools]
+    command: [bash, misc/boyhouse/build-server.sh]
+  verify:
+    <<: *common
+    profiles: [tools]
+    command: [bash, misc/boyhouse/verify-server.sh]
+  init:
+    <<: *common
+    profiles: [tools]
+    command: [node, misc/boyhouse/init-staging.cjs]
+  staging:
+    <<: *common
+    working_dir: /state
+    command: [node, dist_back/skymp5-server.js]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:17777:17777/udp"
+      - "127.0.0.1:17778:17778/tcp"
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:17778/manifest.json').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3

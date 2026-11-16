@@ -20,6 +20,7 @@ export class Spawn implements System {
       let actorId = ctx.svr.getActorsByProfileId(userProfileId)[0];
       if (actorId) {
         this.log("Loading character", actorId.toString(16));
+        ctx.gm.emit("beforeSpawn", actorId);
         ctx.svr.setEnabled(actorId, true);
         ctx.svr.setUserActor(userId, actorId);
       } else {

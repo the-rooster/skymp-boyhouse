@@ -55,6 +55,11 @@ MpActor* ActionListener::SendToNeighbours(uint32_t idx,
     return nullptr;
   }
 
+  if (!myActor->SharesWorldInstance(*actor)) {
+    partOne.SendHostStop(userId, *actor);
+    return nullptr;
+  }
+
   if (idx != myActor->GetIdx()) {
     // Possible fix for "players link to each other" bug
     // See also PartOne::SetUserActor
@@ -469,6 +474,10 @@ void ActionListener::OnActivate(const RawMessageData& rawMsgData,
     return;
 
   constexpr bool kDefaultProcessingOnlyFalse = false;
+  if (!ac->SharesWorldInstance(*targetPtr)) {
+    return;
+  }
+
   targetPtr->Activate(
     msg.data.caster == 0x14 ? *ac
                             : partOne.worldState.GetFormAt<MpObjectReference>(
@@ -661,6 +670,9 @@ void ActionListener::OnHostAttempt(const RawMessageData& rawMsgData,
   }
 
   auto& remote = partOne.worldState.GetFormAt<MpObjectReference>(remoteId);
+  if (!me->SharesWorldInstance(remote)) {
+    return;
+  }
 
   auto user = partOne.serverState.UserByActor(remote.AsActor());
   if (user != Networking::InvalidUserId) {
@@ -1046,6 +1058,11 @@ void ActionListener::OnHit(const RawMessageData& rawMsgData,
     return;
   }
 
+  if (!myActor->SharesWorldInstance(*aggressor) ||
+      !aggressor->SharesWorldInstance(*targetRef)) {
+    return;
+  }
+
   const FormDesc& aggressorCellOrWorld = aggressor->GetCellOrWorld();
   const FormDesc& targetCellOrWorld = targetRef->GetCellOrWorld();
 
@@ -1155,6 +1172,17 @@ void ActionListener::OnSpellCast(const RawMessageData& rawMsgData,
 
   if (spellCastData.target == 0x14) {
     spellCastData.target = myActor->GetFormId();
+  }
+
+  if (!myActor->SharesWorldInstance(*caster)) {
+    return;
+  }
+  const auto spellTarget =
+    partOne.worldState.LookupFormById(spellCastData.target);
+  const auto targetReference =
+    spellTarget ? spellTarget->AsObjectReference() : nullptr;
+  if (targetReference && !caster->SharesWorldInstance(*targetReference)) {
+    return;
   }
 
   if (caster->IsDead()) {

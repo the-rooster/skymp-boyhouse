@@ -69,6 +69,8 @@ public:
   NiPoint3 position = { 0, 0, 0 };
   NiPoint3 angle = { 0, 0, 0 };
   FormDesc worldOrCellDesc;
+  // Empty is the shared realm. Assigned only by trusted server code.
+  std::string worldInstance;
   Inventory inv;
   LearnedSpells learnedSpells;
 
@@ -136,13 +138,14 @@ public:
   {
     return std::make_tuple(
       recType, formDesc, baseDesc, position.x, position.y, position.z, angle.x,
-      angle.y, angle.z, worldOrCellDesc, inv.ToJson(), isHarvested, isOpen,
-      baseContainerAdded, nextRelootDatetime, isDisabled, profileId, isDeleted,
-      count, isRaceMenuOpen, isDead, consoleCommandsAllowed, appearanceDump,
-      equipment.ToJson(), actorValues.ToTuple(), healthRespawnPercentage,
-      magickaRespawnPercentage, staminaRespawnPercentage, spawnPoint,
-      dynamicFields, spawnDelay, learnedSpells, templateChain, lastAnimation,
-      setNodeTextureSet, setNodeScale, displayName);
+      angle.y, angle.z, worldOrCellDesc, worldInstance, inv.ToJson(),
+      isHarvested, isOpen, baseContainerAdded, nextRelootDatetime, isDisabled,
+      profileId, isDeleted, count, isRaceMenuOpen, isDead,
+      consoleCommandsAllowed, appearanceDump, equipment.ToJson(),
+      actorValues.ToTuple(), healthRespawnPercentage, magickaRespawnPercentage,
+      staminaRespawnPercentage, spawnPoint, dynamicFields, spawnDelay,
+      learnedSpells, templateChain, lastAnimation, setNodeTextureSet,
+      setNodeScale, displayName);
   }
 
   static nlohmann::json ToJson(const MpChangeFormREFR& changeForm);

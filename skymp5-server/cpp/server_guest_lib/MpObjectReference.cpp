@@ -441,6 +441,9 @@ void MpObjectReference::Activate(MpObjectReference& activationSource,
                                  bool defaultProcessingOnly,
                                  bool isSecondActivation)
 {
+  if (!SharesWorldInstance(activationSource)) {
+    throw std::runtime_error("World instance does not match");
+  }
   if (spdlog::should_log(spdlog::level::trace)) {
     for (auto& script : ListActivePexInstances()) {
       spdlog::trace("MpObjectReference::Activate {:x} - found script {}",
@@ -668,6 +671,39 @@ void MpObjectReference::SetChanceNoneOverride(uint8_t newChanceNone)
   chanceNoneOverride.reset(new uint8_t(newChanceNone));
 }
 
+const std::string& MpObjectReference::GetWorldInstance() const
+{
+  return ChangeForm().worldInstance;
+}
+
+bool MpObjectReference::SharesWorldInstance(
+  const MpObjectReference& other) const
+{
+  return GetWorldInstance() == other.GetWorldInstance();
+}
+
+void MpObjectReference::SetWorldInstance(const std::string& instance)
+{
+  if (instance.size() > 128) {
+    throw std::invalid_argument("worldInstance exceeds 128 bytes");
+  }
+  if (instance == GetWorldInstance()) {
+    return;
+  }
+  EditChangeForm([&](MpChangeForm& form) { form.worldInstance = instance; });
+  if (auto world = GetParent()) {
+    // Revoke leases in both directions before accepting further packets.
+    for (auto it = world->hosters.begin(); it != world->hosters.end();) {
+      if (it->first == GetFormId() || it->second == GetFormId()) {
+        it = world->hosters.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  ForceSubscriptionsUpdate();
+}
+
 void MpObjectReference::SetCellOrWorld(const FormDesc& newWorldOrCell)
 {
   SetCellOrWorldObsolete(newWorldOrCell);
@@ -695,8 +731,14 @@ void MpObjectReference::ForceSubscriptionsUpdate()
 
   auto& was = *this->listeners;
   auto pos = GetGridPos(GetPos());
-  auto& now =
+  const auto& nearby =
     worldState->GetNeighborsByPosition(worldOrCell, pos.first, pos.second);
+  std::set<MpObjectReference*> now;
+  for (auto candidate : nearby) {
+    if (SharesWorldInstance(*candidate)) {
+      now.insert(candidate);
+    }
+  }
 
   std::vector<MpObjectReference*> toRemove;
   std::set_difference(was.begin(), was.end(), now.begin(), now.end(),
@@ -873,6 +915,10 @@ void MpObjectReference::RemoveItem(uint32_t baseId, uint32_t count,
 void MpObjectReference::RemoveItems(
   const std::vector<Inventory::Entry>& entries, MpObjectReference* target)
 {
+  if (target && !SharesWorldInstance(*target)) {
+    throw std::runtime_error(
+      "Cannot transfer inventory across world instances");
+  }
   EditChangeForm([&](MpChangeFormREFR& changeForm) {
     changeForm.inv.RemoveItems(entries);
   });
@@ -977,6 +1023,9 @@ void MpObjectReference::RegisterPrivateIndexedProperty(
 void MpObjectReference::Subscribe(MpObjectReference* emitter,
                                   MpObjectReference* listener)
 {
+  if (!emitter->SharesWorldInstance(*listener)) {
+    return;
+  }
   auto actorEmitter = emitter->AsActor();
   auto actorListener = listener->AsActor();
   if (!actorEmitter && !actorListener) {
@@ -1300,7 +1349,9 @@ void MpObjectReference::VisitNeighbours(const Visitor& visitor)
   auto& neighbours =
     worldState->GetNeighborsByPosition(worldOrCell, pos.first, pos.second);
   for (auto neighbour : neighbours) {
-    visitor(neighbour);
+    if (SharesWorldInstance(*neighbour)) {
+      visitor(neighbour);
+    }
   }
 }
 
@@ -1647,7 +1698,7 @@ bool MpObjectReference::CheckIfObjectCanStartOccupyThis(
     return true;
   }
 
-  if (this->occupant->IsDisabled()) {
+  if (this->occupant->IsDisabled() || !SharesWorldInstance(*this->occupant)) {
     spdlog::info("MpObjectReference::ProcessActivate {:x} - occupant is "
                  "disabled (activationSource = {:x})",
                  GetFormId(), activationSource.GetFormId());
@@ -2002,6 +2053,9 @@ void MpObjectReference::EnsureBaseContainerAdded(espm::Loader& espm)
 
 void MpObjectReference::CheckInteractionAbility(MpObjectReference& refr)
 {
+  if (!SharesWorldInstance(refr)) {
+    throw std::runtime_error("World instance does not match");
+  }
   auto& loader = GetParent()->GetEspm();
   auto& compressedFieldsCache = GetParent()->GetEspmCache();
 

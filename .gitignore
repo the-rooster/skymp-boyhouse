@@ -9,3 +9,9 @@ node_modules
 # vim
 .*.swp
 skyrim_data_files/
+
+# Boyhouse local build and owned game data
+.vcpkg-cache/
+artifacts/
+__pycache__/
+build-*.log

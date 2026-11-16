@@ -415,6 +415,8 @@ VarValue PapyrusObjectReference::PlaceAtMe(
 
   auto worldState = selfRefr->GetParent();
   auto newRefrId = worldState->GenerateFormId();
+  // Assign scope before AddForm can make the object visible.
+  newRefr->SetWorldInstance(selfRefr->GetWorldInstance());
   worldState->AddForm(std::move(newRefr), newRefrId);
 
   auto& refr = worldState->GetFormAt<MpObjectReference>(newRefrId);

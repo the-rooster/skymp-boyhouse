@@ -43,6 +43,10 @@ void CraftService::OnCraftItem(const RawMessageData& rawMsgData,
     return spdlog::error("Unable to craft without Actor attached");
   }
 
+  if (!me->SharesWorldInstance(workbench)) {
+    return spdlog::error("Cannot craft across world instances");
+  }
+
   auto workbenchBase = br.LookupById(workbench.GetBaseId());
 
   if (!workbenchBase.rec) {

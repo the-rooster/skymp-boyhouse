@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "upstreamCommit": "2849e676fe008925384b26f34476e382a30bd877",
+  "runtimeObserved": "1.7.104.0",
+  "sources": [
+    {
+      "file": "Skyrim.esm",
+      "bytes": 249752131,
+      "sha256": "e198c3b85e5e48e0c92a6580d8f66e644256b68d812ee32b61735cf9b753df73",
+      "questRecordCount": 1811
+    },
+    {
+      "file": "Update.esm",
+      "bytes": 19121864,
+      "sha256": "b298b0f65fa0127fd13c1f5ef6bb30eaf9d21fd19f5e6f8f91f829c9007d3280",
+      "questRecordCount": 84
+    },
+    {
+      "file": "Dawnguard.esm",
+      "bytes": 25884488,
+      "sha256": "fc8f92cb7ed55217046ee96b84caa54c058c12f7c408ac2a71da880a7bd3eab7",
+      "questRecordCount": 199
+    },
+    {
+      "file": "HearthFires.esm",
+      "bytes": 3979105,
+      "sha256": "0f681496771e6d1983c6c1c9dd6602964068837f015bfa21e69a149c3b050047",
+      "questRecordCount": 41
+    },
+    {
+      "file": "Dragonborn.esm",
+      "bytes": 64664159,
+      "sha256": "635f21a938a17b8677f524cf41210933afc7f23820f2e210ab3bb6d3cd837046",
+      "questRecordCount": 256
+    }
+  ],
+  "summary": {
+    "distinctQuestRecords": 2274,
+    "deletedRecords": 0,
+    "supported": 0,
+    "untested": 2274
+  },
+  "note": "Hashes and record counts only. No game assets. Inventory is not a quest compatibility certification."
+}

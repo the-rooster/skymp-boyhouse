@@ -25,6 +25,7 @@
 #include "SpawnPointBinding.h"
 #include "TemplateChainBinding.h"
 #include "TypeBinding.h"
+#include "WorldInstanceBinding.h"
 #include "WorldOrCellDescBinding.h"
 
 std::map<std::string, std::shared_ptr<PropertyBinding>>
@@ -50,6 +51,7 @@ PropertyBindingFactory::CreateStandardPropertyBindings()
   result["spawnPoint"] = std::make_shared<SpawnPointBinding>();
   result["type"] = std::make_shared<TypeBinding>();
   result["worldOrCellDesc"] = std::make_shared<WorldOrCellDescBinding>();
+  result["worldInstance"] = std::make_shared<WorldInstanceBinding>();
   result["idx"] = std::make_shared<IdxBinding>();
   result["consoleCommandsAllowed"] =
     std::make_shared<ConsoleCommandsAllowedBinding>();

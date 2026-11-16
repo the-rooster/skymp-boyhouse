@@ -705,9 +705,11 @@ Napi::Value ScampServer::CreateBot(const Napi::CallbackInfo& info)
   jBot.Set(
     "getUserId",
     Napi::Function::New(
-      info.Env(), [bot, pair, serverCombined](const Napi::CallbackInfo& info) {
+      // Capture only the ID: retaining pair.first keeps the mock client alive
+      // after bot.destroy(), so no disconnect event can be delivered.
+      info.Env(), [childUserId = pair.second, serverCombined](const Napi::CallbackInfo& info) {
         try {
-          Networking::UserId realUserId = pair.second;
+          Networking::UserId realUserId = childUserId;
           return Napi::Number::New(
             info.Env(),
             serverCombined->GetCombinedUserId(kMockServerIdx, realUserId));
