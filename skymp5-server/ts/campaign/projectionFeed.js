@@ -1,21 +1,21 @@
 "use strict";
 
-const { randomBytes } = require("node:crypto");
 const TYPE = "boyhouse.projection";
 const CHUNK_SIZE = 128;
+const BASELINE_CHUNK_SIZE = 16384;
 
 // The connection owns the acknowledgement. Neither a supplied actor ID nor an
 // old connection's nonce can release another character's gameplay gate.
 class ProjectionFeed {
-  constructor(adapter, now = () => Date.now(), token = () => randomBytes(16).toString("hex")) {
+  constructor(adapter, now = () => Date.now()) {
     this.adapter = adapter;
     this.now = now;
-    this.token = token;
     this.users = new Map();
   }
 
   connect(user) {
     this.adapter.block(user, true);
+    this.adapter.beginEpoch(user);
     this.users.set(user, { session: "", sequence: 0, context: "", pending: null,
       dirty: true, deadline: this.now() + 30000 });
   }
@@ -23,7 +23,7 @@ class ProjectionFeed {
   disconnect(user) { this.users.delete(user); }
 
   send(user, state, body) {
-    this.adapter.send(user, { customPacketType: TYPE, sessionId: state.session,
+    this.adapter.send(user, { customPacketType: TYPE, protocolVersion: 2, sessionId: state.session,
       sequence: state.sequence, ...body });
   }
 
@@ -45,24 +45,36 @@ class ProjectionFeed {
     const actor = this.adapter.actor(user);
     if (!actor || !state.session) return;
     this.adapter.block(user, true);
+    const token = this.adapter.beginEpoch(user);
+    if (!/^[a-f0-9]{32}$/.test(token)) throw Error("Invalid native packet epoch");
     const manifest = this.adapter.read(actor);
     if (!manifest || manifest.actor !== actor || !Array.isArray(manifest.references) ||
         manifest.references.length > 4096) throw Error("Invalid projection manifest");
     const encoded = JSON.stringify(manifest);
     if (Buffer.byteLength(encoded, "utf8") > 1024 * 1024) throw Error("Projection manifest is too large");
+    const baseline = this.adapter.baseline(user, token);
+    if (baseline?.schemaVersion !== 1 || baseline.actor !== actor || baseline.packetEpoch !== token ||
+        !Array.isArray(baseline.messages)) throw Error("Invalid world baseline");
+    const baselineText = JSON.stringify(baseline);
+    if (Buffer.byteLength(baselineText, "utf8") > 2 * 1024 * 1024)
+      throw Error("World baseline is too large");
     const { references, ...metadata } = manifest;
     if (state.sequence >= Number.MAX_SAFE_INTEGER) throw Error("Projection sequence exhausted");
     ++state.sequence;
-    const token = this.token();
     state.pending = { token, actor, encoded };
     state.context = this.context(user);
     state.dirty = false;
     if (!state.deadline) state.deadline = this.now() + 30000;
     const chunks = Math.ceil(references.length / CHUNK_SIZE);
-    this.send(user, state, { kind: "begin", token, metadata, count: references.length, chunks });
+    this.send(user, state, { kind: "begin", token, metadata, count: references.length, chunks,
+      baselineLength: baselineText.length, baselineChunks: Math.ceil(baselineText.length / BASELINE_CHUNK_SIZE) });
     for (let index = 0; index < chunks; ++index) {
       this.send(user, state, { kind: "chunk", token, index,
         references: references.slice(index * CHUNK_SIZE, (index + 1) * CHUNK_SIZE) });
+    }
+    for (let offset = 0; offset < baselineText.length; offset += BASELINE_CHUNK_SIZE) {
+      this.send(user, state, { kind: "baseline", token, index: offset / BASELINE_CHUNK_SIZE,
+        data: baselineText.slice(offset, offset + BASELINE_CHUNK_SIZE) });
     }
   }
 
@@ -71,6 +83,7 @@ class ProjectionFeed {
       if (!this.adapter.connected(user) || this.adapter.actor(user) !== actor) continue;
       try {
         this.adapter.block(user, true);
+        this.adapter.beginEpoch(user);
         if (state.sequence >= Number.MAX_SAFE_INTEGER) throw Error("Projection sequence exhausted");
         ++state.sequence;
         state.pending = null;
@@ -86,6 +99,7 @@ class ProjectionFeed {
     if (!state || !this.adapter.connected(user)) return;
     try {
       if (packet.action === "hello") {
+        if (packet.protocolVersion !== 2) throw Error("Campaign projection requires protocol version 2");
         if (typeof packet.sessionId !== "string" || !/^[a-zA-Z0-9_-]{1,64}$/.test(packet.sessionId)) return;
         if (state.session && state.session !== packet.sessionId) return;
         if (state.session) return; // Reliable transport; repeats cannot extend the deadline.
@@ -94,14 +108,14 @@ class ProjectionFeed {
         return;
       }
       const pending = state.pending;
-      if (!pending || packet.sessionId !== state.session || packet.sequence !== state.sequence ||
+      if (!pending || packet.protocolVersion !== 2 || packet.sessionId !== state.session || packet.sequence !== state.sequence ||
           packet.token !== pending.token || this.adapter.actor(user) !== pending.actor) return;
       if (packet.action === "failed") {
         this.fail(user, Error("Client could not apply the campaign projection"));
       } else if (packet.action === "ack") {
         // State may change while the engine applies the manifest. Never release
         // against an obsolete mapping, phase, owner identity, or disabled state.
-        if (this.context(user) !== state.context ||
+        if (this.adapter.epoch(user) !== pending.token || this.context(user) !== state.context ||
             JSON.stringify(this.adapter.read(pending.actor)) !== pending.encoded) {
           this.publish(user, state);
           return;

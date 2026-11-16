@@ -2,6 +2,7 @@ const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const { ProjectionFeed } = require("../../skymp5-server/ts/campaign/projectionFeed.js");
 const { WorldProjectionReplica } = require("../../skymp5-client/src/campaign/worldProjection.ts");
+const { CampaignPacketChannel } = require("../../skymp5-client/src/campaign/campaignPacketChannel.ts");
 
 const actor = 0xff000001;
 function manifest(count = 1, owner = actor) {
@@ -15,17 +16,28 @@ function manifest(count = 1, owner = actor) {
 function fixture(count = 1) {
   let now = 0, nonce = 0, reads = 0;
   const data = new Map([[0, manifest(count)], [1, { ...manifest(count, actor + 1), actor: actor + 1 }]]);
-  const connected = new Set([0, 1]), blocked = new Map(), packets = [], closed = [];
+  const connected = new Set([0, 1]), blocked = new Map(), packets = [], closed = [], epochs = new Map();
   const adapter = {
     connected: user => connected.has(user),
     actor: user => data.get(user)?.actor ?? 0,
     instance: id => [...data.values()].find(m => m.actor === id).instance,
     read: id => { ++reads; return structuredClone([...data.values()].find(m => m.actor === id)); },
     block: (user, value) => blocked.set(user, value),
+    beginEpoch: user => {
+      assert.equal(blocked.get(user), true);
+      const epoch = (++nonce).toString(16).padStart(32, "0"); epochs.set(user, epoch); return epoch;
+    },
+    epoch: user => epochs.get(user),
+    baseline: (user, packetEpoch) => ({ schemaVersion: 1, actor: data.get(user).actor, packetEpoch, messages: [
+      { t: 32, eventSources: [], updateOwnerFunctions: [], updateNeighborFunctions: [] },
+      { t: 33, idx: 1, refrId: data.get(user).actor, isMe: true,
+        transform: { pos: [0, 0, 0], rot: [0, 0, 0], worldOrCell: 60 },
+        props: { inventory: { entries: [] }, isRaceMenuOpen: false }, customPropsJsonDumps: [] },
+    ] }),
     send: (user, packet) => packets.push({ user, packet: structuredClone(packet) }),
     close: (user, error) => { closed.push({ user, error }); connected.delete(user); },
   };
-  const feed = new ProjectionFeed(adapter, () => now, () => (++nonce).toString(16).padStart(32, "0"));
+  const feed = new ProjectionFeed(adapter, () => now);
   const replica = new WorldProjectionReplica();
   feed.connect(0); replica.begin("session");
   const deliver = () => {
@@ -34,14 +46,14 @@ function fixture(count = 1) {
       if (user === 0) assert.equal(replica.accept(packet), true, JSON.stringify(packet));
     }
   };
-  const hello = () => feed.packet(0, { action: "hello", sessionId: "session" });
+  const hello = () => feed.packet(0, { action: "hello", protocolVersion: 2, sessionId: "session" });
   return { feed, replica, data, adapter, blocked, packets, closed, connected, deliver, hello,
     advance: ms => now += ms, reads: () => reads };
 }
 
 test("4096 hidden and visible originals arrive atomically in bounded chunks", () => {
   const f = fixture(4096); f.hello();
-  assert.equal(f.packets.length, 33);
+  assert.equal(f.packets.length, 34);
   assert.ok(f.packets.every(p => JSON.stringify(p.packet).length < 32768));
   const begin = f.packets.shift().packet;
   assert.equal(f.replica.accept(begin), true);
@@ -87,7 +99,7 @@ test("acknowledgements are tied to the connection, token, sequence and actor ass
   const f = fixture(); f.hello(); f.deliver();
   const ack = f.replica.applied(f.replica.version);
   f.feed.connect(1);
-  f.feed.packet(1, { action: "hello", sessionId: "session" });
+  f.feed.packet(1, { action: "hello", protocolVersion: 2, sessionId: "session" });
   f.feed.packet(1, { ...ack, actor: actor + 1 });
   assert.equal(f.blocked.get(1), true);
   for (const replacement of [{ token: "f".repeat(32) }, { sequence: 999 }, { sessionId: "old" }])
@@ -155,7 +167,7 @@ test("reused connections cannot restore old manifests or acknowledgement authori
   const oldPackets = f.packets.map(p => p.packet); f.deliver();
   const oldAck = f.replica.applied(f.replica.version);
   f.feed.disconnect(0); f.feed.connect(0); f.replica.begin("new");
-  f.feed.packet(0, { action: "hello", sessionId: "new" });
+  f.feed.packet(0, { action: "hello", protocolVersion: 2, sessionId: "new" });
   f.feed.packet(0, oldAck);
   assert.equal(f.blocked.get(0), true);
   for (const packet of oldPackets) assert.equal(f.replica.accept(packet), false);
@@ -166,7 +178,7 @@ test("reused connections cannot restore old manifests or acknowledgement authori
 
 test("duplicate references and malformed chunks cannot partially replace a projection", () => {
   const f = fixture(129); f.hello();
-  const [begin, first, last] = f.packets.map(p => p.packet);
+  const [begin, first, last, baseline] = f.packets.map(p => p.packet);
   assert.equal(f.replica.accept(begin), true);
   assert.equal(f.replica.accept(first), true);
   for (const replacement of [
@@ -181,6 +193,8 @@ test("duplicate references and malformed chunks cannot partially replace a proje
   assert.equal(f.replica.snapshot(), undefined);
   assert.equal(f.replica.accept(first), true, "An identical retransmission is harmless");
   assert.equal(f.replica.accept(last), true);
+  assert.equal(f.replica.prepared(), undefined, "Reference bindings alone cannot acknowledge a baseline");
+  assert.equal(f.replica.accept(baseline), true);
   const prepared = f.replica.prepared(); prepared.references.length = 0;
   assert.equal(f.replica.prepared().references.length, 129);
 });
@@ -205,4 +219,101 @@ test("empty shared-space manifests still require engine application and server r
   assert.equal(f.replica.ready, false);
   f.feed.packet(0, f.replica.applied(f.replica.version)); f.deliver();
   assert.equal(f.replica.ready, true);
+});
+
+test("missing, malformed and cross-epoch baselines cannot release a projection", () => {
+  const f = fixture(); f.hello();
+  const [begin, refs, packet] = f.packets.map(p => p.packet);
+  f.replica.accept(begin); f.replica.accept(refs);
+  assert.equal(f.replica.prepared(), undefined);
+  assert.equal(f.replica.applied(f.replica.version), undefined);
+  assert.equal(f.replica.accept({ ...packet, token: 'f'.repeat(32) }), false);
+  assert.equal(f.replica.accept({ ...packet, data: ' '.repeat(packet.data.length) }), false);
+  assert.equal(f.replica.accept(packet), true);
+  const baseline = f.replica.preparedBaseline();
+  assert.equal(baseline.packetEpoch, f.adapter.epoch(0));
+  baseline.messages.length = 0;
+  assert.equal(f.replica.preparedBaseline().messages.length, 2);
+});
+
+test("baseline assembly rejects input, snippets, private state, duplicate identities and a different self", () => {
+  for (const mutate of [
+    b => b.messages.push({ t: 30 }), b => b.messages.push({ t: 1, contentJsonDump: '{}' }),
+    b => b.messages[1].customPropsJsonDumps.push({ propName: 'private.boyhouse.questJournal', propValueJsonDump: '{}' }),
+    b => b.messages.push({ ...b.messages[1], isMe: false }),
+    b => b.messages[1].refrId++, b => b.messages[1].isMe = false,
+    b => delete b.messages[1].props.inventory, b => b.packetEpoch = 'f'.repeat(32),
+  ]) {
+    const f = fixture(); const read = f.adapter.baseline;
+    f.adapter.baseline = (...args) => { const baseline = read(...args); mutate(baseline); return baseline; };
+    f.hello();
+    if (f.closed.length) continue; // Native envelope mismatch is rejected server-side too.
+    const packets = f.packets.map(p => p.packet);
+    for (const packet of packets.slice(0, -1)) assert.equal(f.replica.accept(packet), true);
+    assert.equal(f.replica.accept(packets.at(-1)), false);
+    assert.equal(f.replica.applied(f.replica.version), undefined);
+    assert.equal(f.blocked.get(0), true);
+  }
+});
+
+test("native epoch rotation invalidates an otherwise matching acknowledgement", () => {
+  const f = fixture(); f.hello(); f.deliver();
+  const ack = f.replica.applied(f.replica.version), old = f.replica.packetEpoch;
+  f.adapter.beginEpoch(0); f.feed.packet(0, ack); f.deliver();
+  assert.notEqual(f.replica.packetEpoch, old);
+  assert.equal(f.replica.ready, false); assert.equal(f.blocked.get(0), true);
+});
+
+test("large Unicode baselines assemble out of order with bounded chunks", () => {
+  const f = fixture(), read = f.adapter.baseline;
+  f.adapter.baseline = (...args) => {
+    const b = read(...args);
+    b.messages[1].customPropsJsonDumps.push({ propName: 'visible', propValueJsonDump: JSON.stringify('🐉'.repeat(20000)) });
+    return b;
+  };
+  f.hello();
+  const begin = f.packets.shift().packet;
+  assert.ok(begin.baselineChunks > 2);
+  assert.equal(f.replica.accept(begin), true);
+  assert.ok(f.packets.every(p => Buffer.byteLength(JSON.stringify(p.packet)) < 64 * 1024));
+  f.packets.reverse(); f.deliver();
+  assert.equal(JSON.parse(f.replica.preparedBaseline().messages[1].customPropsJsonDumps[0].propValueJsonDump), '🐉'.repeat(20000));
+});
+
+test("oversized baseline data fails before any begin packet is published", () => {
+  const f = fixture(), read = f.adapter.baseline;
+  f.adapter.baseline = (...args) => { const b = read(...args); b.messages.push({ data: 'x'.repeat(2 * 1024 * 1024) }); return b; };
+  f.hello();
+  assert.equal(f.packets.length, 0);
+  assert.equal(f.closed.length, 1);
+  assert.equal(f.blocked.get(0), true);
+});
+
+test("manifest-only protocol clients cannot release the native gameplay gate", () => {
+  const legacy = fixture();
+  legacy.feed.packet(0, { action: "hello", sessionId: "session" });
+  assert.equal(legacy.closed.length, 1); assert.equal(legacy.blocked.get(0), true);
+  const f = fixture(); f.hello(); f.deliver();
+  const ack = f.replica.applied(f.replica.version);
+  f.feed.packet(0, { ...ack, protocolVersion: undefined });
+  assert.equal(f.blocked.get(0), true);
+  f.feed.packet(0, ack); f.deliver();
+  assert.equal(f.replica.ready, true);
+});
+
+test("the baseline epoch selects replication without replaying gameplay from the previous phase", () => {
+  const f = fixture(), channel = new CampaignPacketChannel(), delivered = [];
+  channel.requireEpoch(); f.hello(); f.deliver();
+  const old = f.replica.packetEpoch;
+  channel.select(old);
+  channel.incoming({ t: 34, epoch: old, message: { t: 2, idx: 1 } }, m => delivered.push(m));
+  assert.equal(channel.outgoing({ t: 2 }), undefined);
+  f.feed.pauseActor(actor); f.feed.poll(); f.deliver();
+  const current = f.replica.packetEpoch; channel.select(current);
+  channel.incoming({ t: 34, epoch: old, message: { t: 25, idx: 1 } }, m => delivered.push(m));
+  channel.incoming({ t: 34, epoch: current, message: { t: 2, idx: 2 } }, m => delivered.push(m));
+  assert.equal(channel.release(old, m => delivered.push(m)), false);
+  f.feed.packet(0, f.replica.applied(f.replica.version)); f.deliver();
+  assert.equal(channel.release(current, m => delivered.push(m)), true);
+  assert.deepEqual(delivered, [{ t: 2, idx: 2 }]);
 });

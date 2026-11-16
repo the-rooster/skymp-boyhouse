@@ -79,6 +79,11 @@ public:
   uint32_t GetUserActor(Networking::UserId userId);
   std::string BeginPacketEpoch(Networking::UserId userId);
   std::string GetPacketEpoch(Networking::UserId userId);
+  // Read-only replication baseline for the currently blocked packet epoch.
+  // Does not reassign the actor, refresh subscriptions or dispatch load
+  // events.
+  nlohmann::json GetWorldBaseline(Networking::UserId userId,
+                                  const std::string& packetEpoch);
   std::string GetUserGuid(Networking::UserId userId);
   Networking::UserId GetUserByActor(uint32_t formId);
   void DestroyActor(uint32_t actorFormId);
@@ -141,6 +146,8 @@ public:
   static MessageSerializer& GetMessageSerializerInstance();
 
 private:
+  CreateActorMessage BuildCreateActorMessage(MpObjectReference& emitter,
+                                             MpObjectReference& listener);
   void Init();
 
   enum class UserType

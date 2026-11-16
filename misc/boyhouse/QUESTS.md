@@ -197,22 +197,28 @@ timeouts and reported application failures quarantine the character. A host
 awaiting application cannot admit new guests. Existing guests remain admitted
 while their host refreshes the same phase.
 
-The pure client replica validates and assembles chunks, but acknowledges only
-when an engine adapter explicitly reports application complete. The protocol
-smoke uses real native bot packets and simulates that engine completion. It is
-not an in-game test. Incoming gameplay gating does not freeze server simulation
-or outgoing replication. The Skyrim engine adapter, transition coordinator and
-reference restoration are still unfinished. Keep the flag unset in staging and
-normal clients until those are implemented and tested. No quests are certified.
+Protocol version 2 binds the manifest token to the native packet epoch and sends
+a fresh world baseline as part of the same transition. Older manifest-only
+handshakes are refused. The pure client replica validates and assembles both
+parts, but acknowledges only when an engine adapter explicitly reports
+application complete. The protocol smoke uses real native bot packets and
+simulates that engine completion. It is not an in-game test. Incoming gameplay
+gating does not freeze server simulation or outgoing replication. The Skyrim
+engine adapter, client transition coordinator and reference restoration remain
+unfinished. Keep the flag unset in staging and normal clients until those are
+implemented and tested. No quests are certified.
 
-### Packet epochs (transport implemented; transition integration pending)
+### Packet epochs and world baselines (experimental server integration)
 
 Trusted `mp.beginPacketEpoch(userId)` requires a connected user with gameplay
 blocked. It creates a fresh, random 128-bit token; `mp.getPacketEpoch(userId)`
 reads it. A new connection starts without a token and retains legacy transport.
-No production coordinator calls these methods yet, including the experimental
-projection feed. The manifest acknowledgement token and packet epoch currently
-remain separate facilities.
+The experimental projection feed now rotates the epoch at connection setup,
+before changing a phase, and before capturing a replacement manifest/baseline.
+That native token is also the acknowledgement token. An epoch changed by trusted
+server code invalidates a pending acknowledgement even if the manifest matches.
+Staging still has projection disabled; the ordinary client has no engine
+transition coordinator wired yet.
 
 Once selected, the native server requires the current token on all gameplay
 input, including custom commands, even after the gameplay gate reopens. Outbound
@@ -221,7 +227,37 @@ retains the original binary payload and reliability, adding 22 bytes. Frames are
 bounded to a 1 MiB payload; nested, truncated and trailing frames are rejected.
 Projection control stays unframed; initial login may pass before actor binding.
 Deferred messages capture the enqueue-time token and are dropped after rotation
-instead of being relabeled as current state. A fresh baseline must replace them.
+instead of being relabeled as current state. The fresh baseline replaces their
+replicated state; executable snippets are never replayed by a baseline.
+
+Trusted `mp.getWorldBaseline(userId, packetEpoch)` requires the current blocked
+epoch and an active assigned character. It captures existing subscriptions,
+using the same per-recipient spawn serializer and presentation/property filters
+as normal stream-in. It returns gamemode definitions, the player first (including
+explicitly empty inventory and a false creation flag), current visible reference
+snapshots, and NPC hosting assignments. It does not reassign or respawn the actor,
+change subscriptions, or rerun reference initialization/load handlers. References
+stay alive during capture; changes to actor identity, phase, epoch, connection or
+subscriptions invalidate it. The limit is 4,096 references and 2 MiB of serialized
+data. This is a local visible-world snapshot, not every world record at once.
+
+The common spawn serializer now always excludes `private.*` properties, even
+when those fields were not registered in the gamemode property table. Previously
+unregistered private fields could appear in initial spawn packets. Both normal
+stream-in and the baseline now omit campaign VM state and allocation ledgers;
+owner-only and neighbor-visible public fields retain their visibility rules.
+
+The feed captures the complete baseline before publishing the begin message,
+then transfers it in 16,384-character chunks tied to the same session, sequence
+and epoch as the reference manifest. The client assembles it separately from
+live replication. Missing, conflicting, malformed or cross-epoch chunks cannot
+produce `prepared()` or an acknowledgement. The baseline validates one matching
+self, unique reference identities, bounded counts, transforms, hosting targets
+and public property envelopes; snippets and custom commands are forbidden.
+The engine coordinator must replace the prior replica/hosting state, use the
+self snapshot to bootstrap a generated world if needed, apply reference mapping,
+and drain current-epoch deltas before gameplay resumes. Receipt alone does none
+of that engine work.
 
 The client's `NetworkingService` routes structured, raw and reference-ID sends
 through a common gate. Explicit selection queues only that epoch's replication,
@@ -235,12 +271,21 @@ packet batch when a callback replaces or destroys it.
 
 Epoch transport requires the matching `MpClientPlugin` 2.1.0 codec; older codecs
 are refused with input closed. Neither receipt of a frame nor a manifest enables
-gameplay. The coordinator still must rotate before allocation/phase changes,
-send a fresh authoritative baseline after epoch selection, apply/restore engine
-references, and cancel stale asynchronous engine work before acknowledging and
-releasing. Large replication baselines need bounded batching and explicit failure
-handling. These tests exercise the transport and service wiring, not Skyrim's
-engine or a playable quest.
+gameplay. The remaining client coordinator must select the validated epoch,
+apply/restore engine references and baseline state, and cancel stale asynchronous
+engine work before acknowledging and releasing. Capture and publication are
+currently synchronous and bounded; incremental streaming, loading deadlines and
+16/32-client performance still require work. Tests exercise the native baseline,
+transport and server/client protocol assembly, not Skyrim's engine or a playable
+quest.
+
+Verification: 83 Node tests, 219 native tests (90,853 assertions), server/client
+TypeScript builds, native API smoke and projection/non-projection bot sessions.
+Bot sessions cover gated login, native baseline capture, host/guest transition,
+boundary departure, reconnect, stale/forged acknowledgements and unframed-input
+rejection. Engine completion is simulated explicitly. Evidence is retained in
+ignored `artifacts/world-baseline-*` locally and the corresponding
+`/home/andrew/skymp-test-artifacts/world-baseline-*` logs on boyhouse.
 
 ### Deferred client effect lifetime
 

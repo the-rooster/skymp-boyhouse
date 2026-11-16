@@ -11,6 +11,7 @@
 #include "CreateActorMessage.h"
 #include "CustomPacketMessage.h"
 #include "DestroyActorMessage.h"
+#include "HostStartMessage.h"
 #include "HostStopMessage.h"
 #include "SetRaceMenuOpenMessage.h"
 #include "SpSnippetMessage.h"
@@ -285,6 +286,116 @@ std::string PartOne::GetPacketEpoch(Networking::UserId userId)
 {
   serverState.EnsureUserExists(userId);
   return serverState.userInfo[userId]->packetEpoch;
+}
+
+nlohmann::json PartOne::GetWorldBaseline(Networking::UserId userId,
+                                         const std::string& packetEpoch)
+{
+  serverState.EnsureUserExists(userId);
+  if (packetEpoch.empty() || GetPacketEpoch(userId) != packetEpoch ||
+      !serverState.userInfo[userId]->gameplayBlocked)
+    throw std::runtime_error(
+      "World baseline requires the blocked current packet epoch");
+  auto* actor = serverState.ActorByUser(userId);
+  if (!actor || actor->IsDisabled() || actor->IsDeleted())
+    throw std::runtime_error(
+      "World baseline requires an active assigned actor");
+  const auto actorId = actor->GetFormId();
+  const auto actorLifetime = worldState.LookupFormByIdNoLoad(actorId);
+  const auto instanceEpoch = actor->GetWorldInstanceEpoch();
+  if (actorLifetime.get() != actor)
+    throw std::runtime_error("World baseline actor is no longer registered");
+
+  // Hold every reference alive while per-recipient presentation callbacks run.
+  // Snapshot existing subscriptions, never re-subscribe or dispatch OnLoad.
+  constexpr size_t maxReferences = 4096, maxBytes = 2 * 1024 * 1024;
+  std::vector<std::shared_ptr<MpForm>> forms{ actorLifetime };
+  const auto subscriptions = actor->GetEmitters();
+  for (auto* emitter : subscriptions) {
+    if (emitter == actor)
+      continue;
+    if (forms.size() >= maxReferences)
+      throw std::runtime_error("World baseline has too many references");
+    const auto lifetime =
+      worldState.LookupFormByIdNoLoad(emitter->GetFormId());
+    if (lifetime.get() != emitter || !emitter->SharesWorldInstance(*actor))
+      throw std::runtime_error("World baseline has an invalid subscription");
+    forms.push_back(lifetime);
+  }
+  std::sort(forms.begin() + 1, forms.end(), [](const auto& a, const auto& b) {
+    return a->GetFormId() < b->GetFormId();
+  });
+  auto messages = nlohmann::json::array();
+  size_t bytes = 256; // Reserve the envelope and array punctuation.
+  const auto append = [&](const IMessageBase& message) {
+    nlohmann::json json;
+    message.WriteJson(json);
+    bytes += json.dump().size() + 1;
+    if (bytes > maxBytes)
+      throw std::runtime_error("World baseline exceeds its byte limit");
+    messages.push_back(std::move(json));
+  };
+  UpdateGameModeDataMessage emptyGamemode;
+  if (pImpl->updateGamemodeDataMsg.empty())
+    append(emptyGamemode);
+  else {
+    auto decoded = GetMessageSerializerInstance().Deserialize(
+      pImpl->updateGamemodeDataMsg.data(),
+      pImpl->updateGamemodeDataMsg.size());
+    if (!decoded || decoded->msgType != MsgType::UpdateGamemodeData)
+      throw std::runtime_error("Invalid cached gamemode baseline");
+    append(*decoded->message);
+  }
+  for (const auto& lifetime : forms) {
+    auto* reference = lifetime->AsObjectReference();
+    if (!reference || reference->IsDisabled() || reference->IsDeleted())
+      continue;
+    auto message = BuildCreateActorMessage(*reference, *actor);
+    if (reference == actor) {
+      // Empty values are authoritative too: a previous character's loadout
+      // and creation flag must not survive a full replacement.
+      message.props.inventory = actor->GetInventory();
+      message.props.isRaceMenuOpen = actor->IsRaceMenuOpen();
+    }
+    append(message);
+  }
+  for (const auto& lifetime : forms) {
+    auto* reference = lifetime->AsObjectReference();
+    if (reference == actor || reference->IsDisabled() ||
+        reference->IsDeleted())
+      continue;
+    const auto host = worldState.hosters.find(reference->GetFormId());
+    if (reference->AsActor() && host != worldState.hosters.end() &&
+        host->second == actorId) {
+      HostStartMessage message;
+      message.target = reference->GetFormId();
+      if (message.target < 0xff000000)
+        message.target += 0x100000000;
+      append(message);
+    }
+  }
+  // Presentation hooks must not change the authority of an in-flight capture.
+  if (!IsConnected(userId) || GetPacketEpoch(userId) != packetEpoch ||
+      !serverState.userInfo[userId]->gameplayBlocked ||
+      serverState.ActorByUser(userId) != actor || actor->IsDisabled() ||
+      worldState.LookupFormByIdNoLoad(actorId) != actorLifetime ||
+      actor->GetWorldInstanceEpoch() != instanceEpoch)
+    throw std::runtime_error("World baseline context changed during capture");
+  if (actor->GetEmitters() != subscriptions)
+    throw std::runtime_error(
+      "World baseline subscriptions changed during capture");
+  for (const auto& lifetime : forms) {
+    auto* reference = lifetime->AsObjectReference();
+    if (worldState.LookupFormByIdNoLoad(reference->GetFormId()) != lifetime ||
+        !reference->SharesWorldInstance(*actor) ||
+        (reference != actor && !actor->GetEmitters().count(reference)))
+      throw std::runtime_error(
+        "World baseline subscriptions changed during capture");
+  }
+  return { { "schemaVersion", 1 },
+           { "actor", actorId },
+           { "packetEpoch", packetEpoch },
+           { "messages", std::move(messages) } };
 }
 
 Networking::UserId PartOne::GetUserByActor(uint32_t formId)
@@ -819,6 +930,118 @@ std::vector<PartOne::Message>& PartOne::Messages()
   return pImpl->fakeSendTarget.messages;
 }
 
+CreateActorMessage PartOne::BuildCreateActorMessage(
+  MpObjectReference& emitterRef, MpObjectReference& listenerRef)
+{
+  auto* emitter = &emitterRef;
+  auto* listener = &listenerRef;
+  auto& emitterPos = emitter->GetPos();
+  auto& emitterRot = emitter->GetAngle();
+
+  bool isMe = emitter == listener;
+
+  MpActor* emitterAsActor = emitter->AsActor();
+
+  CreateActorMessage message;
+
+  std::string jAnimation;
+
+  if (emitterAsActor) {
+    auto appearance = emitterAsActor->GetAppearance();
+    message.appearance = appearance ? std::optional<Appearance>(*appearance)
+                                    : std::optional<Appearance>(std::nullopt);
+    if (pImpl->onActorStreamIn) {
+      pImpl->onActorStreamIn(*emitterAsActor, *listener, message);
+    }
+  }
+
+  if (emitterAsActor) {
+    message.equipment = emitterAsActor->GetEquipment();
+  }
+
+  if (emitterAsActor) {
+    message.animation = emitterAsActor->GetLastAnimEvent();
+  }
+
+  uint64_t longFormId = emitter->GetFormId();
+  if (emitterAsActor && longFormId < 0xff000000) {
+    longFormId += 0x100000000;
+  }
+  message.refrId = longFormId;
+
+  if (emitter->GetBaseId() != 0x00000000 &&
+      emitter->GetBaseId() != 0x00000007) {
+    message.baseId = emitter->GetBaseId();
+  }
+
+  if (emitterAsActor && emitterAsActor->IsDead()) {
+    message.isDead = true;
+  }
+
+  const bool isOwner = emitter == listener;
+
+  auto mode = VisitPropertiesMode::OnlyPublic;
+  if (isOwner) {
+    mode = VisitPropertiesMode::All;
+  }
+
+  emitter->VisitProperties(message, mode);
+
+  auto isFilteredOut = [&](const CustomPropsEntry& customPropsEntry) {
+    if (customPropsEntry.propName.rfind(
+          MpObjectReference::GetPropertyPrefixPrivate(), 0) == 0)
+      return true;
+    auto it = pImpl->gamemodeApiState.createdProperties.find(
+      customPropsEntry.propName);
+    if (it != pImpl->gamemodeApiState.createdProperties.end()) {
+      if (!it->second.isVisibleByOwner) {
+        //  From docs: isVisibleByNeighbors is considered to be always false
+        //  for properties with `isVisibleByOwner == false`, in that case,
+        //  actual flag value is ignored.
+        return true;
+      }
+      if (!it->second.isVisibleByNeighbors && !isOwner) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  message.customPropsJsonDumps.erase(
+    std::remove_if(message.customPropsJsonDumps.begin(),
+                   message.customPropsJsonDumps.end(), isFilteredOut),
+    message.customPropsJsonDumps.end());
+
+  const bool hasUser = emitterAsActor &&
+    serverState.UserByActor(emitterAsActor) != Networking::InvalidUserId;
+  auto hosterIterator = worldState.hosters.find(emitter->GetFormId());
+
+  if (hasUser ||
+      (hosterIterator != worldState.hosters.end() &&
+       hosterIterator->second != 0 &&
+       hosterIterator->second != listener->GetFormId())) {
+    message.props.isHostedByOther = true;
+  }
+
+  uint32_t worldOrCell =
+    emitter->GetCellOrWorld().ToFormId(worldState.espmFiles);
+
+  // See 'perf: improve game framerate #1186'
+  // Client needs to know if it is DOOR or not
+  if (const std::string& baseType = emitter->GetBaseType();
+      baseType == "DOOR") {
+    message.baseRecordType = "DOOR";
+  }
+
+  message.idx = emitter->GetIdx();
+  message.isMe = isMe;
+  message.transform.pos = { emitterPos.x, emitterPos.y, emitterPos.z };
+  message.transform.rot = { emitterRot.x, emitterRot.y, emitterRot.z };
+  message.transform.worldOrCell = worldOrCell;
+
+  return message;
+}
+
 void PartOne::Init()
 {
   pImpl.reset(new Impl);
@@ -841,108 +1064,7 @@ void PartOne::Init()
       return;
     }
 
-    auto& emitterPos = emitter->GetPos();
-    auto& emitterRot = emitter->GetAngle();
-
-    bool isMe = emitter == listener;
-
-    MpActor* emitterAsActor = emitter->AsActor();
-
-    CreateActorMessage message;
-
-    std::string jAnimation;
-
-    if (emitterAsActor) {
-      auto appearance = emitterAsActor->GetAppearance();
-      message.appearance = appearance
-        ? std::optional<Appearance>(*appearance)
-        : std::optional<Appearance>(std::nullopt);
-      if (pImpl->onActorStreamIn) {
-        pImpl->onActorStreamIn(*emitterAsActor, *listener, message);
-      }
-    }
-
-    if (emitterAsActor) {
-      message.equipment = emitterAsActor->GetEquipment();
-    }
-
-    if (emitterAsActor) {
-      message.animation = emitterAsActor->GetLastAnimEvent();
-    }
-
-    uint64_t longFormId = emitter->GetFormId();
-    if (emitterAsActor && longFormId < 0xff000000) {
-      longFormId += 0x100000000;
-    }
-    message.refrId = longFormId;
-
-    if (emitter->GetBaseId() != 0x00000000 &&
-        emitter->GetBaseId() != 0x00000007) {
-      message.baseId = emitter->GetBaseId();
-    }
-
-    if (emitterAsActor && emitterAsActor->IsDead()) {
-      message.isDead = true;
-    }
-
-    const bool isOwner = emitter == listener;
-
-    auto mode = VisitPropertiesMode::OnlyPublic;
-    if (isOwner) {
-      mode = VisitPropertiesMode::All;
-    }
-
-    emitter->VisitProperties(message, mode);
-
-    auto isFilteredOut = [&](const CustomPropsEntry& customPropsEntry) {
-      auto it = pImpl->gamemodeApiState.createdProperties.find(
-        customPropsEntry.propName);
-      if (it != pImpl->gamemodeApiState.createdProperties.end()) {
-        if (!it->second.isVisibleByOwner) {
-          //  From docs: isVisibleByNeighbors is considered to be always false
-          //  for properties with `isVisibleByOwner == false`, in that case,
-          //  actual flag value is ignored.
-          return true;
-        }
-        if (!it->second.isVisibleByNeighbors && !isOwner) {
-          return true;
-        }
-      }
-      return false;
-    };
-
-    message.customPropsJsonDumps.erase(
-      std::remove_if(message.customPropsJsonDumps.begin(),
-                     message.customPropsJsonDumps.end(), isFilteredOut),
-      message.customPropsJsonDumps.end());
-
-    const bool hasUser = emitterAsActor &&
-      serverState.UserByActor(emitterAsActor) != Networking::InvalidUserId;
-    auto hosterIterator = worldState.hosters.find(emitter->GetFormId());
-
-    if (hasUser ||
-        (hosterIterator != worldState.hosters.end() &&
-         hosterIterator->second != 0 &&
-         hosterIterator->second != listener->GetFormId())) {
-      message.props.isHostedByOther = true;
-    }
-
-    uint32_t worldOrCell =
-      emitter->GetCellOrWorld().ToFormId(worldState.espmFiles);
-
-    // See 'perf: improve game framerate #1186'
-    // Client needs to know if it is DOOR or not
-    if (const std::string& baseType = emitter->GetBaseType();
-        baseType == "DOOR") {
-      message.baseRecordType = "DOOR";
-    }
-
-    message.idx = emitter->GetIdx();
-    message.isMe = isMe;
-    message.transform.pos = { emitterPos.x, emitterPos.y, emitterPos.z };
-    message.transform.rot = { emitterRot.x, emitterRot.y, emitterRot.z };
-    message.transform.worldOrCell = worldOrCell;
-
+    const auto message = BuildCreateActorMessage(*emitter, *listener);
     sendTarget->Send(listenerUserId, message, true);
   };
 

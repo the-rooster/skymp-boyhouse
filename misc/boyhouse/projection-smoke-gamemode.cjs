@@ -16,7 +16,15 @@ function receive(p) {
 async function prepared(p) {
   for (let i = 0; i < 80; ++i) {
     receive(p);
-    if (p.replica.prepared()) return p.replica.prepared();
+    if (p.replica.prepared()) {
+      const baseline = p.replica.preparedBaseline();
+      assert.equal(baseline.packetEpoch, server.getPacketEpoch(p.user));
+      assert.equal(baseline.actor, p.actor);
+      assert.equal(baseline.messages[1].isMe, true);
+      assert.equal(baseline.messages[1].refrId, p.actor);
+      assert.equal(JSON.stringify(baseline).includes('private.boyhouse'), false);
+      return p.replica.prepared();
+    }
     await sleep(25);
   }
   throw Error("No projection manifest arrived");
@@ -39,7 +47,7 @@ async function login(profile, session) {
   const user = bot.getUserId();
   assert.equal(server.getGameplayBlocked(user), true, "Native gameplay gate starts before login");
   const replica = new WorldProjectionReplica(); replica.begin(session);
-  packet(bot, { customPacketType: "boyhouse.projection", action: "hello", sessionId: session });
+  packet(bot, { customPacketType: "boyhouse.projection", protocolVersion: 2, action: "hello", sessionId: session });
   packet(bot, { customPacketType: "loginWithSkympIo", gameData: { profileId: profile } });
   await sleep(300);
   const actor = server.getUserActor(user); assert.ok(actor);
@@ -49,7 +57,9 @@ async function login(profile, session) {
   return player;
 }
 async function command(p, body) {
-  packet(p.bot, { customPacketType: "boyhouse.instance", ...body }); await sleep(250);
+  p.bot.send({ t: 34, epoch: p.replica.packetEpoch, message: {
+    t: 1, contentJsonDump: JSON.stringify({ customPacketType: "boyhouse.instance", ...body }),
+  } }); await sleep(250);
 }
 
 (async () => {
@@ -59,6 +69,9 @@ async function command(p, body) {
   await command(owner, { action: "enter", area: "fixture" });
   assert.equal(scope(owner), "", "Custom gameplay commands are blocked before acknowledgement");
   await acknowledge(owner);
+  packet(owner.bot, { customPacketType: "boyhouse.instance", action: "enter", area: "fixture" });
+  await sleep(250);
+  assert.equal(scope(owner), "", "Untagged input cannot bypass the released epoch");
   const guest = await login(2002, "guest"); await acknowledge(guest);
   const stranger = await login(2003, "stranger"); await acknowledge(stranger);
   const key = "4e50d:Skyrim.esm";

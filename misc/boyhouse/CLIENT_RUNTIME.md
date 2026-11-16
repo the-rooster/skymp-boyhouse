@@ -228,8 +228,12 @@ Its binary frame retains the inner packet and exposes decoded frames to the
 TypeScript networking service. Epoch-aware sessions refuse earlier codecs with
 gameplay input closed. Native unit tests cover frame round trips, stale-epoch
 rejection and reconnecting inside a packet callback; service tests cover every
-outgoing path and bounded replication replay. This transport is not yet enabled
-by the projection coordinator and does not validate Skyrim's hooks or layouts.
+outgoing path and bounded replication replay. The experimental server projection
+feed now rotates epochs and transfers authoritative world baselines using
+protocol version 2; native bot sessions verify that path. The client replica
+requires both the baseline and manifest before engine acknowledgement. The
+Skyrim-side coordinator is still unwired, so this does not validate engine
+application or restoration. See [the protocol contract](QUESTS.md#packet-epochs-and-world-baselines-experimental-server-integration).
 
 Finish hook/layout checks, align content, and package the native and TypeScript
 client. Broaden native API/event coverage beyond the smoke above.

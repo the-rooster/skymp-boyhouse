@@ -54,6 +54,9 @@ export class CampaignInstances implements System {
       actor: (user: number) => ctx.svr.getUserActor(user),
       instance: (actor: number) => api.get(actor, "worldInstance"),
       read: (actor: number) => api.get(actor, "campaignReferences"),
+      beginEpoch: (user: number) => ctx.svr.beginPacketEpoch(user),
+      epoch: (user: number) => ctx.svr.getPacketEpoch(user),
+      baseline: (user: number, epoch: string) => ctx.svr.getWorldBaseline(user, epoch),
       block: (user: number, blocked: boolean) => ctx.svr.setGameplayBlocked(user, blocked),
       send: (user: number, packet: unknown) => ctx.svr.sendCustomPacket(user, JSON.stringify(packet)),
       close: (user: number, error: unknown) => {

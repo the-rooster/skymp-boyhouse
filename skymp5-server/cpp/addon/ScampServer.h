@@ -55,6 +55,7 @@ public:
   Napi::Value GetGameplayBlocked(const Napi::CallbackInfo& info);
   Napi::Value BeginPacketEpoch(const Napi::CallbackInfo& info);
   Napi::Value GetPacketEpoch(const Napi::CallbackInfo& info);
+  Napi::Value GetWorldBaseline(const Napi::CallbackInfo& info);
 
   Napi::Value GetLocalizedString(const Napi::CallbackInfo& info);
   Napi::Value GetServerSettings(const Napi::CallbackInfo& info);

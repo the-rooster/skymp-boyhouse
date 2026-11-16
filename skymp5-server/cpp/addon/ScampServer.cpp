@@ -106,6 +106,7 @@ Napi::Object ScampServer::Init(Napi::Env env, Napi::Object exports)
       InstanceMethod("getGameplayBlocked", &ScampServer::GetGameplayBlocked),
       InstanceMethod("beginPacketEpoch", &ScampServer::BeginPacketEpoch),
       InstanceMethod("getPacketEpoch", &ScampServer::GetPacketEpoch),
+      InstanceMethod("getWorldBaseline", &ScampServer::GetWorldBaseline),
 
       InstanceMethod("getLocalizedString", &ScampServer::GetLocalizedString),
       InstanceMethod("getServerSettings", &ScampServer::GetServerSettings),
@@ -856,6 +857,21 @@ Napi::Value ScampServer::GetPacketEpoch(const Napi::CallbackInfo& info)
     if (id >= partOne->serverState.userInfo.size())
       throw std::invalid_argument("Invalid packet epoch user");
     return Napi::String::New(info.Env(), partOne->GetPacketEpoch(id));
+  } catch (const std::exception& error) {
+    throw Napi::Error::New(info.Env(), error.what());
+  }
+}
+
+Napi::Value ScampServer::GetWorldBaseline(const Napi::CallbackInfo& info)
+{
+  try {
+    const auto id = NapiHelper::ExtractUInt32(info[0], "userId");
+    if (id >= partOne->serverState.userInfo.size() || !info[1].IsString())
+      throw std::invalid_argument("Invalid world baseline request");
+    return NapiHelper::ParseJson(
+      info.Env(),
+      partOne->GetWorldBaseline(id, info[1].As<Napi::String>().Utf8Value())
+        .dump());
   } catch (const std::exception& error) {
     throw Napi::Error::New(info.Env(), error.what());
   }

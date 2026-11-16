@@ -9,6 +9,8 @@
 #include "UpdateMovementMessage.h"
 #include <slikenet/BitStream.h>
 
+extern espm::Loader& GetEspmLoader();
+
 namespace {
 std::vector<uint8_t> Encode(const IMessageBase& message)
 {
@@ -281,6 +283,114 @@ TEST_CASE("Epoch rotation discards queued packets instead of retagging them",
   DoConnect(server, 0);
   REQUIRE(server.GetPacketEpoch(0).empty());
   REQUIRE(Advance(server, 0) != epoch);
+}
+
+TEST_CASE("World baselines contain only the current subscribed world and "
+          "preserve private fields",
+          "[Instance][Projection][CampaignFrame]")
+{
+  PartOne server;
+  auto& actor = Player(server, 0xff000001, 0);
+  auto& peer = Player(server, 0xff000002, 1);
+  auto& stranger = Player(server, 0xff000003, 2);
+  server.CreateActor(0xff000004, { 1, 2, 3 }, 0, 0x3c);
+  auto& npc = server.worldState.GetFormAt<MpActor>(0xff000004);
+  const auto phase = "campaign:4278190081:fixture";
+  actor.SetWorldInstance(phase);
+  peer.SetWorldInstance(phase);
+  npc.SetWorldInstance(phase);
+  REQUIRE(stranger.GetWorldInstance().empty());
+  server.worldState.hosters[npc.GetFormId()] = actor.GetFormId();
+  GamemodeApi::State gamemode;
+  gamemode.createdProperties["ownerOnly"].isVisibleByOwner = true;
+  gamemode.createdProperties["visible"].isVisibleByOwner = true;
+  gamemode.createdProperties["visible"].isVisibleByNeighbors = true;
+  server.NotifyGamemodeApiStateChanged(gamemode);
+  // Property-message construction resolves record metadata, even for a silent
+  // write.
+  server.AttachEspm(&GetEspmLoader());
+  for (auto* reference : { &actor, &peer }) {
+    reference->SetPropertyValueDump("private.boyhouse.questJournal",
+                                    R"({"secret":"vm"})", false, false);
+    reference->SetPropertyValueDump("ownerOnly", "42", false, false);
+    reference->SetPropertyValueDump("visible", "12", false, false);
+  }
+  server.Messages().clear();
+  const auto subscriptions = actor.GetEmitters();
+  server.serverState.userInfo[0]->gameplayBlocked = true;
+  const auto epoch = server.BeginPacketEpoch(0);
+  const auto baseline = server.GetWorldBaseline(0, epoch);
+  REQUIRE(baseline["actor"] == actor.GetFormId());
+  REQUIRE(baseline["packetEpoch"] == epoch);
+  REQUIRE(server.Messages().empty());
+  REQUIRE(actor.GetEmitters() == subscriptions);
+  const auto& messages = baseline["messages"];
+  REQUIRE(messages.size() ==
+          5); // Gamemode, self, peer, hosted NPC, host start.
+  REQUIRE(messages[0]["t"] == static_cast<int>(MsgType::UpdateGamemodeData));
+  REQUIRE(messages[1]["isMe"] == true);
+  REQUIRE(messages[1]["props"]["inventory"]["entries"].empty());
+  REQUIRE(messages[1]["props"]["isRaceMenuOpen"] == false);
+  REQUIRE(messages[2]["refrId"] == peer.GetFormId());
+  REQUIRE_FALSE(messages[2]["props"].contains("inventory"));
+  REQUIRE(messages[3]["refrId"] == npc.GetFormId());
+  REQUIRE(messages[4]["t"] == static_cast<int>(MsgType::HostStart));
+  REQUIRE(messages[4]["target"] == npc.GetFormId());
+  REQUIRE(baseline.dump().find("secret") == std::string::npos);
+  REQUIRE(messages[1]["customPropsJsonDumps"].size() == 2);
+  REQUIRE(messages[2]["customPropsJsonDumps"].size() == 1);
+  REQUIRE(messages[2]["customPropsJsonDumps"][0]["propName"] == "visible");
+  // Normal stream-in uses exactly the same privacy filter.
+  MpObjectReference::Unsubscribe(&peer, &actor);
+  server.Messages().clear();
+  MpObjectReference::Subscribe(&peer, &actor);
+  REQUIRE(server.Messages().size() == 1);
+  REQUIRE(server.Messages()[0].j["message"] == messages[2]);
+}
+
+TEST_CASE("World baseline authority cannot survive an epoch change or actor "
+          "replacement",
+          "[Instance][Projection][CampaignFrame]")
+{
+  PartOne server;
+  auto& actor = Player(server, 0xff000001, 0);
+  REQUIRE_THROWS(server.GetWorldBaseline(0, ""));
+  server.serverState.userInfo[0]->gameplayBlocked = true;
+  const auto epoch = server.BeginPacketEpoch(0);
+  REQUIRE_NOTHROW(server.GetWorldBaseline(0, epoch));
+  const auto next = server.BeginPacketEpoch(0);
+  REQUIRE_THROWS(server.GetWorldBaseline(0, epoch));
+  server.serverState.userInfo[0]->gameplayBlocked = false;
+  REQUIRE_THROWS(server.GetWorldBaseline(0, next));
+  server.serverState.userInfo[0]->gameplayBlocked = true;
+  server.SetUserActor(0, 0);
+  REQUIRE_THROWS(server.GetWorldBaseline(0, next));
+  server.SetUserActor(0, actor.GetFormId());
+  server.SetOnActorStreamIn([&](const auto&, const auto&, auto&) {
+    actor.SetWorldInstance("campaign:4278190081:changed");
+  });
+  REQUIRE_THROWS_WITH(server.GetWorldBaseline(0, next),
+                      Catch::Matchers::ContainsSubstring("context changed"));
+  DoDisconnect(server, 0);
+  REQUIRE_THROWS(server.GetWorldBaseline(0, next));
+}
+
+TEST_CASE("World baseline rejects oversized data before sending anything",
+          "[Instance][Projection][CampaignFrame]")
+{
+  PartOne server;
+  auto& actor = Player(server, 0xff000001, 0);
+  server.AttachEspm(&GetEspmLoader());
+  actor.SetPropertyValueDump(
+    "publicHuge", nlohmann::json(std::string(2 * 1024 * 1024, 'x')).dump(),
+    false, false);
+  server.serverState.userInfo[0]->gameplayBlocked = true;
+  const auto epoch = server.BeginPacketEpoch(0);
+  server.Messages().clear();
+  REQUIRE_THROWS_WITH(server.GetWorldBaseline(0, epoch),
+                      Catch::Matchers::ContainsSubstring("byte limit"));
+  REQUIRE(server.Messages().empty());
+  REQUIRE(server.serverState.userInfo[0]->gameplayBlocked);
 }
 
 namespace {
