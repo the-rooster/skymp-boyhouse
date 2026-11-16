@@ -29,10 +29,10 @@
     "skymp5-server/cpp/server_guest_lib/CampaignInventoryApi.h": "85e381d5c2aeccbd50ab95836d26bf837beb68c54079b0d6e019ca1277f70dd6",
     "skymp5-server/cpp/server_guest_lib/CampaignReferenceBinding.cpp": "1629f4092c67cdd7e5f74f68c27fe27412d25186d40df1b857e34558dbee2055",
     "skymp5-server/cpp/server_guest_lib/CampaignReferenceBinding.h": "3379b7ebbf6efe5f25378e0a3ff0ecb268976b166508e21b89fa97dac46ff027",
-    "skymp5-server/cpp/server_guest_lib/QuestJournal.cpp": "f3ee8fd24b93fd4b15dd0d035687ab8be70da552700ccdfa51f0a8c14a638f8e",
-    "skymp5-server/cpp/server_guest_lib/QuestJournal.h": "d4e23009d8c3150ea9c460436200d9dd34a1a6980581e74ac9382bb074276db2",
-    "skymp5-server/cpp/server_guest_lib/WorldState.cpp": "cf0f11beb9f06e2dad51ab4cbd341b92b0e3bef0a211b495646008be76c0bece",
-    "skymp5-server/cpp/server_guest_lib/WorldState.h": "61d961f8594ad149f73e7db79853bbe10a55e05a91180045f9c1efafc7d09cbf",
+    "skymp5-server/cpp/server_guest_lib/QuestJournal.cpp": "06f089eb9194399228aeacce1556e31e5f7d76b3e785a78a8ab2cc64f631c9c6",
+    "skymp5-server/cpp/server_guest_lib/QuestJournal.h": "e2a73ff9035ea904766d2da0432dcb44f6a02795db142bd5d69f9c9d801ed920",
+    "skymp5-server/cpp/server_guest_lib/WorldState.cpp": "14b82e2bc2787fb609ed8c5439f7ddc5c8a1e9bdb01e491e8c2d9c7fbad4978d",
+    "skymp5-server/cpp/server_guest_lib/WorldState.h": "026372fdf342516900415dfa17b7845ea549b48f1c2f70691d8284c0dae0fddb",
     "skymp5-server/cpp/server_guest_lib/Inventory.cpp": "99fcca6fa5235137d6db1a3b398be76865322fbf4723df62da1300f64ffbb9a3",
     "skymp5-server/cpp/server_guest_lib/ChangeFormGuard.h": "71af2807f5c08caa6009956b6733427a51f4e34a69d5b4da912b91863054e9bf",
     "skymp5-server/cpp/server_guest_lib/MpObjectReference.cpp": "dc8dadb6e93f175f7947f8036c857e0c9bd1f4f65824d8259be8886466679625",
@@ -48,7 +48,10 @@
     "libespm/src/Browser.cpp": "61def9acb2ea0cdffebd040b27958e271122b7662395d06fd399d76e1ecf8747",
     "skymp5-server/cpp/server_guest_lib/LeveledListUtils.h": "aecd1c2abd94d5733ce3d2459c108a65072e12db94566d5f82b99ad2e4818bcd",
     "skymp5-server/cpp/server_guest_lib/LeveledListUtils.cpp": "c27d0b4e6ae8cdad3d5a5f4cb71108184ecc5c1663016729a490f299fc50a55e",
-    "skymp5-server/cpp/server_guest_lib/InventoryDefaults.h": "9c746f3353072177207b0644e247bf5d135bcc2144aeaa601c6e214d25a1cb24"
+    "skymp5-server/cpp/server_guest_lib/InventoryDefaults.h": "9c746f3353072177207b0644e247bf5d135bcc2144aeaa601c6e214d25a1cb24",
+    "skymp5-server/cpp/server_guest_lib/CampaignReferenceFactory.cpp": "8620c5c5cc761411bae0d551ed140ece65a039305f287daeacc3265c3dd14834",
+    "skymp5-server/cpp/server_guest_lib/CampaignReferenceFactory.h": "204a06e800105c5f60feab2db1620410e8b2112f352d93c3adec196cfc3b62d9",
+    "libespm/src/NPC_.cpp": "6f311d368dd90b165cf2dc2ee48954ebae00ff740b16496c310f63e030ef80ef"
   },
   "nativeSubsets": [
     "actor.getactorbase",

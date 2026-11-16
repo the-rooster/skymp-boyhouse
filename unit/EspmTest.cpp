@@ -379,7 +379,9 @@ TEST_CASE("Loads NPC factions", "[espm]")
   espm::CompressedFieldsCache compressedFieldsCache;
   REQUIRE(npc->GetData(compressedFieldsCache).factions.size() == 8);
   REQUIRE(npc->GetData(compressedFieldsCache).factions[0].formId == 0x28848);
-  REQUIRE(npc->GetData(compressedFieldsCache).factions[0].rank == 72);
+  // SNAM stores the signed rank after its four-byte faction ID. 72 was the
+  // low byte (0x48) of faction 0x28848, not this guard's authored rank.
+  REQUIRE(npc->GetData(compressedFieldsCache).factions[0].rank == 0);
 }
 
 TEST_CASE("Loads NPC flags", "[espm]")

@@ -39,6 +39,30 @@ authority.enter(guest, owner, "fixture");
 assert.equal(server.get(owner, "worldInstance"), server.get(guest, "worldInstance"));
 assert.notEqual(server.get(stranger, "worldInstance"), server.get(guest, "worldInstance"));
 assert.equal(progress(guest).campaignOwner, owner);
+const allocate = (id, level = 5) => server.set(id, "campaignReferences", {
+  references: [0x1a677, 0x8a986], encounterLevel: level,
+});
+assert.throws(() => allocate(guest), /owning private phase/);
+assert.throws(() => allocate(owner, 1.5), /Invalid encounter level/);
+allocate(owner);
+const allocations = server.get(owner, "private.boyhouse.referenceAllocations");
+const npcCopy = 0xff000000 + parseInt(allocations.copies["1a677:Skyrim.esm"], 16);
+assert.equal(server.get(npcCopy, "type"), "MpActor");
+assert.equal(server.get(npcCopy, "worldInstance"), server.get(owner, "worldInstance"));
+const allocatedInventory = server.get(npcCopy, "inventory");
+allocate(owner, 50);
+assert.deepEqual(server.get(owner, "private.boyhouse.referenceAllocations"), allocations);
+assert.deepEqual(server.get(npcCopy, "inventory"), allocatedInventory);
+const allocationArea = {
+  worldOrCell: server.getActorCellOrWorld(npcCopy),
+  center: server.getActorPos(npcCopy), radius: 1,
+};
+server.set(owner, "campaignReferences", { area: allocationArea, encounterLevel: 5 });
+assert.equal(server.get(owner, "private.boyhouse.referenceAllocations").copies["1a677:Skyrim.esm"],
+  allocations.copies["1a677:Skyrim.esm"]);
+assert.throws(() => server.set(owner, "campaignReferences", {
+  area: { ...allocationArea, radius: -1 }, encounterLevel: 5,
+}), /Invalid campaign allocation area/);
 stage(guest, 20);
 assert.equal(progress(owner).quests[key].stage, 20);
 assert.deepEqual(progress(stranger).quests, {});
@@ -68,5 +92,5 @@ assert.equal(packets[1].packet.journal.campaignOwner, guest);
 assert.deepEqual(packets[1].packet.journal.quests, guestPersonal);
 assert.notEqual(server.get(owner, "worldInstance"), server.get(guest, "worldInstance"));
 assert.throws(() => server.set(owner, "worldInstance", 42));
-console.log("Native server + party + journal/feed + original MQ102/DA04 fragments passed (not quest playthroughs)");
+console.log("Native server + party + private allocation + journal/feed + original MQ102/DA04 fragments passed (not quest playthroughs)");
 process.exit(0);

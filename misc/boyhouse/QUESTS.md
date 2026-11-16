@@ -120,9 +120,45 @@ respawn. Copies may load before their owner; their scripts wait for a player
 subscription. Bound placed-item copies are retained by database loading too.
 Recovery validates the original record, base, copy kind, owner identity and
 private phase. Pending loot timers and active magic effects fail explicitly
-until campaign timer recovery is implemented. Automatic reference creation,
+until campaign timer recovery is implemented. Automatic area-entry integration,
 complete quest startup, trigger/activation/combat events and ordinary player inventory
 events still need implementation; no vanilla adapter is enabled.
+
+### Creating private reference copies
+
+Trusted server code can now call `mp.set(owner, "campaignReferences", {
+references: [originalFormId, ...], encounterLevel: 5 })` while the owner is in
+their own private phase. Alternatively supply `area: { worldOrCell, center:
+[x, y, z], radius }` instead of `references`; the plugin spatial index discovers
+winning placed records inside that sphere without loading shared references.
+The caller must supply the authoritative encounter level. This is not a client
+command and is not yet wired into automatic party entry.
+
+The factory creates unique/story NPCs, disabled references and placed item stacks,
+which the ordinary shared loader may skip. It selects template chains, inventory,
+outfits, spells and starting corpse loot; reads initial enable-parent state; and
+copies factions and the currently implemented actor attributes. The owner gets a
+private allocation ledger mapping stable original forms to dynamic copies.
+Subsequent calls reuse those copies, including their changed inventories and
+deletion state. Missing allocations fail instead of silently regenerating loot.
+Copies can recover before their owner and keep their original allocation results.
+
+Preparation builds replacement form, spatial and identity indexes and the complete
+pending save batch before publishing anything. The owner's identity/ledger and
+new copies enter one atomic storage batch. Creation runs no load handlers or
+shared VM scripts; the existing subscription lifecycle invokes campaign handlers
+later. Calls from inside a quest transaction are refused until allocation can
+participate in that transaction. Notifications still precede asynchronous disk
+commit; see [the storage contract](STORAGE.md).
+
+This does not yet project original-to-copy replacement into Skyrim or make a
+location playable. Automatic entry/recovery integration, cross-area migration,
+enable-parent change propagation, scale/ownership/lock overlays, NPC auto-calculated
+stats, respawns and durable lifecycle delivery remain unfinished. The factory
+currently copies the relevant world indexes during a batch; this needs measurement
+and optimization before a 16–32 player rollout. Requests are bounded to 4,096
+references, a radius of 65,536 units, and a 100,000-entry/8 MiB owner ledger;
+streaming and ledger partitioning are required for a full world.
 
 ### Inventory defaults for private reference allocation
 
@@ -138,9 +174,9 @@ ownership metadata and empty lists without a count field. Container and inherite
 NPC inventory IDs use the supplying plugin's load-order mapping. An outfit is
 rolled once and the result is reused for inventory and equipment.
 
-These are allocation prerequisites, not automatic private-world creation.
-Allocation rolls, campaign encounter levels and respawns still need their own
-persistent lifecycle. Special-loot formulas and ownership metadata semantics are
+The factory persists selected templates and inventory in each copy; authoritative
+campaign encounter levels and respawns still need their own lifecycle.
+Special-loot formulas and ownership metadata semantics are
 not implemented; UseAll level behavior still needs comparison with the engine.
 An empty leveled NPC template currently fails explicitly rather than silently
 choosing a different actor. The scoped Papyrus inventory API still rejects
@@ -202,14 +238,14 @@ The [dependency analyzer](DEPENDENCIES.md) discovers shared work across the full
 | --- | --- |
 | Original quest execution | Extend the implemented scoped fragment runner with startup/stop events, alias filling and alias scripts, nested quest lifecycle transitions, repeatable stages, and the remaining condition/native semantics. The existing global VM must not become an alternate campaign-effect path. |
 | VM persistence | Shared arrays, variables, globals and alias bindings now persist; add alias lifecycle, timers, latent continuations, content hashes and content migrations. Restart during a stage/reward must neither lose nor duplicate effects. |
-| World overlays | Materialize the new logical `(campaign, original form)` identities; isolate NPC death/enable state, inventories, globals, factions, locations, doors, and encounters. Current instance filtering alone hides shared references. |
+| World overlays | Connect the reference factory to automatic area entry and client projection; extend isolated death/enable state, inventories, globals, factions, locations, doors, and encounters with their full mutation/event semantics. Filtering alone hides shared references. |
 | Dialogue and story | Implement topic/response selection, conditions, aliases, scenes, packages, story-manager events, radiants, followers, and quest item/reward behavior. Every mutating effect must carry campaign context. |
 | Client engine | Port/audit Skyrim Platform for installed runtime 1.7.104; reset/rebind local world state when changing phases; integrate journal/objective markers without rerunning client fragments; acknowledge transitions. See [the native runtime audit](CLIENT_RUNTIME.md). Current native build is not proven compatible with that runtime. |
 | In-game quest coverage | For every quest and relevant branch, exercise solo and guest play, divergent histories, late joins, party removal, disconnects and restart mid-scene/mid-reward on actual Skyrim clients. Individual quests are integration tests; the completion target is the full five-master campaign. |
 | Full content | Cover main quest, guilds, civil war, side/radiant quests, and DLC. Track branches and inter-quest dependencies rather than assuming successful SetStage equals support. |
 | Community release | Test 16/32 real or representative clients, load/recovery, reward idempotency, content-version agreement, authentication, and packaging. |
 
-The next execution slice needs materialized campaign reference overlays, complete alias fill/effect semantics, and lifecycle execution around them. Vanilla stage fragments already expose these dependencies. A global reference plus one progress map cannot resolve conflicting NPC states.
+The next execution slice needs area-entry/client integration for materialized references, complete alias fill/effect semantics, and lifecycle execution around them. Vanilla stage fragments already expose these dependencies. A global reference plus one progress map cannot resolve conflicting NPC states.
 
 ## Verification commands
 

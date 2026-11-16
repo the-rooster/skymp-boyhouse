@@ -4,6 +4,7 @@
 #include "AngleBinding.h"
 #include "AppearanceBinding.h"
 #include "BaseDescBinding.h"
+#include "CampaignReferencesBinding.h"
 #include "ConsoleCommandsAllowedBinding.h"
 #include "CustomPropertyBinding.h"
 #include "EquipmentBinding.h"
@@ -53,6 +54,7 @@ PropertyBindingFactory::CreateStandardPropertyBindings()
   result["type"] = std::make_shared<TypeBinding>();
   result["worldOrCellDesc"] = std::make_shared<WorldOrCellDescBinding>();
   result["worldInstance"] = std::make_shared<WorldInstanceBinding>();
+  result["campaignReferences"] = std::make_shared<CampaignReferencesBinding>();
   result["questJournal"] = std::make_shared<QuestJournalBinding>();
   result["questCommand"] = std::make_shared<QuestCommandBinding>();
   result["questExecuteStage"] = std::make_shared<QuestStageExecutionBinding>();

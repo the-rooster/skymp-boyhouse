@@ -93,6 +93,9 @@ public:
 
 private:
   friend class QuestJournal;
+  friend class CampaignReferenceFactory;
+  void CommitCampaignReferences(MpActor& owner, MpChangeForm ownerState,
+                                const std::vector<MpChangeForm>& copies);
   // Internal campaign commit: prepare every live/save copy before publishing
   // any of them. Only inventory and the owner's private journal may change.
   void CommitCampaignInventory(

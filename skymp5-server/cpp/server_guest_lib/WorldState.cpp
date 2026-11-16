@@ -191,7 +191,7 @@ void WorldState::AddForm(std::unique_ptr<MpForm> form, uint32_t formId,
           optionalChangeFormToApply->factions.has_value();
       // Index spatially without firing load events while the owner and other
       // saved references may still be absent. A real subscriber loads scripts.
-      if (!refr->IsDisabled()) {
+      if (!refr->IsDisabled() && !refr->IsDeleted()) {
         const auto cell = refr->GetCellOrWorld().ToFormId(espmFiles);
         refr->MoveOnGrid(*grids[cell].grid);
       }
@@ -440,6 +440,105 @@ void WorldState::CommitCampaignInventory(
       } // State is already committed, even if logging fails.
     }
   }
+}
+
+void WorldState::CommitCampaignReferences(
+  MpActor& owner, MpChangeForm ownerState,
+  const std::vector<MpChangeForm>& copies)
+{
+  if (pImpl->formLoadingInProgress || QuestJournal::HasActiveTransaction() ||
+      owner.GetParent() != this ||
+      LookupFormByIdNoLoad(owner.GetFormId()).get() != &owner ||
+      !formIdxManager || owner.GetIdx() == FormIndex::g_invalidIdx)
+    throw std::runtime_error("Invalid campaign allocation context");
+  if (pImpl->saveStorage && !pImpl->saveStorage->SupportsAtomicBatches())
+    throw std::runtime_error("Campaign allocation requires atomic storage");
+
+  // Build replacement indexes off to the side. Existing objects retain their
+  // addresses; only grids receiving new copies are cloned. No subscriptions,
+  // Papyrus, timers or external callbacks run during preparation/publication.
+  auto nextForms = forms;
+  auto nextIndex = actorIdByPrivateIndexedProperty;
+  auto nextGrids = grids;
+  auto nextByIdx = refrByIdxUnreliable;
+  auto saves = pImpl->changesByIdx;
+  std::set<uint32_t> clonedGrids;
+  std::vector<uint32_t> reserved;
+  reserved.reserve(copies.size());
+  try {
+    for (const auto& saved : copies) {
+      const auto original =
+        CampaignReferenceBinding::SavedOriginal(*this, saved);
+      const auto id = saved.formDesc.ToFormId(espmFiles);
+      if (nextForms.contains(id) ||
+          saved.worldInstance != owner.GetWorldInstance())
+        throw std::runtime_error("Campaign copy allocation conflict");
+      const auto base = saved.baseDesc.ToFormId(espmFiles);
+      const auto baseRecord = GetEspm().GetBrowser().LookupById(base);
+      if (!baseRecord.rec || baseRecord.rec->IsDeleted())
+        throw std::runtime_error("Missing campaign copy base");
+      std::shared_ptr<MpObjectReference> copy;
+      if (saved.recType == MpChangeForm::ACHR)
+        copy = std::make_shared<MpActor>(LocationalData(),
+                                         formCallbacksFactory(), base);
+      else
+        copy = std::make_shared<MpObjectReference>(
+          LocationalData(), formCallbacksFactory(), base,
+          baseRecord.rec->GetType().ToString().c_str());
+      uint32_t idx;
+      if (!formIdxManager->CreateID(idx))
+        throw std::runtime_error("Campaign reference index exhausted");
+      reserved.push_back(idx);
+      copy->idx = idx;
+      copy->MpForm::Init(this, id, true);
+      copy->EditChangeForm([&](MpChangeForm& value) { value = saved; },
+                           ChangeFormGuard::Mode::NoRequestSave);
+      const auto source = GetEspm().GetBrowser().LookupById(original);
+      const auto data = reinterpret_cast<const espm::REFR*>(source.rec)
+                          ->GetData(GetEspmCache());
+      if (data.boundsDiv2)
+        copy->SetPrimitive(
+          { data.boundsDiv2[0], data.boundsDiv2[1], data.boundsDiv2[2] });
+      if (auto* actor = copy->AsActor())
+        actor->factionsLoaded = saved.factions.has_value();
+      saved.dynamicFields.ForEachValueDump(
+        [&](const auto& key, const auto& value) {
+          if (key.starts_with("private.indexed."))
+            nextIndex[MakePrivateIndexedPropertyMapKey(key, value)].insert(id);
+        });
+      if (!saved.isDisabled && !saved.isDeleted) {
+        const auto cell = saved.worldOrCellDesc.ToFormId(espmFiles);
+        auto& grid = nextGrids[cell].grid;
+        if (clonedGrids.insert(cell).second)
+          grid = std::make_shared<GridImpl<MpObjectReference*>>(*grid);
+        copy->MoveOnGrid(*grid);
+      }
+      nextByIdx.resize(std::max(nextByIdx.size(), size_t(idx) + 1), nullptr);
+      nextByIdx[idx] = copy.get();
+      MpChangeForm::ToJson(saved).dump();
+      saves.resize(std::max(saves.size(), size_t(idx) + 1));
+      saves[idx] = saved;
+      nextForms.emplace(id, std::move(copy));
+    }
+    MpChangeForm::ToJson(ownerState).dump();
+    saves.resize(std::max(saves.size(), size_t(owner.GetIdx()) + 1));
+    saves[owner.GetIdx()] = ownerState;
+  } catch (...) {
+    for (auto it = reserved.rbegin(); it != reserved.rend(); ++it)
+      formIdxManager->DestroyID(*it);
+    throw;
+  }
+  static_assert(noexcept(forms.swap(nextForms)));
+  static_assert(noexcept(actorIdByPrivateIndexedProperty.swap(nextIndex)));
+  static_assert(noexcept(grids.swap(nextGrids)));
+  forms.swap(nextForms);
+  actorIdByPrivateIndexedProperty.swap(nextIndex);
+  grids.swap(nextGrids);
+  refrByIdxUnreliable.swap(nextByIdx);
+  owner.CommitPreparedCampaignChange(ownerState);
+  pImpl->changesByIdx.swap(saves);
+  pImpl->changesByIdxEmpty = false;
+  pImpl->allFormsByModIndexCache[0xff].reset();
 }
 
 const std::shared_ptr<MpForm>& WorldState::LookupFormById(
@@ -1217,10 +1316,12 @@ std::string WorldState::MakePrivateIndexedPropertyMapKey(
 
 uint32_t WorldState::GenerateFormId()
 {
-  while (LookupFormById(pImpl->nextId)) {
-    ++pImpl->nextId;
+  while (pImpl->nextId >= 0xff000000) {
+    const auto id = pImpl->nextId++;
+    if (!LookupFormByIdNoLoad(id))
+      return id;
   }
-  return pImpl->nextId++;
+  throw std::overflow_error("Dynamic reference ID space exhausted");
 }
 
 void WorldState::SetRelootTime(const std::string& recordType,

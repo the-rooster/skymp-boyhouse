@@ -418,6 +418,11 @@ const Inventory& QuestJournal::ReadInventory(MpActor& actor,
   return InventoryTarget(actor, target).current;
 }
 
+bool QuestJournal::HasActiveTransaction() noexcept
+{
+  return transaction != nullptr;
+}
+
 void QuestJournal::EditInventory(MpActor& actor, MpObjectReference& target,
                                  const std::function<void(Inventory&)>& edit)
 {

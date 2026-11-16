@@ -114,6 +114,24 @@ TEST_CASE("Leveled entries retain nested counts and ignore unused padding",
   REQUIRE_THROWS(f.Expand(10, std::numeric_limits<uint32_t>::max()));
 }
 
+TEST_CASE("NPC faction ranks are read after the faction form ID",
+          "[CampaignAllocation][espm]")
+{
+  SyntheticLists f;
+  Bytes faction;
+  Append(faction, uint32_t(0x12345678));
+  Append(faction, int8_t(-1));
+  faction.resize(8, 0);
+  f.Add("NPC_", 10, Field("SNAM", faction));
+  f.Finish();
+  espm::CompressedFieldsCache cache;
+  const auto data =
+    espm::Convert<espm::NPC_>(f.browser->LookupById(10).rec)->GetData(cache);
+  REQUIRE(data.factions.size() == 1);
+  REQUIRE(data.factions[0].formId == 0x12345678);
+  REQUIRE(data.factions[0].rank == -1);
+}
+
 TEST_CASE(
   "Level selection distinguishes the nearest tier from all lower tiers",
   "[LeveledAllocation]")

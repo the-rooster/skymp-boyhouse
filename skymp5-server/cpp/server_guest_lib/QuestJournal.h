@@ -23,6 +23,7 @@ public:
   // Synchronous journal/VM and staged-inventory transaction. Other world
   // effects and latent natives still require transactional adapters.
   static void Atomic(MpActor& actor, const std::function<void()>& execute);
+  static bool HasActiveTransaction() noexcept;
   static const Inventory& ReadInventory(MpActor& actor,
                                         MpObjectReference& target);
   static void EditInventory(MpActor& actor, MpObjectReference& target,
