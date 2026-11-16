@@ -11,6 +11,10 @@ Experimental work on personal campaigns in a shared Skyrim world. Upstream basel
 - Development console commands in the forked client; no polished party UI yet.
 - Owned-master quest inventory scanner with overrides, compressed records, source hashes, and an explicit untested status.
 
+## Automated quest dependency analysis
+
+The [catalog analyzer](misc/boyhouse/DEPENDENCIES.md) scans all five owned masters and the original PEX archive, follows typed script calls, and ranks missing shared capabilities. See the [generated backlog](misc/boyhouse/QUEST_BACKLOG.md). Reports preserve unknowns and runtime-dispatch limits; they never enable adapters or certify quests.
+
 ## Quest journal and fragment runtime
 
 Persistent personal/host journals, 23 Papyrus Quest state methods, four quest condition predicates, expired-context guards, and a read-only client journal feed are implemented. The new `questExecuteStage` trusted server API loads original PEX fragments into a campaign-scoped VM and commits journal changes and script variables together. It remains gated by experimental per-quest adapters; no complete vanilla quest is enabled. `mp "bh journal"` displays the diagnostic projection. See [the implementation contract and remaining gates](misc/boyhouse/QUESTS.md).

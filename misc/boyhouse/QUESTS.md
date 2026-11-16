@@ -61,6 +61,10 @@ Mutations require the owner's private `private.boyhouse.questAdapters` array to 
 
 The persisted field is `private.boyhouse.questJournal`. Unknown save versions are refused rather than reset. The implementation validates before writing and uses the existing character save path; it does not yet provide atomic transactions spanning quest state, inventory rewards, and world overlays. The ledger limit is 8 MiB. The diagnostic feed currently sends full snapshots, capped at 1 MiB; exceeding that limit returns unavailable rather than truncating progress. Delta/chunk transport is required before full campaign rollout. VM epochs are process-local guards, not network transition acknowledgements or VM persistence.
 
+## Catalog-wide automation
+
+The [dependency analyzer](DEPENDENCIES.md) discovers shared work across the full catalog; the [ranked backlog](QUEST_BACKLOG.md) records potential impact. It resolves load-order overrides, associates dialogue/scenes/story nodes, reads VMAD/PEX metadata, and traces typed calls to engine APIs. Unknown dependencies and runtime-dispatch candidates remain explicit. This automates discovery and regression inputs; it does not replace engine implementation or playthrough evidence.
+
 ## Remaining implementation gates
 
 | Gate | Required work and evidence |

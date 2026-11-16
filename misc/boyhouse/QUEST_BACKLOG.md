@@ -1,0 +1,128 @@
+# Quest dependency backlog
+
+Generated static analysis. Counts include internal/helper quests and potential dependencies in all attached functions/states, including unreachable code. Counts overlap and do not predict how many quests a feature makes playable.
+
+- Quest records: **2274**.
+- Parsed PEX objects: **14026**.
+- Quests with explicit unresolved dependencies: **0**.
+- Quests with runtime-dependent dispatch sites: **1146**.
+- Record IDs not indexed: **1** (listed in JSON).
+- Certified playable quests: **0**. Every active catalog entry remains untested.
+
+## Missing shared systems
+
+| Capability | Quest records affected |
+| --- | ---: |
+| condition.non-stage-evaluation | 2118 |
+| alias.reference | 1978 |
+| engine.dialogue | 1865 |
+| world.campaign-references | 1796 |
+| engine.story-manager | 1424 |
+| alias.fill.unique-actor | 1378 |
+| engine.scenes | 1308 |
+| engine.events | 1296 |
+| alias.fill.event | 1180 |
+| condition.run-on:7 | 1062 |
+| alias.properties | 1058 |
+| forms.asset-bindings | 910 |
+| alias.scripts | 699 |
+| engine.packages | 592 |
+| alias.fill.forced-reference | 547 |
+| alias.fill.matching-or-script | 520 |
+| alias.location | 486 |
+| condition.flags-or-global-comparison | 403 |
+| alias.fill.created-reference | 384 |
+| condition.run-on:5 | 277 |
+| alias.fill.location-or-alias | 265 |
+| condition.run-on:1 | 164 |
+| condition.run-on:2 | 154 |
+| alias.fill.specific-location | 142 |
+| alias.fill.matching-reference | 138 |
+| world.campaign-player | 114 |
+| quest.log-flags | 72 |
+| alias.fill.external-alias | 63 |
+| condition.run-on:3 | 31 |
+| condition.run-on:6 | 7 |
+| condition.run-on:4 | 3 |
+
+## Most widely referenced missing native APIs
+
+| API | Quest records affected |
+| --- | ---: |
+| quest.stop | 877 |
+| referencealias.getreference | 838 |
+| game.getplayer | 810 |
+| alias.getowningquest | 568 |
+| topicinfo.getowningquest | 563 |
+| objectreference.additem | 450 |
+| utility.wait | 444 |
+| objectreference.disable | 441 |
+| actor.isinfaction | 386 |
+| objectreference.enable | 385 |
+| actor.setfactionrank | 332 |
+| actor.removefromfaction | 301 |
+| objectreference.removeitem | 298 |
+| actor.setactorvalue | 283 |
+| actor.getactorvalue | 270 |
+| scene.start | 264 |
+| actor.evaluatepackage | 256 |
+| objectreference.moveto | 250 |
+| actor.startcombat | 247 |
+| debug.trace | 241 |
+| scene.getowningquest | 231 |
+| actor.kill | 210 |
+| referencealias.forcerefto | 210 |
+| actor.setrelationshiprank | 205 |
+| objectreference.getparentcell | 203 |
+| objectreference.getdistance | 200 |
+| objectreference.delete | 199 |
+| actor.stopcombat | 198 |
+| game.addachievement | 192 |
+| objectreference.addtomap | 191 |
+
+## Most widely referenced missing condition functions
+
+| Condition | Quest records affected |
+| --- | ---: |
+| GetIsID (72) | 1467 |
+| GetInCurrentLoc (359) | 1058 |
+| GetIsEditorLocation (565) | 634 |
+| GetInFaction (71) | 475 |
+| GetIsAliasRef (566) | 416 |
+| GetEventData (576) | 393 |
+| GetInCell (67) | 351 |
+| GetVMQuestVariable (629) | 304 |
+| GetDistance (1) | 244 |
+| GetIsVoiceType (426) | 242 |
+| LocationHasKeyword (562) | 219 |
+| IsSceneActionComplete (550) | 198 |
+| GetItemCount (47) | 179 |
+| GetDead (46) | 173 |
+| HasRefType (561) | 169 |
+| IsInDialogueWithPlayer (249) | 144 |
+| GetActorValue (14) | 126 |
+| GetInCurrentLocAlias (360) | 118 |
+| IsLinkedTo (650) | 117 |
+| GetPCIsSex (131) | 105 |
+
+## Limits and next steps
+
+- Static discovery cannot prove branch reachability, correct behavior or playability.
+- Declared receiver types do not enumerate all virtual overrides or runtime object types.
+- Runtime-created forms, computed IDs, native-engine side effects and dynamic events need traces.
+- World-reference/asset record scripts and non-script relationships are not traversed yet.
+- Cross-quest record links are reported separately, not expanded into every linked quest.
+- Client projection, phase transitions, lifecycle, persistence and real-client validation remain gates.
+
+Implement shared capabilities, then rerun this report and the regression suites. Use runtime traces and real playthroughs to resolve unknowns; a dependency report must never automatically enable a quest adapter.
+
+## Reproducibility
+
+Capability registry SHA-256: a8b441d91920661fccb23b9d30a77110fce49ea3709d3e40acf1758c0afcf4c4
+
+- Skyrim.esm: e198c3b85e5e48e0c92a6580d8f66e644256b68d812ee32b61735cf9b753df73
+- Update.esm: b298b0f65fa0127fd13c1f5ef6bb30eaf9d21fd19f5e6f8f91f829c9007d3280
+- Dawnguard.esm: fc8f92cb7ed55217046ee96b84caa54c058c12f7c408ac2a71da880a7bd3eab7
+- HearthFires.esm: 0f681496771e6d1983c6c1c9dd6602964068837f015bfa21e69a149c3b050047
+- Dragonborn.esm: 635f21a938a17b8677f524cf41210933afc7f23820f2e210ab3bb6d3cd837046
+- Skyrim - Misc.bsa: 30957adeb1a109c8b8079a5791c2a24c1fdd1d01957e9338480f4d8e03d9d23f
