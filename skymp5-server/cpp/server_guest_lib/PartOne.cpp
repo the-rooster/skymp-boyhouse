@@ -172,7 +172,10 @@ void PartOne::Tick()
 {
   TickPacketHistoryPlaybacks();
   TickDeferredMessages();
-  worldState.Tick();
+  worldState.Tick([this] {
+    if (pImpl->actionListener)
+      pImpl->actionListener->TickCampaignMovements();
+  });
 }
 
 uint32_t PartOne::CreateActor(uint32_t formId, const NiPoint3& pos,

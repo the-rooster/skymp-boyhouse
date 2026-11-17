@@ -1,5 +1,7 @@
 #include "ActionListener.h"
 #include "AnimationSystem.h"
+#include "CampaignMovement.h"
+#include "CampaignReferenceBinding.h"
 #include "ConditionsEvaluator.h"
 #include "ConsoleCommands.h"
 #include "CropRegeneration.h"
@@ -11,6 +13,8 @@
 #include "MpObjectReference.h"
 #include "MsgType.h"
 #include "Overloaded.h"
+#include "QuestJobRunner.h"
+#include "QuestJournal.h"
 #include "WorldState.h"
 #include "gamemode_events/CustomEvent.h"
 #include "gamemode_events/EatItemEvent.h"
@@ -335,6 +339,11 @@ void ActionListener::OnUpdateMovement(const RawMessageData& rawMsgData,
   if (!current(currentPos, currentRot))
     return;
 
+  // A retained save must settle before another sample can consume flags,
+  // correct the client, or alter the accepted trigger baseline.
+  if (actor->HasPendingCampaignMovement())
+    return;
+
   const bool teleportFlag = actor->GetTeleportFlag();
   actor->SetTeleportFlag(false);
   // A server teleport intentionally corrects/rejects one finite packet.
@@ -351,6 +360,11 @@ void ActionListener::OnUpdateMovement(const RawMessageData& rawMsgData,
         FormDesc::FromFormId(msg.data.worldOrCell, espmFiles),
         rawMsgData.userId, actor, espmFiles))
     return;
+
+  if (actor->UsesCampaignMovement()) {
+    AdmitCampaignMovement(*context, rawMsgData, msg);
+    return;
+  }
 
   // Supersede an outer packet only after this one passes validation. A newer
   // accepted call can have exactly the same transform but different flags.
@@ -378,6 +392,23 @@ void ActionListener::OnUpdateMovement(const RawMessageData& rawMsgData,
   if (!current(requestedPos, requestedRot))
     return;
 
+  ApplyMovementFlags(*actor, msg);
+
+  // Publish only accepted movement, using the resulting listener set. Each
+  // send can reenter host code; no actor writes follow publication.
+  PublishToNeighbours(*context, rawMsgData.unparsed, rawMsgData.unparsedLength,
+                      false,
+                      [&] { return current(requestedPos, requestedRot); });
+}
+
+void ActionListener::ApplyMovementFlags(MpActor& target,
+                                        const UpdateMovementMessage& msg)
+{
+  auto* actor = &target;
+  if (partOne.worldState.lastMovUpdateByIdx.size() <= msg.idx) {
+    const auto newSize = static_cast<size_t>(msg.idx) + 1;
+    partOne.worldState.lastMovUpdateByIdx.resize(newSize);
+  }
   if (!msg.data.isBlocking)
     actor->IncreaseBlockCount();
   else
@@ -396,18 +427,137 @@ void ActionListener::OnUpdateMovement(const RawMessageData& rawMsgData,
   }
   if (msg.data.runMode != "Standing")
     actor->SetLastAnimEvent(std::nullopt);
-  if (partOne.worldState.lastMovUpdateByIdx.size() <= msg.idx) {
-    auto newSize = static_cast<size_t>(msg.idx) + 1;
-    partOne.worldState.lastMovUpdateByIdx.resize(newSize);
-  }
   partOne.worldState.lastMovUpdateByIdx[msg.idx] =
     std::chrono::system_clock::now();
+}
 
-  // Publish only accepted movement, using the resulting listener set. Each
-  // send can reenter host code; no actor writes follow publication.
-  PublishToNeighbours(*context, rawMsgData.unparsed, rawMsgData.unparsedLength,
-                      false,
-                      [&] { return current(requestedPos, requestedRot); });
+void ActionListener::AdmitCampaignMovement(
+  const ActorUpdateContext& context, const RawMessageData& raw,
+  const UpdateMovementMessage& message)
+{
+  auto& actor = *context.actor->AsActor();
+  auto& requester = *context.requester->AsActor();
+  // Bound both retained packet bytes and the outbox before any admission.
+  if (!raw.unparsed || !raw.unparsedLength || raw.unparsedLength > 65536 ||
+      (!pendingMovements.contains(&actor) && pendingMovements.size() >= 256))
+    throw std::runtime_error(
+      "Campaign movement publication capacity exceeded");
+  auto pending = std::make_shared<PendingMovement>();
+  pending->context = context;
+  pending->plan = actor.PrepareCampaignMovement(
+    requester,
+    { message.data.pos[0], message.data.pos[1], message.data.pos[2] },
+    { message.data.rot[0], message.data.rot[1], message.data.rot[2] });
+  pending->plan->SetAuthorityValidator(
+    [this, context, verified = raw.hasVerifiedEpoch] {
+      if (!IsActorUpdateCurrent(context) ||
+          !IsMessageAllowed(context.userId, MsgType::UpdateMovement, verified))
+        return false;
+      const auto& users = partOne.serverState.userInfo;
+      return context.userId < users.size() && users[context.userId] &&
+        !users[context.userId]->isDisconnecting &&
+        !users[context.userId]->campaignVisibilityFailed &&
+        partOne.worldState.lastMovUpdateByIdx.size() > context.idx;
+    });
+  auto& owner = QuestJournal::Owner(requester);
+  pending->owner = partOne.worldState.LookupFormByIdNoLoad(owner.GetFormId());
+  pending->ownerEpoch = owner.GetWorldInstanceEpoch();
+  pending->campaignIdentity = CampaignReferenceBinding::GetIdentity(owner);
+  pending->cell = actor.GetCellOrWorld();
+  pending->verifiedEpoch = raw.hasVerifiedEpoch;
+  pending->message = message;
+  pending->bytes.assign(raw.unparsed, raw.unparsed + raw.unparsedLength);
+  if (partOne.worldState.lastMovUpdateByIdx.size() <= message.idx)
+    partOne.worldState.lastMovUpdateByIdx.resize(
+      static_cast<size_t>(message.idx) + 1);
+  auto& slot = pendingMovements[&actor];
+  auto previous = slot;
+  slot = pending;
+  try {
+    const auto result = partOne.worldState.GetQuestJobs().AdmitMovement(
+      requester, pending->plan);
+    // AdmitMovement has no duplicate/query path. Its return transfers the
+    // exact new receipt without allocating after physical publication.
+    pending->receipt = result.receipt;
+    activeMovements.erase(&actor);
+    // Transient animation state belongs to acceptance time. Delaying these
+    // writes until storage acknowledges could overwrite a newer animation.
+    ApplyMovementFlags(actor, pending->message);
+  } catch (...) {
+    const auto found = pendingMovements.find(&actor);
+    if (found != pendingMovements.end() && found->second == pending) {
+      if (previous)
+        found->second = std::move(previous);
+      else
+        pendingMovements.erase(found);
+    }
+    throw;
+  }
+}
+
+bool ActionListener::IsPendingMovementCurrent(
+  const PendingMovement& pending) const
+{
+  try {
+    if (!IsActorUpdateCurrent(pending.context) ||
+        !IsMessageAllowed(pending.context.userId, MsgType::UpdateMovement,
+                          pending.verifiedEpoch))
+      return false;
+    auto& actor = *pending.context.actor->AsActor();
+    auto& requester = *pending.context.requester->AsActor();
+    auto& owner = QuestJournal::Owner(requester);
+    if (actor.IsDeleted() || actor.IsDisabled() || requester.IsDeleted() ||
+        requester.IsDisabled() || owner.IsDeleted() ||
+        pending.owner.get() != &owner ||
+        owner.GetWorldInstanceEpoch() != pending.ownerEpoch ||
+        partOne.worldState.LookupFormByIdNoLoad(owner.GetFormId()) !=
+          pending.owner ||
+        CampaignReferenceBinding::GetIdentity(owner) !=
+          pending.campaignIdentity ||
+        actor.GetCellOrWorld() != pending.cell ||
+        actor.GetPos() != pending.plan->GetPosition() ||
+        actor.GetAngle() != pending.plan->GetAngle() ||
+        actor.GetChangeForm().dynamicFields.GetValueDump(
+          CampaignMovementPlan::kProperty) != pending.plan->GetBaselineDump())
+      return false;
+    const auto id = pending.context.userId;
+    const auto& users = partOne.serverState.userInfo;
+    return id < users.size() && users[id] && !users[id]->isDisconnecting &&
+      !users[id]->campaignVisibilityFailed;
+  } catch (...) {
+    return false;
+  }
+}
+
+void ActionListener::TickCampaignMovements()
+{
+  // Copy ready entries before callbacks; sends may accept newer movement or
+  // disconnect any participant. Erase each entry before invoking host code.
+  std::vector<std::shared_ptr<PendingMovement>> ready;
+  ready.reserve(pendingMovements.size());
+  for (const auto& [actor, pending] : pendingMovements)
+    if (pending->receipt &&
+        pending->receipt->GetState() != SaveReceipt::State::Pending)
+      ready.push_back(pending);
+  for (const auto& pending : ready) {
+    auto* actor = pending->context.actor->AsActor();
+    const auto found = pendingMovements.find(actor);
+    if (found == pendingMovements.end() || found->second != pending)
+      continue;
+    pendingMovements.erase(found);
+    if (pending->receipt->GetState() != SaveReceipt::State::Durable ||
+        !IsPendingMovementCurrent(*pending))
+      continue;
+    try {
+      PublishToNeighbours(pending->context, pending->bytes.data(),
+                          pending->bytes.size(), false,
+                          [&] { return IsPendingMovementCurrent(*pending); });
+    } catch (...) {
+      // An accepted save cannot be rolled back by an unreliable packet send.
+      // New movement or a reconnect supplies a fresh authoritative snapshot.
+      spdlog::warn("Accepted campaign movement could not be published");
+    }
+  }
 }
 
 void ActionListener::OnUpdateAnimation(const RawMessageData& rawMsgData,

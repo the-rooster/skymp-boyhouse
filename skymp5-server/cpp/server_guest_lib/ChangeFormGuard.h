@@ -50,6 +50,17 @@ public:
     lastSaveRequest = std::chrono::system_clock::now();
   }
 
+  // The movement transaction already owns its save snapshot and occupancy.
+  // Do not call SetPos: its subscription and trigger tails are not atomic.
+  void CommitPreparedMovementTransform(const NiPoint3& position,
+                                       const NiPoint3& angle) noexcept
+  {
+    static_assert(noexcept(changeForm.position = position));
+    static_assert(noexcept(changeForm.angle = angle));
+    changeForm.position = position;
+    changeForm.angle = angle;
+  }
+
   auto GetLastSaveRequestMoment() const { return lastSaveRequest; }
 
   bool blockSaving = false;

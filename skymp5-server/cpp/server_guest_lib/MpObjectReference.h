@@ -39,6 +39,7 @@ struct GridPosInfo
 
 class MpActor;
 class WorldState;
+class CampaignMovementPlan;
 class OccupantDestroyEventSink;
 class OccupantDisableEventSink;
 
@@ -83,6 +84,7 @@ class MpObjectReference
   friend class OccupantDestroyEventSink;
   friend class OccupantDisableEventSink;
   friend class WorldState;
+  friend class CampaignMovementPlan;
 
 public:
   static const char* Type() { return "ObjectReference"; }
@@ -152,6 +154,11 @@ public:
                             bool isVisibleByOwner, bool isVisibleByNeighbor);
   void SetTeleportFlag(bool value);
   void SetPosAndAngleSilent(const NiPoint3& pos, const NiPoint3& rot);
+  bool UsesCampaignMovement() const;
+  bool HasPendingCampaignMovement() const;
+  std::shared_ptr<CampaignMovementPlan> PrepareCampaignMovement(
+    MpActor& requester, const NiPoint3& position, const NiPoint3& angle);
+  void RequireCampaignSpatialMutation() const;
   void Delete();
   void SetCount(uint32_t count);
 
@@ -238,6 +245,7 @@ private:
   void InitListenersAndEmitters();
   bool HasPendingSubscriptions() const;
   void RestorePrimitiveOccupancy();
+  bool IsCampaignMovementEnrolled() const;
   void SendOpenContainer(uint32_t refId);
   void CheckInteractionAbility(MpObjectReference& ac);
   bool IsLocationSavingNeeded() const;

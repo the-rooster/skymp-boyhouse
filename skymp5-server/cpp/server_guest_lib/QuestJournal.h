@@ -12,6 +12,7 @@ class MpActor;
 class MpObjectReference;
 class Inventory;
 class MpChangeFormREFR;
+class CampaignMovementPlan;
 
 // Campaign state shared by Papyrus and the trusted gamemode API. Clients may
 // read snapshots but cannot issue mutations. Original stage fragments/alias
@@ -45,12 +46,20 @@ public:
     MpActor& actor, uint64_t jobId, const std::function<void()>& execute);
   // Admission-only leases for contiguous new native occurrences. Each
   // initializer must install a pristine root and save only its first recipient
-  // snapshot. No handler, existing stack or gameplay effect may execute here.
-  // Empty batches seal an unchanged owner snapshot without inventing a job.
+  // snapshot. Initializers cannot execute handlers or change gameplay state.
+  // Prepare alone may attach a physical movement plan with StageMovement.
+  // Empty batches consume no job identities and may still save movement.
   static std::shared_ptr<const SaveReceipt> AtomicJobAdmissions(
     MpActor& actor, const std::vector<uint64_t>& jobIds,
     const std::function<void()>& prepare,
     const std::function<void(uint64_t)>& initializeOne);
+  // Exactly one physical participant, staged only by the active requester's
+  // admission prepare callback. This grants no source inventory or personal
+  // journal authority; the world publishes it with the common save receipt.
+  static void StageMovement(MpActor& requester,
+                            const std::shared_ptr<CampaignMovementPlan>& plan);
+  // Results are owned copies. Active transactions reuse their validated job
+  // snapshot internally; reads outside a transaction decode current storage.
   static QuestJobState JobState(MpActor& actor);
   static QuestJobState PersonalJobState(MpActor& owner);
   static void SetJobState(MpActor& actor, const QuestJobState& state);

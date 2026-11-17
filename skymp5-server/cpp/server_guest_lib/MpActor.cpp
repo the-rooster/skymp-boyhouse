@@ -90,6 +90,16 @@ struct MpActor::Impl
 
 namespace {
 
+void RequireActorPositionMutation(MpActor& actor)
+{
+  actor.RequireCampaignSpatialMutation();
+  auto* world = actor.GetParent();
+  if ((!world || (!world->IsRestoring() && !world->IsClearing())) &&
+      actor.UsesCampaignMovement())
+    throw std::runtime_error(
+      "Private campaign movement requires durable admission");
+}
+
 void RestoreActorValuePatched(MpActor* actor, espm::ActorValue actorValue,
                               float value)
 {
@@ -475,6 +485,7 @@ void MpActor::SendCampaignFactionsUpdate()
 
 void MpActor::Disable()
 {
+  RequireCampaignSpatialMutation();
   if (ChangeForm().isDisabled) {
     return;
   }
@@ -662,6 +673,7 @@ MpChangeForm MpActor::GetChangeForm() const
 
 void MpActor::ApplyChangeForm(const MpChangeForm& newChangeForm)
 {
+  RequireCampaignSpatialMutation();
   if (newChangeForm.recType != MpChangeForm::ACHR) {
     throw std::runtime_error(
       "Expected record type to be ACHR, but found REFR");
@@ -1143,6 +1155,8 @@ float MpActor::GetStaminaRespawnPercentage() const
 
 void MpActor::SendAndSetDeathState(bool isDead, bool shouldTeleport)
 {
+  if (shouldTeleport)
+    RequireActorPositionMutation(*this);
   spdlog::trace(
     "MpActor::SendAndSetDeathState {:x} - isDead: {}, shouldTeleport: {}",
     GetFormId(), isDead, shouldTeleport);
@@ -1461,6 +1475,8 @@ void MpActor::Init(WorldState* worldState, uint32_t formId, bool hasChangeForm)
 
 void MpActor::Kill(MpActor* killer, bool shouldTeleport)
 {
+  if (shouldTeleport)
+    RequireActorPositionMutation(*this);
   spdlog::trace("MpActor::Kill {:x} - killer is {:x}", GetFormId(),
                 killer ? killer->GetFormId() : 0);
 
@@ -1491,6 +1507,8 @@ void MpActor::RespawnWithDelay(bool shouldTeleport)
   if (pImpl->isRespawning) {
     return;
   }
+  if (shouldTeleport)
+    RequireActorPositionMutation(*this);
   pImpl->isRespawning = true;
 
   ++pImpl->respawnTimerIndex;
@@ -1506,6 +1524,8 @@ void MpActor::RespawnWithDelay(bool shouldTeleport)
       if (worldState->LookupFormById(formId).get() == this) {
         bool isLatestRespawn = respawnTimerIndex == pImpl->respawnTimerIndex;
         if (isLatestRespawn) {
+          if (shouldTeleport)
+            RequireActorPositionMutation(*this);
           // This is implemented here, not in MpActor::Respawn because we don't
           // want inventory to be re-added in case of artificial resurrect from
           // the gamemode
@@ -1562,6 +1582,8 @@ void MpActor::Respawn(bool shouldTeleport)
   if (IsDead() == false) {
     return;
   }
+  if (shouldTeleport)
+    RequireActorPositionMutation(*this);
   pImpl->isRespawning = false;
 
   RespawnEvent respawnEvent(this, shouldTeleport);
@@ -1570,6 +1592,7 @@ void MpActor::Respawn(bool shouldTeleport)
 
 void MpActor::Teleport(const LocationalData& position)
 {
+  RequireActorPositionMutation(*this);
   TeleportMessage msg;
   msg.idx = GetIdx();
   std::copy(&position.pos[0], &position.pos[0] + 3, std::begin(msg.pos));

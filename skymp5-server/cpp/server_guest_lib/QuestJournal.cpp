@@ -1,5 +1,6 @@
 #include "QuestJournal.h"
 #include "CampaignFactionApi.h"
+#include "CampaignMovement.h"
 #include "CampaignReferenceBinding.h"
 #include "MpActor.h"
 #include "QuestVmState.h"
@@ -40,6 +41,14 @@ struct Transaction
   Json ledger;
   std::map<uint32_t, InventoryEdit> inventories;
   std::map<uint32_t, ReferenceEdit> references;
+  // Immutable, transaction-local decoded jobs. SetJobState publishes this
+  // together with ledger["jobs"]; other journal writers preserve that field.
+  // Borrowed references stay inside their getter/guard call; the snapshot
+  // never survives this transaction. External changes still fail read guards.
+  std::shared_ptr<const QuestJobState> jobs;
+  MpActor* requester = nullptr;
+  std::shared_ptr<CampaignMovementPlan> movement;
+  bool durable = false, admissionPreparing = false, stagingMovement = false;
   std::optional<uint64_t> jobId;
   bool jobTransitionApplied = false;
   bool admissionOnly = false, admissionRuntimeEntered = false;
@@ -763,7 +772,19 @@ std::shared_ptr<const SaveReceipt> QuestJournal::AtomicJobAdmissions(
     actor,
     [&] {
       const auto beforePrepare = transaction->ledger;
-      prepare();
+      {
+        struct PreparationGuard
+        {
+          bool& active;
+          explicit PreparationGuard(bool& value)
+            : active(value)
+          {
+            active = true;
+          }
+          ~PreparationGuard() { active = false; }
+        } guard(transaction->admissionPreparing);
+        prepare();
+      }
       if (transaction->ledger != beforePrepare)
         throw std::runtime_error("Admission preparation changed the journal");
       for (const auto id : ids) {
@@ -776,8 +797,7 @@ std::shared_ptr<const SaveReceipt> QuestJournal::AtomicJobAdmissions(
         RequireAdmissionHeap(
           beforeHeap,
           SavedHeap(transaction->ledger.value("vm", Json::object())));
-        const auto jobs = JobState(actor);
-        const auto* job = jobs.FindLive(id);
+        const auto* job = transaction->jobs->FindLive(id);
         if (!job || !IsAdmissionSnapshot(*job) ||
             !transaction->jobTransitionApplied)
           throw std::runtime_error(
@@ -785,6 +805,29 @@ std::shared_ptr<const SaveReceipt> QuestJournal::AtomicJobAdmissions(
       }
     },
     true, std::nullopt, &ids);
+}
+
+void QuestJournal::StageMovement(
+  MpActor& requester, const std::shared_ptr<CampaignMovementPlan>& plan)
+{
+  if (!transaction || !transaction->durable || !transaction->admissionOnly ||
+      !transaction->admissionPreparing || transaction->jobId ||
+      transaction->requester != &requester || !plan || transaction->movement ||
+      transaction->stagingMovement)
+    throw std::runtime_error(
+      "Movement requires the requester's unused admission prepare lease");
+  struct StagingGuard
+  {
+    bool& active;
+    explicit StagingGuard(bool& value)
+      : active(value)
+    {
+      active = true;
+    }
+    ~StagingGuard() { active = false; }
+  } guard(transaction->stagingMovement);
+  plan->Validate(requester);
+  transaction->movement = plan;
 }
 
 std::shared_ptr<const SaveReceipt> QuestJournal::AtomicImpl(
@@ -809,9 +852,10 @@ std::shared_ptr<const SaveReceipt> QuestJournal::AtomicImpl(
   const auto actorEpoch = actor.GetWorldInstanceEpoch();
   const auto ownerEpoch = owner.GetWorldInstanceEpoch();
   const auto initial = Read(owner);
-  const auto jobs = initial.contains("jobs")
-    ? QuestJobState::Read(initial.at("jobs"))
-    : QuestJobState{};
+  const auto initialJobs = std::make_shared<const QuestJobState>(
+    initial.contains("jobs") ? QuestJobState::Read(initial.at("jobs"))
+                             : QuestJobState{});
+  const auto& jobs = *initialJobs;
   if (jobId) {
     const auto* selected = jobs.FindLive(*jobId);
     if (!*jobId || (!selected && jobs.nextJob != *jobId))
@@ -858,6 +902,9 @@ std::shared_ptr<const SaveReceipt> QuestJournal::AtomicImpl(
     : Json::object();
   const auto initialJournal = owner.GetDynamicFields().GetValueDump(kProperty);
   Transaction local{ &owner, initial, {}, {} };
+  local.jobs = initialJobs;
+  local.requester = &actor;
+  local.durable = durable;
   local.jobId = jobId;
   local.admissionOnly = admissions != nullptr;
   local.initialLedger = &initial;
@@ -895,6 +942,8 @@ std::shared_ptr<const SaveReceipt> QuestJournal::AtomicImpl(
           throw std::runtime_error(
             "Campaign reference changed during execution");
       }
+      if (local.movement)
+        local.movement->Validate(actor);
     };
     validateReads();
     if (jobId) {
@@ -956,7 +1005,8 @@ std::shared_ptr<const SaveReceipt> QuestJournal::AtomicImpl(
     if (durable || !changes.empty() || !visibility.empty() ||
         !factions.empty())
       return world.CommitCampaignInventory(owner, dump, changes, visibility,
-                                           factions, validateReads, durable);
+                                           factions, validateReads, durable,
+                                           local.movement);
     else if (local.ledger != initial)
       owner.SetPropertyValueDump(kProperty, dump, false, false);
     return {};
@@ -1057,6 +1107,13 @@ QuestJobState QuestJournal::JobState(MpActor& actor)
 
 QuestJobState QuestJournal::PersonalJobState(MpActor& owner)
 {
+  if (transaction) {
+    if (transaction->owner != &owner)
+      throw std::runtime_error("Cross-campaign quest transaction");
+    // The public result remains an owned copy. A caller cannot mutate the
+    // selected lease or a sleeping root through a borrowed cache reference.
+    return *transaction->jobs;
+  }
   const auto ledger = Read(owner);
   return ledger.contains("jobs") ? QuestJobState::Read(ledger.at("jobs"))
                                  : QuestJobState{};
@@ -1069,19 +1126,25 @@ void QuestJournal::RequireJobAccess(MpActor& actor)
 
 void QuestJournal::RequirePersonalJobAccess(MpActor& owner)
 {
-  const auto ledger = Read(owner);
-  if (!ledger.contains("jobs"))
-    return;
-  const auto jobs = QuestJobState::Read(ledger.at("jobs"));
-  if (transaction && transaction->owner == &owner && transaction->jobId) {
-    // The selected root can be terminal by commit-time inventory validation.
-    // Its final result still belongs to this transaction's original lease.
-    if (!jobs.FindLive(*transaction->jobId) &&
-        !jobs.FindCompleted(*transaction->jobId))
-      throw std::runtime_error("Quest job has not installed its root");
+  if (transaction) {
+    if (transaction->owner != &owner)
+      throw std::runtime_error("Cross-campaign quest transaction");
+    if (!transaction->ledger.contains("jobs"))
+      return;
+    const auto& jobs = *transaction->jobs;
+    if (transaction->jobId) {
+      // The selected root can be terminal by commit-time inventory validation.
+      // Its final result still belongs to this transaction's original lease.
+      if (!jobs.FindLive(*transaction->jobId) &&
+          !jobs.FindCompleted(*transaction->jobId))
+        throw std::runtime_error("Quest job has not installed its root");
+      return;
+    }
+    if (jobs.HasLive())
+      throw std::runtime_error("Campaign has an active quest job");
     return;
   }
-  if (jobs.HasLive())
+  if (PersonalJobState(owner).HasLive())
     throw std::runtime_error("Campaign has an active quest job");
 }
 
@@ -1091,8 +1154,7 @@ void QuestJournal::RequireJobExecution(MpActor& actor, uint64_t jobId)
   if (!jobId || !transaction || transaction->owner != &owner ||
       transaction->jobId != jobId)
     throw std::runtime_error("Quest runtime does not own this job lease");
-  const auto jobs = JobState(actor);
-  const auto* selected = jobs.FindLive(jobId);
+  const auto* selected = transaction->jobs->FindLive(jobId);
   if (!selected ||
       selected->actor != actor.GetChangeForm().formDesc.ToString() ||
       selected->owner != owner.GetChangeForm().formDesc.ToString() ||
@@ -1105,8 +1167,7 @@ void QuestJournal::RequireJobExecution(MpActor& actor,
 {
   RequireJobExecution(actor, job.id);
   if (transaction->admissionOnly) {
-    const auto jobs = JobState(actor);
-    const auto* selected = jobs.FindLive(job.id);
+    const auto* selected = transaction->jobs->FindLive(job.id);
     if (transaction->admissionRuntimeEntered || !selected ||
         *selected != job || !job.IsPristine() ||
         job.kind != QuestJobState::Kind::Interaction || !job.occurrence)
@@ -1122,7 +1183,8 @@ void QuestJournal::SetJobState(MpActor& actor, const QuestJobState& state)
   if (!transaction || transaction->owner != &owner || !transaction->jobId)
     throw std::runtime_error("Job state requires an owning job transaction");
   const auto saved = state.Save();
-  const auto previous = JobState(actor);
+  const auto previousSnapshot = transaction->jobs;
+  const auto& previous = *previousSnapshot;
   const auto old = previous.Save();
   if (transaction->ledger.contains("jobs") && old == saved)
     return;
@@ -1330,7 +1392,12 @@ void QuestJournal::SetJobState(MpActor& actor, const QuestJobState& state)
   ledger["jobs"] = saved;
   ledger["revision"] = revision + 1;
   Validate(ledger, false);
-  transaction->ledger = std::move(ledger);
+  // Both allocating/validating operations finish before either view changes.
+  // A caught validation or allocation failure leaves the old lease and JSON
+  // intact. No callback can run between these nonthrowing publications.
+  auto nextSnapshot = std::make_shared<const QuestJobState>(state);
+  transaction->ledger.swap(ledger);
+  transaction->jobs.swap(nextSnapshot);
   // A pristine initial install exposes the new job to script/native guards.
   // Every other transition must receive its own durable receipt before the
   // next cursor can advance; repeated identical calls above remain harmless.
@@ -1389,8 +1456,7 @@ void QuestJournal::MarkReferenceInitialized(MpActor& actor, uint32_t original)
       ledger.at("referenceInit").contains(key))
     return;
   if (transaction->jobId) {
-    const auto jobs = JobState(actor);
-    const auto* job = jobs.FindLive(*transaction->jobId);
+    const auto* job = transaction->jobs->FindLive(*transaction->jobId);
     if (!job || job->kind != QuestJobState::Kind::ReferenceLoad ||
         !job->referenceLoad || job->referenceLoad->target != key ||
         job->loadPhase != QuestJobState::LoadPhase::Init || job->handler ||

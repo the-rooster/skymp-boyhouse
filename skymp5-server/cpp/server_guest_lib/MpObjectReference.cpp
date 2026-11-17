@@ -1,4 +1,5 @@
 #include "MpObjectReference.h"
+#include "CampaignMovement.h"
 #include "CampaignReferenceBinding.h"
 #include "ChangeFormGuard.h"
 #include "EvaluateTemplate.h"
@@ -13,7 +14,9 @@
 #include "MpChangeForms.h"
 #include "MsgType.h"
 #include "Primitive.h"
+#include "QuestJournal.h"
 #include "QuestScriptRuntime.h"
+#include "SaveReceipt.h"
 #include "ScriptVariablesHolder.h"
 #include "UpdatePropertyMessage.h"
 #include "WorldState.h"
@@ -33,6 +36,7 @@
 #include <TimeUtils.h>
 #include <antigo/Context.h>
 #include <antigo/ResolvedContext.h>
+#include <cmath>
 #include <limits>
 #include <map>
 #include <numeric>
@@ -45,6 +49,18 @@
 #include "script_classes/PapyrusObjectReference.h" // kOriginalNameExpression
 
 constexpr uint32_t kPlayerCharacterLevel = 1;
+
+namespace {
+void RequirePositionMutation(MpObjectReference& reference)
+{
+  reference.RequireCampaignSpatialMutation();
+  auto* world = reference.GetParent();
+  if (world && !world->IsRestoring() && !world->IsClearing() &&
+      reference.UsesCampaignMovement())
+    throw std::runtime_error(
+      "Private campaign movement requires durable admission");
+}
+}
 
 UpdatePropertyMessage MpObjectReference::CreatePropertyMessage_(
   MpObjectReference* self, const char* name, const std::string& valueDump)
@@ -196,7 +212,355 @@ public:
   std::set<MpObjectReference*> publishingListeners;
   uint64_t nextPublication = 0;
   bool subscriptionsPending = false;
+  bool campaignMovementEnrolled = false;
+  bool destroying = false;
+  std::shared_ptr<const SaveReceipt> movementReceipt;
 };
+
+struct CampaignMovementPlan::Impl
+{
+  struct Read
+  {
+    std::shared_ptr<MpForm> lifetime;
+    uint64_t epoch;
+    nlohmann::json snapshot;
+  };
+  WorldState* world = nullptr;
+  MpActor* source = nullptr;
+  MpActor* requester = nullptr;
+  MpActor* owner = nullptr;
+  NiPoint3 position, angle;
+  std::vector<Read> reads;
+  std::vector<Event> events;
+  std::vector<std::shared_ptr<MpForm>> targets;
+  std::set<MpObjectReference*> emitters, listeners;
+  std::map<MpObjectReference*, bool> oldOccupancy;
+  std::set<MpObjectReference*> oldInside;
+  std::unique_ptr<std::map<MpObjectReference*, bool>> occupancy;
+  std::unique_ptr<std::set<MpObjectReference*>> inside;
+  std::string baseline;
+  std::function<bool()> authority;
+  bool published = false;
+};
+
+CampaignMovementPlan::CampaignMovementPlan(std::unique_ptr<Impl> impl)
+  : pImpl(std::move(impl))
+{
+}
+
+CampaignMovementPlan::~CampaignMovementPlan() = default;
+
+const std::vector<CampaignMovementPlan::Event>&
+CampaignMovementPlan::GetEvents() const
+{
+  return pImpl->events;
+}
+
+MpActor& CampaignMovementPlan::GetSource() const
+{
+  return *pImpl->source;
+}
+const NiPoint3& CampaignMovementPlan::GetPosition() const
+{
+  return pImpl->position;
+}
+const NiPoint3& CampaignMovementPlan::GetAngle() const
+{
+  return pImpl->angle;
+}
+const std::string& CampaignMovementPlan::GetBaselineDump() const
+{
+  return pImpl->baseline;
+}
+
+void CampaignMovementPlan::Validate(MpActor& requester) const
+{
+  if (pImpl->published || &requester != pImpl->requester ||
+      requester.GetParent() != pImpl->world)
+    throw std::runtime_error("Campaign movement plan context changed");
+  if (pImpl->authority && !pImpl->authority())
+    throw std::runtime_error("Campaign movement packet authority changed");
+  for (const auto& read : pImpl->reads) {
+    auto* reference = read.lifetime->AsObjectReference();
+    if (!reference ||
+        pImpl->world->LookupFormByIdNoLoad(reference->GetFormId()) !=
+          read.lifetime ||
+        reference->GetWorldInstanceEpoch() != read.epoch ||
+        MpChangeForm::ToJson(reference->GetChangeForm()) != read.snapshot)
+      throw std::runtime_error("Campaign movement participant changed");
+  }
+  // This read-only preparation also rechecks bindings, initialized targets,
+  // exact primitive geometry, the persistent baseline and the complete roster.
+  const auto current = pImpl->source->PrepareCampaignMovement(
+    requester, pImpl->position, pImpl->angle);
+  if (current->pImpl->owner != pImpl->owner ||
+      current->pImpl->baseline != pImpl->baseline ||
+      current->pImpl->emitters != pImpl->emitters ||
+      current->pImpl->listeners != pImpl->listeners ||
+      current->pImpl->oldOccupancy != pImpl->oldOccupancy ||
+      current->pImpl->oldInside != pImpl->oldInside ||
+      current->pImpl->targets != pImpl->targets)
+    throw std::runtime_error("Campaign movement roster or geometry changed");
+}
+
+void CampaignMovementPlan::SetAuthorityValidator(
+  std::function<bool()> validator)
+{
+  if (pImpl->published || pImpl->authority || !validator)
+    throw std::runtime_error("Campaign movement authority is already fixed");
+  pImpl->authority = std::move(validator);
+}
+
+void CampaignMovementPlan::Publish(
+  std::shared_ptr<const SaveReceipt> receipt) noexcept
+{
+  auto& source = static_cast<MpObjectReference&>(*pImpl->source);
+  source.CommitPreparedMovementTransform(pImpl->position, pImpl->angle);
+  source.emittersWithPrimitives.swap(pImpl->occupancy);
+  source.primitivesWeAreInside.swap(pImpl->inside);
+  source.pImpl->campaignMovementEnrolled = true;
+  source.pImpl->movementReceipt = receipt;
+  for (const auto& target : pImpl->targets) {
+    auto* reference = target->AsObjectReference();
+    reference->pImpl->campaignMovementEnrolled = true;
+    reference->pImpl->movementReceipt = receipt;
+  }
+  pImpl->published = true;
+}
+
+bool MpObjectReference::UsesCampaignMovement() const
+{
+  if (IsCampaignMovementEnrolled())
+    return true;
+  if (AsActor() && emittersWithPrimitives)
+    for (const auto& [emitter, inside] : *emittersWithPrimitives)
+      if (emitter->GetDynamicFields().GetValueDump(
+            CampaignReferenceBinding::kProperty) != "null")
+        return true;
+  return false;
+}
+
+bool MpObjectReference::IsCampaignMovementEnrolled() const
+{
+  if (pImpl->campaignMovementEnrolled ||
+      GetDynamicFields().GetValueDump(CampaignMovementPlan::kProperty) !=
+        "null")
+    return true;
+  // During passive restoration the source may load before or after its target.
+  // Persistent source ownership protects reconstructed target geometry too.
+  if (pImpl->primitive && listeners)
+    for (const auto* listener : *listeners)
+      if (listener->GetDynamicFields().GetValueDump(
+            CampaignMovementPlan::kProperty) != "null")
+        return true;
+  return false;
+}
+
+bool MpObjectReference::HasPendingCampaignMovement() const
+{
+  return pImpl->movementReceipt &&
+    pImpl->movementReceipt->GetState() != SaveReceipt::State::Durable;
+}
+
+void MpObjectReference::RequireCampaignSpatialMutation() const
+{
+  auto* world = GetParent();
+  if (pImpl->destroying ||
+      (world && (world->IsRestoring() || world->IsClearing())))
+    return;
+  if (IsCampaignMovementEnrolled() || HasPendingCampaignMovement())
+    throw std::runtime_error(
+      "Campaign movement requires an atomic spatial transition");
+}
+
+std::shared_ptr<CampaignMovementPlan>
+MpObjectReference::PrepareCampaignMovement(MpActor& requester,
+                                           const NiPoint3& position,
+                                           const NiPoint3& angle)
+{
+  using Json = nlohmann::json;
+  constexpr size_t maxPrimitives = 64, maxBaselineBytes = 1024 * 1024;
+  constexpr uint64_t maxSequence = 9007199254740991ULL;
+  auto* world = GetParent();
+  auto* source = AsActor();
+  if (!world || !source || world->IsRestoring() || world->IsClearing() ||
+      requester.GetParent() != world || IsDeleted() || IsDisabled() ||
+      requester.IsDeleted() || requester.IsDisabled() ||
+      !SharesWorldInstance(requester) || HasPendingCampaignMovement() ||
+      HasPendingSubscriptions())
+    throw std::runtime_error("Campaign movement source is unavailable");
+  const auto finite = [](const NiPoint3& value) {
+    return std::isfinite(value.x) && std::isfinite(value.y) &&
+      std::isfinite(value.z);
+  };
+  const auto gridSafe = [&](const NiPoint3& value) {
+    return finite(value) && std::abs(value.x / 4096) < 32767 &&
+      std::abs(value.y / 4096) < 32767;
+  };
+  if (!gridSafe(GetPos()) || !gridSafe(position) || !finite(GetAngle()) ||
+      !finite(angle) || GetGridPos(GetPos()) != GetGridPos(position) ||
+      !everSubscribedOrListened || !emitters || !listeners || HasPrimitive())
+    throw std::runtime_error(
+      "Campaign movement requires a stable grid roster");
+  auto& owner = QuestJournal::Owner(requester);
+  if (&owner != &QuestJournal::Owner(*source))
+    throw std::runtime_error("Campaign movement belongs to another owner");
+  if (source != &requester) {
+    const auto host = world->hosters.find(GetFormId());
+    if (GetBaseId() == 7 || GetChangeForm().profileId >= 0 ||
+        host == world->hosters.end() || host->second != requester.GetFormId())
+      throw std::runtime_error("Campaign movement source is not hosted");
+  }
+  auto prepared = std::make_unique<CampaignMovementPlan::Impl>();
+  prepared->world = world;
+  prepared->source = source;
+  prepared->requester = &requester;
+  prepared->owner = &owner;
+  prepared->position = position;
+  prepared->angle = angle;
+  prepared->emitters = *emitters;
+  prepared->listeners = *listeners;
+  if (emittersWithPrimitives)
+    prepared->oldOccupancy = *emittersWithPrimitives;
+  if (primitivesWeAreInside)
+    prepared->oldInside = *primitivesWeAreInside;
+  prepared->occupancy = std::make_unique<std::map<MpObjectReference*, bool>>();
+  prepared->inside = std::make_unique<std::set<MpObjectReference*>>();
+  const auto read = [&](MpObjectReference& reference) {
+    const auto lifetime = world->LookupFormByIdNoLoad(reference.GetFormId());
+    if (lifetime.get() != &reference || reference.GetParent() != world)
+      throw std::runtime_error("Unregistered campaign movement participant");
+    prepared->reads.push_back(
+      { lifetime, reference.GetWorldInstanceEpoch(),
+        MpChangeForm::ToJson(reference.GetChangeForm()) });
+  };
+  read(*source);
+  read(requester);
+  read(owner);
+  const auto point = [](const NiPoint3& value) {
+    return Json::array({ value.x, value.y, value.z });
+  };
+  struct Target
+  {
+    std::string identity;
+    std::shared_ptr<MpForm> lifetime;
+    Json saved;
+    bool before, after;
+  };
+  std::vector<Target> targets;
+  if (emittersWithPrimitives && emittersWithPrimitives->size() > maxPrimitives)
+    throw std::runtime_error("Campaign movement primitive limit exceeded");
+  if (emittersWithPrimitives)
+    for (const auto& [emitter, oldInside] : *emittersWithPrimitives) {
+      if (!emitter || !emitter->pImpl->primitive || emitter->IsDisabled() ||
+          emitter->IsDeleted() || !SharesWorldInstance(*emitter) ||
+          emitter->GetCellOrWorld() != GetCellOrWorld() ||
+          emitter->HasPendingCampaignMovement() ||
+          emitter->HasPendingSubscriptions() || !emitters->count(emitter) ||
+          !emitter->GetListeners().count(this))
+        throw std::runtime_error("Campaign movement primitive roster changed");
+      const auto& bounds = emitter->pImpl->primitive->boundsDiv2;
+      if (!finite(emitter->GetPos()) || !finite(emitter->GetAngle()) ||
+          !finite(bounds) || bounds.x <= 0 || bounds.y <= 0 || bounds.z <= 0 ||
+          emitter->GetAngle().x != 0 || emitter->GetAngle().y != 0)
+        throw std::runtime_error("Invalid campaign primitive geometry");
+      const auto vertices =
+        Primitive::GetVertices(emitter->GetPos(), emitter->GetAngle(), bounds);
+      const auto cached =
+        emitter->pImpl->primitive->polygonProc.GetPolygon().GetV();
+      if (vertices.size() != cached.size())
+        throw std::runtime_error("Campaign primitive geometry is stale");
+      for (size_t index = 0; index < vertices.size(); ++index)
+        if (!finite(vertices[index]) || vertices[index].x != cached[index].x ||
+            vertices[index].y != cached[index].y ||
+            vertices[index].z != cached[index].z)
+          throw std::runtime_error("Campaign primitive geometry is stale");
+      const auto captured = QuestScriptRuntime::CaptureInteraction(
+        requester, *emitter, "OnTrigger", *source);
+      read(*emitter);
+      const bool before = emitter->IsPointInsidePrimitive(GetPos());
+      const bool after = emitter->IsPointInsidePrimitive(position);
+      targets.push_back({ captured.target,
+                          world->LookupFormByIdNoLoad(emitter->GetFormId()),
+                          { { "target", captured.target },
+                            { "reference", captured.targetReference },
+                            { "templates", captured.targetTemplates },
+                            { "position", point(emitter->GetPos()) },
+                            { "angle", point(emitter->GetAngle()) },
+                            { "bounds", point(bounds) },
+                            { "inside", before } },
+                          before,
+                          after });
+    }
+  std::sort(targets.begin(), targets.end(),
+            [](const auto& left, const auto& right) {
+              return left.identity < right.identity;
+            });
+  Json roster = Json::array();
+  std::string previous;
+  for (const auto& target : targets) {
+    if (target.identity == previous)
+      throw std::runtime_error("Duplicate campaign movement primitive");
+    previous = target.identity;
+    roster.push_back(target.saved);
+  }
+  const auto& savedDump =
+    GetDynamicFields().GetValueDump(CampaignMovementPlan::kProperty);
+  uint64_t sequence = 0;
+  Json saved;
+  if (savedDump != "null") {
+    if (savedDump.size() > maxBaselineBytes)
+      throw std::runtime_error("Campaign movement baseline is too large");
+    saved = Json::parse(savedDump);
+    if (!saved.is_object() || !saved.at("sequence").is_number_integer() ||
+        (!saved.at("sequence").is_number_unsigned() &&
+         saved.at("sequence").get<int64_t>() < 1) ||
+        !saved.at("schemaVersion").is_number_integer())
+      throw std::runtime_error("Malformed campaign movement baseline");
+    sequence = saved.at("sequence").get<uint64_t>();
+    if (!sequence || sequence >= maxSequence)
+      throw std::runtime_error("Campaign movement sequence exhausted");
+  }
+  Json baseline = { { "schemaVersion", 1 },
+                    { "source", GetChangeForm().formDesc.ToString() },
+                    { "owner", owner.GetChangeForm().formDesc.ToString() },
+                    { "campaignIdentity",
+                      CampaignReferenceBinding::GetIdentity(owner) },
+                    { "instance", GetWorldInstance() },
+                    { "cell", GetCellOrWorld().ToString() },
+                    { "position", point(GetPos()) },
+                    { "angle", point(GetAngle()) },
+                    { "sequence", sequence },
+                    { "primitives", roster } };
+  if (savedDump != "null" && saved != baseline)
+    throw std::runtime_error("Saved campaign movement baseline changed");
+  for (size_t index = 0; index < targets.size(); ++index) {
+    const auto& target = targets[index];
+    auto* reference = target.lifetime->AsObjectReference();
+    prepared->targets.push_back(target.lifetime);
+    prepared->occupancy->emplace(reference, target.after);
+    if (target.after)
+      prepared->inside->insert(reference);
+    if (target.before != target.after)
+      prepared->events.push_back(
+        { target.lifetime,
+          target.after ? "OnTriggerEnter" : "OnTriggerLeave" });
+    baseline["primitives"][index]["inside"] = target.after;
+  }
+  for (const auto& target : targets)
+    if (target.after)
+      prepared->events.push_back({ target.lifetime, "OnTrigger" });
+  if (prepared->events.size() > QuestJobState::MaxBatchOccurrences)
+    throw std::runtime_error("Campaign movement occurrence limit exceeded");
+  baseline["position"] = point(position);
+  baseline["angle"] = point(angle);
+  baseline["sequence"] = sequence + 1;
+  prepared->baseline = baseline.dump();
+  if (prepared->baseline.size() > maxBaselineBytes)
+    throw std::runtime_error("Campaign movement baseline is too large");
+  return std::shared_ptr<CampaignMovementPlan>(
+    new CampaignMovementPlan(std::move(prepared)));
+}
 
 namespace {
 ChangeFormGuard::Mode MakeMode(bool isLocationSaveNeeded,
@@ -467,6 +831,18 @@ void MpObjectReference::Activate(MpObjectReference& activationSource,
   if (auto worldState = activationSource.GetParent(); worldState->HasEspm()) {
     CheckInteractionAbility(activationSource);
 
+    // A teleport door must refuse unsupported movement before the activation
+    // callback or default processing can change either participant.
+    if (!isSecondActivation && (!activationBlocked || defaultProcessingOnly)) {
+      const auto& browser = worldState->GetEspm().GetBrowser();
+      const auto base = browser.LookupById(GetBaseId());
+      const auto* record =
+        espm::Convert<espm::REFR>(browser.LookupById(GetFormId()).rec);
+      if (base.rec && base.rec->GetType() == espm::DOOR::kType && record &&
+          record->GetData(worldState->GetEspmCache()).teleport)
+        RequirePositionMutation(activationSource);
+    }
+
     // Pillars puzzle Bleak Falls Barrow
     bool workaroundBypassParentsCheck = &activationSource == this;
 
@@ -526,6 +902,7 @@ void MpObjectReference::Disable()
     return;
   }
 
+  RequireCampaignSpatialMutation();
   EditChangeForm(
     [&](MpChangeFormREFR& changeForm) { changeForm.isDisabled = true; });
 
@@ -540,6 +917,7 @@ void MpObjectReference::Enable()
     return;
   }
 
+  RequireCampaignSpatialMutation();
   EditChangeForm(
     [&](MpChangeFormREFR& changeForm) { changeForm.isDisabled = false; });
 
@@ -550,6 +928,7 @@ void MpObjectReference::Enable()
 
 void MpObjectReference::ValidateCampaignVisibilityChange() const
 {
+  RequireCampaignSpatialMutation();
   if (occupant)
     throw std::runtime_error(
       "Occupied references require transactional occupancy changes");
@@ -567,6 +946,7 @@ void MpObjectReference::ReconcileCampaignVisibility()
 
 void MpObjectReference::SetPos(const NiPoint3& newPos, SetPosMode setPosMode)
 {
+  RequirePositionMutation(*this);
   auto* world = GetParent();
   const auto lifetime =
     world ? world->LookupFormByIdNoLoad(GetFormId()) : nullptr;
@@ -636,7 +1016,8 @@ void MpObjectReference::SetPos(const NiPoint3& newPos, SetPosMode setPosMode)
                   emitter != emitterLifetime || !emitterRefr ||
                   GetWorldInstanceEpoch() != sourceEpoch ||
                   emitterRefr->GetWorldInstanceEpoch() != emitterEpoch ||
-                  !SharesWorldInstance(*emitterRefr)) {
+                  !SharesWorldInstance(*emitterRefr) ||
+                  UsesCampaignMovement()) {
                 return;
               }
               emitterRefr->SendPapyrusEvent(
@@ -673,6 +1054,7 @@ void MpObjectReference::SetPos(const NiPoint3& newPos, SetPosMode setPosMode)
 void MpObjectReference::SetAngle(const NiPoint3& newAngle,
                                  SetAngleMode setAngleMode)
 {
+  RequireCampaignSpatialMutation();
   EditChangeForm(
     [&](MpChangeFormREFR& changeForm) { changeForm.angle = newAngle; },
     MakeMode(IsLocationSavingNeeded(), setAngleMode));
@@ -759,6 +1141,7 @@ void MpObjectReference::SetWorldInstance(const std::string& instance)
   if (instance == GetWorldInstance()) {
     return;
   }
+  RequireCampaignSpatialMutation();
   ++worldInstanceEpoch;
   EditChangeForm([&](MpChangeForm& form) { form.worldInstance = instance; });
   if (auto world = GetParent()) {
@@ -788,6 +1171,7 @@ void MpObjectReference::SetActivationBlocked(bool blocked)
 
 void MpObjectReference::ForceSubscriptionsUpdate()
 {
+  RequireCampaignSpatialMutation();
   auto worldState = GetParent();
   if (!worldState || IsDisabled() || IsDeleted()) {
     return;
@@ -915,6 +1299,11 @@ void MpObjectReference::RestorePrimitiveOccupancy()
   if (!primitivesWeAreInside)
     primitivesWeAreInside.reset(new std::set<MpObjectReference*>);
   for (auto& [emitter, inside] : *emittersWithPrimitives) {
+    if (GetDynamicFields().GetValueDump(CampaignMovementPlan::kProperty) !=
+        "null") {
+      pImpl->campaignMovementEnrolled = true;
+      emitter->pImpl->campaignMovementEnrolled = true;
+    }
     inside = !IsDisabled() && !IsDeleted() && !emitter->IsDisabled() &&
       !emitter->IsDeleted() && SharesWorldInstance(*emitter) &&
       emitter->IsPointInsidePrimitive(GetPos());
@@ -927,6 +1316,7 @@ void MpObjectReference::RestorePrimitiveOccupancy()
 
 void MpObjectReference::SetPrimitive(const NiPoint3& boundsDiv2)
 {
+  RequireCampaignSpatialMutation();
   auto vertices = Primitive::GetVertices(GetPos(), GetAngle(), boundsDiv2);
   pImpl->primitive =
     PrimitiveData{ boundsDiv2, Primitive::CreateGeoPolygonProc(vertices) };
@@ -950,6 +1340,9 @@ void MpObjectReference::SetPropertyValueDump(const std::string& propertyName,
                                              bool isVisibleByOwner,
                                              bool isVisibleByNeighbor)
 {
+  if (propertyName == CampaignMovementPlan::kProperty)
+    throw std::runtime_error(
+      "Campaign movement baseline requires atomic publication");
   auto msg = CreatePropertyMessage_(this, propertyName.c_str(), valueDump);
   EditChangeForm([&](MpChangeFormREFR& changeForm) {
     changeForm.dynamicFields.SetValueDump(propertyName, valueDump);
@@ -972,6 +1365,7 @@ void MpObjectReference::SetTeleportFlag(bool value)
 void MpObjectReference::SetPosAndAngleSilent(const NiPoint3& pos,
                                              const NiPoint3& rot)
 {
+  RequirePositionMutation(*this);
   EditChangeForm(
     [&](MpChangeFormREFR& changeForm) {
       changeForm.position = pos;
@@ -982,6 +1376,7 @@ void MpObjectReference::SetPosAndAngleSilent(const NiPoint3& pos,
 
 void MpObjectReference::Delete()
 {
+  RequireCampaignSpatialMutation();
   if (IsEspmForm()) {
     spdlog::warn("MpObjectReference::Delete {:x} - Attempt to delete non-FF "
                  "object, ignoring",
@@ -1213,6 +1608,10 @@ void MpObjectReference::Subscribe(MpObjectReference* emitter,
     return;
   const auto emitterEpoch = emitter->GetWorldInstanceEpoch();
   const auto listenerEpoch = listener->GetWorldInstanceEpoch();
+  if (!emitter->pImpl->destroying && !listener->pImpl->destroying) {
+    emitter->RequireCampaignSpatialMutation();
+    listener->RequireCampaignSpatialMutation();
+  }
   const bool restoring = world->IsRestoring();
   const bool hasPrimitive = emitter->HasPrimitive();
   emitter->InitListenersAndEmitters();
@@ -1317,6 +1716,10 @@ void MpObjectReference::Subscribe(MpObjectReference* emitter,
 void MpObjectReference::Unsubscribe(MpObjectReference* emitter,
                                     MpObjectReference* listener)
 {
+  if (!emitter->pImpl->destroying && !listener->pImpl->destroying) {
+    emitter->RequireCampaignSpatialMutation();
+    listener->RequireCampaignSpatialMutation();
+  }
   auto actorEmitter = emitter->AsActor();
   auto actorListener = listener->AsActor();
   bool bothNonActors = !actorEmitter && !actorListener;
@@ -1495,6 +1898,7 @@ void MpObjectReference::CommitPreparedCampaignChange(
 
 void MpObjectReference::ApplyChangeForm(const MpChangeForm& changeForm)
 {
+  RequireCampaignSpatialMutation();
   ANTIGO_CONTEXT_INIT(ctx);
   auto* world = GetParent();
   std::optional<WorldState::RestorationScope> restoration;
@@ -1602,6 +2006,7 @@ const DynamicFields& MpObjectReference::GetDynamicFields() const
 
 void MpObjectReference::SetCellOrWorldObsolete(const FormDesc& newWorldOrCell)
 {
+  RequireCampaignSpatialMutation();
   auto worldState = GetParent();
   if (!worldState) {
     return;
@@ -1820,6 +2225,7 @@ void MpObjectReference::ProcessActivateNormal(
     auto refrRecord = espm::Convert<espm::REFR>(lookupRes.rec);
     auto teleport = refrRecord->GetData(compressedFieldsCache).teleport;
     if (teleport) {
+      RequirePositionMutation(activationSource);
       if (!IsOpen()) {
         SetOpen(true);
         RequestReloot();
@@ -2049,6 +2455,7 @@ bool MpObjectReference::CheckIfObjectCanStartOccupyThis(
 
 void MpObjectReference::RemoveFromGridAndUnsubscribeAll()
 {
+  RequireCampaignSpatialMutation();
   auto* world = GetParent();
   const auto lifetime = world->LookupFormByIdNoLoad(GetFormId());
   auto worldOrCell = GetCellOrWorld().ToFormId(world->espmFiles);
@@ -2072,6 +2479,7 @@ void MpObjectReference::RemoveFromGridAndUnsubscribeAll()
 
 void MpObjectReference::UnsubscribeFromAll()
 {
+  RequireCampaignSpatialMutation();
   auto* world = GetParent();
   const auto lifetime = world->LookupFormByIdNoLoad(GetFormId());
   std::vector<std::shared_ptr<MpForm>> emittersCopy;
@@ -2425,6 +2833,7 @@ void MpObjectReference::SendMessageToActorListeners(const IMessageBase& msg,
 
 void MpObjectReference::BeforeDestroy()
 {
+  pImpl->destroying = true;
   if (this->occupant && this->occupantDestroySink) {
     this->occupant->RemoveEventSink(this->occupantDestroySink);
   }

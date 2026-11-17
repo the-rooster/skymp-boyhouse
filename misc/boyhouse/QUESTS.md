@@ -1032,9 +1032,9 @@ The larger live-root capacity is separate from the existing per-tick execution
 budget. It permits later events to wake more than twenty independently waiting
 handlers; it does not provide unlimited throughput or prove multiplayer latency.
 OnTrigger occurrences are explicit individual samples: this API neither invents
-native cadence nor coalesces level events. The production movement path still
-needs atomic physical transform/occupancy/event acceptance and receipt-gated
-packet publication. These backend changes do not certify any complete quest.
+native cadence nor coalesces level events. The stable-roster movement integration
+below connects this API to physical samples. These backend changes do not certify
+any complete quest.
 
 ## Production movement validation and publication
 
@@ -1046,7 +1046,7 @@ the existing correction only for the requesting player's own actor, without
 relaying the rejected movement to peers. The existing teleport flag still rejects
 and corrects one finite authorized packet; malformed floats do not consume it.
 
-Authorization and packet publication are separate operations. Movement applies
+Authorization and packet publication are separate operations. Ordinary movement applies
 SetPos, rechecks the captured actor/requester registrations, phase epochs,
 connection identity, packet epoch, authority and expected transform, and only then
 updates the remaining movement fields. A callback that invalidates that context
@@ -1064,11 +1064,77 @@ retain their existing authorize-then-forward ordering; their own action tails ar
 not made transactional by this helper change. Final-transform equality alone
 does not detect arbitrary same-phase move-away-and-back chronology.
 
-This fixes production packet ordering and callback safety. Position, primitive
-occupancy, captured trigger occurrences and persistence receipts still need one
-atomic physical acceptance boundary. The existing synchronous OnTrigger and
-subscription/load paths, native lifecycle eligibility, durable event production,
-and full quest/client/performance validation remain unfinished.
+Private campaign primitives use the separate durable path below. General
+subscription/load lifecycle, other event producers, and full quest/client/
+performance validation remain unfinished.
+
+### Durable movement through initialized private primitives
+
+The experimental packet path prepares a physical sample without calling SetPos.
+It admits the source pose, a bounded persistent primitive-membership baseline,
+and every resulting trigger occurrence in the same sealed save batch. Guest
+movement changes the host's quest journal and the guest's pose/baseline while
+preserving the guest's inventory and personal journal. Empty-event movement still
+saves its physical baseline without inventing a quest job or consuming an
+occurrence ID. A failed preparation or admission leaves the physical sample and
+all event identities unconsumed.
+
+Each accepted endpoint sample emits one Enter/Leave for every changed membership,
+then one OnTrigger for each containing primitive. Targets have stable canonical
+ordering; level events are neither merged nor silently dropped under pressure.
+The first sample derives prior membership from the old authoritative position;
+later samples require an exact match with the saved pose, campaign identity,
+primitive bindings/templates/geometry, and sorted roster. Baselines are limited
+to 64 primitives and 1 MiB, and a sample may produce at most 64 occurrences.
+
+Only packet publication waits for the exact receipt. Transient movement flags
+apply at admission, before newer animation actions can arrive. Deferred packets
+own their input bytes and recheck source/requester/owner lifetimes, authority,
+connection and packet epochs, and the accepted baseline before every send.
+Newer same-pose samples advance the baseline and suppress stale publication.
+Storage failures retry the same immutable batch. World ticks cannot reenter the
+save/publication/timer sequence. No handlers run before their admission receipt.
+
+This currently requires a stable, fully initialized and published roster in the
+same cell and grid bucket, with upright primitives and no pending subscriptions.
+Pending saves refuse new movement before consuming teleport flags. Enrolled
+participants refuse unsupported legacy spatial, primitive, visibility, and
+subscription changes before effects; ordinary disconnect/destruction remains
+available. Guest-hosted NPC movement is not supported by the interaction context
+yet. Recovery retains the baseline but refuses movement while restored
+subscriptions are pending: safe publication without replaying load events,
+cross-cell/grid movement, teleport/phase transitions, and general roster changes
+are still required. These restrictions are development gates, not the intended
+final gameplay. No complete quest or 16–32-player throughput is certified.
+
+Within one quest transaction, an immutable validated job-state snapshot avoids
+repeated full decoding by runtime guards. Public reads return owned copies;
+updates replace the JSON and snapshot together only after validation. External
+reads, final heap checks, and stale-context checks remain independent. The hidden
+QuestOccurrencePerformance benchmark compares warm batches of 1/16/64 with one
+sleeping root, and with that sleeper plus 32 unexecuted item roots. Its fixture
+manifest costs and controlled storage timings are not production latency proof.
+
+The first before/after run used identical benchmark source, three samples per
+cohort, a three-CPU/four-GiB container, and controlled in-memory storage. Median
+admission times were:
+
+| Existing live roots | New occurrences | Before (ms) | After (ms) |
+| ---: | ---: | ---: | ---: |
+| 1 | 1 | 6.78 | 5.47 |
+| 1 | 16 | 201.34 | 131.56 |
+| 1 | 64 | 2546.78 | 1624.80 |
+| 33 | 1 | 75.86 | 60.84 |
+| 33 | 16 | 808.62 | 554.33 |
+| 33 | 64 | 4950.55 | 3304.65 |
+
+This is still too slow for the community-server target. Repeated full-state
+serialization and validation during each admitted root remain. A specialized
+Journal-owned builder can assemble validated pristine roots and first recipient
+snapshots before one final serialization, while preserving independent old-state,
+heap, retirement and physical read checks. General SetJobState validation must
+remain strict. That builder, production movement measurements, and multi-campaign
+fairness/load tests are not implemented by this change.
 
 ## Verification commands
 
@@ -1318,3 +1384,25 @@ live roots no longer consume completed-result slots, and OnTrigger is now an
 allowed native occurrence. Invalid transition checks remain, and a new level-event
 test checks distinct effects and duplicate retry safety. The failed focused snapshot
 is retained as attempt-2; the final full run includes every affected case.
+
+The stable-roster campaign-movement changes passed the Linux build and complete
+verification on 2026-11-17 UTC: 867 native cases / 512,472 assertions,
+368 JavaScript tests, 47 Python tests, addon and both protocol
+smokes, and the existing SQLite recovery suite for 32 characters. The focused
+run passed 30 cases / 4,775 assertions. New physical
+movement tests use real PacketParser/ActionListener calls, generated binary PEX,
+owned primitive metadata, and controlled atomic storage. They cover multi-trigger
+single-save admission, guest isolation, immutable failed-save retries, owned
+deferred packet bytes, zero-event saves, preinitialization rejection, stale
+connection/lifetime publication and teleport rejection before effects.
+The SQLite smoke does not certify recovery of the new enrolled movement producer:
+restored subscription publication and spatial lifecycle transitions remain gated.
+The hidden occurrence benchmark passed on identical test source before and after
+the transaction snapshot change; the 18 samples per run include fixture manifest
+cost and do not certify production latency or 16–32-player throughput.
+No complete quest is certified. Skyrim, the installed client and staging were
+not launched, changed or deployed by this verification.
+Attempt-1 retains the initial base/derived pImpl compile error. Attempt-2 retains
+the successful first build/focused run (29 cases / 4,597 assertions) before the
+additional teleport guard. Attempt-3 retains a test compile error caused by calling
+a private helper; the regression now exercises the public teleporting Kill path.

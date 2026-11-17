@@ -16,6 +16,7 @@
 
 class ServerState;
 class WorldState;
+class CampaignMovementPlan;
 struct ActorValues;
 
 class ActionListener
@@ -38,6 +39,7 @@ public:
 
   virtual void OnUpdateMovement(const RawMessageData& rawMsgData,
                                 const UpdateMovementMessage& msg);
+  void TickCampaignMovements();
 
   virtual void OnUpdateAnimation(const RawMessageData& rawMsgData,
                                  const UpdateAnimationMessage& msg);
@@ -117,6 +119,23 @@ private:
   std::optional<ActorUpdateContext> AuthorizeActorUpdate(
     uint32_t idx, Networking::UserId userId);
   bool IsActorUpdateCurrent(const ActorUpdateContext& context) const;
+  struct PendingMovement
+  {
+    ActorUpdateContext context;
+    std::shared_ptr<CampaignMovementPlan> plan;
+    std::shared_ptr<const SaveReceipt> receipt;
+    std::shared_ptr<MpForm> owner;
+    uint64_t ownerEpoch = 0;
+    std::string campaignIdentity;
+    FormDesc cell;
+    bool verifiedEpoch = false;
+    UpdateMovementMessage message;
+    std::vector<uint8_t> bytes;
+  };
+  bool IsPendingMovementCurrent(const PendingMovement&) const;
+  void AdmitCampaignMovement(const ActorUpdateContext&, const RawMessageData&,
+                             const UpdateMovementMessage&);
+  void ApplyMovementFlags(MpActor&, const UpdateMovementMessage&);
   MpActor* PublishToNeighbours(const ActorUpdateContext& context,
                                Networking::PacketData data, size_t length,
                                bool reliable,
@@ -135,6 +154,7 @@ private:
   // Only active accepted calls are tracked. A nested accepted packet replaces
   // its caller's token; finishing it must never revive the stale caller.
   std::map<MpActor*, std::shared_ptr<const uint8_t>> activeMovements;
+  std::map<MpActor*, std::shared_ptr<PendingMovement>> pendingMovements;
 
   // TODO: inverse dependency
   std::shared_ptr<CraftService> craftService;

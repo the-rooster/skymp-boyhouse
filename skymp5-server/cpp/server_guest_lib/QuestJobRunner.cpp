@@ -1,4 +1,5 @@
 #include "QuestJobRunner.h"
+#include "CampaignMovement.h"
 #include "CampaignReferenceBinding.h"
 #include "MpActor.h"
 #include "QuestJobContent.h"
@@ -363,12 +364,78 @@ QuestJobRunner::AdmissionBatchResult QuestJobRunner::AdmitOccurrences(
                                      hashManifest, true, automatic);
 }
 
+QuestJobRunner::AdmissionBatchResult QuestJobRunner::AdmitMovement(
+  MpActor& requester, const std::shared_ptr<CampaignMovementPlan>& plan)
+{
+  const auto movement = plan;
+  const auto captured = CaptureMovement(requester, movement);
+  if (captured.empty())
+    return AdmitOccurrencesWithContent(requester, captured, {}, {}, {}, false,
+                                       true, movement);
+  const auto& pinned = Scripts();
+  return AdmitOccurrencesWithContent(requester, captured, pinned, {}, manifest,
+                                     false, true, movement);
+}
+
+QuestJobRunner::AdmissionBatchResult QuestJobRunner::AdmitMovement(
+  MpActor& requester, const std::shared_ptr<CampaignMovementPlan>& plan,
+  const MetadataOverrides& overrides,
+  const std::vector<PexScript::Lazy>& sources, bool automatic)
+{
+  const auto movement = plan;
+  const auto captured = CaptureMovement(requester, movement);
+  if (captured.empty())
+    return AdmitOccurrencesWithContent(requester, captured, {}, {}, {}, true,
+                                       automatic, movement);
+  const auto hashManifest = QuestJobContent::WithMetadataOverrides(
+    world, QuestJobContent::ScriptManifest(sources), overrides);
+  return AdmitOccurrencesWithContent(requester, captured, sources, overrides,
+                                     hashManifest, true, automatic, movement);
+}
+
+std::vector<QuestJobRunner::CapturedOccurrence>
+QuestJobRunner::CaptureMovement(
+  MpActor& requester, const std::shared_ptr<CampaignMovementPlan>& movement)
+{
+  if (!movement)
+    throw std::invalid_argument("Missing campaign movement plan");
+  movement->Validate(requester);
+  RequireReady(requester);
+  const auto& events = movement->GetEvents();
+  if (events.size() > QuestJobState::MaxBatchOccurrences)
+    throw std::runtime_error("Movement occurrence batch limit exceeded");
+  std::vector<CapturedOccurrence> captured;
+  if (!events.empty()) {
+    auto id = NextOccurrence(requester);
+    const auto jobs = QuestJournal::JobState(requester);
+    if (events.size() > QuestJobState::MaxLive - jobs.live.size() ||
+        events.size() > MaxIdentity - jobs.nextJob ||
+        events.size() > MaxIdentity - id.sequence)
+      throw std::runtime_error("Campaign has no movement occurrence capacity");
+    captured.reserve(events.size());
+    for (const auto& event : events) {
+      auto* target =
+        event.target ? event.target->AsObjectReference() : nullptr;
+      if (!target)
+        throw std::runtime_error("Movement occurrence lost its target");
+      captured.push_back(CaptureOccurrence(requester, id, *target, event.name,
+                                           movement->GetSource()));
+      ++id.sequence;
+    }
+  }
+  movement->Validate(requester);
+  if (PrepareOccurrences(requester, captured))
+    throw std::runtime_error("Movement requires a fresh occurrence admission");
+  return captured;
+}
+
 QuestJobRunner::AdmissionBatchResult
 QuestJobRunner::AdmitOccurrencesWithContent(
   MpActor& actor, const std::vector<CapturedOccurrence>& occurrences,
   const std::vector<PexScript::Lazy>& sources,
   const MetadataOverrides& overrides, const std::string& hashManifest,
-  bool fixtureAwait, bool automatic)
+  bool fixtureAwait, bool automatic,
+  std::shared_ptr<CampaignMovementPlan> movement)
 {
   if (automatic && fixtureAwait && !occurrences.empty()) {
     if (!schedulerFixture ||
@@ -384,8 +451,19 @@ QuestJobRunner::AdmitOccurrencesWithContent(
     : QuestJobContent::Environment(world, hashManifest);
   // Script loaders may invoke host callbacks. Revalidate after every loader
   // and content calculation, before preallocating scheduler/admission state.
-  if (const auto existing = PrepareOccurrences(actor, occurrences))
+  if (movement) {
+    movement->Validate(actor);
+    RequireReady(actor);
+    const auto current = QuestJournal::JobState(actor);
+    if (!occurrences.empty() &&
+        occurrences.front().id.sequence != current.ingress.next)
+      throw std::runtime_error("Movement occurrence identity was consumed");
+  }
+  if (const auto existing = PrepareOccurrences(actor, occurrences)) {
+    if (movement)
+      throw std::runtime_error("Movement cannot reuse an occurrence receipt");
     return *existing;
+  }
   auto& owner = QuestJournal::Owner(actor);
   auto jobs = QuestJournal::JobState(actor);
   if (!occurrences.empty())
@@ -455,7 +533,11 @@ QuestJobRunner::AdmitOccurrencesWithContent(
       barrier.admittingGeneration = jobs.generation;
     }
     result.receipt = QuestJournal::AtomicJobAdmissions(
-      actor, ids, [] {},
+      actor, ids,
+      [&] {
+        if (movement)
+          QuestJournal::StageMovement(actor, movement);
+      },
       [&](uint64_t id) {
         auto retired = jobs.RetireForAdmission();
         retiredIds.insert(retiredIds.end(), retired.begin(), retired.end());

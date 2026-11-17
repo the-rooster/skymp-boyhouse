@@ -11,6 +11,7 @@ class MpActor;
 class MpForm;
 class MpObjectReference;
 class WorldState;
+class CampaignMovementPlan;
 
 // Trusted host coordinator. Waiting requests and completed results are only
 // observable after their exact segment has committed to storage. No client
@@ -98,7 +99,7 @@ public:
   // Prospective only: does not reserve, publish or acknowledge an admission.
   RequestId NextRequest(MpActor& actor);
   // Prospective capture only. Neither call reserves or consumes a sequence.
-  // Native movement/subscription routing does not call this trusted bridge.
+  // Movement uses this capture contract through AdmitMovement below.
   OccurrenceId NextOccurrence(MpActor& actor);
   CapturedOccurrence CaptureOccurrence(MpActor& actor, const OccurrenceId& id,
                                        MpObjectReference& target,
@@ -119,6 +120,15 @@ public:
     MpActor& actor, const std::vector<CapturedOccurrence>& occurrences);
   AdmissionBatchResult AdmitOccurrences(
     MpActor& actor, const std::vector<CapturedOccurrence>& occurrences,
+    const MetadataOverrides& overrides,
+    const std::vector<PexScript::Lazy>& scripts, bool automatic = false);
+  // Atomically save the physical sample and all of its fresh occurrences.
+  // Movement never resolves through an old-batch query: every successful
+  // return carries this sample's exact nonnull receipt, even with no events.
+  AdmissionBatchResult AdmitMovement(
+    MpActor& requester, const std::shared_ptr<CampaignMovementPlan>& plan);
+  AdmissionBatchResult AdmitMovement(
+    MpActor& requester, const std::shared_ptr<CampaignMovementPlan>& plan,
     const MetadataOverrides& overrides,
     const std::vector<PexScript::Lazy>& scripts, bool automatic = false);
   // Admission durability is independent of subsequent handler status. A
@@ -228,10 +238,13 @@ private:
                                     const QuestJobState&);
   std::optional<AdmissionBatchResult> PrepareOccurrences(
     MpActor&, const std::vector<CapturedOccurrence>&);
+  std::vector<CapturedOccurrence> CaptureMovement(
+    MpActor&, const std::shared_ptr<CampaignMovementPlan>&);
   AdmissionBatchResult AdmitOccurrencesWithContent(
     MpActor&, const std::vector<CapturedOccurrence>&,
     const std::vector<PexScript::Lazy>&, const MetadataOverrides&,
-    const std::string&, bool fixtureAwait, bool automatic);
+    const std::string&, bool fixtureAwait, bool automatic,
+    std::shared_ptr<CampaignMovementPlan> movement = {});
   std::optional<Result> Retired(MpActor&, const Request&,
                                 const QuestJobState&);
   std::optional<Result> Retired(MpActor&, const Request&);

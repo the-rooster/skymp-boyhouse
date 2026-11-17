@@ -1,4 +1,5 @@
 #include "WorldState.h"
+#include "CampaignMovement.h"
 #include "CampaignReferenceBinding.h"
 #include "EvaluateTemplate.h"
 #include "FormCallbacks.h"
@@ -61,7 +62,7 @@ struct WorldState::Impl
   std::list<std::shared_ptr<SaveBatch>> sealedSaves;
   size_t queuedReceiptBytes = 0;
   uint64_t nextSaveSequence = 0;
-  bool saveTickActive = false, clearing = false;
+  bool saveTickActive = false, clearing = false, tickActive = false;
   static constexpr size_t maxSaveBatches = 256;
   static constexpr size_t maxReceiptBytes = 128 * 1024 * 1024;
 
@@ -117,6 +118,11 @@ WorldState::RestorationScope::~RestorationScope() noexcept
 bool WorldState::IsRestoring() const noexcept
 {
   return pImpl->restorationDepth != 0;
+}
+
+bool WorldState::IsClearing() const noexcept
+{
+  return pImpl->clearing;
 }
 
 void WorldState::Clear()
@@ -317,12 +323,25 @@ void WorldState::AddForm(std::unique_ptr<MpForm> form, uint32_t formId,
   }
 }
 
-void WorldState::Tick()
+void WorldState::Tick(const std::function<void()>& afterSave)
 {
-  if (IsRestoring())
+  if (IsRestoring() || pImpl->tickActive || pImpl->clearing)
     return;
+  struct TickGuard
+  {
+    bool& active;
+    explicit TickGuard(bool& value)
+      : active(value)
+    {
+      active = true;
+    }
+    ~TickGuard() { active = false; }
+  } guard(pImpl->tickActive);
   const auto now = std::chrono::system_clock::now();
   TickSaveStorage(now);
+  if (afterSave && !IsRestoring() && !pImpl->saveTickActive &&
+      !pImpl->clearing)
+    afterSave();
   TickTimers(now);
   if (pImpl->questJobs && !IsRestoring() && !pImpl->saveTickActive &&
       !pImpl->clearing)
@@ -571,7 +590,8 @@ std::shared_ptr<const SaveReceipt> WorldState::CommitCampaignInventory(
   const std::vector<CampaignInventoryChange>& changes,
   const std::vector<CampaignVisibilityChange>& visibility,
   const std::vector<CampaignFactionChange>& factions,
-  const std::function<void()>& validateReads, bool durable)
+  const std::function<void()>& validateReads, bool durable,
+  const std::shared_ptr<CampaignMovementPlan>& movement)
 {
   if (durable)
     RequireDurableSaveStorage();
@@ -612,6 +632,19 @@ std::shared_ptr<const SaveReceipt> WorldState::CommitCampaignInventory(
   auto& ownerChange = prepare(owner);
   ownerChange.live.dynamicFields.SetValueDump(QuestJournal::kProperty,
                                               journal);
+  if (movement) {
+    if (!durable || !changes.empty() || !visibility.empty() ||
+        !factions.empty())
+      throw std::runtime_error(
+        "Movement requires an isolated durable admission");
+    // The requester may be visiting this owner's campaign or hosting an NPC.
+    // This lane changes only the source pose and its producer baseline.
+    auto& source = prepare(movement->GetSource());
+    source.live.position = movement->GetPosition();
+    source.live.angle = movement->GetAngle();
+    source.live.dynamicFields.SetValueDump(CampaignMovementPlan::kProperty,
+                                           movement->GetBaselineDump());
+  }
   std::set<uint32_t> unique;
   for (const auto& change : changes) {
     if (!change.reference ||
@@ -781,6 +814,8 @@ std::shared_ptr<const SaveReceipt> WorldState::CommitCampaignInventory(
     if (entry.factionsChanged)
       entry.reference->AsActor()->factionsLoaded = true;
   }
+  if (movement)
+    movement->Publish(receipt);
   if (nextGrids) {
     grids.swap(*nextGrids);
     hosters.swap(*nextHosters);

@@ -318,3 +318,164 @@ TEST_CASE("Admission preserves sleeping roots and their shared heap",
   REQUIRE(saved.live.at(2) == before.at(2));
   REQUIRE(QuestJournal::ScriptState(*f.actor) == heap);
 }
+
+TEST_CASE("Transaction job snapshots publish only successful owned updates",
+          "[Quest][QuestJob][QuestTransactionSnapshot]")
+{
+  Fixture f;
+  const auto initial = TwoJobs();
+  auto heap = Heap(initial);
+  f.Seed(initial, heap);
+  f.Commit(2, [&] {
+    auto detached = QuestJournal::JobState(*f.actor);
+    detached.live.erase(1);
+    REQUIRE(QuestJournal::PersonalJobState(*f.actor).live == initial.live);
+    REQUIRE_NOTHROW(QuestJournal::RequireJobExecution(*f.actor, 2));
+
+    auto rejected = initial;
+    ++rejected.live.at(1).instructions;
+    REQUIRE_NOTHROW(rejected.Save());
+    REQUIRE_THROWS(QuestJournal::SetJobState(*f.actor, rejected));
+    REQUIRE(QuestJournal::JobState(*f.actor).Save() == initial.Save());
+
+    auto completed = initial;
+    Complete(completed, heap, 2);
+    QuestJournal::SetJobState(*f.actor, completed);
+    REQUIRE_FALSE(QuestJournal::JobState(*f.actor).FindLive(2));
+    REQUIRE(QuestJournal::PersonalJobState(*f.actor).FindCompleted(2));
+    REQUIRE_THROWS(QuestJournal::RequireJobExecution(*f.actor, 2));
+    REQUIRE_NOTHROW(QuestJournal::RequireJobAccess(*f.actor));
+    // Caller mutation after publication cannot change either the saved JSON
+    // or the transaction's selected-root/other-root guards.
+    ++completed.live.at(1).instructions;
+    REQUIRE(QuestJournal::JobState(*f.actor).live.at(1) == initial.live.at(1));
+    REQUIRE(detached.FindLive(2));
+    QuestJournal::SetScriptState(*f.actor, heap);
+    REQUIRE(QuestJournal::JobState(*f.actor).FindCompleted(2));
+  });
+  REQUIRE(QuestJournal::JobState(*f.actor).live.at(1) == initial.live.at(1));
+  REQUIRE(QuestJournal::JobState(*f.actor).FindCompleted(2));
+}
+
+TEST_CASE("Transaction snapshot rollback leaves the next lease fresh",
+          "[Quest][QuestJob][QuestTransactionSnapshot][Rollback]")
+{
+  Fixture f;
+  const auto initial = TwoJobs();
+  auto heap = Heap(initial);
+  f.Seed(initial, heap);
+  SECTION("Current job schema")
+  {
+  }
+  SECTION("Older job schema is decoded before caching")
+  {
+    auto legacy = f.Saved();
+    legacy["jobs"]["schemaVersion"] = 9;
+    f.actor->SetPropertyValueDump(QuestJournal::kProperty, legacy.dump(),
+                                  false, false);
+  }
+  const auto before = f.Saved();
+  auto completed = initial;
+  Complete(completed, heap, 2);
+  REQUIRE_THROWS(QuestJournal::AtomicJob(*f.actor, 2, [&] {
+    QuestJournal::SetJobState(*f.actor, completed);
+    QuestJournal::SetScriptState(*f.actor, heap);
+    REQUIRE(QuestJournal::JobState(*f.actor).FindCompleted(2));
+    throw std::runtime_error("Abort after publishing a transaction snapshot");
+  }));
+  REQUIRE(f.Saved() == before);
+  REQUIRE(QuestJournal::JobState(*f.actor).Save() == initial.Save());
+  f.Commit(2, [&] {
+    REQUIRE(QuestJournal::JobState(*f.actor).Save() == initial.Save());
+    QuestJournal::SetJobState(*f.actor, completed);
+    QuestJournal::SetScriptState(*f.actor, heap);
+  });
+  REQUIRE(QuestJournal::JobState(*f.actor).FindCompleted(2));
+}
+
+TEST_CASE("A validated job snapshot cannot bypass final heap validation",
+          "[Quest][QuestJob][QuestTransactionSnapshot][Rollback]")
+{
+  Fixture f;
+  auto jobs = TwoJobs();
+  auto heap = Heap(jobs);
+  f.Seed(jobs, heap);
+  const auto before = f.Saved();
+  Complete(jobs, heap, 2);
+  REQUIRE_THROWS(QuestJournal::AtomicJob(*f.actor, 2, [&] {
+    QuestJournal::SetJobState(*f.actor, jobs);
+    REQUIRE(QuestJournal::JobState(*f.actor).FindCompleted(2));
+    // Deliberately retain the old heap's continuation for the now-completed
+    // root. Typed cursor validity cannot authorize this inconsistent commit.
+  }));
+  REQUIRE(f.Saved() == before);
+  REQUIRE(QuestJournal::JobState(*f.actor).FindLive(2));
+}
+
+TEST_CASE("External same-revision changes are never a cached job authority",
+          "[Quest][QuestJob][QuestTransactionSnapshot][Rollback]")
+{
+  Fixture f;
+  const auto initial = TwoJobs();
+  f.Seed(initial, Heap(initial));
+  const auto before = f.Saved();
+  auto changed = initial;
+  changed.live.at(1).automatic = true;
+  auto replacement = before;
+  replacement["jobs"] = changed.Save();
+  REQUIRE(replacement.at("revision") == before.at("revision"));
+  SECTION("Outside getters decode a replacement despite identical revision")
+  {
+    REQUIRE(QuestJournal::JobState(*f.actor).live.at(1).automatic == false);
+    f.actor->SetPropertyValueDump(QuestJournal::kProperty, replacement.dump(),
+                                  false, false);
+    REQUIRE(QuestJournal::JobState(*f.actor).live.at(1).automatic);
+    f.Commit(2, [&] {
+      REQUIRE(QuestJournal::JobState(*f.actor).live.at(1).automatic);
+    });
+  }
+  SECTION("External mutation during a lease still aborts the commit")
+  {
+    const auto gold = f.actor->GetInventory().GetItemCount(0xf);
+    REQUIRE_THROWS(QuestJournal::AtomicJob(*f.actor, 2, [&] {
+      QuestJournal::EditInventory(*f.actor, *f.actor,
+                                  [](Inventory& inv) { inv.AddItem(0xf, 1); });
+      f.actor->SetPropertyValueDump(QuestJournal::kProperty,
+                                    replacement.dump(), false, false);
+      // Transactional reads remain on their own snapshot, as before caching;
+      // the exact live-source read guard must reject its eventual publication.
+      REQUIRE_FALSE(QuestJournal::JobState(*f.actor).live.at(1).automatic);
+    }));
+    REQUIRE(f.actor->GetInventory().GetItemCount(0xf) == gold);
+    REQUIRE(f.Saved() == replacement);
+    REQUIRE(QuestJournal::JobState(*f.actor).live.at(1).automatic);
+  }
+  SECTION("Malformed replacement still fails before invoking a new lease")
+  {
+    replacement["jobs"]["live"][0]["unexpected"] = true;
+    f.actor->SetPropertyValueDump(QuestJournal::kProperty, replacement.dump(),
+                                  false, false);
+    REQUIRE_THROWS(QuestJournal::JobState(*f.actor));
+    bool entered = false;
+    REQUIRE_THROWS(
+      QuestJournal::AtomicJob(*f.actor, 2, [&] { entered = true; }));
+    REQUIRE_FALSE(entered);
+  }
+}
+
+TEST_CASE("A transaction snapshot cannot supply another campaign's reads",
+          "[Quest][QuestJob][QuestTransactionSnapshot]")
+{
+  Fixture f;
+  const auto jobs = TwoJobs();
+  f.Seed(jobs, Heap(jobs));
+  f.server.CreateActor(OwnerId + 1, { 1, 2, 3 }, 0, 0x3c);
+  auto& other = f.server.worldState.GetFormAt<MpActor>(OwnerId + 1);
+  f.Commit(2, [&] {
+    REQUIRE_THROWS(QuestJournal::PersonalJobState(other));
+    REQUIRE_THROWS(QuestJournal::JobState(other));
+    REQUIRE_THROWS(QuestJournal::RequirePersonalJobAccess(other));
+    REQUIRE(QuestJournal::JobState(*f.actor).Save() == jobs.Save());
+  });
+  REQUIRE_FALSE(QuestJournal::JobState(other).HasLive());
+}

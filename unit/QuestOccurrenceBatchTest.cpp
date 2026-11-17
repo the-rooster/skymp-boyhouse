@@ -7,7 +7,9 @@
 #include "libespm/REFR.h"
 #include "save_storages/ISaveStorage.h"
 #include <algorithm>
+#include <chrono>
 #include <exception>
+#include <iostream>
 #include <set>
 
 extern espm::Loader& GetEspmLoader();
@@ -783,4 +785,138 @@ TEST_CASE(
   REQUIRE(f.Owner().GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
           journal);
   REQUIRE(f.Gold() == 16);
+}
+
+TEST_CASE("Measure warm trusted occurrence admission and host segments",
+          "[.][QuestOccurrencePerformance]")
+{
+  // Opt-in CPU measurements using generated PEX, owned metadata and controlled
+  // in-memory acknowledgements. These are not physical packet or disk timings.
+  using Clock = std::chrono::steady_clock;
+  const auto measure = [](const auto& operation) {
+    const auto begin = Clock::now();
+    operation();
+    return std::chrono::duration<double, std::micro>(Clock::now() - begin)
+      .count();
+  };
+  for (const size_t unexecuted : { 0u, 32u }) {
+    for (const size_t batchSize : { 1u, 16u, 64u }) {
+      for (size_t sample = 0; sample < 3; ++sample) {
+        CAPTURE(unexecuted, batchSize, sample);
+        // Recreate and warm the same state for every sample, so earlier
+        // measurements cannot grow its history or change its live-root count.
+        BatchFixture f(true);
+        const auto warmEvents = f.Capture(1, kTrigger, "OnTriggerEnter");
+        const auto warm = PendingRequests(f.Admit(warmEvents), 1);
+        f.Ack();
+        REQUIRE(f.Drain(warm.front()) == Status::Sleeping);
+        if (unexecuted) {
+          PendingRequests(f.Admit(f.Capture(unexecuted)), unexecuted);
+          f.Ack();
+        }
+        // Every warm-up receipt is durable before releasing retained fake
+        // storage snapshots. No production state or heap is injected.
+        f.storage->submissions.clear();
+        const auto baseline = QuestJournal::JobState(f.Owner());
+        const auto heap = QuestJournal::ScriptState(f.Owner());
+        REQUIRE(baseline.live.size() == unexecuted + 1);
+        REQUIRE(heap.at("continuations").size() == 1);
+        Json result = {
+          { "benchmark", "quest_occurrence_batch_v1" },
+          { "sample", sample },
+          { "batch_size", batchSize },
+          { "unit", "microseconds" },
+          { "clock", "steady_clock" },
+          { "storage", "controlled_in_memory" },
+          { "fixture_manifest_included_in_admit_and_advance", true },
+          { "baseline",
+            { { "sleeping_roots", 1 },
+              { "unexecuted_item_roots", unexecuted },
+              { "live_roots", baseline.live.size() },
+              { "completed_roots", baseline.completed.size() },
+              { "jobs_json_bytes", baseline.Save().dump().size() },
+              { "heap_json_bytes", heap.dump().size() },
+              { "continuations", heap.at("continuations").size() },
+              { "journal_json_bytes",
+                f.Owner()
+                  .GetDynamicFields()
+                  .GetValueDump(QuestJournal::kProperty)
+                  .size() } } }
+        };
+        std::vector<Occurrence> events;
+        result["capture_us"] = measure(
+          [&] { events = f.Capture(batchSize, kTrigger, "OnTriggerEnter"); });
+        QuestJobRunner::AdmissionBatchResult admitted;
+        result["admission_us"] = measure([&] { admitted = f.Admit(events); });
+        const auto requests = PendingRequests(admitted, batchSize);
+
+        const auto receipt = [&] {
+          const auto previous = f.storage->submissions.size();
+          const auto submitUs = measure([&] { f.Tick(); });
+          REQUIRE(f.storage->submissions.size() == previous + 1);
+          const auto index = f.storage->submissions.size() - 1;
+          const auto& forms = f.storage->submissions[index].forms;
+          const auto bytes = Serialized(forms).dump().size();
+          const auto participants =
+            std::count_if(forms.begin(), forms.end(),
+                          [](const auto& form) { return form.has_value(); });
+          const auto ackUs = measure([&] {
+            f.storage->Complete(index);
+            f.Tick();
+          });
+          return Json{ { "submit_tick_us", submitUs },
+                       { "ack_and_tick_us", ackUs },
+                       { "serialized_forms_json_bytes", bytes },
+                       { "participants", participants } };
+        };
+        result["admission_receipt"] = receipt();
+        REQUIRE(admitted.receipt->GetState() == SaveReceipt::State::Durable);
+        REQUIRE(QuestJournal::JobState(f.Owner()).live.size() ==
+                unexecuted + 1 + batchSize);
+
+        // Sample only the first new root through one actual wait. Other new
+        // roots remain unexecuted, bounding cost even for a 64-event batch.
+        auto segments = Json::array();
+        size_t handlerStarts = 0;
+        for (size_t boundary = 0; boundary < 8; ++boundary) {
+          const auto status =
+            f.Jobs().Inspect(f.Owner(), requests.front()).status;
+          if (status == Status::Sleeping)
+            break;
+          REQUIRE(status == Status::Ready);
+          const auto jobs = QuestJournal::JobState(f.Owner());
+          const auto* job = jobs.FindLive(requests.front().sequence);
+          REQUIRE(job);
+          const bool handler = job->handler && job->handler->cursor == "begin";
+          const auto priorInstructions = job->instructions;
+          QuestJobRunner::Result advanced;
+          const auto advanceUs = measure([&] {
+            advanced =
+              f.Jobs().Advance(f.Owner(), requests.front(), f.program.metadata,
+                               f.program.Scripts());
+          });
+          REQUIRE(advanced.status == Status::Pending);
+          handlerStarts += handler ? 1 : 0;
+          const auto committed = QuestJournal::JobState(f.Owner());
+          const auto* after = committed.FindLive(requests.front().sequence);
+          REQUIRE(after);
+          Json segment = {
+            { "phase", handler ? "handler_start" : "host_dispatch" },
+            { "advance_us", advanceUs },
+            { "budget_units", after->instructions - priorInstructions }
+          };
+          segment["receipt"] = receipt();
+          segments.push_back(std::move(segment));
+        }
+        REQUIRE(f.Jobs().Inspect(f.Owner(), requests.front()).status ==
+                Status::Sleeping);
+        REQUIRE(handlerStarts == 1);
+        REQUIRE(f.Field("prefixes") == 2);
+        REQUIRE(f.Field("suffixes") == 0);
+        REQUIRE(f.Gold() == 12);
+        result["first_root_segments"] = std::move(segments);
+        std::cout << result.dump() << std::endl;
+      }
+    }
+  }
 }

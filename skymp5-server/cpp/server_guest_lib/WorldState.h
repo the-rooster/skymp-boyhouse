@@ -40,6 +40,7 @@ class ISaveStorage;
 class IScriptStorage;
 class GameModeEvent;
 class QuestJobRunner;
+class CampaignMovementPlan;
 
 class WorldState
 {
@@ -64,6 +65,7 @@ public:
   };
 
   bool IsRestoring() const noexcept;
+  bool IsClearing() const noexcept;
 
   struct NpcSettingsEntry
   {
@@ -100,7 +102,9 @@ public:
   void LoadChangeForm(const MpChangeForm& changeForm,
                       const FormCallbacks& callbacks);
 
-  void Tick();
+  // Accepted movement is published after its save receipt, before any quest
+  // timer or handler can advance the scene.
+  void Tick(const std::function<void()>& afterSave = {});
   QuestJobRunner& GetQuestJobs();
 
   void RequestReloot(MpObjectReference& ref,
@@ -149,7 +153,8 @@ private:
     const std::vector<CampaignInventoryChange>& changes,
     const std::vector<CampaignVisibilityChange>& visibility,
     const std::vector<CampaignFactionChange>& factions,
-    const std::function<void()>& validateReads, bool durable = false);
+    const std::function<void()>& validateReads, bool durable = false,
+    const std::shared_ptr<CampaignMovementPlan>& movement = {});
   void RequireDurableSaveStorage() const;
 
 public:
