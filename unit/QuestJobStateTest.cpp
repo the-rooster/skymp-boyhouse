@@ -168,14 +168,18 @@ Json Legacy(const QuestJobState& state, uint64_t version = 1)
 {
   auto saved = state.Save();
   saved["schemaVersion"] = version;
+  saved.erase("retiredThrough");
   auto strip = [version](Json& job) {
-    for (const char* field : { "handlerIdentity", "eventHead", "nextHandler",
-                               "dispatch", "handler" })
-      job.erase(field);
-    for (auto& child : job["children"])
-      child.erase("handlerIdentity");
-    if (job["cursor"] == "done")
-      job["events"] = Json::array();
+    job.erase("sequenced");
+    if (version < 4) {
+      for (const char* field : { "handlerIdentity", "eventHead", "nextHandler",
+                                 "dispatch", "handler" })
+        job.erase(field);
+      for (auto& child : job["children"])
+        child.erase("handlerIdentity");
+      if (job["cursor"] == "done")
+        job["events"] = Json::array();
+    }
     if (version < 3) {
       job.erase("automatic");
       job.erase("contentMode");
@@ -202,13 +206,20 @@ Json Legacy(const QuestJobState& state, uint64_t version = 1)
 
 QuestJobState MigratedLegacy(QuestJobState state, uint64_t version = 1)
 {
-  if (state.active && version < 3)
-    state.active->contentMode = "legacy";
+  state.retiredThrough = 0;
+  if (state.active) {
+    state.active->sequenced = false;
+    if (version < 3)
+      state.active->contentMode = "legacy";
+  }
   for (auto& job : state.completed) {
+    job.sequenced = false;
     if (version < 3)
       job.contentMode = "legacy";
-    job.events.clear();
-    job.eventHead = 0;
+    if (version < 4) {
+      job.events.clear();
+      job.eventHead = 0;
+    }
   }
   return state;
 }
@@ -317,6 +328,62 @@ Json DispatchHeap(const QuestJobState::Job& job)
   return heap;
 }
 
+QuestJobState::Job CompletedRecord(uint64_t id, bool sequenced)
+{
+  auto job = Done(Waiting()).completed.front();
+  job.id = id;
+  job.sequenced = sequenced;
+  job.command = sequenced ? "quest-request:" + std::to_string(job.generation) +
+      ":" + std::to_string(id)
+                          : "legacy-" + std::to_string(id);
+  job.completions.clear();
+  job.completions[job.Scope() + ":1"] = true;
+  return job;
+}
+
+QuestJobState History(size_t legacy, size_t recent)
+{
+  QuestJobState state;
+  for (size_t index = 0; index < legacy + recent; ++index)
+    state.completed.push_back(
+      CompletedRecord(state.nextJob++, index >= legacy));
+  return state;
+}
+
+QuestJobState::Job LargeCompletion(uint64_t id, bool sequenced)
+{
+  auto job = CompletedRecord(id, sequenced);
+  const auto plugin = std::string(240, 'x') + ".esm";
+  job.events.assign(
+    1024, QuestJobState::Event{ "14:" + plugin, "f:" + plugin, "", 1, true });
+  job.eventHead = static_cast<uint32_t>(job.events.size());
+  return job;
+}
+
+QuestJobState ByteHeavyHistory()
+{
+  QuestJobState state;
+  state.completed.push_back(LargeCompletion(state.nextJob++, false));
+  state.completed.push_back(LargeCompletion(state.nextJob++, true));
+  state.completed.push_back(CompletedRecord(state.nextJob++, false));
+  state.completed.push_back(LargeCompletion(state.nextJob++, true));
+  state.completed.push_back(LargeCompletion(state.nextJob++, true));
+  state.completed.push_back(CompletedRecord(state.nextJob++, true));
+  return state;
+}
+
+void AddPending(QuestJobState& state, bool sequenced)
+{
+  auto job = *Begin().active;
+  job.id = state.nextJob++;
+  job.generation = state.generation;
+  job.sequenced = sequenced;
+  job.command = sequenced ? "quest-request:" + std::to_string(job.generation) +
+      ":" + std::to_string(job.id)
+                          : "legacy-" + std::to_string(job.id);
+  state.active = job;
+}
+
 struct JobStorage
   : Viet::ISaveStorage<MpChangeForm, FormDesc, std::vector<FormDesc>>
 {
@@ -371,6 +438,28 @@ struct Fixture
     return Json::parse(
       actor->GetDynamicFields().GetValueDump(QuestJournal::kProperty));
   }
+  void SeedJobs(const QuestJobState& jobs)
+  {
+    jobs.ValidateHeap(Json::object());
+    const Json ledger = { { "schemaVersion", 2 },
+                          { "revision", uint64_t(1) },
+                          { "quests", Json::object() },
+                          { "jobs", jobs.Save() } };
+    actor->SetPropertyValueDump(QuestJournal::kProperty, ledger.dump(), false,
+                                false);
+  }
+  void PublishJobs(const QuestJobState& jobs)
+  {
+    const auto id = jobs.active ? jobs.active->id : jobs.completed.back().id;
+    const auto receipt = QuestJournal::AtomicJob(
+      *actor, id, [&] { QuestJournal::SetJobState(*actor, jobs); });
+    REQUIRE(receipt);
+    for (size_t tick = 0;
+         tick < 4 && receipt->GetState() == SaveReceipt::State::Pending;
+         ++tick)
+      server.worldState.Tick();
+    REQUIRE(receipt->GetState() == SaveReceipt::State::Durable);
+  }
   void Start()
   {
     QuestJournal::AtomicJob(
@@ -404,7 +493,7 @@ TEST_CASE("Quest jobs reject corrupt exact fields identities and cursor state",
   std::vector<std::function<void(Json&)>> corrupt = {
     [](Json& v) { v["unknown"] = 1; },
     [](Json& v) { v.erase("active"); },
-    [](Json& v) { v["schemaVersion"] = 5; },
+    [](Json& v) { v["schemaVersion"] = 6; },
     [](Json& v) { v["generation"] = 0; },
     [](Json& v) { v["nextJob"] = 1; },
     [](Json& v) { v["nextJob"] = UINT64_MAX; },
@@ -670,9 +759,9 @@ TEST_CASE("New job transactions require a matching saved job and hide other "
     *f.actor, [&] { QuestJournal::SetJobState(*f.actor, Begin()); }));
 }
 
-TEST_CASE(
-  "Full job history rejects new commands without evicting deduplication",
-  "[Quest][QuestJob]")
+TEST_CASE("Full legacy history rejects new named commands without evicting "
+          "deduplication",
+          "[Quest][QuestJob]")
 {
   Fixture f;
   QuestJobState full;
@@ -689,9 +778,13 @@ TEST_CASE(
                         { "jobs", full.Save() } };
   f.actor->SetPropertyValueDump(QuestJournal::kProperty, ledger.dump(), false,
                                 false);
+  auto admission = full;
+  AddPending(admission, false);
   bool ran = false;
-  REQUIRE_THROWS(
-    QuestJournal::AtomicJob(*f.actor, full.nextJob, [&] { ran = true; }));
+  REQUIRE_THROWS(QuestJournal::AtomicJob(*f.actor, full.nextJob, [&] {
+    QuestJournal::SetJobState(*f.actor, admission);
+    ran = true;
+  }));
   REQUIRE_FALSE(ran);
   REQUIRE(f.Saved() == ledger);
   auto missing = full.Save();
@@ -726,7 +819,7 @@ TEST_CASE(
     const auto legacy = Legacy(state);
     const auto migrated = QuestJobState::Read(legacy);
     REQUIRE(migrated.Save() == MigratedLegacy(state).Save());
-    REQUIRE(migrated.Save()["schemaVersion"] == 4);
+    REQUIRE(migrated.Save()["schemaVersion"] == 5);
   }
   auto external = Waiting();
   external.active->awaitKey = "quest-stage";
@@ -1100,7 +1193,7 @@ TEST_CASE("Timer jobs round trip UTC deadlines and typed None completions",
   for (const auto& value : { state, Done(state) })
     REQUIRE(QuestJobState::Read(value.Save()).Save() == value.Save());
   const auto saved = state.Save();
-  REQUIRE(saved["schemaVersion"] == 4);
+  REQUIRE(saved["schemaVersion"] == 5);
   REQUIRE(saved["active"]["timer"]["policy"] == "utc-deadline-v1");
   const auto done = Done(state);
   const auto& job = done.completed.front();
@@ -1680,4 +1773,381 @@ TEST_CASE(
   active = SelectedHandler();
   active.active->segment = QuestJobState::MaxSegments + 1;
   REQUIRE_THROWS(active.Save());
+}
+
+TEST_CASE(
+  "Schema four histories migrate without reclassifying commands or stacks",
+  "[Quest][QuestJob]")
+{
+  for (const auto& original :
+       { Begin(), Waiting(), TimerWaiting(), Nested(true),
+         SelectedHandler(true, true), Done(Waiting()), History(2, 0) }) {
+    auto legacy = Legacy(original, 4);
+    auto migrated = QuestJobState::Read(legacy);
+    REQUIRE(migrated.Save() == original.Save());
+    REQUIRE(migrated.retiredThrough == 0);
+    REQUIRE(migrated.Save()["schemaVersion"] == 5);
+    if (migrated.active) {
+      REQUIRE_FALSE(migrated.active->sequenced);
+      REQUIRE(migrated.active->Scope() == original.active->Scope());
+      REQUIRE(migrated.active->NextToken() == original.active->NextToken());
+      REQUIRE_NOTHROW(migrated.ValidateHeap(DispatchHeap(*migrated.active)));
+    }
+    for (const auto& job : migrated.completed)
+      REQUIRE_FALSE(job.sequenced);
+  }
+  auto legacy = Legacy(Waiting(), 4);
+  legacy["active"]["command"] = "quest-request:1:1";
+  REQUIRE_FALSE(QuestJobState::Read(legacy).active->sequenced);
+  legacy["active"]["sequenced"] = false;
+  REQUIRE_THROWS(QuestJobState::Read(legacy));
+}
+
+TEST_CASE("Sequenced commands are canonical while legacy command names stay "
+          "independent",
+          "[Quest][QuestJob]")
+{
+  auto state = Waiting();
+  state.active->sequenced = true;
+  state.active->command = "quest-request:1:1";
+  REQUIRE_NOTHROW(state.Save());
+  REQUIRE_NOTHROW(state.ValidateHeap(Heap(*state.active)));
+  for (const auto* command :
+       { "", "quest-request:01:1", "quest-request:1:01", "quest-request:1:2",
+         "quest-request:2:1", "quest-request:+1:1", "Quest-request:1:1",
+         "command-one" }) {
+    auto invalid = state;
+    invalid.active->command = command;
+    REQUIRE_THROWS(invalid.Save());
+  }
+  auto value = state.Save();
+  value["active"]["sequenced"] = 1;
+  REQUIRE_THROWS(QuestJobState::Read(value));
+  auto mixed = History(1, 1);
+  mixed.completed.front().command = mixed.completed.back().command;
+  REQUIRE_NOTHROW(mixed.Save());
+  REQUIRE(QuestJobState::Read(mixed.Save()).Save() == mixed.Save());
+  mixed.completed.push_back(CompletedRecord(mixed.nextJob++, false));
+  mixed.completed.back().command = mixed.completed.front().command;
+  REQUIRE_THROWS(mixed.Save());
+}
+
+TEST_CASE("Retired histories preserve sorted permanent legacy records and a "
+          "contiguous recent tail",
+          "[Quest][QuestJob]")
+{
+  QuestJobState state;
+  for (uint64_t id = 1; id <= 6; ++id)
+    state.completed.push_back(CompletedRecord(state.nextJob++, id % 2 == 0));
+  state.completed.erase(state.completed.begin() + 1);
+  state.retiredThrough = 2;
+  REQUIRE_NOTHROW(state.Save());
+  AddPending(state, true);
+  REQUIRE_NOTHROW(state.Save());
+  const auto original = state.Save();
+  const std::vector<std::function<void(Json&)>> corrupt = {
+    [](Json& v) { v["retiredThrough"] = 0; },
+    [](Json& v) { v["retiredThrough"] = 3; },
+    [](Json& v) { v["retiredThrough"] = v["nextJob"]; },
+    [](Json& v) { v["retiredThrough"] = -1; },
+    [](Json& v) { v["retiredThrough"] = 2.0; },
+    [](Json& v) { v.erase("retiredThrough"); },
+    [](Json& v) { v["nextJob"] = 9; },
+    [](Json& v) { v["completed"].erase(v["completed"].begin() + 2); },
+    [](Json& v) { std::swap(v["completed"][0], v["completed"][1]); },
+    [](Json& v) {
+      v["completed"][0]["sequenced"] = true;
+      v["completed"][0]["command"] = "quest-request:1:1";
+    },
+    [](Json& v) {
+      v["active"]["id"] = 2;
+      v["active"]["command"] = "quest-request:1:2";
+    },
+    [](Json& v) { v["completed"][1]["id"] = 1; },
+    [](Json& v) { v["completed"][2]["generation"] = 2; }
+  };
+  for (size_t index = 0; index < corrupt.size(); ++index) {
+    INFO("Retention corruption " << index);
+    auto value = original;
+    corrupt[index](value);
+    REQUIRE_THROWS(QuestJobState::Read(value));
+  }
+}
+
+TEST_CASE(
+  "Legacy and sequenced history capacities apply to their own namespaces",
+  "[Quest][QuestJob]")
+{
+  auto state =
+    History(QuestJobState::MaxCompleted, QuestJobState::MaxRecentCompleted);
+  REQUIRE(state.completed.size() == 288);
+  REQUIRE_NOTHROW(state.Save());
+  auto activeSequence = state;
+  AddPending(activeSequence, true);
+  REQUIRE_THROWS(activeSequence.Save());
+  auto activeLegacy = state;
+  AddPending(activeLegacy, false);
+  REQUIRE_THROWS(activeLegacy.Save());
+  state.RetireForAdmission();
+  AddPending(state, true);
+  REQUIRE_NOTHROW(state.Save());
+  auto legacySlot = History(QuestJobState::MaxCompleted - 1,
+                            QuestJobState::MaxRecentCompleted);
+  AddPending(legacySlot, false);
+  REQUIRE_NOTHROW(legacySlot.Save());
+  auto tooManyRecent = History(0, QuestJobState::MaxRecentCompleted + 1);
+  REQUIRE_THROWS(tooManyRecent.Save());
+  auto tooManyLegacy = History(QuestJobState::MaxCompleted + 1, 0);
+  REQUIRE_THROWS(tooManyLegacy.Save());
+}
+
+TEST_CASE("Admission retirement removes only the oldest sequenced completion",
+          "[Quest][QuestJob]")
+{
+  QuestJobState state;
+  state.completed.push_back(CompletedRecord(state.nextJob++, false));
+  state.completed.push_back(CompletedRecord(state.nextJob++, true));
+  state.completed.push_back(CompletedRecord(state.nextJob++, false));
+  for (size_t index = 1; index < QuestJobState::MaxRecentCompleted; ++index)
+    state.completed.push_back(CompletedRecord(state.nextJob++, true));
+  const auto before = state.Save();
+  auto expected = before;
+  expected["completed"].erase(expected["completed"].begin() + 1);
+  expected["retiredThrough"] = 2;
+  state.RetireForAdmission();
+  REQUIRE(state.Save() == expected);
+  REQUIRE(state.completed.front().id == 1);
+  REQUIRE(state.completed[1].id == 3);
+  REQUIRE(state.nextJob == before["nextJob"]);
+  state.RetireForAdmission();
+  REQUIRE(state.Save() == expected);
+  // Filling the recent window again advances past another permanent legacy
+  // record without dropping or rewriting that record's full audit payload.
+  state.completed.push_back(CompletedRecord(state.nextJob++, true));
+  const auto refill = state.Save();
+  expected = refill;
+  expected["completed"].erase(expected["completed"].begin() + 2);
+  expected["retiredThrough"] = 4;
+  state.RetireForAdmission();
+  REQUIRE(state.Save() == expected);
+  REQUIRE(state.Save()["completed"][0] == before["completed"][0]);
+  REQUIRE(state.Save()["completed"][1] == before["completed"][2]);
+}
+
+TEST_CASE("Retirement refuses active or malformed typed state without "
+          "changing history",
+          "[Quest][QuestJob]")
+{
+  auto active = History(1, QuestJobState::MaxRecentCompleted - 1);
+  AddPending(active, true);
+  const auto before = active.Save();
+  REQUIRE_THROWS(active.RetireForAdmission());
+  REQUIRE(active.Save() == before);
+  auto state = History(2, 4);
+  const auto untouched = state.Save();
+  state.RetireForAdmission();
+  REQUIRE(state.Save() == untouched);
+  auto malformed = History(1, QuestJobState::MaxRecentCompleted);
+  malformed.completed.back().command = "malformed";
+  const auto idsBefore = malformed.nextJob;
+  REQUIRE_THROWS(malformed.RetireForAdmission());
+  REQUIRE(malformed.retiredThrough == 0);
+  REQUIRE(malformed.nextJob == idsBefore);
+  REQUIRE(malformed.completed.size() == 33);
+  REQUIRE(malformed.completed.back().command == "malformed");
+}
+
+TEST_CASE(
+  "Retired runner state cannot regain the standalone continuation exemption",
+  "[Quest][QuestJob]")
+{
+  auto state = History(0, QuestJobState::MaxRecentCompleted);
+  state.RetireForAdmission();
+  REQUIRE(state.retiredThrough == 1);
+  REQUIRE_NOTHROW(state.ValidateHeap(Json::object()));
+  REQUIRE_THROWS(state.ValidateHeap(Heap(*Waiting().active)));
+  const auto saved = state.Save();
+  auto migrated = QuestJobState::Read(saved);
+  REQUIRE(migrated.retiredThrough == state.retiredThrough);
+  REQUIRE(migrated.nextJob == state.nextJob);
+  REQUIRE(migrated.Save() == saved);
+}
+
+TEST_CASE("Active Journal jobs cannot retire history or change permanent "
+          "completion results",
+          "[Quest][QuestJob]")
+{
+  Fixture f;
+  auto history = History(2, QuestJobState::MaxRecentCompleted);
+  history.RetireForAdmission();
+  f.SeedJobs(history);
+  auto candidate = history;
+  AddPending(candidate, true);
+  f.PublishJobs(candidate);
+  const auto before = f.Saved();
+  SECTION("advance frontier and remove another sequenced completion")
+  {
+    candidate.retiredThrough = candidate.completed[2].id;
+    candidate.completed.erase(candidate.completed.begin() + 2);
+  }
+  SECTION("forget retained legacy command below frontier")
+  {
+    candidate.completed.erase(candidate.completed.begin());
+  }
+  SECTION("rewrite retained completion result")
+  {
+    candidate.completed.front().completions.begin()->second = false;
+  }
+  SECTION("reclassify active sequenced request as legacy")
+  {
+    candidate.active->sequenced = false;
+  }
+  // These candidates are individually well-formed: the Journal must reject
+  // their relationship to the already-published history.
+  REQUIRE_NOTHROW(candidate.Save());
+  REQUIRE_THROWS(QuestJournal::AtomicJob(*f.actor, candidate.active->id, [&] {
+    QuestJournal::SetJobState(*f.actor, candidate);
+  }));
+  REQUIRE(f.Saved() == before);
+}
+
+TEST_CASE("Journal admission permits only the exact required oldest-request "
+          "retirement",
+          "[Quest][QuestJob]")
+{
+  Fixture f;
+  const auto initial = History(2, QuestJobState::MaxRecentCompleted);
+  f.SeedJobs(initial);
+  const auto before = f.Saved();
+  auto candidate = initial;
+  candidate.RetireForAdmission();
+  AddPending(candidate, true);
+  bool validCodec = true;
+  SECTION("omit required retirement")
+  {
+    candidate = initial;
+    AddPending(candidate, true);
+    validCodec = false;
+  }
+  SECTION("retire two sequenced results")
+  {
+    candidate.retiredThrough = candidate.completed[2].id;
+    candidate.completed.erase(candidate.completed.begin() + 2);
+  }
+  SECTION("retire the wrong sequenced result")
+  {
+    candidate = initial;
+    candidate.retiredThrough = candidate.completed[3].id;
+    candidate.completed.erase(candidate.completed.begin() + 3);
+    AddPending(candidate, true);
+    validCodec = false;
+  }
+  SECTION("drop a permanent legacy result with the correct frontier")
+  {
+    candidate.completed.erase(candidate.completed.begin());
+  }
+  SECTION("rewrite a retained sequenced result")
+  {
+    candidate.completed[2].completions.begin()->second = false;
+  }
+  if (validCodec)
+    REQUIRE_NOTHROW(candidate.Save());
+  else
+    REQUIRE_THROWS(candidate.Save());
+  REQUIRE_THROWS(QuestJournal::AtomicJob(*f.actor, candidate.active->id, [&] {
+    QuestJournal::SetJobState(*f.actor, candidate);
+  }));
+  REQUIRE(f.Saved() == before);
+}
+
+TEST_CASE("Journal admits sequenced work beyond all permanent legacy slots "
+          "and retires durably",
+          "[Quest][QuestJob]")
+{
+  Fixture f;
+  auto state =
+    History(QuestJobState::MaxCompleted, QuestJobState::MaxRecentCompleted);
+  f.SeedJobs(state);
+  const auto permanent = state.Save()["completed"];
+  for (uint64_t admission = 0; admission < 2; ++admission) {
+    state.RetireForAdmission();
+    AddPending(state, true);
+    const auto id = state.active->id;
+    REQUIRE(id > QuestJobState::MaxCompleted);
+    REQUIRE_NOTHROW(f.PublishJobs(state));
+    REQUIRE(QuestJournal::JobState(*f.actor).Save() == state.Save());
+    state = Done(state); // A pristine body has no pending event dispatch.
+    REQUIRE_NOTHROW(f.PublishJobs(state));
+    REQUIRE(state.retiredThrough ==
+            QuestJobState::MaxCompleted + admission + 1);
+    const auto saved = QuestJournal::JobState(*f.actor).Save();
+    REQUIRE(saved == state.Save());
+    REQUIRE(saved["completed"].size() ==
+            QuestJobState::MaxCompleted + QuestJobState::MaxRecentCompleted);
+    for (size_t index = 0; index < QuestJobState::MaxCompleted; ++index)
+      REQUIRE(saved["completed"][index] == permanent[index]);
+  }
+}
+
+TEST_CASE("Sequenced admission retires by canonical byte budget before "
+          "filling the count window",
+          "[Quest][QuestJob]")
+{
+  auto state = ByteHeavyHistory();
+  REQUIRE(state.completed.size() < QuestJobState::MaxRecentCompleted);
+  const auto original = state.Save();
+  size_t canonicalBytes = 0;
+  for (const auto& job : original["completed"])
+    if (job["sequenced"].get<bool>())
+      canonicalBytes += job.dump().size();
+  REQUIRE(state.RetainedSequencedBytes() == canonicalBytes);
+  REQUIRE(canonicalBytes > QuestJobState::MaxRecentBytes);
+  // A just-completed large result may exceed the window while still at rest.
+  REQUIRE(QuestJobState::Read(original).Save() == original);
+  auto admission = state;
+  AddPending(admission, true);
+  REQUIRE_THROWS(admission.Save());
+  auto legacyAdmission = state;
+  AddPending(legacyAdmission, false);
+  REQUIRE_NOTHROW(legacyAdmission.Save());
+  state.RetireForAdmission();
+  auto expected = original;
+  expected["completed"].erase(expected["completed"].begin() + 3);
+  expected["completed"].erase(expected["completed"].begin() + 1);
+  expected["retiredThrough"] = 4;
+  REQUIRE(state.Save() == expected);
+  REQUIRE(state.RetainedSequencedBytes() <= QuestJobState::MaxRecentBytes);
+  REQUIRE(state.completed.size() == 4);
+  // The large permanent legacy audit is excluded from the recent byte window.
+  REQUIRE(state.Save().dump().size() > QuestJobState::MaxRecentBytes);
+  AddPending(state, true);
+  REQUIRE_NOTHROW(state.Save());
+}
+
+TEST_CASE("Journal admits only the exact byte-triggered retirement and "
+          "preserves legacy audit",
+          "[Quest][QuestJob]")
+{
+  Fixture f;
+  const auto initial = ByteHeavyHistory();
+  f.SeedJobs(initial);
+  const auto before = f.Saved();
+  auto admitted = initial;
+  admitted.RetireForAdmission();
+  AddPending(admitted, true);
+  auto excessive = admitted;
+  excessive.retiredThrough = excessive.completed[2].id;
+  excessive.completed.erase(excessive.completed.begin() + 2);
+  REQUIRE_NOTHROW(excessive.Save());
+  REQUIRE_THROWS(QuestJournal::AtomicJob(*f.actor, excessive.active->id, [&] {
+    QuestJournal::SetJobState(*f.actor, excessive);
+  }));
+  REQUIRE(f.Saved() == before);
+  REQUIRE_NOTHROW(f.PublishJobs(admitted));
+  const auto saved = QuestJournal::JobState(*f.actor);
+  REQUIRE(saved.Save() == admitted.Save());
+  REQUIRE(saved.retiredThrough == 4);
+  REQUIRE(saved.RetainedSequencedBytes() <= QuestJobState::MaxRecentBytes);
+  REQUIRE(saved.Save()["completed"][0] == before["jobs"]["completed"][0]);
+  REQUIRE(saved.Save()["completed"][1] == before["jobs"]["completed"][2]);
 }

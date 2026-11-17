@@ -637,8 +637,9 @@ std::shared_ptr<const SaveReceipt> QuestJournal::AtomicImpl(
   if (jobId) {
     if (!*jobId || (jobs.active ? jobs.active->id : jobs.nextJob) != *jobId)
       throw std::runtime_error("Quest transaction does not own this job");
-    if (!jobs.active && jobs.completed.size() >= QuestJobState::MaxCompleted)
-      throw std::runtime_error("Quest job completion history is full");
+    // Admission publishes a pristine typed root before any script executes.
+    // Its codec/transition checks enforce the separate legacy and numbered
+    // windows; total completed count is no longer a lifetime limit.
   } else if (jobs.active)
     throw std::runtime_error("Campaign has an active quest job");
   const auto initialJournal = owner.GetDynamicFields().GetValueDump(kProperty);
@@ -862,11 +863,18 @@ void QuestJournal::SetJobState(MpActor& actor, const QuestJobState& state)
   if (!previous.active && (!state.active || state.active->cursor != "begin"))
     throw std::runtime_error(
       "New quest job must first install its pristine root");
+  auto retained = previous;
+  if (!previous.active && candidate->sequenced)
+    retained.RetireForAdmission();
+  if (state.retiredThrough != retained.retiredThrough)
+    throw std::runtime_error(
+      "Job transaction changed its retirement frontier");
   if (previous.active) {
     const auto& prior = *previous.active;
     if (candidate->id != prior.id ||
         candidate->generation != prior.generation ||
         candidate->command != prior.command ||
+        candidate->sequenced != prior.sequenced ||
         candidate->automatic != prior.automatic ||
         candidate->contentMode != prior.contentMode ||
         candidate->actor != prior.actor || candidate->owner != prior.owner ||
@@ -973,7 +981,7 @@ void QuestJournal::SetJobState(MpActor& actor, const QuestJobState& state)
           "Job transaction reused or bypassed a new child");
     }
   }
-  auto history = old.at("completed");
+  auto history = retained.Save().at("completed");
   auto nextHistory = saved.at("completed");
   if (!state.active) {
     nextHistory.erase(nextHistory.end() - 1);

@@ -331,7 +331,8 @@ void RequirePending(const QuestJobRunner::Result& result)
 
 // Every host transition has its own receipt. This helper deliberately stops
 // at an external wait or timer; it never invents a completion for a script.
-QuestJobRunner::Result Drain(Fixture& f, const std::string& command,
+QuestJobRunner::Result Drain(Fixture& f,
+                             const QuestJobRunner::Request& command,
                              const QuestJobRunner::MetadataOverrides& metadata,
                              const std::vector<PexScript::Lazy>& scripts)
 {
@@ -793,8 +794,9 @@ void AttachDatabase(PartOne& server, const SqliteFiles& files)
     "quest-job-restart", 1));
 }
 
-QuestJobRunner::Result WaitForDurable(PartOne& server, MpActor& owner,
-                                      const std::string& command = kCommand)
+QuestJobRunner::Result WaitForDurable(
+  PartOne& server, MpActor& owner,
+  const QuestJobRunner::Request& command = kCommand)
 {
   const auto deadline =
     std::chrono::steady_clock::now() + std::chrono::seconds(10);
@@ -809,7 +811,7 @@ QuestJobRunner::Result WaitForDurable(PartOne& server, MpActor& owner,
 }
 
 QuestJobRunner::Result DrainStored(
-  PartOne& server, MpActor& owner, const std::string& command,
+  PartOne& server, MpActor& owner, const QuestJobRunner::Request& command,
   const QuestJobRunner::MetadataOverrides& metadata,
   const std::vector<PexScript::Lazy>& scripts)
 {
@@ -2867,4 +2869,484 @@ TEST_CASE("Inventory handlers share the stage instruction budget",
   f.Tick();
   REQUIRE(f.storage->submissions.size() == saves);
   RequireReady(f.InspectEvent());
+}
+
+namespace {
+constexpr uint32_t kRetentionQuest = 0x2aa57;
+constexpr uint32_t kRetentionNoLogQuest = 0x1075b1;
+using RequestId = QuestJobRunner::RequestId;
+
+std::string RequestName(const RequestId& request)
+{
+  return "quest-request:" + std::to_string(request.generation) + ":" +
+    std::to_string(request.sequence);
+}
+
+void RequireSameRequest(const RequestId& one, const RequestId& two)
+{
+  REQUIRE(one.owner == two.owner);
+  REQUIRE(one.generation == two.generation);
+  REQUIRE(one.sequence == two.sequence);
+}
+
+void RequireRetired(const QuestJobRunner::Result& result)
+{
+  REQUIRE(result.status == Status::Retired);
+  REQUIRE_FALSE(result.accepted);
+  REQUIRE(result.token.empty());
+  REQUIRE(result.key.empty());
+}
+
+struct RetentionProgram
+{
+  Program program;
+  QuestJobRunner::MetadataOverrides metadata;
+  explicit RetentionProgram(bool await = false, bool fail = false)
+  {
+    auto reward = Reward(1);
+    reward.code.instructions.pop_back();
+    if (await) {
+      reward.locals.push_back({ "completed", "Bool" });
+      reward.code.instructions.push_back(
+        { FunctionCode::kOp_CallStatic,
+          { VarValue("FixtureAwait"), VarValue("AwaitBool"), Name("completed"),
+            VarValue(1), VarValue("retained") } });
+      reward.code.instructions.push_back(
+        { FunctionCode::kOp_CallMethod,
+          { VarValue("AddItem"), Name("target"), Name("temp"), VarValue(3),
+            Name("gold"), VarValue(2), VarValue(true) } });
+    }
+    if (fail)
+      reward.code.instructions.push_back(
+        { FunctionCode::kOp_CallMethod,
+          { VarValue("UnsupportedRetirementAdmission"), Name("self"),
+            Name("temp"), VarValue(0) } });
+    reward.code.instructions.push_back(
+      { FunctionCode::kOp_Return, { VarValue::None() } });
+    program.script->objectTable[0].states = { { "",
+                                                { { "Reward", reward } } } };
+    program.metadata.fragments = { { 10, 0, 1, "JobFixture", "Reward" } };
+    metadata[kRetentionQuest] = program.metadata;
+    auto noLogs = program.metadata;
+    noLogs.fragments.clear();
+    metadata[kRetentionNoLogQuest] = noLogs;
+  }
+  auto Scripts() const { return program.Scripts(); }
+  void Enable(MpActor& actor) const
+  {
+    actor.SetPropertyValueDump(QuestJournal::kEnabled,
+                               "[\"2aa57:Skyrim.esm\",\"1075b1:Skyrim.esm\"]",
+                               false, false);
+  }
+};
+
+struct RetentionFixture : Fixture
+{
+  RetentionProgram content;
+  explicit RetentionFixture(bool await = false)
+    : content(await)
+  {
+    content.Enable(Owner());
+  }
+  QuestJobRunner::Result SubmitRequest(const RequestId& request)
+  {
+    return Jobs().Submit(Owner(), request, kRetentionQuest, 10,
+                         content.metadata, content.Scripts());
+  }
+  QuestJobRunner::Result DrainRequest(const RequestId& request)
+  {
+    return Drain(*this, request, content.metadata, content.Scripts());
+  }
+  RequestId CompleteNext()
+  {
+    const auto request = Jobs().NextRequest(Owner());
+    RequirePending(SubmitRequest(request));
+    REQUIRE(DrainRequest(request).status == Status::Completed);
+    storage->submissions.clear();
+    return request;
+  }
+};
+}
+
+TEST_CASE("Sequenced quest requests retain bounded history beyond 256 rewards",
+          "[Quest][QuestJobs][Retention]")
+{
+  RetentionFixture f;
+  const auto first = f.Jobs().NextRequest(f.Owner());
+  RequireSameRequest(first, f.Jobs().NextRequest(f.Owner()));
+  REQUIRE(first.sequence == 1);
+  REQUIRE(first.owner == f.Owner().GetChangeForm().formDesc.ToString());
+  std::vector<RequestId> requests;
+  for (uint64_t index = 0; index < 300; ++index) {
+    INFO("completed request " << index + 1);
+    const auto request = f.CompleteNext();
+    requests.push_back(request);
+    REQUIRE(request.sequence == index + 1);
+    REQUIRE(f.Gold() == 11 + index);
+    const auto jobs = QuestJournal::JobState(f.Owner());
+    REQUIRE_FALSE(jobs.active);
+    REQUIRE(jobs.completed.size() == std::min<uint64_t>(index + 1, 32));
+    REQUIRE(std::all_of(jobs.completed.begin(), jobs.completed.end(),
+                        [](const auto& job) { return job.sequenced; }));
+    REQUIRE(MpChangeForm::ToJson(f.Owner().GetChangeForm()).dump().size() <
+            256 * 1024);
+  }
+  const auto jobs = QuestJournal::JobState(f.Owner());
+  REQUIRE(jobs.retiredThrough == 268);
+  REQUIRE(jobs.nextJob == 301);
+  REQUIRE(jobs.completed.front().id == 269);
+  REQUIRE(jobs.completed.back().id == 300);
+  REQUIRE(QuestJournal::Get(f.Owner(), kRetentionQuest).at("stages") ==
+          Json::array({ 10 }));
+  const auto before = QuestJournal::Snapshot(f.Owner());
+  const auto beforeJobs = QuestJournal::JobState(f.Owner()).Save();
+  auto wrongOwner = first;
+  wrongOwner.owner = "14:Skyrim.esm";
+  REQUIRE_THROWS(f.Jobs().Inspect(f.Owner(), wrongOwner));
+  REQUIRE_THROWS(f.SubmitRequest(wrongOwner));
+  auto wrongGeneration = first;
+  ++wrongGeneration.generation;
+  REQUIRE_THROWS(f.Jobs().Inspect(f.Owner(), wrongGeneration));
+  REQUIRE_THROWS(f.SubmitRequest(wrongGeneration));
+  RequireRetired(f.Jobs().Inspect(f.Owner(), first));
+  RequireRetired(f.SubmitRequest(first));
+  RequireRetired(f.Jobs().Advance(f.Owner(), first, f.content.metadata,
+                                  f.content.Scripts()));
+  RequireRetired(f.Jobs().Resume(f.Owner(), first, "forgotten-token", false,
+                                 f.content.metadata, f.content.Scripts()));
+  REQUIRE_NOTHROW(f.Jobs().Retry(f.Owner(), first));
+  RequireRetired(f.Jobs().Inspect(f.Owner(), requests[267]));
+  REQUIRE(f.SubmitRequest(requests[268]).status == Status::Completed);
+  REQUIRE(f.SubmitRequest(requests.back()).status == Status::Completed);
+  REQUIRE(f.Gold() == 310);
+  REQUIRE(QuestJournal::Snapshot(f.Owner()) == before);
+  REQUIRE(QuestJournal::JobState(f.Owner()).Save() == beforeJobs);
+  f.Tick();
+  REQUIRE(f.storage->submissions.empty());
+}
+
+TEST_CASE("Permanent legacy receipts cannot exhaust the sequenced namespace",
+          "[Quest][QuestJobs][Retention]")
+{
+  RetentionFixture f;
+  auto future = f.Jobs().NextRequest(f.Owner());
+  future.sequence = 257;
+  const auto sameText = RequestName(future);
+  for (uint64_t index = 0; index < 256; ++index) {
+    const std::string command =
+      index == 0 ? sameText : "permanent-legacy-" + std::to_string(index);
+    RequirePending(f.Jobs().Submit(f.Owner(), command, kRetentionNoLogQuest, 0,
+                                   f.content.metadata, f.content.Scripts()));
+    REQUIRE(
+      Drain(f, command, f.content.metadata, f.content.Scripts()).status ==
+      Status::Completed);
+    f.storage->submissions.clear();
+  }
+  REQUIRE(f.Gold() == 10);
+  REQUIRE(QuestJournal::JobState(f.Owner()).completed.size() == 256);
+  RequireSameRequest(future, f.Jobs().NextRequest(f.Owner()));
+  REQUIRE_THROWS(f.Jobs().Submit(f.Owner(), "legacy-over-cap",
+                                 kRetentionNoLogQuest, 0, f.content.metadata,
+                                 f.content.Scripts()));
+  for (size_t index = 0; index < 34; ++index)
+    f.CompleteNext();
+  const auto jobs = QuestJournal::JobState(f.Owner());
+  REQUIRE(jobs.completed.size() == 288);
+  REQUIRE(jobs.retiredThrough == 258);
+  REQUIRE(std::count_if(jobs.completed.begin(), jobs.completed.end(),
+                        [](const auto& job) { return !job.sequenced; }) ==
+          256);
+  REQUIRE(f.Gold() == 44);
+  const auto before = QuestJournal::Snapshot(f.Owner());
+  RequireRetired(f.Jobs().Inspect(f.Owner(), future));
+  REQUIRE(f.Jobs().Inspect(f.Owner(), sameText).status == Status::Completed);
+  const auto legacy =
+    f.Jobs().Submit(f.Owner(), sameText, kRetentionNoLogQuest, 0,
+                    f.content.metadata, f.content.Scripts());
+  REQUIRE(legacy.status == Status::Completed);
+  REQUIRE_FALSE(legacy.accepted);
+  auto legacyId = future;
+  legacyId.sequence = 1;
+  REQUIRE_THROWS(f.Jobs().Inspect(f.Owner(), legacyId));
+  REQUIRE_THROWS(f.SubmitRequest(legacyId));
+  REQUIRE(QuestJournal::Snapshot(f.Owner()) == before);
+  REQUIRE(f.Gold() == 44);
+}
+
+TEST_CASE("Retirement publishes only with its exact admission receipt",
+          "[Quest][QuestJobs][Retention][SaveReceipt][Rollback]")
+{
+  RetentionFixture f;
+  std::vector<RequestId> old;
+  for (size_t index = 0; index < 33; ++index)
+    old.push_back(f.CompleteNext());
+  RequireRetired(f.Jobs().Inspect(f.Owner(), old[0]));
+  REQUIRE(f.Jobs().Inspect(f.Owner(), old[1]).status == Status::Completed);
+  const auto request = f.Jobs().NextRequest(f.Owner());
+  RetentionProgram broken(false, true);
+  const auto before = QuestJournal::Snapshot(f.Owner());
+  const auto beforeJobs = QuestJournal::JobState(f.Owner()).Save();
+  const auto beforeHeap = QuestJournal::ScriptState(f.Owner());
+  REQUIRE_THROWS(f.Jobs().Submit(f.Owner(), request, kRetentionQuest, 10,
+                                 broken.metadata, broken.Scripts()));
+  REQUIRE(QuestJournal::Snapshot(f.Owner()) == before);
+  REQUIRE(QuestJournal::JobState(f.Owner()).Save() == beforeJobs);
+  REQUIRE(QuestJournal::ScriptState(f.Owner()) == beforeHeap);
+  REQUIRE(f.Gold() == 43);
+  RequireSameRequest(request, f.Jobs().NextRequest(f.Owner()));
+  REQUIRE(f.Jobs().Inspect(f.Owner(), old[1]).status == Status::Completed);
+  RequirePending(f.SubmitRequest(request));
+  REQUIRE(f.Gold() == 44);
+  RequireRetired(f.Jobs().Inspect(f.Owner(), old[0]));
+  RequirePending(f.Jobs().Inspect(f.Owner(), old[1]));
+  RequirePending(f.SubmitRequest(old[1]));
+  REQUIRE(f.Jobs().Inspect(f.Owner(), old.back()).status == Status::Completed);
+  f.Tick();
+  REQUIRE(f.storage->submissions.size() == 1);
+  const auto bytes = Serialized(f.storage->submissions[0].forms);
+  f.storage->Complete(
+    0, std::make_exception_ptr(std::runtime_error("retirement")));
+  f.Tick();
+  REQUIRE(f.storage->submissions.size() == 2);
+  REQUIRE(Serialized(f.storage->submissions[1].forms) == bytes);
+  RequirePending(f.Jobs().Inspect(f.Owner(), old[1]));
+  RequireRetired(f.Jobs().Inspect(f.Owner(), old[0]));
+  REQUIRE(f.Gold() == 44);
+  f.storage->Complete(0);
+  f.Tick();
+  RequirePending(f.Jobs().Inspect(f.Owner(), old[1]));
+  f.storage->Complete(1);
+  RequirePending(f.Jobs().Inspect(f.Owner(), old[1]));
+  f.Tick();
+  RequireRetired(f.Jobs().Inspect(f.Owner(), old[1]));
+  RequireReady(f.Jobs().Inspect(f.Owner(), request));
+  REQUIRE(f.DrainRequest(request).status == Status::Completed);
+  const auto next = f.Jobs().NextRequest(f.Owner());
+  RequirePending(f.SubmitRequest(next));
+  RequireRetired(f.Jobs().Inspect(f.Owner(), old[0]));
+  RequireRetired(f.Jobs().Inspect(f.Owner(), old[1]));
+  RequirePending(f.Jobs().Inspect(f.Owner(), old[2]));
+  REQUIRE(f.DrainRequest(next).status == Status::Completed);
+  REQUIRE(f.Gold() == 45);
+}
+
+TEST_CASE("Prospective quest request keys reject gaps and conflicting reuse",
+          "[Quest][QuestJobs][Retention][Rollback]")
+{
+  RetentionFixture f(true);
+  const auto request = f.Jobs().NextRequest(f.Owner());
+  RequireSameRequest(request, f.Jobs().NextRequest(f.Owner()));
+  const auto before = QuestJournal::Snapshot(f.Owner());
+  std::vector<RequestId> invalid;
+  auto wrong = request;
+  wrong.owner = "14:Skyrim.esm";
+  invalid.push_back(wrong);
+  wrong = request;
+  ++wrong.generation;
+  invalid.push_back(wrong);
+  wrong = request;
+  ++wrong.sequence;
+  invalid.push_back(wrong);
+  wrong.sequence = 0;
+  invalid.push_back(wrong);
+  wrong.sequence = 9007199254740992ULL;
+  invalid.push_back(wrong);
+  for (const auto& key : invalid) {
+    REQUIRE_THROWS(f.SubmitRequest(key));
+    REQUIRE(QuestJournal::Snapshot(f.Owner()) == before);
+    REQUIRE(f.Gold() == 10);
+  }
+  RequirePending(f.SubmitRequest(request));
+  REQUIRE(f.Gold() == 11);
+  const auto waiting = f.DrainRequest(request);
+  REQUIRE(waiting.status == Status::Waiting);
+  REQUIRE(waiting.key == "retained");
+  REQUIRE(f.SubmitRequest(request).token == waiting.token);
+  const auto checkpoint = QuestJournal::Snapshot(f.Owner());
+  REQUIRE_THROWS(f.Jobs().Submit(f.Owner(), request, kRetentionQuest, 20,
+                                 f.content.metadata, f.content.Scripts()));
+  REQUIRE_THROWS(f.Jobs().Submit(f.Owner(), request, kRetentionNoLogQuest, 0,
+                                 f.content.metadata, f.content.Scripts()));
+  auto following = request;
+  ++following.sequence;
+  REQUIRE_THROWS(f.SubmitRequest(following));
+  RetentionProgram changed;
+  REQUIRE_THROWS(f.Jobs().Resume(f.Owner(), request, waiting.token, true,
+                                 changed.metadata, changed.Scripts()));
+  REQUIRE(QuestJournal::Snapshot(f.Owner()) == checkpoint);
+  REQUIRE(f.Gold() == 11);
+  const auto phase = f.Owner().GetWorldInstance();
+  f.Owner().SetWorldInstance("campaign:" + std::to_string(kOwner) + ":other");
+  REQUIRE_THROWS(f.SubmitRequest(request));
+  REQUIRE_THROWS(f.Jobs().Resume(f.Owner(), request, waiting.token, true,
+                                 f.content.metadata, f.content.Scripts()));
+  f.Owner().SetWorldInstance(phase);
+  RequirePending(f.Jobs().Resume(f.Owner(), request, waiting.token, true,
+                                 f.content.metadata, f.content.Scripts()));
+  REQUIRE(f.Gold() == 13);
+  REQUIRE(f.DrainRequest(request).status == Status::Completed);
+  const auto complete = QuestJournal::Snapshot(f.Owner());
+  REQUIRE(f.Jobs()
+            .Resume(f.Owner(), request, waiting.token, true,
+                    f.content.metadata, f.content.Scripts())
+            .status == Status::Completed);
+  REQUIRE_THROWS(f.Jobs().Resume(f.Owner(), request, waiting.token, false,
+                                 f.content.metadata, f.content.Scripts()));
+  REQUIRE_THROWS(f.Jobs().Submit(f.Owner(), request, kRetentionQuest, 20,
+                                 f.content.metadata, f.content.Scripts()));
+  REQUIRE(QuestJournal::Snapshot(f.Owner()) == complete);
+  REQUIRE(f.Gold() == 13);
+}
+
+TEST_CASE("SQLite restart preserves both sides of a quest retirement receipt",
+          "[Quest][QuestJobs][Retention][SQLite]")
+{
+  SqliteFiles files;
+  RetentionProgram immediate, waiting(true);
+  RequestId oldest, admitted;
+  std::string token;
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    Initialize(server);
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    immediate.Enable(owner);
+    auto& jobs = server.worldState.GetQuestJobs();
+    oldest = jobs.NextRequest(owner);
+    for (size_t index = 0; index < 32; ++index) {
+      const auto request = jobs.NextRequest(owner);
+      RequirePending(jobs.Submit(owner, request, kRetentionQuest, 10,
+                                 immediate.metadata, immediate.Scripts()));
+      REQUIRE(DrainStored(server, owner, request, immediate.metadata,
+                          immediate.Scripts())
+                .status == Status::Completed);
+    }
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 42);
+    REQUIRE(jobs.Inspect(owner, oldest).status == Status::Completed);
+    admitted = jobs.NextRequest(owner);
+    REQUIRE(admitted.sequence == 33);
+  }
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    auto& jobs = server.worldState.GetQuestJobs();
+    RequireSameRequest(jobs.NextRequest(owner), admitted);
+    REQUIRE(jobs.Inspect(owner, oldest).status == Status::Completed);
+    RequirePending(jobs.Submit(owner, admitted, kRetentionQuest, 10,
+                               waiting.metadata, waiting.Scripts()));
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 43);
+    RequirePending(jobs.Inspect(owner, oldest));
+    // No Tick: neither the retirement nor the new prefix reached SQLite.
+  }
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    auto& jobs = server.worldState.GetQuestJobs();
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 42);
+    RequireSameRequest(jobs.NextRequest(owner), admitted);
+    REQUIRE(jobs.Inspect(owner, oldest).status == Status::Completed);
+    REQUIRE(QuestJournal::JobState(owner).retiredThrough == 0);
+    RequirePending(jobs.Submit(owner, admitted, kRetentionQuest, 10,
+                               waiting.metadata, waiting.Scripts()));
+    const auto result = WaitForDurable(server, owner, admitted);
+    REQUIRE(result.status == Status::Waiting);
+    REQUIRE(result.key == "retained");
+    token = result.token;
+    RequireRetired(jobs.Inspect(owner, oldest));
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 43);
+    REQUIRE(QuestJournal::JobState(owner).retiredThrough == oldest.sequence);
+  }
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    auto& jobs = server.worldState.GetQuestJobs();
+    RequireRetired(jobs.Inspect(owner, oldest));
+    RequireRetired(jobs.Submit(owner, oldest, kRetentionQuest, 10,
+                               immediate.metadata, immediate.Scripts()));
+    REQUIRE(jobs.Inspect(owner, admitted).token == token);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 43);
+    RequirePending(jobs.Resume(owner, admitted, token, true, waiting.metadata,
+                               waiting.Scripts()));
+    REQUIRE(
+      DrainStored(server, owner, admitted, waiting.metadata, waiting.Scripts())
+        .status == Status::Completed);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 45);
+    REQUIRE(jobs
+              .Resume(owner, admitted, token, true, waiting.metadata,
+                      waiting.Scripts())
+              .status == Status::Completed);
+    REQUIRE_THROWS(jobs.Resume(owner, admitted, token, false, waiting.metadata,
+                               waiting.Scripts()));
+  }
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    auto& jobs = server.worldState.GetQuestJobs();
+    const auto before = QuestJournal::Snapshot(owner);
+    RequireRetired(
+      jobs.Advance(owner, oldest, immediate.metadata, immediate.Scripts()));
+    REQUIRE(jobs.Inspect(owner, admitted).status == Status::Completed);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 45);
+    REQUIRE(QuestJournal::Snapshot(owner) == before);
+  }
+}
+
+TEST_CASE(
+  "Automatic typed requests retain their namespace through timer recovery",
+  "[Quest][QuestJobs][Retention][SQLite][Scheduler]")
+{
+  SqliteFiles files;
+  TimerProgram content;
+  RequestId request;
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    Initialize(server);
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    content.Enable(owner);
+    auto& jobs = server.worldState.GetQuestJobs();
+    jobs.SetClock([] { return QuestJobTime{ 1000000, 5000 }; });
+    jobs.SetSchedulerFixtureContent(content.metadata, content.Scripts());
+    request = jobs.NextRequest(owner);
+    RequirePending(jobs.Submit(owner, request, kTimerQuest, 5,
+                               content.metadata, content.Scripts(), true));
+    RequireSleeping(WaitForDurable(server, owner, request));
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 12);
+    REQUIRE(QuestJournal::JobState(owner).active->sequenced);
+  }
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    auto& jobs = server.worldState.GetQuestJobs();
+    jobs.SetClock([] { return QuestJobTime{ 1002000, 100 }; });
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    RequireReady(jobs.Inspect(owner, request));
+    server.worldState.Tick();
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 12);
+    jobs.SetSchedulerFixtureContent(content.metadata, content.Scripts());
+    const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (jobs.Inspect(owner, request).status != Status::Completed &&
+           std::chrono::steady_clock::now() < deadline) {
+      server.worldState.Tick();
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(jobs.Inspect(owner, request).status == Status::Completed);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 15);
+    const auto command = RequestName(request);
+    REQUIRE_THROWS(jobs.Inspect(owner, command));
+    RequirePending(jobs.Submit(owner, command, kTimerQuest, 5,
+                               content.metadata, content.Scripts()));
+    REQUIRE(WaitForDurable(server, owner, command).status ==
+            Status::Completed);
+    REQUIRE_FALSE(jobs.Inspect(owner, command).accepted);
+    REQUIRE(jobs.Inspect(owner, request).accepted);
+    REQUIRE(QuestJournal::JobState(owner).completed.size() == 2);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 15);
+    REQUIRE_NOTHROW(jobs.Retry(owner, request));
+  }
 }

@@ -12,13 +12,32 @@
 #include <stdexcept>
 
 namespace {
-const QuestJobState::Job* Find(const QuestJobState& state,
-                               const std::string& command)
+constexpr uint64_t MaxIdentity = 9007199254740991ULL;
+
+bool Matches(const QuestJobState::Job& job,
+             const QuestJobRunner::Request& request)
 {
-  if (state.active && state.active->command == command)
+  return request.sequence
+    ? job.sequenced && job.id == request.sequence->sequence &&
+      job.generation == request.sequence->generation &&
+      job.owner == request.sequence->owner
+    : !job.sequenced && job.command == request.command;
+}
+
+QuestJobRunner::Request RequestFor(const QuestJobState::Job& job)
+{
+  if (job.sequenced)
+    return QuestJobRunner::RequestId{ job.owner, job.generation, job.id };
+  return job.command;
+}
+
+const QuestJobState::Job* Find(const QuestJobState& state,
+                               const QuestJobRunner::Request& command)
+{
+  if (state.active && Matches(*state.active, command))
     return &*state.active;
   for (const auto& job : state.completed)
-    if (job.command == command)
+    if (Matches(job, command))
       return &job;
   return nullptr;
 }
@@ -55,6 +74,25 @@ struct BusyGuard
 };
 }
 
+QuestJobRunner::Request::Request(std::string value)
+  : command(std::move(value))
+{
+}
+
+QuestJobRunner::Request::Request(const char* value)
+  : command(value ? value : "")
+{
+  if (!value)
+    throw std::invalid_argument("Null quest command");
+}
+
+QuestJobRunner::Request::Request(RequestId id)
+  : command("quest-request:" + std::to_string(id.generation) + ":" +
+            std::to_string(id.sequence))
+  , sequence(std::move(id))
+{
+}
+
 QuestJobRunner::QuestJobRunner(WorldState& world)
   : world(world)
   , clock([] {
@@ -70,6 +108,88 @@ QuestJobRunner::QuestJobRunner(WorldState& world)
                          static_cast<uint64_t>(steady) };
   })
 {
+}
+
+QuestJobRunner::RequestId QuestJobRunner::NextRequest(MpActor& actor)
+{
+  const auto jobs = QuestJournal::JobState(actor);
+  const auto& owner = QuestJournal::Owner(actor);
+  RequestId id{ owner.GetChangeForm().formDesc.ToString(), jobs.generation,
+                jobs.nextJob };
+  RequireRequest(actor, id, jobs);
+  if (id.sequence >= MaxIdentity)
+    throw std::overflow_error("Quest request identities exhausted");
+  return id;
+}
+
+void QuestJobRunner::RequireRequest(MpActor& actor, const Request& request,
+                                    const QuestJobState& jobs) const
+{
+  if (stopped || actor.GetParent() != &world || actor.IsDeleted() ||
+      world.LookupFormByIdNoLoad(actor.GetFormId()).get() != &actor)
+    throw std::runtime_error(
+      "Quest request actor or coordinator is unavailable");
+  const auto& owner = QuestJournal::Owner(actor);
+  if (owner.IsDeleted() ||
+      world.LookupFormByIdNoLoad(owner.GetFormId()).get() != &owner)
+    throw std::runtime_error("Quest request campaign owner is unavailable");
+  if (const auto& id = request.sequence) {
+    if (id->owner != owner.GetChangeForm().formDesc.ToString() ||
+        id->generation != jobs.generation || !id->sequence ||
+        id->sequence > MaxIdentity)
+      throw std::runtime_error(
+        "Quest request belongs to another campaign or generation");
+    const auto legacyId = [&](const QuestJobState::Job& job) {
+      return !job.sequenced && job.id == id->sequence;
+    };
+    if ((jobs.active && legacyId(*jobs.active)) ||
+        std::any_of(jobs.completed.begin(), jobs.completed.end(), legacyId))
+      throw std::runtime_error("Numbered request identifies a legacy command");
+  }
+}
+
+std::optional<QuestJobRunner::Result> QuestJobRunner::Retired(
+  MpActor& actor, const Request& request, const QuestJobState& jobs)
+{
+  RequireRequest(actor, request, jobs);
+  if (!request.sequence || request.sequence->sequence > jobs.retiredThrough)
+    return std::nullopt;
+  const auto id = request.sequence->sequence;
+  const auto& owner = QuestJournal::Owner(actor);
+  if (const auto found = barriers.find(owner.GetFormId());
+      found != barriers.end()) {
+    const auto& barrier = found->second;
+    if (barrier.owner.lock().get() != &owner)
+      throw std::runtime_error("Quest retirement owner was replaced");
+    // A reentrant native callback must not observe a transaction-local
+    // retirement before its receipt can be published.
+    if (barrier.busy)
+      return Result{ Status::Pending, id };
+    if (id > barrier.retiredFrom && id <= barrier.retiredThrough &&
+        barrier.retirementReceipt) {
+      const auto state = barrier.retirementReceipt->GetState();
+      if (state == SaveReceipt::State::Pending)
+        return Result{ Status::Pending, id };
+      if (state != SaveReceipt::State::Durable)
+        return Result{
+          Status::Failed,
+          id,
+          false,
+          {},
+          {},
+          "Quest retirement was abandoned; recovery is required"
+        };
+    }
+  }
+  return Result{ Status::Retired, id };
+}
+
+std::optional<QuestJobRunner::Result> QuestJobRunner::Retired(
+  MpActor& actor, const Request& request)
+{
+  if (!request.sequence)
+    return std::nullopt;
+  return Retired(actor, request, QuestJournal::JobState(actor));
 }
 
 void QuestJobRunner::Stop() noexcept
@@ -125,6 +245,8 @@ void QuestJobRunner::Track(MpActor& owner, const QuestJobState::Job& job)
     throw std::runtime_error("Quest scheduler campaign limit exceeded");
   const auto found = scheduled.find(owner.GetFormId());
   if (found != scheduled.end() && found->second.job == job.id &&
+      found->second.generation == job.generation &&
+      found->second.sequenced == job.sequenced &&
       found->second.command == job.command &&
       found->second.instance == job.instance &&
       found->second.contentMode == job.contentMode &&
@@ -134,6 +256,8 @@ void QuestJobRunner::Track(MpActor& owner, const QuestJobState::Job& job)
     return;
   Scheduled entry;
   entry.job = job.id;
+  entry.generation = job.generation;
+  entry.sequenced = job.sequenced;
   entry.actor = FormDesc::FromString(job.actor).ToFormId(world.espmFiles);
   entry.command = job.command;
   entry.instance = job.instance;
@@ -194,11 +318,19 @@ bool QuestJobRunner::TimerReady(MpActor& actor, const QuestJobState::Job& job)
   return time.steadyMs >= barrier.timer->dueSteadyMs;
 }
 
-void QuestJobRunner::Retry(MpActor& actor, const std::string& command)
+void QuestJobRunner::Retry(MpActor& actor, const Request& command)
 {
+  if (command.sequence) {
+    const auto observed = Inspect(actor, command);
+    if (observed.status == Status::Completed ||
+        observed.status == Status::Retired)
+      return; // Terminal numbered work cannot be reopened or clear another
+              // job.
+  }
   RequireReady(actor);
   const auto jobs = QuestJournal::JobState(actor);
-  if (!jobs.active || jobs.active->command != command)
+  RequireRequest(actor, command, jobs);
+  if (!jobs.active || !Matches(*jobs.active, command))
     throw std::runtime_error("No active quest job to retry");
   RequireContext(actor, *jobs.active);
   Track(QuestJournal::Owner(actor), *jobs.active);
@@ -289,6 +421,8 @@ void QuestJobRunner::Pump() noexcept
         continue;
       const auto jobs = QuestJournal::PersonalJobState(*owner);
       if (!jobs.active || jobs.active->id != work.job ||
+          jobs.active->generation != work.generation ||
+          jobs.active->sequenced != work.sequenced ||
           !jobs.active->automatic) {
         scheduled.erase(ownerId);
         continue;
@@ -300,15 +434,16 @@ void QuestJobRunner::Pump() noexcept
       } catch (const std::exception&) {
         continue; // The initiating actor must return to the original context.
       }
-      const auto observed = Inspect(*actor, work.command);
+      const auto request = RequestFor(*jobs.active);
+      const auto observed = Inspect(*actor, request);
       if (observed.status != Status::Ready)
         continue;
       ++executed;
       if (jobs.active->contentMode == "fixture")
-        Advance(*actor, work.command, schedulerFixture->metadata,
+        Advance(*actor, request, schedulerFixture->metadata,
                 schedulerFixture->scripts);
       else
-        Advance(*actor, work.command);
+        Advance(*actor, request);
     } catch (const std::exception& error) {
       quarantine(error.what());
     } catch (...) {
@@ -376,13 +511,15 @@ const std::vector<PexScript::Lazy>& QuestJobRunner::Scripts()
 }
 
 QuestJobRunner::Result QuestJobRunner::Inspect(MpActor& actor,
-                                               const std::string& command)
+                                               const Request& command)
 {
   if (stopped)
     return {
       Status::Failed, 0, false, {}, {}, "Quest coordinator was cleared"
     };
   const auto jobs = QuestJournal::JobState(actor);
+  if (const auto retired = Retired(actor, command, jobs))
+    return *retired;
   const auto* job = Find(jobs, command);
   if (!job)
     throw std::invalid_argument("Unknown quest job command");
@@ -430,16 +567,18 @@ QuestJobRunner::Result QuestJobRunner::Inspect(MpActor& actor,
 }
 
 QuestJobRunner::Result QuestJobRunner::Submit(MpActor& actor,
-                                              const std::string& command,
+                                              const Request& command,
                                               uint32_t quest, uint16_t stage)
 {
+  if (const auto retired = Retired(actor, command))
+    return *retired;
   const auto& pinned = Scripts();
   return SubmitWithContent(actor, command, quest, stage, pinned, {}, manifest,
                            false, true);
 }
 
 QuestJobRunner::Result QuestJobRunner::Submit(
-  MpActor& actor, const std::string& command, uint32_t quest, uint16_t stage,
+  MpActor& actor, const Request& command, uint32_t quest, uint16_t stage,
   const espm::QuestScriptData& metadata,
   const std::vector<PexScript::Lazy>& scripts)
 {
@@ -448,10 +587,12 @@ QuestJobRunner::Result QuestJobRunner::Submit(
 }
 
 QuestJobRunner::Result QuestJobRunner::Submit(
-  MpActor& actor, const std::string& command, uint32_t quest, uint16_t stage,
+  MpActor& actor, const Request& command, uint32_t quest, uint16_t stage,
   const MetadataOverrides& overrides,
   const std::vector<PexScript::Lazy>& scripts, bool automatic)
 {
+  if (const auto retired = Retired(actor, command))
+    return *retired;
   const auto hashManifest = QuestJobContent::WithMetadataOverrides(
     world, QuestJobContent::ScriptManifest(scripts), overrides);
   return SubmitWithContent(actor, command, quest, stage, scripts, overrides,
@@ -459,13 +600,13 @@ QuestJobRunner::Result QuestJobRunner::Submit(
 }
 
 QuestJobRunner::Result QuestJobRunner::SubmitWithContent(
-  MpActor& actor, const std::string& command, uint32_t quest, uint16_t stage,
+  MpActor& actor, const Request& command, uint32_t quest, uint16_t stage,
   const std::vector<PexScript::Lazy>& sources,
   const MetadataOverrides& overrides, const std::string& hashManifest,
   bool fixtureAwait, bool automatic)
 {
-  if (command.empty() || command.size() > 128 ||
-      command.find('\0') != std::string::npos || stopped ||
+  if (command.command.empty() || command.command.size() > 128 ||
+      command.command.find('\0') != std::string::npos || stopped ||
       actor.GetParent() != &world)
     throw std::invalid_argument("Invalid quest job submission");
   if (automatic && fixtureAwait && !schedulerFixture)
@@ -480,6 +621,7 @@ QuestJobRunner::Result QuestJobRunner::SubmitWithContent(
       "Automatic fixture content differs from its scheduler provider");
   auto& owner = QuestJournal::Owner(actor);
   auto jobs = QuestJournal::JobState(actor);
+  RequireRequest(actor, command, jobs);
   const auto questKey =
     FormDesc::FromFormId(quest, world.espmFiles).ToString();
   const auto hash = QuestJobContent::Hash(
@@ -494,15 +636,26 @@ QuestJobRunner::Result QuestJobRunner::SubmitWithContent(
     return Inspect(actor, command);
   }
   RequireReady(actor);
-  if (jobs.active || jobs.completed.size() >= QuestJobState::MaxCompleted ||
-      jobs.nextJob >= 9007199254740991ULL)
+  const auto legacyCount =
+    std::count_if(jobs.completed.begin(), jobs.completed.end(),
+                  [](const auto& job) { return !job.sequenced; });
+  if (jobs.active ||
+      (!command.sequence && legacyCount >= QuestJobState::MaxCompleted) ||
+      jobs.nextJob >= MaxIdentity)
     throw std::runtime_error(
       "Campaign has active work or its command history is full");
+  if (command.sequence && command.sequence->sequence != jobs.nextJob)
+    throw std::runtime_error(
+      "Quest request is not the next admission identity");
+  const auto previousFrontier = jobs.retiredThrough;
+  if (command.sequence)
+    jobs.RetireForAdmission();
   QuestJournal::RequireAdapter(actor, quest);
   QuestJobState::Job job;
   job.id = jobs.nextJob++;
   job.generation = jobs.generation;
-  job.command = command;
+  job.command = command.command;
+  job.sequenced = command.sequence.has_value();
   job.automatic = automatic;
   job.contentMode = fixtureAwait ? "fixture" : "owned";
   job.actor =
@@ -517,7 +670,9 @@ QuestJobRunner::Result QuestJobRunner::SubmitWithContent(
   jobs.active = std::move(job);
   jobs.Save();
   return RunSegment(actor, std::move(jobs), sources, overrides, hashManifest,
-                    {}, fixtureAwait, true);
+                    {}, fixtureAwait, true, false,
+                    command.sequence ? std::optional(previousFrontier)
+                                     : std::nullopt);
 }
 
 void QuestJobRunner::ValidateContent(const QuestJobState::Job& job,
@@ -538,21 +693,25 @@ void QuestJobRunner::ValidateContent(const QuestJobState::Job& job,
 }
 
 QuestJobRunner::Result QuestJobRunner::Resume(MpActor& actor,
-                                              const std::string& command,
+                                              const Request& command,
                                               const std::string& token,
                                               bool completion)
 {
+  if (const auto retired = Retired(actor, command))
+    return *retired;
   const auto& pinned = Scripts();
   return ResumeWithContent(actor, command, token, completion, pinned, {},
                            manifest, false);
 }
 
 QuestJobRunner::Result QuestJobRunner::Resume(
-  MpActor& actor, const std::string& command, const std::string& token,
+  MpActor& actor, const Request& command, const std::string& token,
   bool completion, const espm::QuestScriptData& metadata,
   const std::vector<PexScript::Lazy>& scripts)
 {
   const auto jobs = QuestJournal::JobState(actor);
+  if (const auto retired = Retired(actor, command, jobs))
+    return *retired;
   const auto* job = Find(jobs, command);
   if (!job)
     throw std::invalid_argument("Unknown quest job command");
@@ -563,10 +722,12 @@ QuestJobRunner::Result QuestJobRunner::Resume(
 }
 
 QuestJobRunner::Result QuestJobRunner::Resume(
-  MpActor& actor, const std::string& command, const std::string& token,
+  MpActor& actor, const Request& command, const std::string& token,
   bool completion, const MetadataOverrides& overrides,
   const std::vector<PexScript::Lazy>& scripts)
 {
+  if (const auto retired = Retired(actor, command))
+    return *retired;
   const auto hashManifest = QuestJobContent::WithMetadataOverrides(
     world, QuestJobContent::ScriptManifest(scripts), overrides);
   return ResumeWithContent(actor, command, token, completion, scripts,
@@ -574,12 +735,13 @@ QuestJobRunner::Result QuestJobRunner::Resume(
 }
 
 QuestJobRunner::Result QuestJobRunner::ResumeWithContent(
-  MpActor& actor, const std::string& command, const std::string& token,
+  MpActor& actor, const Request& command, const std::string& token,
   bool completion, const std::vector<PexScript::Lazy>& sources,
   const MetadataOverrides& overrides, const std::string& hashManifest,
   bool fixtureAwait)
 {
   auto jobs = QuestJournal::JobState(actor);
+  RequireRequest(actor, command, jobs);
   const auto* prior = Find(jobs, command);
   if (!prior)
     throw std::invalid_argument("Unknown quest job command");
@@ -593,7 +755,7 @@ QuestJobRunner::Result QuestJobRunner::ResumeWithContent(
     return Inspect(actor, command);
   }
   RequireReady(actor);
-  if (!jobs.active || jobs.active->command != command)
+  if (!jobs.active || !Matches(*jobs.active, command))
     throw std::runtime_error("Quest completion does not match active work");
   const auto& current = jobs.active->Current();
   if (current.cursor != "waiting" || current.awaitKind != "bool" ||
@@ -604,17 +766,20 @@ QuestJobRunner::Result QuestJobRunner::ResumeWithContent(
 }
 
 QuestJobRunner::Result QuestJobRunner::Advance(MpActor& actor,
-                                               const std::string& command)
+                                               const Request& command)
 {
+  if (const auto retired = Retired(actor, command))
+    return *retired;
   const auto& pinned = Scripts();
   return AdvanceWithContent(actor, command, pinned, {}, manifest, false);
 }
 
 QuestJobRunner::Result QuestJobRunner::Advance(
-  MpActor& actor, const std::string& command,
-  const MetadataOverrides& overrides,
+  MpActor& actor, const Request& command, const MetadataOverrides& overrides,
   const std::vector<PexScript::Lazy>& scripts)
 {
+  if (const auto retired = Retired(actor, command))
+    return *retired;
   const auto hashManifest = QuestJobContent::WithMetadataOverrides(
     world, QuestJobContent::ScriptManifest(scripts), overrides);
   return AdvanceWithContent(actor, command, scripts, overrides, hashManifest,
@@ -622,12 +787,13 @@ QuestJobRunner::Result QuestJobRunner::Advance(
 }
 
 QuestJobRunner::Result QuestJobRunner::AdvanceWithContent(
-  MpActor& actor, const std::string& command,
+  MpActor& actor, const Request& command,
   const std::vector<PexScript::Lazy>& sources,
   const MetadataOverrides& overrides, const std::string& hashManifest,
   bool fixtureAwait)
 {
   auto jobs = QuestJournal::JobState(actor);
+  RequireRequest(actor, command, jobs);
   const auto* prior = Find(jobs, command);
   if (!prior)
     throw std::invalid_argument("Unknown quest job command");
@@ -657,12 +823,13 @@ QuestJobRunner::Result QuestJobRunner::RunSegment(
   const std::vector<PexScript::Lazy>& sources,
   const MetadataOverrides& overrides, const std::string& hashManifest,
   std::optional<QuestJobState::Completion> completion, bool fixtureAwait,
-  bool submit, bool consumeChild)
+  bool submit, bool consumeChild, std::optional<uint64_t> retirementFrom)
 {
   auto& owner = QuestJournal::Owner(actor);
   auto& job = *jobs.active;
   const auto ownerId = owner.GetFormId();
-  const auto command = job.command;
+  const auto command = RequestFor(job);
+  const auto retiredThrough = jobs.retiredThrough;
   Track(owner, job);
   // Preallocate the barrier before committing effects. Publishing its exact
   // receipt must not allocate or throw after AtomicJob has committed.
@@ -710,9 +877,15 @@ QuestJobRunner::Result QuestJobRunner::RunSegment(
     });
     barrier.timer = std::move(timerAnchor);
     barrier.receipt = receipt;
+    if (retirementFrom && retiredThrough > *retirementFrom) {
+      barrier.retiredFrom = *retirementFrom;
+      barrier.retiredThrough = retiredThrough;
+      barrier.retirementReceipt = receipt;
+    }
     const auto scheduledJob = scheduled.find(ownerId);
     if (scheduledJob != scheduled.end() &&
-        scheduledJob->second.command == command)
+        scheduledJob->second.command == command.command &&
+        scheduledJob->second.sequenced == command.sequence.has_value())
       scheduledJob->second.waitingExternal = jobs.active &&
         jobs.active->Current().cursor == "waiting" &&
         jobs.active->Current().awaitKind == "bool";

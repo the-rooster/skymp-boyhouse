@@ -82,6 +82,7 @@ struct QuestJobState
     std::string command, actor, owner, instance;
     std::string contentMode = "owned";
     bool automatic = false;
+    bool sequenced = false;
     uint32_t instructions = 0, steps = 0;
     std::vector<Event> events;
     uint32_t eventHead = 0;
@@ -97,10 +98,12 @@ struct QuestJobState
     const Stage& Current() const;
     bool IsComplete() const;
   };
-  uint64_t generation = 1, nextJob = 1;
+  uint64_t generation = 1, nextJob = 1, retiredThrough = 0;
   std::optional<Job> active;
   std::vector<Job> completed;
   static constexpr size_t MaxCompleted = 256;
+  static constexpr size_t MaxRecentCompleted = 32;
+  static constexpr size_t MaxRecentBytes = 1024 * 1024;
   static constexpr size_t MaxOperations = 256;
   static constexpr size_t MaxEvents = 4096;
   static constexpr size_t MaxDepth = 128;
@@ -112,6 +115,11 @@ struct QuestJobState
 
   static QuestJobState Read(const nlohmann::json& value);
   nlohmann::json Save() const;
+  // Canonical full-job JSON bytes, excluding permanent legacy completions.
+  size_t RetainedSequencedBytes() const;
+  // Called only at durable sequenced admission. Retire oldest sequenced work
+  // until count and byte limits both permit the next pristine root.
+  void RetireForAdmission();
   // Validate canonical heap shape plus one-to-one active job/stack ownership.
   // No object resolution or script execution occurs in this validation.
   void ValidateHeap(const nlohmann::json& heap) const;

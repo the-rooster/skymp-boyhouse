@@ -409,7 +409,7 @@ parents, container UI and other spatial effects are outside this transaction;
 they still need campaign-specific integration. Movement is also outside the
 script transaction. Automatic alias fills, remaining natives and latent handlers
 remain restricted. Controlled script tests do not certify any vanilla quest or
-establish throughput for 16ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“32 players.
+establish throughput for 16ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ32 players.
 
 ### Creating private reference copies
 
@@ -463,7 +463,7 @@ location playable. Automatic entry, engine-side transition application, cross-ar
 enable-parent change propagation, scale/ownership/lock overlays, NPC auto-calculated
 stats, respawns and durable lifecycle delivery remain unfinished. The factory
 currently copies the relevant world indexes during a batch; this needs measurement
-and optimization before a 16ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“32 player rollout. Requests are bounded to 4,096
+and optimization before a 16ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ32 player rollout. Requests are bounded to 4,096
 references, a radius of 65,536 units, and a 100,000-entry/8 MiB owner ledger;
 streaming and ledger partitioning are required for a full world.
 
@@ -771,9 +771,50 @@ inventory; AddItems/RemoveItems do not supply the corresponding campaign events.
 Ordinary reference load/interaction entry points still run synchronously and
 reject positive waits.
 They need durable ingress and load-generation/OnInit completion semantics before
-using the handler machinery. Quest startup/shutdown/reset, game-calendar waits,
-scalable command retention and client integration remain unfinished. This is
+using the handler machinery. Quest startup/shutdown/reset, game-calendar waits
+and client integration remain unfinished. This is
 runtime infrastructure, not certification that any complete quest is playable.
+
+## Numbered request retention
+
+Trusted host producers can use `QuestJobRunner::NextRequest(actor)` to obtain a
+prospective `RequestId { owner, generation, sequence }`, then pass that typed ID
+to Submit, Inspect, Advance or Resume. NextRequest neither reserves an ID nor
+acknowledges a write. Competing producers can receive the same prospective ID;
+the first admitted payload owns it, and conflicting reuse is rejected while
+the result is retained. The sequence is the campaign's global job ID, including
+IDs consumed by older string-keyed commands. Keep the typed ID across retries;
+its diagnostic command spelling is not an interchangeable legacy key.
+
+Schema5 preserves old command identities, scopes and continuations. Completed
+string-keyed commands remain permanent and retain their existing 256-command
+admission cap. Numbered work has no such lifetime cap: a new numbered admission
+retires oldest numbered completions until fewer than 32 remain and their full
+canonical serialized records occupy at most 1 MiB. All legacy records and newer
+numbered records remain unchanged. The completed result window can hold up to 32
+records; large results can be retired sooner. A newly completed large result
+is subject to this byte check on the next numbered admission. The overall 8 MiB
+journal and active-job/VM resource limits still apply independently.
+
+Retirement and the new job's first segment share one atomic save. A newly
+retired request remains Pending until that exact receipt is Durable. Failed
+writes retry the same snapshot; a failed execution leaves the previous frontier
+and effects unchanged. Older durable retirements remain observable during later
+pending saves. Reentrant observations during a busy transaction conservatively
+return Pending. Abandoned retirement receipts require recovery.
+
+At or below the durable retirement frontier, a typed retry returns Retired and
+never executes. Retired carries no accepted result and cannot validate the old
+payload, original actor, phase or content mode after those details are erased.
+It still validates the current campaign owner/generation and rejects retained
+legacy IDs in the numbered namespace. Recent completions keep their exact
+context/content/Boolean-result checks. Retry of a numbered Completed or Retired
+request is a no-op. Request IDs and native operation scopes are never reused.
+
+This is the retention prerequisite for continuing server event traffic. It does
+not yet provide an inbox or independent sleeping root stacks. An interaction
+queued solely behind a quest waiting for that interaction can deadlock; those
+stacks must share the campaign heap while executing serial durable segments.
 
 ## Verification commands
 
@@ -897,3 +938,16 @@ validation. The owned quest scan remains a static analysis: no complete quest
 is certified playable. Generated handler fixtures are not quest playthroughs
 or production performance evidence. Skyrim was not launched; the installed
 client and staging deployment were unchanged.
+
+The numbered-request-retention batch passed the Linux server build and full
+verification on 2026-11-17 UTC: 754 native cases / 469,373 assertions,
+368 JavaScript tests, 47 Python tests, addon and both protocol
+smokes, and SQLite recovery of 32 characters. Its 105 focused cases
+(17,162 assertions) include 300 reward-producing numbered
+completions, coexistence with 256 permanent legacy commands, count/byte retirement,
+namespace and payload conflicts, exact failed-save retries, rollback before
+publication, and fresh-server recovery before and after retirement. The tests
+retain full recent result checks and prove that retired requests cannot replay
+rewards. These are runtime/storage fixtures, not full quest playthroughs or
+production latency evidence. No quest is certified playable. Skyrim was not
+launched; the installed client and staging deployment were unchanged.
