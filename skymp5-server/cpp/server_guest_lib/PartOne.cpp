@@ -509,46 +509,49 @@ void PartOne::AttachSaveStorage(
 
   int n = 0;
   int numPlayerCharacters = 0;
-  saveStorage->IterateSync([&](MpChangeForm changeForm) {
-    // Do not let players become NPCs
-    if (changeForm.profileId != -1 && !changeForm.isDisabled) {
-      changeForm.isDisabled = true;
-    }
+  {
+    WorldState::RestorationScope restoration(worldState);
+    saveStorage->IterateSync([&](MpChangeForm changeForm) {
+      // Do not let players become NPCs
+      if (changeForm.profileId != -1 && !changeForm.isDisabled) {
+        changeForm.isDisabled = true;
+      }
 
-    if (changeForm.isDeleted) {
-      pImpl->logger->info(
-        "Skipping deleted form {}, will likely overwrite at some point",
-        changeForm.formDesc.ToString());
-      return;
-    }
-
-    bool isFF = changeForm.formDesc.file.empty();
-
-    if (isFF) {
-      auto baseId = changeForm.baseDesc.ToFormId(worldState.espmFiles);
-      auto lookupRes = GetEspm().GetBrowser().LookupById(baseId);
-
-      if (lookupRes.rec && espm::utils::IsItem(lookupRes.rec->GetType()) &&
-          changeForm.dynamicFields.GetValueDump(
-            CampaignReferenceBinding::kProperty) == "null") {
-        pImpl->logger->info("Skipping FF item {} (type is {}), will likely "
-                            "overwrite at some point",
-                            changeForm.formDesc.ToString(),
-                            lookupRes.rec->GetType().ToString());
+      if (changeForm.isDeleted) {
+        pImpl->logger->info(
+          "Skipping deleted form {}, will likely overwrite at some point",
+          changeForm.formDesc.ToString());
         return;
       }
-    }
 
-    n++;
-    worldState.LoadChangeForm(changeForm, CreateFormCallbacks());
-    if (changeForm.profileId >= 0) {
-      ++numPlayerCharacters;
-    }
+      bool isFF = changeForm.formDesc.file.empty();
 
-    if (n % 25 == 0) {
-      pImpl->logger->info("Loaded {} ChangeForms", n);
-    }
-  });
+      if (isFF) {
+        auto baseId = changeForm.baseDesc.ToFormId(worldState.espmFiles);
+        auto lookupRes = GetEspm().GetBrowser().LookupById(baseId);
+
+        if (lookupRes.rec && espm::utils::IsItem(lookupRes.rec->GetType()) &&
+            changeForm.dynamicFields.GetValueDump(
+              CampaignReferenceBinding::kProperty) == "null") {
+          pImpl->logger->info("Skipping FF item {} (type is {}), will likely "
+                              "overwrite at some point",
+                              changeForm.formDesc.ToString(),
+                              lookupRes.rec->GetType().ToString());
+          return;
+        }
+      }
+
+      n++;
+      worldState.LoadChangeForm(changeForm, CreateFormCallbacks());
+      if (changeForm.profileId >= 0) {
+        ++numPlayerCharacters;
+      }
+
+      if (n % 25 == 0) {
+        pImpl->logger->info("Loaded {} ChangeForms", n);
+      }
+    });
+  }
 
   auto end = std::chrono::steady_clock::now();
   auto duration =

@@ -931,6 +931,38 @@ confirms latent load work and game-state-dependent loops, without proving a
 specific CellLoad dependency on an OnLoad-only write.
 No complete quest or live multiplayer playthrough is certified by these tests.
 
+## Passive world restoration
+
+WorldState::RestorationScope nests across the entire saved-form iteration,
+individual and deferred loads, saved AddForm, and actor/reference ApplyChangeForm.
+Its destructor only lowers the depth. Timers, save flushing and quest pumping
+wait for a later ordinary tick; restoration does not lazily load plugin chunks.
+
+Spatial relationships are reconstructed without load callbacks or new client
+publication. Primitive occupancy is seeded from saved positions in either object
+order, and primitive geometry is rebuilt after applying saved position/angle.
+Pending relationships are excluded from published actor listeners. A later real
+subscription pass or movement promotes them; promotion preserves occupancy so
+the first actual exit remains a Leave instead of inventing an Enter. Removing a
+pending relationship also removes its primitive occupancy pointers.
+
+Publication tracks an in-memory relationship occurrence, pins native identities
+across callbacks, retries failed publication, and tolerates reentrant refresh.
+These tokens are transient subscription bookkeeping, not durable native Papyrus
+load-occurrence identities. A callback that throws after externally publishing
+may still have emitted a partial network effect; no exactly-once network delivery
+claim is made.
+
+Applying a save that would change the position, angle, cell, phase, disabled or
+deleted state of an already published reference is rejected before mutation.
+This is cold spatial restoration, not a live-world rewind protocol. Metadata-only
+application at unchanged spatial state retains existing relationships. Actor
+effect reconstruction suppresses direct actor-value network updates while keeping
+its timers. Existing actor-value/respawn restoration behavior is otherwise retained.
+
+Native load ordering, initialization/reentrancy rules, durable ingress, quest
+lifecycle and full multiplayer playthrough/performance validation remain open.
+
 ## Verification commands
 
 ```sh
@@ -1103,3 +1135,23 @@ These generated runtime fixtures do not certify complete quests or production
 latency. Production subscription/trigger restoration ordering, load occurrence
 deduplication and physical player-action integration remain unfinished. Skyrim
 was not launched; the installed client and staging were unchanged.
+
+The passive-world-restoration batch passed the Linux server build and full
+verification on 2026-11-17 UTC: 813 native cases / 487,411 assertions,
+368 JavaScript tests, 47 Python tests, addon and both protocol
+smokes, and SQLite recovery of 32 characters. Its final focused run passed
+69 cases / 3,318 assertions across restoration,
+world state, instances and reference lifecycle. The initial broad run passed
+518 of 519 cases and caught a late-profile load-eligibility regression, fixed
+without weakening that existing test. Restoration
+fixtures cover passive subscription and trigger occupancy reconstruction,
+disabled actors, pending-edge removal, nested guards and exception unwinding.
+Saved-world reconstruction now suppresses callback publication and pauses
+world ticks, timers, queued saves and lazy chunk loading while nested restore
+scopes remain active. Leaving a scope does not run gameplay callbacks.
+These fixtures do not certify complete quests or production latency. Durable
+load admission is still a trusted backend recipe: native load-event eligibility,
+callback ordering, OnInit call gating, reset generations and per-occurrence
+admission need further audit before production wiring. Skyrim was not launched;
+the installed client and staging were unchanged. Certified playable quests
+remain zero.

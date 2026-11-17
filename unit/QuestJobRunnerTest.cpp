@@ -4511,6 +4511,7 @@ TEST_CASE(
   "[Quest][QuestJobs][Interactions][Rollback]")
 {
   const auto corruption = GENERATE(0, 1, 2);
+  const bool ownerFirst = GENERATE(false, true);
   InteractionFixture f(false, false);
   const auto request = f.Jobs().NextRequest(f.Owner());
   f.SubmitInteraction(request);
@@ -4537,10 +4538,11 @@ TEST_CASE(
   restarted.AttachEspm(&GetEspmLoader());
   auto storage = std::make_shared<ControlledStorage>();
   restarted.AttachSaveStorage(storage);
-  // Match ordinary SQLite recovery order. Restoring a trigger first would
-  // cause owner positioning to enter the separate synchronous trigger path.
-  restarted.worldState.LoadChangeForm(ownerSave, FormCallbacks::DoNothing());
-  restarted.worldState.LoadChangeForm(targetSave, FormCallbacks::DoNothing());
+  // Saved trigger occupancy must be silent in either database iteration order.
+  restarted.worldState.LoadChangeForm(ownerFirst ? ownerSave : targetSave,
+                                      FormCallbacks::DoNothing());
+  restarted.worldState.LoadChangeForm(ownerFirst ? targetSave : ownerSave,
+                                      FormCallbacks::DoNothing());
   auto& owner = restarted.worldState.GetFormAt<MpActor>(kOwner);
   auto& jobs = restarted.worldState.GetQuestJobs();
   const auto before = QuestJournal::JobState(owner).Save();
@@ -5144,6 +5146,7 @@ TEST_CASE(
   "[Quest][QuestJobs][ReferenceLoad][Rollback]")
 {
   const auto corruption = GENERATE(0, 1);
+  const bool ownerFirst = GENERATE(false, true);
   LoadFixture f(false);
   const auto request = f.Jobs().NextRequest(f.Owner());
   f.server.CreateActor(kOwner + 1, { 1, 2, 3 }, 0, 0x3c);
@@ -5185,10 +5188,10 @@ TEST_CASE(
   restarted.AttachEspm(&GetEspmLoader());
   auto storage = std::make_shared<ControlledStorage>();
   restarted.AttachSaveStorage(storage);
-  // Keep this backend recovery check separate from ordinary subscription
-  // ingress.
-  restarted.worldState.LoadChangeForm(ownerSave, FormCallbacks::DoNothing());
-  restarted.worldState.LoadChangeForm(targetSave, FormCallbacks::DoNothing());
+  restarted.worldState.LoadChangeForm(ownerFirst ? ownerSave : targetSave,
+                                      FormCallbacks::DoNothing());
+  restarted.worldState.LoadChangeForm(ownerFirst ? targetSave : ownerSave,
+                                      FormCallbacks::DoNothing());
   auto& owner = restarted.worldState.GetFormAt<MpActor>(kOwner);
   const auto checkpoint = QuestJournal::JobState(owner).Save();
   const auto heap = QuestJournal::ScriptState(owner);

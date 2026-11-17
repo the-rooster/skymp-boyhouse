@@ -236,6 +236,8 @@ private:
   void InitScripts();
   void MoveOnGrid(GridImpl<MpObjectReference*>& grid);
   void InitListenersAndEmitters();
+  bool HasPendingSubscriptions() const;
+  void RestorePrimitiveOccupancy();
   void SendOpenContainer(uint32_t refId);
   void CheckInteractionAbility(MpObjectReference& ac);
   bool IsLocationSavingNeeded() const;
@@ -254,10 +256,7 @@ private:
   // Should be empty for non-actor refs
   std::unique_ptr<std::set<MpObjectReference*>> emitters;
 
-  // The following keys were originally formIds, but changed to pointers for
-  // the sake of performance. Luckily, the server never releases objects, so
-  // the pointers are always valid.
-  // TODO: ensure primitivesWeAreInside is freed correctly
+  // Subscription removal clears both pointer collections before destruction.
   std::unique_ptr<std::map<MpObjectReference*, bool /* wasInside */>>
     emittersWithPrimitives;
   std::unique_ptr<std::set<MpObjectReference*>> primitivesWeAreInside;

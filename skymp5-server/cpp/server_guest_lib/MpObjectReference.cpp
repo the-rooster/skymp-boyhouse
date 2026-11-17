@@ -187,6 +187,15 @@ public:
   std::optional<PrimitiveData> primitive;
   bool teleportFlag = false;
   bool setPropertyCalled = false;
+  // Spatial membership reconstructed from a save has not been published to
+  // scripts or clients. Keep that distinction until a real subscription pass.
+  std::map<MpObjectReference*, uint64_t> pendingListeners;
+  // Published edges retain their occurrence too: a later player profile can
+  // make their load events eligible without requiring another network create.
+  std::map<MpObjectReference*, uint64_t> listenerOccurrences;
+  std::set<MpObjectReference*> publishingListeners;
+  uint64_t nextPublication = 0;
+  bool subscriptionsPending = false;
 };
 
 namespace {
@@ -558,15 +567,43 @@ void MpObjectReference::ReconcileCampaignVisibility()
 
 void MpObjectReference::SetPos(const NiPoint3& newPos, SetPosMode setPosMode)
 {
+  auto* world = GetParent();
+  const auto lifetime =
+    world ? world->LookupFormByIdNoLoad(GetFormId()) : nullptr;
+  const auto epoch = GetWorldInstanceEpoch();
+  const auto cell = GetCellOrWorld();
+  const auto oldPosition = GetPos();
+  const auto requestedPosition = newPos;
+  const auto current = [&](const NiPoint3& position) {
+    return !world ||
+      (world->LookupFormByIdNoLoad(GetFormId()) == lifetime &&
+       lifetime.get() == this && GetWorldInstanceEpoch() == epoch &&
+       GetCellOrWorld() == cell && GetPos() == position);
+  };
+  const bool restoring = world && world->IsRestoring();
+  if (!restoring && pImpl->subscriptionsPending)
+    ForceSubscriptionsUpdate();
+  if (!current(oldPosition))
+    return;
+
   auto oldGridPos = GetGridPos(ChangeForm().position);
-  auto newGridPos = GetGridPos(newPos);
+  auto newGridPos = GetGridPos(requestedPosition);
 
   EditChangeForm(
-    [&newPos](MpChangeFormREFR& changeForm) { changeForm.position = newPos; },
+    [&requestedPosition](MpChangeFormREFR& changeForm) {
+      changeForm.position = requestedPosition;
+    },
     MakeMode(IsLocationSavingNeeded(), setPosMode));
 
   if (oldGridPos != newGridPos || !everSubscribedOrListened)
     ForceSubscriptionsUpdate();
+  if (!current(requestedPosition))
+    return;
+
+  if (restoring) {
+    RestorePrimitiveOccupancy();
+    return;
+  }
 
   if (!IsDisabled()) {
     if (emittersWithPrimitives) {
@@ -575,7 +612,7 @@ void MpObjectReference::SetPos(const NiPoint3& newPos, SetPosMode setPosMode)
       }
 
       for (auto& [emitterRefr, wasInside] : *emittersWithPrimitives) {
-        bool inside = emitterRefr->IsPointInsidePrimitive(newPos);
+        bool inside = emitterRefr->IsPointInsidePrimitive(requestedPosition);
         if (wasInside != inside) {
           wasInside = inside;
           auto me = ToVarValue();
@@ -618,11 +655,16 @@ void MpObjectReference::SetPos(const NiPoint3& newPos, SetPosMode setPosMode)
     if (primitivesWeAreInside) {
       auto me = ToVarValue();
 
-      // May be modified inside loop, so copying
-      const auto set = *primitivesWeAreInside;
-
-      for (MpObjectReference* emitterRefr : set) {
-        emitterRefr->SendPapyrusEvent("OnTrigger", &me, 1);
+      std::vector<std::shared_ptr<MpForm>> set;
+      for (auto* emitter : *primitivesWeAreInside)
+        set.push_back(world->LookupFormByIdNoLoad(emitter->GetFormId()));
+      for (const auto& emitter : set) {
+        if (!current(requestedPosition))
+          return;
+        auto* ref = emitter ? emitter->AsObjectReference() : nullptr;
+        if (ref && world->LookupFormByIdNoLoad(ref->GetFormId()) == emitter &&
+            primitivesWeAreInside->count(ref) && SharesWorldInstance(*ref))
+          ref->SendPapyrusEvent("OnTrigger", &me, 1);
       }
     }
   }
@@ -747,9 +789,20 @@ void MpObjectReference::SetActivationBlocked(bool blocked)
 void MpObjectReference::ForceSubscriptionsUpdate()
 {
   auto worldState = GetParent();
-  if (!worldState || IsDisabled()) {
+  if (!worldState || IsDisabled() || IsDeleted()) {
     return;
   }
+  const auto lifetime = worldState->LookupFormByIdNoLoad(GetFormId());
+  if (lifetime.get() != this)
+    return;
+  const auto epoch = GetWorldInstanceEpoch();
+  const auto position = GetPos();
+  const auto cell = GetCellOrWorld();
+  const auto current = [&] {
+    return worldState->LookupFormByIdNoLoad(GetFormId()) == lifetime &&
+      GetWorldInstanceEpoch() == epoch && GetPos() == position &&
+      GetCellOrWorld() == cell && !IsDisabled() && !IsDeleted();
+  };
   InitListenersAndEmitters();
 
   auto worldOrCell = GetCellOrWorld().ToFormId(worldState->espmFiles);
@@ -761,9 +814,12 @@ void MpObjectReference::ForceSubscriptionsUpdate()
   auto pos = GetGridPos(GetPos());
   const auto& nearby =
     worldState->GetNeighborsByPosition(worldOrCell, pos.first, pos.second);
+  if (!current())
+    return;
   std::set<MpObjectReference*> now;
   for (auto candidate : nearby) {
-    if (SharesWorldInstance(*candidate)) {
+    if (!candidate->IsDisabled() && !candidate->IsDeleted() &&
+        SharesWorldInstance(*candidate)) {
       now.insert(candidate);
     }
   }
@@ -771,26 +827,102 @@ void MpObjectReference::ForceSubscriptionsUpdate()
   std::vector<MpObjectReference*> toRemove;
   std::set_difference(was.begin(), was.end(), now.begin(), now.end(),
                       std::inserter(toRemove, toRemove.begin()));
+  // Callbacks may destroy another neighbour before its turn. Pin the entire
+  // pass and check registration again before using any candidate.
+  struct Neighbor
+  {
+    std::shared_ptr<MpForm> lifetime;
+    uint64_t epoch;
+    NiPoint3 position;
+    FormDesc cell;
+  };
+  std::map<MpObjectReference*, Neighbor> lifetimes;
+  const auto pin = [&](MpObjectReference* ref) {
+    lifetimes.emplace(
+      ref,
+      Neighbor{ worldState->LookupFormByIdNoLoad(ref->GetFormId()),
+                ref->GetWorldInstanceEpoch(), ref->GetPos(),
+                ref->GetCellOrWorld() });
+  };
+  for (auto* ref : now)
+    pin(ref);
+  for (auto* ref : toRemove)
+    pin(ref);
+  const auto registered = [&](MpObjectReference* ref) {
+    const auto& saved = lifetimes.at(ref);
+    return saved.lifetime.get() == ref &&
+      worldState->LookupFormByIdNoLoad(ref->GetFormId()) == saved.lifetime &&
+      ref->GetWorldInstanceEpoch() == saved.epoch &&
+      ref->GetPos() == saved.position && ref->GetCellOrWorld() == saved.cell;
+  };
   for (auto listener : toRemove) {
+    if (!current())
+      return;
+    if (!registered(listener))
+      continue;
     Unsubscribe(this, listener);
     // Unsubscribe from self is NEEDED. See comment below
-    if (this != listener)
+    if (current() && registered(listener) && this != listener)
       Unsubscribe(listener, this);
   }
 
-  std::vector<MpObjectReference*> toAdd;
-  std::set_difference(now.begin(), now.end(), was.begin(), was.end(),
-                      std::inserter(toAdd, toAdd.begin()));
-  for (auto listener : toAdd) {
-    Subscribe(this, listener);
+  for (auto listener : now) {
+    if (!current())
+      return;
+    if (!registered(listener))
+      continue;
+    if (worldState->IsRestoring() || !was.count(listener) ||
+        pImpl->pendingListeners.count(listener) ||
+        (!pImpl->onInitEventSent && listener->ChangeForm().profileId != -1))
+      Subscribe(this, listener);
     // Note: Self-subscription is OK this check is performed as we don't want
     // to self-subscribe twice! We have already been subscribed to self in
     // the last line of code
-    if (this != listener)
+    if (current() && registered(listener) && this != listener &&
+        (worldState->IsRestoring() || !listener->GetListeners().count(this) ||
+         listener->pImpl->pendingListeners.count(this) ||
+         (!listener->pImpl->onInitEventSent && ChangeForm().profileId != -1)))
       Subscribe(listener, this);
   }
 
+  if (!current())
+    return;
   everSubscribedOrListened = true;
+  if (!worldState->IsRestoring())
+    pImpl->subscriptionsPending = HasPendingSubscriptions();
+}
+
+bool MpObjectReference::HasPendingSubscriptions() const
+{
+  if (!pImpl->pendingListeners.empty())
+    return true;
+  if (!pImpl->onInitEventSent)
+    for (auto* listener : GetListeners())
+      if (listener->ChangeForm().profileId != -1)
+        return true;
+  for (auto* emitter : GetEmitters())
+    if (emitter->pImpl->pendingListeners.count(
+          const_cast<MpObjectReference*>(this)) ||
+        (!emitter->pImpl->onInitEventSent && ChangeForm().profileId != -1))
+      return true;
+  return false;
+}
+
+void MpObjectReference::RestorePrimitiveOccupancy()
+{
+  if (!emittersWithPrimitives)
+    return;
+  if (!primitivesWeAreInside)
+    primitivesWeAreInside.reset(new std::set<MpObjectReference*>);
+  for (auto& [emitter, inside] : *emittersWithPrimitives) {
+    inside = !IsDisabled() && !IsDeleted() && !emitter->IsDisabled() &&
+      !emitter->IsDeleted() && SharesWorldInstance(*emitter) &&
+      emitter->IsPointInsidePrimitive(GetPos());
+    if (inside)
+      primitivesWeAreInside->insert(emitter);
+    else
+      primitivesWeAreInside->erase(emitter);
+  }
 }
 
 void MpObjectReference::SetPrimitive(const NiPoint3& boundsDiv2)
@@ -1003,6 +1135,14 @@ void MpObjectReference::RegisterProfileId(int32_t profileId)
   EditChangeForm(
     [&](MpChangeFormREFR& changeForm) { changeForm.profileId = profileId; });
 
+  if (currentProfileId == -1) {
+    // Existing spatial edges may already be published as NPC relationships.
+    // Registration makes their load events eligible on the next real refresh.
+    pImpl->subscriptionsPending = true;
+    for (auto* emitter : GetEmitters())
+      emitter->pImpl->subscriptionsPending = true;
+  }
+
   if (profileId > 0) {
     worldState->actorIdByProfileId[profileId].insert(formId);
   }
@@ -1051,7 +1191,9 @@ void MpObjectReference::RegisterPrivateIndexedProperty(
 void MpObjectReference::Subscribe(MpObjectReference* emitter,
                                   MpObjectReference* listener)
 {
-  if (!emitter->SharesWorldInstance(*listener)) {
+  if (!emitter->SharesWorldInstance(*listener) || emitter->IsDisabled() ||
+      emitter->IsDeleted() || listener->IsDisabled() ||
+      listener->IsDeleted()) {
     return;
   }
   auto actorEmitter = emitter->AsActor();
@@ -1060,8 +1202,84 @@ void MpObjectReference::Subscribe(MpObjectReference* emitter,
     return;
   }
 
-  if (!emitter->pImpl->onInitEventSent &&
-      listener->GetChangeForm().profileId != -1) {
+  auto* world = emitter->GetParent();
+  if (!world || listener->GetParent() != world)
+    return;
+  const auto emitterId = emitter->GetFormId();
+  const auto listenerId = listener->GetFormId();
+  const auto emitterLifetime = world->LookupFormByIdNoLoad(emitterId);
+  const auto listenerLifetime = world->LookupFormByIdNoLoad(listenerId);
+  if (emitterLifetime.get() != emitter || listenerLifetime.get() != listener)
+    return;
+  const auto emitterEpoch = emitter->GetWorldInstanceEpoch();
+  const auto listenerEpoch = listener->GetWorldInstanceEpoch();
+  const bool restoring = world->IsRestoring();
+  const bool hasPrimitive = emitter->HasPrimitive();
+  emitter->InitListenersAndEmitters();
+  listener->InitListenersAndEmitters();
+
+  if (!emitter->listeners->count(listener)) {
+    if (emitter->pImpl->nextPublication ==
+        std::numeric_limits<uint64_t>::max())
+      throw std::overflow_error("Subscription publication sequence exhausted");
+    const auto occurrence = emitter->pImpl->nextPublication + 1;
+    try {
+      emitter->pImpl->listenerOccurrences.emplace(listener, occurrence);
+      emitter->pImpl->pendingListeners.emplace(listener, occurrence);
+      emitter->listeners->insert(listener);
+      listener->emitters->insert(emitter);
+    } catch (...) {
+      emitter->pImpl->listenerOccurrences.erase(listener);
+      emitter->pImpl->pendingListeners.erase(listener);
+      emitter->listeners->erase(listener);
+      listener->emitters->erase(emitter);
+      throw;
+    }
+    emitter->pImpl->nextPublication = occurrence;
+    emitter->pImpl->subscriptionsPending = true;
+    listener->pImpl->subscriptionsPending = true;
+  }
+  if (hasPrimitive) {
+    if (!listener->emittersWithPrimitives)
+      listener->emittersWithPrimitives.reset(
+        new std::map<MpObjectReference*, bool>);
+    listener->emittersWithPrimitives->insert({ emitter, false });
+    if (restoring)
+      listener->RestorePrimitiveOccupancy();
+  }
+  const bool pendingPublication =
+    emitter->pImpl->pendingListeners.count(listener) != 0;
+  const bool needsLoad =
+    !emitter->pImpl->onInitEventSent && listener->ChangeForm().profileId != -1;
+  if (restoring || (!pendingPublication && !needsLoad))
+    return;
+  const auto occurrence = emitter->pImpl->listenerOccurrences.at(listener);
+  if (!emitter->pImpl->publishingListeners.insert(listener).second)
+    return;
+  const auto sameSubscription = [&] {
+    const auto it = emitter->pImpl->listenerOccurrences.find(listener);
+    return world->LookupFormByIdNoLoad(emitterId) == emitterLifetime &&
+      world->LookupFormByIdNoLoad(listenerId) == listenerLifetime &&
+      emitter->GetWorldInstanceEpoch() == emitterEpoch &&
+      listener->GetWorldInstanceEpoch() == listenerEpoch &&
+      !emitter->IsDisabled() && !emitter->IsDeleted() &&
+      !listener->IsDisabled() && !listener->IsDeleted() &&
+      it != emitter->pImpl->listenerOccurrences.end() &&
+      it->second == occurrence;
+  };
+
+  struct Publication
+  {
+    Impl& state;
+    MpObjectReference* listener;
+  } publication{ *emitter->pImpl, listener };
+  Viet::ScopedTask<Publication> guard(
+    [](Publication& value) {
+      value.state.publishingListeners.erase(value.listener);
+    },
+    publication);
+
+  if (needsLoad) {
     if (emitter->GetDynamicFields().GetValueDump(
           CampaignReferenceBinding::kProperty) != "null") {
       const auto [owner, original] =
@@ -1071,35 +1289,29 @@ void MpObjectReference::Subscribe(MpObjectReference* emitter,
     } else {
       emitter->pImpl->onInitEventSent = true;
       emitter->SendPapyrusEvent("OnInit");
+      if (!sameSubscription())
+        return;
       emitter->SendPapyrusEvent("OnCellLoad");
+      if (!sameSubscription())
+        return;
       emitter->SendPapyrusEvent("OnLoad");
     }
   }
 
-  const bool hasPrimitive = emitter->HasPrimitive();
-
-  emitter->InitListenersAndEmitters();
-  listener->InitListenersAndEmitters();
-
-  auto [it, inserted] = emitter->listeners->insert(listener);
-
-  if (actorListener && inserted) {
-    emitter->actorListenerArray.push_back(actorListener);
-  }
-
-  listener->emitters->insert(emitter);
-
-  if (!hasPrimitive) {
+  // A load handler may have disabled or moved either endpoint. Do not publish
+  // a relationship it removed while executing.
+  if (!sameSubscription() || !emitter->listeners->count(listener) ||
+      !emitter->SharesWorldInstance(*listener))
+    return;
+  if (!pendingPublication)
+    return;
+  if (!hasPrimitive)
     emitter->callbacks->subscribe(emitter, listener);
-  }
-
-  if (hasPrimitive) {
-    if (!listener->emittersWithPrimitives) {
-      listener->emittersWithPrimitives.reset(
-        new std::map<MpObjectReference*, bool>);
-    }
-    listener->emittersWithPrimitives->insert({ emitter, false });
-  }
+  if (!sameSubscription())
+    return;
+  if (actorListener)
+    emitter->actorListenerArray.push_back(actorListener);
+  emitter->pImpl->pendingListeners.erase(listener);
 }
 
 void MpObjectReference::Unsubscribe(MpObjectReference* emitter,
@@ -1114,10 +1326,18 @@ void MpObjectReference::Unsubscribe(MpObjectReference* emitter,
 
   const bool hasPrimitive = emitter->HasPrimitive();
 
-  if (!hasPrimitive) {
-    emitter->callbacks->unsubscribe(emitter, listener);
-  }
+  auto* world = emitter->GetParent();
+  const auto emitterLifetime =
+    world->LookupFormByIdNoLoad(emitter->GetFormId());
+  const auto listenerLifetime =
+    world->LookupFormByIdNoLoad(listener->GetFormId());
+  const bool pending = emitter->pImpl->pendingListeners.erase(listener) > 0;
+  emitter->pImpl->listenerOccurrences.erase(listener);
+  const bool publish = !hasPrimitive && !pending && !world->IsRestoring() &&
+    emitter->GetListeners().count(listener);
 
+  if (!emitter->listeners || !listener->emitters)
+    return;
   size_t numElementsErased = emitter->listeners->erase(listener);
 
   if (actorListener && numElementsErased > 0) {
@@ -1132,6 +1352,10 @@ void MpObjectReference::Unsubscribe(MpObjectReference* emitter,
   if (listener->emittersWithPrimitives && hasPrimitive) {
     listener->emittersWithPrimitives->erase(emitter);
   }
+  if (listener->primitivesWeAreInside)
+    listener->primitivesWeAreInside->erase(emitter);
+  if (publish)
+    emitter->callbacks->unsubscribe(emitter, listener);
 }
 
 void MpObjectReference::SetLastAnimation(const std::string& lastAnimation)
@@ -1272,6 +1496,10 @@ void MpObjectReference::CommitPreparedCampaignChange(
 void MpObjectReference::ApplyChangeForm(const MpChangeForm& changeForm)
 {
   ANTIGO_CONTEXT_INIT(ctx);
+  auto* world = GetParent();
+  std::optional<WorldState::RestorationScope> restoration;
+  if (world)
+    restoration.emplace(*world);
 
   if (pImpl->setPropertyCalled) {
     GetParent()->logger->critical(
@@ -1285,7 +1513,8 @@ void MpObjectReference::ApplyChangeForm(const MpChangeForm& changeForm)
     [](MpObjectReference& self) { self.blockSaving = false; }, *this);
 
   const auto currentBaseId = GetBaseId();
-  const auto newBaseId = changeForm.baseDesc.ToFormId(GetParent()->espmFiles);
+  const auto newBaseId = changeForm.baseDesc.ToFormId(
+    world ? world->espmFiles : std::vector<std::string>{});
   if (currentBaseId != newBaseId) {
     spdlog::error("Anomaly, baseId should never change ({:x} => {:x})",
                   currentBaseId, newBaseId);
@@ -1295,6 +1524,28 @@ void MpObjectReference::ApplyChangeForm(const MpChangeForm& changeForm)
     throw std::runtime_error("Expected formDesc to be " +
                              ChangeForm().formDesc.ToString() +
                              ", but found " + changeForm.formDesc.ToString());
+  }
+
+  const bool spatialChange = GetPos() != changeForm.position ||
+    GetAngle() != changeForm.angle ||
+    GetCellOrWorld() != changeForm.worldOrCellDesc ||
+    GetWorldInstance() != changeForm.worldInstance ||
+    IsDisabled() != changeForm.isDisabled ||
+    IsDeleted() != changeForm.isDeleted;
+  if (world && spatialChange) {
+    // Loading a save is a cold reconstruction operation. Silently removing a
+    // published edge here would leave a ghost on an already connected client.
+    for (auto* listener : GetListeners())
+      if (!pImpl->pendingListeners.count(listener))
+        throw std::runtime_error(
+          "Cannot restore spatial state with published subscriptions");
+    for (auto* emitter : GetEmitters())
+      if (!emitter->pImpl->pendingListeners.count(this))
+        throw std::runtime_error(
+          "Cannot restore spatial state with published subscriptions");
+    // Forget the old cell before replacing its descriptor.
+    RemoveFromGridAndUnsubscribeAll();
+    UnsubscribeFromAll();
   }
 
   if (changeForm.profileId >= 0) {
@@ -1319,6 +1570,8 @@ void MpObjectReference::ApplyChangeForm(const MpChangeForm& changeForm)
       f.nextRelootDatetime = 0;
     },
     Mode::NoRequestSave);
+  if (pImpl->primitive)
+    SetPrimitive(pImpl->primitive->boundsDiv2);
   if (changeForm.nextRelootDatetime) {
     auto tp =
       std::chrono::system_clock::from_time_t(changeForm.nextRelootDatetime);
@@ -1796,15 +2049,22 @@ bool MpObjectReference::CheckIfObjectCanStartOccupyThis(
 
 void MpObjectReference::RemoveFromGridAndUnsubscribeAll()
 {
-  auto worldOrCell = GetCellOrWorld().ToFormId(GetParent()->espmFiles);
-  auto gridIterator = GetParent()->grids.find(worldOrCell);
-  if (gridIterator != GetParent()->grids.end()) {
+  auto* world = GetParent();
+  const auto lifetime = world->LookupFormByIdNoLoad(GetFormId());
+  auto worldOrCell = GetCellOrWorld().ToFormId(world->espmFiles);
+  auto gridIterator = world->grids.find(worldOrCell);
+  if (gridIterator != world->grids.end()) {
     gridIterator->second.grid->Forget(this);
   }
 
-  auto listenersCopy = GetListeners();
-  for (auto listener : listenersCopy) {
-    Unsubscribe(this, listener);
+  std::vector<std::shared_ptr<MpForm>> listenersCopy;
+  for (auto* listener : GetListeners())
+    listenersCopy.push_back(
+      world->LookupFormByIdNoLoad(listener->GetFormId()));
+  for (const auto& listener : listenersCopy) {
+    if (listener &&
+        world->LookupFormByIdNoLoad(listener->GetFormId()) == listener)
+      Unsubscribe(this, listener->AsObjectReference());
   }
 
   everSubscribedOrListened = false;
@@ -1812,9 +2072,15 @@ void MpObjectReference::RemoveFromGridAndUnsubscribeAll()
 
 void MpObjectReference::UnsubscribeFromAll()
 {
-  auto emittersCopy = GetEmitters();
-  for (auto emitter : emittersCopy)
-    Unsubscribe(emitter, this);
+  auto* world = GetParent();
+  const auto lifetime = world->LookupFormByIdNoLoad(GetFormId());
+  std::vector<std::shared_ptr<MpForm>> emittersCopy;
+  for (auto* emitter : GetEmitters())
+    emittersCopy.push_back(world->LookupFormByIdNoLoad(emitter->GetFormId()));
+  for (const auto& emitter : emittersCopy)
+    if (emitter &&
+        world->LookupFormByIdNoLoad(emitter->GetFormId()) == emitter)
+      Unsubscribe(emitter->AsObjectReference(), this);
 }
 
 void MpObjectReference::InitScripts()
@@ -2163,12 +2429,12 @@ void MpObjectReference::BeforeDestroy()
     this->occupant->RemoveEventSink(this->occupantDestroySink);
   }
 
-  // Move far far away calling OnTriggerExit, unsubscribing, etc
-  SetPos({ -1'000'000'000, 0, 0 });
-
   MpForm::BeforeDestroy();
 
+  // Destruction is not movement and must never promote an unpublished save.
+  // Remove both directions before releasing the native identity.
   RemoveFromGridAndUnsubscribeAll();
+  UnsubscribeFromAll();
 }
 
 float MpObjectReference::GetTotalItemWeight() const

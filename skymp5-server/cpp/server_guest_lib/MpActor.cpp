@@ -666,6 +666,11 @@ void MpActor::ApplyChangeForm(const MpChangeForm& newChangeForm)
     throw std::runtime_error(
       "Expected record type to be ACHR, but found REFR");
   }
+  // The base restoration scope ends before effects and the actor's spatial
+  // update. Keep the complete override passive, including direct callers.
+  std::optional<WorldState::RestorationScope> restoration;
+  if (auto* world = GetParent())
+    restoration.emplace(*world);
   MpObjectReference::ApplyChangeForm(newChangeForm);
   EditChangeForm(
     [&](MpChangeForm& changeForm) {
@@ -828,6 +833,10 @@ void MpActor::NetSendChangeValues(
   const ActorValues& actorValues,
   const std::optional<std::vector<espm::ActorValue>>& avFilter)
 {
+  // Saved effects still rebuild actor values and retain their timers. Their
+  // values are published by the later real subscription, not reconstruction.
+  if (const auto* world = GetParent(); world && world->IsRestoring())
+    return;
   ChangeValuesMessage message;
   message.idx = GetIdx();
 

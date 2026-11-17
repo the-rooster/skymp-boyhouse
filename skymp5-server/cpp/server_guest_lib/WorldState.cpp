@@ -74,7 +74,7 @@ struct WorldState::Impl
   std::shared_ptr<IPapyrusCompatibilityPolicy> policy;
   std::unordered_map<uint32_t, MpChangeForm> changeFormsForDeferredLoad;
   bool chunkLoadingInProgress = false;
-  bool formLoadingInProgress = false;
+  size_t restorationDepth = 0;
   std::vector<RelootTimeForTypesEntry> relootTimeForTypes;
   std::set<std::string> forbiddenRelootTypes;
   std::vector<std::unique_ptr<IPapyrusClassBase>> classes;
@@ -99,6 +99,24 @@ WorldState::WorldState()
 WorldState::~WorldState()
 {
   Clear();
+}
+
+WorldState::RestorationScope::RestorationScope(WorldState& world)
+  : world(world)
+{
+  if (world.pImpl->restorationDepth == std::numeric_limits<size_t>::max())
+    throw std::overflow_error("World restoration depth exceeded");
+  ++world.pImpl->restorationDepth;
+}
+
+WorldState::RestorationScope::~RestorationScope() noexcept
+{
+  --world.pImpl->restorationDepth;
+}
+
+bool WorldState::IsRestoring() const noexcept
+{
+  return pImpl->restorationDepth != 0;
 }
 
 void WorldState::Clear()
@@ -206,6 +224,9 @@ void WorldState::AddForm(std::unique_ptr<MpForm> form, uint32_t formId,
                          bool skipChecks,
                          const MpChangeForm* optionalChangeFormToApply)
 {
+  std::optional<RestorationScope> restoration;
+  if (optionalChangeFormToApply)
+    restoration.emplace(*this);
   if (!skipChecks && forms.find(formId) != forms.end()) {
     throw std::runtime_error(
       fmt::format("Form with id {:x} already exists", formId));
@@ -283,12 +304,9 @@ void WorldState::AddForm(std::unique_ptr<MpForm> form, uint32_t formId,
       if (auto* actor = refr->AsActor())
         actor->factionsLoaded =
           optionalChangeFormToApply->factions.has_value();
-      // Index spatially without firing load events while the owner and other
-      // saved references may still be absent. A real subscriber loads scripts.
-      if (!refr->IsDisabled() && !refr->IsDeleted()) {
-        const auto cell = refr->GetCellOrWorld().ToFormId(espmFiles);
-        refr->MoveOnGrid(*grids[cell].grid);
-      }
+      // Restore passive subscriptions in either saved-reference order. The
+      // restoration scope prevents load events until a real subscriber acts.
+      refr->ForceSubscriptionsUpdate();
     } else {
       refr->ApplyChangeForm(*optionalChangeFormToApply);
     }
@@ -301,11 +319,13 @@ void WorldState::AddForm(std::unique_ptr<MpForm> form, uint32_t formId,
 
 void WorldState::Tick()
 {
+  if (IsRestoring())
+    return;
   const auto now = std::chrono::system_clock::now();
   TickSaveStorage(now);
   TickTimers(now);
-  if (pImpl->questJobs && !pImpl->formLoadingInProgress &&
-      !pImpl->saveTickActive && !pImpl->clearing)
+  if (pImpl->questJobs && !IsRestoring() && !pImpl->saveTickActive &&
+      !pImpl->clearing)
     pImpl->questJobs->Pump();
 }
 
@@ -319,12 +339,10 @@ QuestJobRunner& WorldState::GetQuestJobs()
 void WorldState::LoadChangeForm(const MpChangeForm& changeForm,
                                 const FormCallbacks& callbacks)
 {
+  RestorationScope restoration(*this);
   if (changeForm.dynamicFields.GetValueDump(
         CampaignReferenceBinding::kProperty) != "null")
     CampaignReferenceBinding::SavedOriginal(*this, changeForm);
-  Viet::ScopedTask<bool> task([](bool& st) { st = false; },
-                              pImpl->formLoadingInProgress);
-  pImpl->formLoadingInProgress = true;
 
   std::unique_ptr<MpObjectReference> form;
 
@@ -453,7 +471,7 @@ void WorldState::RequestReloot(MpObjectReference& ref,
 
 void WorldState::RequestSave(MpObjectReference& ref)
 {
-  if (pImpl->formLoadingInProgress || pImpl->clearing) {
+  if (IsRestoring() || pImpl->clearing) {
     return;
   }
 
@@ -537,7 +555,7 @@ void WorldState::ValidateCampaignFactions(const std::vector<Faction>& factions)
 
 void WorldState::RequireDurableSaveStorage() const
 {
-  if (pImpl->clearing || pImpl->formLoadingInProgress || !pImpl->saveStorage ||
+  if (pImpl->clearing || IsRestoring() || !pImpl->saveStorage ||
       !pImpl->saveStorage->SupportsAtomicBatches() ||
       !pImpl->saveStorage->SupportsUpsertResults())
     throw std::runtime_error(
@@ -557,7 +575,7 @@ std::shared_ptr<const SaveReceipt> WorldState::CommitCampaignInventory(
 {
   if (durable)
     RequireDurableSaveStorage();
-  if (pImpl->formLoadingInProgress)
+  if (IsRestoring())
     throw std::runtime_error("Campaign commit during world loading");
   if (pImpl->saveStorage && !pImpl->saveStorage->SupportsAtomicBatches())
     throw std::runtime_error(
@@ -848,7 +866,7 @@ void WorldState::CommitCampaignReferences(
   const std::vector<MpChangeForm>& copies)
 {
   QuestJournal::RequirePersonalJobAccess(owner);
-  if (pImpl->formLoadingInProgress || QuestJournal::HasActiveTransaction() ||
+  if (IsRestoring() || QuestJournal::HasActiveTransaction() ||
       owner.GetParent() != this ||
       LookupFormByIdNoLoad(owner.GetFormId()).get() != &owner ||
       !formIdxManager || owner.GetIdx() == FormIndex::g_invalidIdx)
@@ -1325,6 +1343,7 @@ bool WorldState::LoadForm(uint32_t formId, std::stringstream* optionalOutTrace)
     auto& refr = GetFormAt<MpObjectReference>(formId);
     auto it = pImpl->changeFormsForDeferredLoad.find(formId);
     if (it != pImpl->changeFormsForDeferredLoad.end()) {
+      RestorationScope restoration(*this);
       auto copy = it->second; // crashes without copying
       refr.ApplyChangeForm(copy);
     }
@@ -1337,7 +1356,8 @@ bool WorldState::LoadForm(uint32_t formId, std::stringstream* optionalOutTrace)
 
 void WorldState::TickSaveStorage(const std::chrono::system_clock::time_point&)
 {
-  if (!pImpl->saveStorage || pImpl->clearing || pImpl->saveTickActive)
+  if (IsRestoring() || !pImpl->saveStorage || pImpl->clearing ||
+      pImpl->saveTickActive)
     return;
   pImpl->saveTickActive = true;
   Viet::ScopedTask<bool> tickGuard([](bool& active) { active = false; },
@@ -1491,6 +1511,8 @@ void WorldState::TickSaveStorage(const std::chrono::system_clock::time_point&)
 
 void WorldState::TickTimers(const std::chrono::system_clock::time_point&)
 {
+  if (IsRestoring())
+    return;
   timerEffects.TickTimers();
   timerRegular.TickTimers();
 
@@ -1546,7 +1568,7 @@ void WorldState::SendPapyrusEvent(MpForm* form, const char* eventName,
 const std::set<MpObjectReference*>& WorldState::GetNeighborsByPosition(
   uint32_t cellOrWorld, int16_t cellX, int16_t cellY)
 {
-  if (espm && !pImpl->chunkLoadingInProgress) {
+  if (espm && !IsRestoring() && !pImpl->chunkLoadingInProgress) {
     Viet::ScopedTask<bool> task([](bool& st) { st = false; },
                                 pImpl->chunkLoadingInProgress);
     pImpl->chunkLoadingInProgress = true;

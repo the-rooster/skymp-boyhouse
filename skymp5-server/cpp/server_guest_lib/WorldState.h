@@ -49,6 +49,22 @@ class WorldState
 public:
   using FormCallbacksFactory = std::function<FormCallbacks()>;
 
+  class RestorationScope
+  {
+  public:
+    explicit RestorationScope(WorldState& world);
+    ~RestorationScope() noexcept;
+    RestorationScope(const RestorationScope&) = delete;
+    RestorationScope& operator=(const RestorationScope&) = delete;
+    RestorationScope(RestorationScope&&) = delete;
+    RestorationScope& operator=(RestorationScope&&) = delete;
+
+  private:
+    WorldState& world;
+  };
+
+  bool IsRestoring() const noexcept;
+
   struct NpcSettingsEntry
   {
     bool spawnInInterior = false;
