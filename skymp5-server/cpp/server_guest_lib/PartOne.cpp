@@ -1,5 +1,6 @@
 #include "PartOne.h"
 #include "CampaignFrameMessage.h"
+#include "CampaignMovement.h"
 #include "CampaignReferenceBinding.h"
 #include <array>
 #include <cassert>
@@ -170,11 +171,14 @@ bool PartOne::IsConnected(Networking::UserId userId) const
 
 void PartOne::Tick()
 {
+  if (!worldState.IsStorageRestoreReady() || worldState.IsRestoring())
+    return;
   TickPacketHistoryPlaybacks();
   TickDeferredMessages();
   worldState.Tick([this] {
     if (pImpl->actionListener)
       pImpl->actionListener->TickCampaignMovements();
+    TickCampaignResumes();
   });
 }
 
@@ -204,9 +208,18 @@ void PartOne::SetUserActor(Networking::UserId userId, uint32_t actorFormId)
 {
   serverState.EnsureUserExists(userId);
 
+  if (auto* previous = serverState.ActorByUser(userId); previous &&
+      previous->GetDynamicFields().GetValueDump(
+        CampaignMovementPlan::kProperty) != "null")
+    throw std::runtime_error(
+      "Enrolled actor assignment requires campaign detach");
   if (actorFormId > 0) {
     auto& actor = worldState.GetFormAt<MpActor>(actorFormId);
 
+    if (actor.GetDynamicFields().GetValueDump(
+          CampaignMovementPlan::kProperty) != "null")
+      throw std::runtime_error(
+        "Enrolled actor assignment requires campaign resume");
     if (actor.IsDisabled()) {
       std::stringstream ss;
       ss << "Actor with id " << std::hex << actorFormId << " is disabled";
@@ -272,6 +285,12 @@ std::string PartOne::BeginPacketEpoch(Networking::UserId userId)
   if (!user.gameplayBlocked)
     throw std::runtime_error(
       "Close the gameplay gate before advancing its packet epoch");
+  user.packetEpoch = NewCampaignToken();
+  return user.packetEpoch;
+}
+
+std::string PartOne::NewCampaignToken()
+{
   std::array<unsigned char, 16> token;
   if (RAND_bytes(token.data(), token.size()) != 1)
     throw std::runtime_error("Unable to generate packet epoch");
@@ -281,7 +300,6 @@ std::string PartOne::BeginPacketEpoch(Networking::UserId userId)
     epoch.push_back(hex[byte >> 4]);
     epoch.push_back(hex[byte & 15]);
   }
-  user.packetEpoch = epoch;
   return epoch;
 }
 
@@ -303,6 +321,7 @@ nlohmann::json PartOne::GetWorldBaseline(Networking::UserId userId,
   if (!actor || actor->IsDisabled() || actor->IsDeleted())
     throw std::runtime_error(
       "World baseline requires an active assigned actor");
+  const auto connection = serverState.userInfo[userId]->connectionIdentity;
   const auto actorId = actor->GetFormId();
   const auto actorLifetime = worldState.LookupFormByIdNoLoad(actorId);
   const auto instanceEpoch = actor->GetWorldInstanceEpoch();
@@ -378,7 +397,9 @@ nlohmann::json PartOne::GetWorldBaseline(Networking::UserId userId,
     }
   }
   // Presentation hooks must not change the authority of an in-flight capture.
-  if (!IsConnected(userId) || GetPacketEpoch(userId) != packetEpoch ||
+  if (!IsConnected(userId) ||
+      serverState.userInfo[userId]->connectionIdentity != connection ||
+      GetPacketEpoch(userId) != packetEpoch ||
       !serverState.userInfo[userId]->gameplayBlocked ||
       serverState.ActorByUser(userId) != actor || actor->IsDisabled() ||
       worldState.LookupFormByIdNoLoad(actorId) != actorLifetime ||
@@ -492,6 +513,7 @@ void PartOne::SetEnabled(uint32_t actorFormId, bool enabled)
 
 void PartOne::SetOnActorStreamIn(OnActorStreamIn callback)
 {
+  ++projectionConfigRevision;
   pImpl->onActorStreamIn = callback;
 }
 
@@ -506,13 +528,14 @@ void PartOne::AttachSaveStorage(
     Viet::ISaveStorage<MpChangeForm, FormDesc, std::vector<FormDesc>>>
     saveStorage)
 {
-  worldState.AttachSaveStorage(saveStorage);
+  worldState.BeginStorageRestore();
 
   auto start = std::chrono::steady_clock::now();
 
   int n = 0;
   int numPlayerCharacters = 0;
-  {
+  try {
+    worldState.AttachSaveStorage(saveStorage);
     WorldState::RestorationScope restoration(worldState);
     saveStorage->IterateSync([&](MpChangeForm changeForm) {
       // Do not let players become NPCs
@@ -520,7 +543,9 @@ void PartOne::AttachSaveStorage(
         changeForm.isDisabled = true;
       }
 
-      if (changeForm.isDeleted) {
+      if (changeForm.isDeleted &&
+          changeForm.dynamicFields.GetValueDump(
+            CampaignReferenceBinding::kProperty) == "null") {
         pImpl->logger->info(
           "Skipping deleted form {}, will likely overwrite at some point",
           changeForm.formDesc.ToString());
@@ -554,6 +579,10 @@ void PartOne::AttachSaveStorage(
         pImpl->logger->info("Loaded {} ChangeForms", n);
       }
     });
+    worldState.CompleteStorageRestore();
+  } catch (...) {
+    worldState.FailStorageRestore();
+    throw;
   }
 
   auto end = std::chrono::steady_clock::now();
@@ -629,19 +658,39 @@ void PartOne::HandlePacket(void* partOneInstance, Networking::UserId userId,
       return this_->AddUser(userId, UserType::User, guid);
     }
     case Networking::PacketType::ServerSideUserDisconnect: {
-      ScopedTask t([userId, this_] {
+      if (userId >= this_->serverState.userInfo.size())
+        return;
+      const auto currentConnection = [&] {
+        const auto& slot = this_->serverState.userInfo[userId];
+        return slot ? slot->connectionIdentity : nullptr;
+      };
+      // Listeners also receive disconnect notifications for unassigned slots.
+      // Stop dispatching if a listener connects a new user in this slot.
+      const auto incarnation = currentConnection();
+      const auto previousDisconnect = this_->serverState.disconnectingUserId;
+      ScopedTask t([&, userId, this_] {
+        this_->serverState.disconnectingUserId = previousDisconnect;
+        if (!incarnation || currentConnection() != incarnation)
+          return;
         if (auto actor = this_->serverState.ActorByUser(userId)) {
           // TODO: apply dependency inversion here: connection handling code
           // should not depend on animation system
           this_->animationSystem.ClearInfo(actor);
         }
+        try {
+          this_->DetachCampaignActor(userId);
+        } catch (const std::exception& error) {
+          spdlog::error("Campaign disconnect {}: {}", userId, error.what());
+        }
         this_->serverState.Disconnect(userId);
-        this_->serverState.disconnectingUserId = Networking::InvalidUserId;
       });
 
       this_->serverState.disconnectingUserId = userId;
-      for (auto& listener : this_->worldState.listeners)
+      for (auto& listener : this_->worldState.listeners) {
+        if (currentConnection() != incarnation)
+          break;
         listener->OnDisconnect(userId);
+      }
       return;
     }
     case Networking::PacketType::Message:
@@ -682,6 +731,7 @@ float PartOne::CalculateDamage(const MpActor& aggressor, const MpActor& target,
 void PartOne::NotifyGamemodeApiStateChanged(
   const GamemodeApi::State& newState) noexcept
 {
+  ++projectionConfigRevision;
   UpdateGameModeDataMessage msg;
 
   msg.eventSources.reserve(newState.createdEventSources.size());
@@ -1095,6 +1145,12 @@ void PartOne::Init()
 void PartOne::AddUser(Networking::UserId userId, UserType type,
                       const std::string& guid)
 {
+  if (IsConnected(userId)) {
+    // A slot can be reused during the previous connection's logout callback.
+    // Revoke its assignment before any listener sees the new connection.
+    DetachCampaignActor(userId);
+    serverState.actorsMap.Erase(userId);
+  }
   serverState.Connect(userId, guid);
   for (auto& listener : worldState.listeners)
     listener->OnConnect(userId);
@@ -1251,4 +1307,30 @@ MessageSerializer& PartOne::GetMessageSerializerInstance()
   static auto g_serializer =
     MessageSerializerFactory::CreateMessageSerializer();
   return *g_serializer;
+}
+
+void PartOne::PublishResumeChange(MpObjectReference& emitter,
+                                  MpActor& listener, bool added,
+                                  const std::function<bool()>& valid)
+{
+  const auto user = serverState.UserByActor(&listener);
+  if (!IsConnected(user))
+    return;
+  const auto connection = serverState.userInfo[user]->connectionIdentity;
+  const auto epoch = GetPacketEpoch(user);
+  if (added) {
+    auto message = BuildCreateActorMessage(emitter, listener);
+    if (!valid() || !IsConnected(user) ||
+        serverState.userInfo[user]->connectionIdentity != connection ||
+        serverState.ActorByUser(user) != &listener ||
+        GetPacketEpoch(user) != epoch ||
+        !listener.GetEmitters().count(&emitter))
+      throw std::runtime_error(
+        "Campaign subscription changed during stream-in");
+    GetSendTarget().Send(user, message, true);
+  } else {
+    DestroyActorMessage message;
+    message.idx = emitter.GetIdx();
+    GetSendTarget().Send(user, message, true);
+  }
 }

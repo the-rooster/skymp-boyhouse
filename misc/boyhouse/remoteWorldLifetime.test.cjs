@@ -3,6 +3,9 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs'), path = require('node:path'), vm = require('node:vm');
 const { EventEmitter } = require('node:events');
 const { NativeReferenceOperations } = require('../../skymp5-client/src/campaign/nativeReferenceOperations.ts');
+const { CampaignPacketChannel } = require('../../skymp5-client/src/campaign/campaignPacketChannel.ts');
+const { WorldProjectionReplica } = require('../../skymp5-client/src/campaign/worldProjection.ts');
+const { ProjectionFeed } = require('../../skymp5-server/ts/campaign/projectionFeed.js');
 const root = path.resolve(__dirname, '../../skymp5-client');
 const ts = require(require.resolve('typescript', { paths: [root, path.resolve(root, '../skymp5-server')] }));
 function load(file, dependencies = {}, extra = {}) {
@@ -16,6 +19,7 @@ function load(file, dependencies = {}, extra = {}) {
   return module.exports;
 }
 const { IdManager } = load('lib/idManager.ts');
+const { WorldProjectionCoordinator } = load('campaign/worldProjectionCoordinator.ts', { './worldProjection': { WorldProjectionReplica } });
 const create = (idx = 1, refrId = 0xff000001, isMe = true) => ({
   t: 33, idx, refrId, isMe, transform: { worldOrCell: 60, pos: [100, 200, 300], rot: [0, 0, 72] },
   props: {}, customPropsJsonDumps: [],
@@ -37,6 +41,7 @@ for (const inProps of [false, true]) test(`initial corpse state from ${inProps ?
 function fixture(storage = {}) {
   const events = new EventEmitter(), emitter = new EventEmitter(), calls = [], ragdolls = [], guards = [];
   let connected = true, platformLoad = false, handle = 20, frame = 0, menu = false, now = 10000;
+  let valueFailure, onValue = () => {}, actorAvailable = true;
   const forms = new Map();
   const reference = id => {
     const captured = frame;
@@ -55,7 +60,7 @@ function fixture(storage = {}) {
     getReferenceHandle: id => id === 0x14 || forms.has(id) ? handle : 0,
     Game: { getPlayer: () => reference(0x14), getFormEx: id => forms.has(id) || id === 0x14 ? reference(id) : null,
       quitToMainMenu: () => calls.push(['quit']) },
-    Actor: { from: value => value }, ObjectReference: { from: value => value },
+    Actor: { from: value => actorAvailable ? value : null }, ObjectReference: { from: value => value },
     Cell: { from: value => value }, WorldSpace: { from: value => value },
     Ui: { isMenuOpen: () => menu },
     TESModPlatform: { moveRefrToPosition: (ref, _cell, _world, ...pos) => calls.push(['move', ref.getFormID(), ...pos]) },
@@ -67,7 +72,10 @@ function fixture(storage = {}) {
     skyrimPlatform: sp, '../../messages': { MsgType: { Activate: 12 } },
     '../../extensions/objectReferenceEx': { ObjectReferenceEx: { dealWithRef: () => calls.push(['configure']) } },
     '../../lib/idManager': { IdManager }, '../../lib/nameof': { nameof: name => name },
-    '../../sync/actorvalues': { setActorValuePercentage: (ref, name, value) => calls.push(['value', ref.getFormID(), name, value]) },
+    '../../sync/actorvalues': { setActorValuePercentage: (ref, name, value) => {
+      if (valueFailure) throw Error(valueFailure);
+      calls.push(['value', ref.getFormID(), name, value]); onValue();
+    } },
     '../../sync/appearance': { applyAppearanceToPlayer: (value, guard) => { calls.push(['appearance', value.name]); guards.push(guard); } },
     '../../view/modelApplyUtils': { ModelApplyUtils: {
       applyModelInventory: () => calls.push(['inventory']), applyModelIsOpen: () => calls.push(['open']),
@@ -102,6 +110,8 @@ function fixture(storage = {}) {
     tick: () => events.emit('tick'), native: (...args) => events.emit(...args),
     connected(value) { connected = value; }, platformLoad(value) { platformLoad = value; },
     handle(value) { handle = value; }, menu(value) { menu = value; },
+    valueFailure(value) { valueFailure = value; }, onValue(callback) { onValue = callback; },
+    actorAvailable(value) { actorAvailable = value; },
   };
 }
 
@@ -143,6 +153,108 @@ test('duplicate creation and index reuse invalidate old per-actor callbacks with
   assert.equal(f.server.getWorldModel().forms.length, 1);
   f.event('changeValuesMessage', { idx: 1, data: { health: 0.5 } }); f.update();
   assert.deepEqual(f.calls.filter(c => c[0] === 'value'), [['value', 0x14, 'health', 0.5]]);
+});
+
+test('actor-value readiness stays pending across loading and owns its received payload', () => {
+  const f = fixture(); f.create();
+  const message = { idx: 1, data: { health: 0.1, stamina: 0.2, magicka: 0.3 } };
+  f.event('changeValuesMessage', message); message.data.health = 0.9;
+  assert.equal(f.server.getActorValueApplicationProgress().ready, false);
+  f.platformLoad(true); f.native('preLoadGame'); f.update(); f.update();
+  assert.equal(f.server.getActorValueApplicationProgress().ready, false);
+  assert.equal(f.calls.some(call => call[0] === 'value'), false);
+  f.emitter.emit('gameLoad', { isCausedBySkyrimPlatform: true }); f.update();
+  assert.equal(f.server.getActorValueApplicationProgress().ready, true);
+  assert.deepEqual(f.calls.filter(call => call[0] === 'value'), [
+    ['value', 0x14, 'health', 0.1], ['value', 0x14, 'stamina', 0.2], ['value', 0x14, 'magicka', 0.3],
+  ]);
+});
+
+for (const failure of ['setter', 'missing', 'nonfinite']) test(`actor-value ${failure} failure blocks readiness until superseded`, () => {
+  const f = fixture(); f.create();
+  if (failure === 'setter') f.valueFailure('native value failed');
+  if (failure === 'missing') f.actorAvailable(false);
+  f.event('changeValuesMessage', { idx: 1, data: { health: failure === 'nonfinite' ? NaN : 0.1 } }); f.update();
+  const progress = f.server.getActorValueApplicationProgress();
+  assert.equal(progress.ready, false); assert.ok(progress.error);
+  f.valueFailure(undefined); f.actorAvailable(true);
+  f.event('changeValuesMessage', { idx: 1, data: { health: 0.7 } }); f.update();
+  assert.equal(f.server.getActorValueApplicationProgress().error, progress.error, 'A later success cannot hide an earlier failed write');
+  f.server.resetWorldModel(); f.create();
+  assert.equal(f.server.getActorValueApplicationProgress().ready, true);
+});
+
+for (const boundary of ['reset', 'replacement', 'failed-load', 'disconnect']) test(`actor-value pending work cannot poison the next ${boundary} lifetime`, () => {
+  const f = fixture(); f.create(); f.event('changeValuesMessage', { idx: 1, data: { health: 0.1 } });
+  if (boundary === 'reset') f.server.resetWorldModel();
+  if (boundary === 'replacement') f.create();
+  if (boundary === 'failed-load') { f.platformLoad(true); f.native('preLoadGame'); f.native('postLoadGame', { success: false }); }
+  if (boundary === 'disconnect') f.emitter.emit('connectionDisconnect', {});
+  assert.equal(f.server.getActorValueApplicationProgress().ready, true);
+  f.create(); f.event('changeValuesMessage', { idx: 1, data: { health: 0.8 } }); f.update();
+  assert.deepEqual(f.calls.filter(call => call[0] === 'value'), [['value', 0x14, 'health', 0.8]]);
+  assert.equal(f.server.getActorValueApplicationProgress().ready, true);
+});
+
+test('a reentrant baseline replacement between value writes stops the old actor update', () => {
+  const f = fixture(); f.create(); f.onValue(() => { f.server.resetWorldModel(); f.create(); });
+  f.event('changeValuesMessage', { idx: 1, data: { health: 0.1, stamina: 0.2, magicka: 0.3 } }); f.update();
+  assert.deepEqual(f.calls.filter(call => call[0] === 'value'), [['value', 0x14, 'health', 0.1]]);
+  assert.equal(f.server.getActorValueApplicationProgress().ready, true);
+});
+
+test('an epoch replacement cannot settle its new catch-up with an old queued callback', () => {
+  const f = fixture(), channel = new CampaignPacketChannel();
+  const first = 'a'.repeat(32), second = 'b'.repeat(32);
+  const deliver = message => f.event('changeValuesMessage', message);
+  channel.select(first); f.server.resetWorldModel(); f.create();
+  channel.incoming({ t: 34, epoch: first, message: { t: 16, idx: 1, data: { health: 0.1 } } }, deliver);
+  channel.drain(first, deliver);
+  channel.select(second); f.server.resetWorldModel(); f.create();
+  channel.incoming({ t: 34, epoch: first, message: { t: 16, idx: 1, data: { health: 0.2 } } }, deliver);
+  channel.incoming({ t: 34, epoch: second, message: { t: 16, idx: 1, data: { health: 0.8 } } }, deliver);
+  channel.drain(second, deliver);
+  assert.equal(f.server.getActorValueApplicationProgress().ready, false);
+  f.update();
+  assert.deepEqual(f.calls.filter(call => call[0] === 'value'), [['value', 0x14, 'health', 0.8]]);
+  assert.equal(f.server.getActorValueApplicationProgress().ready, true);
+});
+
+for (const fail of [false, true]) test(`reliable epoch catch-up ${fail ? 'failure closes' : 'settles before'} projection release`, () => {
+  const f = fixture(), channel = new CampaignPacketChannel(), packets = [], releases = [], closed = [];
+  const actor = 0xff000001, epoch = 'a'.repeat(32);
+  const feed = new ProjectionFeed({ connected: () => true, actor: () => actor, instance: () => '',
+    read: () => ({ schemaVersion: 1, actor, campaignOwner: actor, instance: '', contextEpoch: '1:1', identity: '', references: [] }),
+    block() {}, beginEpoch: () => epoch, epoch: () => epoch,
+    baseline: () => ({ schemaVersion: 1, actor, packetEpoch: epoch, messages: [
+      { t: 32, eventSources: [], updateOwnerFunctions: [], updateNeighborFunctions: [] },
+      { ...create(), props: { inventory: { entries: [] }, isRaceMenuOpen: false } },
+    ] }), send: (_user, packet) => packets.push(packet), close: (_user, reason) => closed.push(reason),
+  });
+  const deliver = message => f.event('changeValuesMessage', message);
+  const coordinator = new WorldProjectionCoordinator({
+    cancel: () => f.server.resetWorldModel(), drained: () => ({ ready: true }),
+    apply: (_projection, world) => world.messages.filter(message => message.t === 33).forEach(message => f.create(message)),
+    observe: () => f.server.getActorValueApplicationProgress(), release: () => releases.push('ready'), disconnect() {},
+  }, {
+    block: token => token ? channel.select(token) : channel.requireEpoch(), send: packet => feed.packet(0, packet),
+    drain: token => channel.drain(token, deliver), release: token => channel.release(token, deliver), close: reason => closed.push(reason),
+  });
+  feed.connect(0); coordinator.connect('catch-up');
+  while (packets.length) coordinator.receive(packets.shift());
+  coordinator.advance(false); coordinator.advance(true);
+  assert.equal(coordinator.status.phase, 'awaiting-ready');
+  channel.incoming({ t: 34, epoch: 'b'.repeat(32), message: { t: 16, idx: 1, data: { health: 0.9 } } }, deliver);
+  channel.incoming({ t: 34, epoch, message: { t: 16, idx: 1, data: { health: 0.4 } } }, deliver);
+  while (packets.length) coordinator.receive(packets.shift());
+  coordinator.advance(true);
+  assert.equal(coordinator.status.phase, 'releasing'); assert.equal(channel.ready, false); assert.equal(releases.length, 0);
+  if (fail) f.valueFailure('catch-up native failure');
+  f.update(); coordinator.advance(true);
+  assert.equal(coordinator.status.phase, fail ? 'failed' : 'ready');
+  assert.equal(channel.ready, !fail); assert.equal(releases.length, fail ? 0 : 1);
+  assert.equal(closed.length > 0, fail);
+  assert.deepEqual(f.calls.filter(call => call[0] === 'value'), fail ? [] : [['value', 0x14, 'health', 0.4]]);
 });
 
 test('unknown destruction cannot quit the game and a new self cancels queued menu exit', () => {

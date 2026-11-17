@@ -11,6 +11,27 @@ export type SendChatMessageFn = (
   message: Record<string, unknown>
 ) => void;
 
+export interface CampaignResumeState {
+  attempt: string;
+  status: "Pending" | "ProjectionReady" | "Failed";
+  actor?: number;
+  error?: string;
+}
+
+export interface CampaignResumeArea {
+  id: string;
+  worldOrCell: number;
+  center: number[];
+  radius: number;
+}
+
+export interface WorldBaseline {
+  schemaVersion: 1;
+  actor: number;
+  packetEpoch: string;
+  messages: Record<string, unknown>[];
+}
+
 export interface ScampServer {
   on(event: "connect", handler: (userId: number) => void): void;
   on(event: "disconnect", handler: (userId: number) => void): void;
@@ -49,10 +70,16 @@ export interface ScampServer {
   getGameplayBlocked(userId: number): boolean;
   beginPacketEpoch(userId: number): string;
   getPacketEpoch(userId: number): string;
-  getWorldBaseline(userId: number, packetEpoch: string): {
-    schemaVersion: 1; actor: number; packetEpoch: string;
-    messages: Record<string, unknown>[];
+  getWorldBaseline(userId: number, packetEpoch: string): WorldBaseline;
+  resumeCampaignActor(userId: number, actorId: number, expectedPhase: string,
+    area: CampaignResumeArea): CampaignResumeState | null;
+  getCampaignResume(userId: number): CampaignResumeState | null;
+  captureCampaignResumeProjection(userId: number, packetEpoch: string): {
+    attempt: string; proof: string; manifest: Record<string, unknown>; baseline: WorldBaseline;
   };
+  completeCampaignResume(userId: number, attempt: string, packetEpoch: string,
+    proof: string, publishReady: () => void): boolean;
+  detachCampaignActor(userId: number): boolean;
   setCampaignVisibilityCallbacks(
     before: ((owner: number, users: number[]) => boolean) | null,
     after: ((owner: number, users: number[], synchronized: boolean) => boolean) | null

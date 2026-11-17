@@ -4,6 +4,8 @@
 const assert = require("node:assert/strict");
 const { WorldProjectionReplica } = require("../../skymp5-client/src/campaign/worldProjection.ts");
 const server = globalThis.mp;
+const community = process.env.BOYHOUSE_PROTOCOL_COMMUNITY === "1";
+const polls = community ? 400 : 80;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const packet = (bot, content) => bot.send({ t: 1, contentJsonDump: JSON.stringify(content) });
 const scope = p => server.get(p.actor, "worldInstance");
@@ -14,7 +16,7 @@ function receive(p) {
   }
 }
 async function prepared(p) {
-  for (let i = 0; i < 80; ++i) {
+  for (let i = 0; i < polls; ++i) {
     receive(p);
     if (p.replica.prepared()) {
       const baseline = p.replica.preparedBaseline();
@@ -33,7 +35,7 @@ async function acknowledge(p) {
   await prepared(p);
   const ack = p.replica.applied(p.replica.version);
   packet(p.bot, ack);
-  for (let i = 0; i < 80; ++i) {
+  for (let i = 0; i < polls; ++i) {
     await sleep(25); receive(p);
     if (p.replica.ready) {
       assert.equal(server.getGameplayBlocked(p.user), false);
@@ -77,6 +79,11 @@ async function finishCreation(p) {
 }
 
 (async () => {
+  if (community) {
+    await require("./community-smoke-gamemode.cjs")({ server, sleep, packet, scope,
+      prepared, acknowledge, login, command, finishCreation });
+    process.exit(0);
+  }
   const owner = await login(2001, "owner");
   const first = owner.replica.prepared();
   assert.equal(first.instance, "");

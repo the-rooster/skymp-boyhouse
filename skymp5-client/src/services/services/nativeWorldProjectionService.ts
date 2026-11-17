@@ -114,6 +114,8 @@ export class NativeWorldProjectionService extends ClientListener implements Proj
         if (!factions.ready) return factions;
         const originals = this.controller.lookupListener(RemoteServer).getOriginalApplicationProgress();
         if (!originals.ready) return originals;
+        const actorValues = this.controller.lookupListener(RemoteServer).getActorValueApplicationProgress();
+        if (!actorValues.ready) return actorValues;
         const ids = this.references.map(reference => reference.original);
         const suppressionError = ids.map(id => this.suppression.error(id)).find(Boolean);
         if (suppressionError) return { ready: false, error: suppressionError };

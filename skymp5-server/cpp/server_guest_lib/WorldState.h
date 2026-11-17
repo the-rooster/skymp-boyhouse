@@ -66,6 +66,11 @@ public:
 
   bool IsRestoring() const noexcept;
   bool IsClearing() const noexcept;
+  // Full database reconstruction is distinct from a nested passive load.
+  void BeginStorageRestore();
+  void CompleteStorageRestore();
+  void FailStorageRestore() noexcept;
+  bool IsStorageRestoreReady() const noexcept;
 
   struct NpcSettingsEntry
   {

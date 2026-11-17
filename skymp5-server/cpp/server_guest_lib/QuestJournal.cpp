@@ -3,6 +3,7 @@
 #include "CampaignMovement.h"
 #include "CampaignReferenceBinding.h"
 #include "MpActor.h"
+#include "QuestJobRunner.h"
 #include "QuestVmState.h"
 #include "WorldState.h"
 #include "libespm/QUST.h"
@@ -685,11 +686,9 @@ QuestJournal::CaptureContext QuestJournal::CaptureReadContext(MpActor& actor)
   return result;
 }
 
-MpActor& QuestJournal::Owner(MpActor& actor)
+uint32_t QuestJournal::ParseCampaignOwnerId(const std::string& instance,
+                                            bool requireCanonical)
 {
-  const auto& instance = actor.GetWorldInstance();
-  if (instance.empty())
-    return actor;
   const std::string prefix = "campaign:";
   const auto separator = instance.find(':', prefix.size());
   if (instance.compare(0, prefix.size(), prefix) ||
@@ -700,9 +699,21 @@ MpActor& QuestJournal::Owner(MpActor& actor)
   const auto parsed = std::from_chars(instance.data() + prefix.size(),
                                       instance.data() + separator, ownerId);
   if (parsed.ec != std::errc() || parsed.ptr != instance.data() + separator ||
-      !ownerId) {
+      !ownerId ||
+      (requireCanonical &&
+       instance.substr(prefix.size(), separator - prefix.size()) !=
+         std::to_string(ownerId))) {
     throw std::runtime_error("Invalid campaign owner");
   }
+  return ownerId;
+}
+
+MpActor& QuestJournal::Owner(MpActor& actor)
+{
+  const auto& instance = actor.GetWorldInstance();
+  if (instance.empty())
+    return actor;
+  const auto ownerId = ParseCampaignOwnerId(instance);
   auto& owner = actor.GetParent()->GetFormAt<MpActor>(ownerId);
   if (!actor.SharesWorldInstance(owner)) {
     throw std::runtime_error("Campaign owner is no longer in this instance");
@@ -1158,6 +1169,8 @@ std::shared_ptr<const SaveReceipt> QuestJournal::AtomicImpl(
     throw std::runtime_error("Unregistered quest transaction participant");
   auto& owner = Owner(actor);
   auto& world = *actor.GetParent();
+  const auto resumeLease = world.GetQuestJobs().RequireJournalAccess(
+    actor, admissions && admissions->empty());
   if (durable)
     world.RequireDurableSaveStorage();
   const auto actorId = actor.GetFormId(), ownerId = owner.GetFormId();
@@ -1262,6 +1275,7 @@ std::shared_ptr<const SaveReceipt> QuestJournal::AtomicImpl(
       }
       if (local.movement)
         local.movement->Validate(actor);
+      world.GetQuestJobs().ValidateJournalAccess(actor, resumeLease);
     };
     validateReads();
     if (jobId) {
@@ -1491,6 +1505,9 @@ void QuestJournal::RequirePersonalJobAccess(MpActor& owner)
       throw std::runtime_error("Campaign has an active quest job");
     return;
   }
+  if (owner.GetParent() &&
+      owner.GetParent()->GetQuestJobs().HasResumeHold(owner))
+    throw std::runtime_error("Campaign execution is held for recovery");
   if (PersonalJobState(owner).HasLive())
     throw std::runtime_error("Campaign has an active quest job");
 }

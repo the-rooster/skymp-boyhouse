@@ -153,3 +153,41 @@ TEST_CASE("Server custom packet", "[PartOne]")
   REQUIRE(partOne.Messages()[0].userId == 1);
   REQUIRE(partOne.Messages()[0].reliable);
 }
+
+TEST_CASE("Disconnect callbacks cannot erase a replacement connection",
+          "[PartOne][CampaignResume]")
+{
+  struct ReconnectListener : FakeListener
+  {
+    explicit ReconnectListener(PartOne& server)
+      : server(server)
+    {
+    }
+    void OnDisconnect(Networking::UserId user) override
+    {
+      DoConnect(server, user);
+    }
+    PartOne& server;
+  };
+  PartOne server;
+  server.AddListener(std::make_shared<ReconnectListener>(server));
+  auto trailing = FakeListener::New();
+  server.AddListener(trailing);
+  std::shared_ptr<const uint8_t> original;
+  SECTION("Assigned slot")
+  {
+    DoConnect(server, 0);
+    server.CreateActor(0xff001234, {}, 0, 0x3c);
+    server.SetUserActor(0, 0xff001234);
+    original = server.serverState.userInfo[0]->connectionIdentity;
+  }
+  SECTION("Unassigned slot")
+  {
+    REQUIRE_FALSE(server.IsConnected(0));
+  }
+  DoDisconnect(server, 0);
+  REQUIRE(server.IsConnected(0));
+  REQUIRE(server.serverState.userInfo[0]->connectionIdentity != original);
+  REQUIRE(server.GetUserActor(0) == 0);
+  REQUIRE(trailing->str().find("OnDisconnect") == std::string::npos);
+}

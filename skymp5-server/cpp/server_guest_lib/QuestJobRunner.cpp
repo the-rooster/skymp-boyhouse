@@ -711,6 +711,7 @@ void QuestJobRunner::Stop() noexcept
   // recover jobs, after its previous writer has shut down.
   stopped = true;
   scheduled.clear();
+  resumeHolds.clear();
 }
 
 QuestJobTime QuestJobRunner::Now()
@@ -802,6 +803,8 @@ void QuestJobRunner::OnActorLoaded(MpActor& actor) noexcept
   if (stopped)
     return;
   try {
+    if (!world.IsStorageRestoreReady())
+      HoldRestoredOwner(actor);
     const auto jobs = QuestJournal::PersonalJobState(actor);
     for (const auto& [id, job] : jobs.live)
       Track(actor, job);
@@ -871,7 +874,8 @@ void QuestJobRunner::Retry(MpActor& actor, const Request& command)
 
 void QuestJobRunner::Pump() noexcept
 {
-  if (stopped || pumping || QuestJournal::HasActiveTransaction() ||
+  if (stopped || pumping || !world.IsStorageRestoreReady() ||
+      world.IsRestoring() || QuestJournal::HasActiveTransaction() ||
       scheduled.empty())
     return;
   BusyGuard guard(pumping);
@@ -887,6 +891,8 @@ void QuestJobRunner::Pump() noexcept
     ++next;
   }
   const auto blocked = [&](uint32_t ownerId) {
+    if (resumeHolds.contains(ownerId))
+      return true;
     const auto barrier = barriers.find(ownerId);
     return barrier != barriers.end() &&
       (barrier->second.busy ||
@@ -1021,10 +1027,190 @@ void QuestJobRunner::RequireContext(MpActor& actor,
     throw std::runtime_error("Quest job campaign context changed");
 }
 
+bool QuestJobRunner::HasResumeHold(MpActor& owner) const
+{
+  return resumeHolds.contains(owner.GetFormId());
+}
+
+void QuestJobRunner::HoldRestoredOwner(MpActor& owner)
+{
+  if (owner.GetDynamicFields().GetValueDump(CampaignMovementPlan::kProperty) ==
+      "null")
+    return;
+  // Visitors remain disabled and unauthorized after storage reconstruction.
+  // Identifying them must not resolve a host that may be absent or elsewhere.
+  // Genuine owners still pass the full lease validation below.
+  if (QuestJournal::ParseCampaignOwnerId(owner.GetWorldInstance(), true) !=
+      owner.GetFormId())
+    return;
+  if (!resumeHolds.contains(owner.GetFormId()))
+    AcquireResumeLease(owner);
+}
+
+QuestJobRunner::ResumeLease QuestJobRunner::AcquireResumeLease(MpActor& owner)
+{
+  if (stopped || owner.GetParent() != &world || owner.IsDeleted() ||
+      world.LookupFormByIdNoLoad(owner.GetFormId()).get() != &owner ||
+      &QuestJournal::Owner(owner) != &owner ||
+      owner.GetWorldInstance().empty())
+    throw std::runtime_error("Invalid campaign resume owner");
+  if (!resumeHolds.contains(owner.GetFormId()) && resumeHolds.size() >= 4096)
+    throw std::runtime_error("Campaign resume hold limit exceeded");
+  auto next = std::make_shared<ResumeHold>();
+  next->owner = world.LookupFormByIdNoLoad(owner.GetFormId());
+  next->epoch = owner.GetWorldInstanceEpoch();
+  next->instance = owner.GetWorldInstance();
+  next->identity = CampaignReferenceBinding::GetIdentity(owner);
+  next->lease = std::make_shared<const uint8_t>(0);
+  resumeHolds.insert_or_assign(owner.GetFormId(), next);
+  return next->lease;
+}
+
+std::shared_ptr<QuestJobRunner::ResumeHold> QuestJobRunner::RequireResumeLease(
+  MpActor& owner, const ResumeLease& lease)
+{
+  const auto found = resumeHolds.find(owner.GetFormId());
+  if (stopped || world.IsClearing() || owner.GetParent() != &world || !lease ||
+      found == resumeHolds.end() || found->second->lease != lease ||
+      found->second->owner.lock().get() != &owner || owner.IsDeleted() ||
+      world.LookupFormByIdNoLoad(owner.GetFormId()).get() != &owner ||
+      found->second->epoch != owner.GetWorldInstanceEpoch() ||
+      found->second->instance != owner.GetWorldInstance() ||
+      &QuestJournal::Owner(owner) != &owner ||
+      found->second->identity != CampaignReferenceBinding::GetIdentity(owner))
+    throw std::runtime_error("Campaign resume lease was replaced");
+  return found->second;
+}
+
+QuestJobRunner::AdmissionBatchResult QuestJobRunner::InspectResumeLease(
+  MpActor& owner, const ResumeLease& lease)
+{
+  RequireResumeLease(owner, lease);
+  AdmissionBatchResult result;
+  const auto found = barriers.find(owner.GetFormId());
+  if (found != barriers.end()) {
+    if (found->second.owner.lock().get() != &owner)
+      throw std::runtime_error("Campaign resume save owner was replaced");
+    result.receipt = found->second.receipt;
+    if (found->second.busy)
+      return result;
+  }
+  if (!world.IsStorageRestoreReady() || world.IsRestoring())
+    return result;
+  result.status = !result.receipt ||
+      result.receipt->GetState() == SaveReceipt::State::Durable
+    ? AdmissionStatus::Durable
+    : result.receipt->GetState() == SaveReceipt::State::Pending
+    ? AdmissionStatus::Pending
+    : AdmissionStatus::Failed;
+  return result;
+}
+
+QuestJobRunner::AdmissionBatchResult QuestJobRunner::AdmitResume(
+  MpActor& owner, const ResumeLease& lease,
+  const std::shared_ptr<CampaignMovementPlan>& plan)
+{
+  const auto hold = RequireResumeLease(owner, lease);
+  RequireSaveReady(owner);
+  if (!plan || plan->GetKind() == CampaignMovementPlan::Kind::Movement ||
+      &plan->GetSource() != &owner || !plan->GetEvents().empty())
+    throw std::runtime_error("Resume requires an owner recovery plan");
+  plan->Validate(owner);
+  RequireResumeLease(owner, lease);
+  RequireSaveReady(owner);
+  Barrier initial;
+  initial.owner = world.LookupFormByIdNoLoad(owner.GetFormId());
+  auto& barrier =
+    barriers.try_emplace(owner.GetFormId(), std::move(initial)).first->second;
+  BusyGuard busy(barrier.busy);
+  struct PermitGuard
+  {
+    ResumeHold& hold;
+    ~PermitGuard() { hold.journalPermit = false; }
+  } permit{ *hold };
+  hold->journalPermit = true;
+  auto commit = QuestJournal::AtomicJobAdmissionRoots(
+    owner, {},
+    [&] {
+      RequireResumeLease(owner, lease);
+      QuestJournal::StageMovement(owner, plan);
+    },
+    [](QuestJobState::Job&) {
+      throw std::logic_error("Resume cannot execute a job");
+    });
+  barrier.receipt = commit.receipt;
+  hold->sealedReceipt = commit.receipt;
+  // Offline owners stay held. Only an online resume needs its graph for ACK.
+  if (plan->GetKind() == CampaignMovementPlan::Kind::Resume)
+    hold->sealedPlan = plan;
+  return { commit.receipt->GetState() == SaveReceipt::State::Durable
+             ? AdmissionStatus::Durable
+             : AdmissionStatus::Pending,
+           std::move(commit.receipt),
+           {} };
+}
+
+void QuestJobRunner::CompleteResumeLease(MpActor& owner,
+                                         const ResumeLease& lease)
+{
+  const auto hold = RequireResumeLease(owner, lease);
+  RequireSaveReady(owner);
+  if (!hold->sealedReceipt || !hold->sealedPlan ||
+      hold->sealedPlan->GetKind() != CampaignMovementPlan::Kind::Resume ||
+      hold->sealedReceipt->GetState() != SaveReceipt::State::Durable ||
+      barriers.at(owner.GetFormId()).receipt != hold->sealedReceipt)
+    throw std::runtime_error(
+      "Resume completion requires its exact durable resume seal");
+  hold->sealedPlan->ValidateCommitted(owner);
+  RequireResumeLease(owner, lease);
+  RequireSaveReady(owner);
+  resumeHolds.erase(owner.GetFormId());
+}
+
+QuestJobRunner::ResumeLease QuestJobRunner::RequireJournalAccess(
+  MpActor& actor, bool emptyAdmission)
+{
+  auto& owner = QuestJournal::Owner(actor);
+  const auto found = resumeHolds.find(owner.GetFormId());
+  if (found == resumeHolds.end()) {
+    if (!world.IsStorageRestoreReady() || world.IsRestoring())
+      throw std::runtime_error(
+        "Campaign execution requires complete restoration");
+    return {};
+  }
+  if (&actor != &owner || !emptyAdmission || !found->second->journalPermit)
+    throw std::runtime_error("Campaign execution is held for recovery");
+  found->second->journalPermit = false;
+  return found->second->lease;
+}
+
+void QuestJobRunner::ValidateJournalAccess(MpActor& actor,
+                                           const ResumeLease& lease)
+{
+  if (stopped || world.IsClearing() || !world.IsStorageRestoreReady() ||
+      world.IsRestoring())
+    throw std::runtime_error("Campaign execution lost its world");
+  auto& owner = QuestJournal::Owner(actor);
+  if (lease)
+    RequireResumeLease(owner, lease);
+  else if (HasResumeHold(owner))
+    throw std::runtime_error("Campaign execution was superseded by recovery");
+}
+
 void QuestJobRunner::RequireReady(MpActor& actor)
+{
+  RequireSaveReady(actor);
+  if (HasResumeHold(QuestJournal::Owner(actor)))
+    throw std::runtime_error("Campaign execution is held for recovery");
+}
+
+void QuestJobRunner::RequireSaveReady(MpActor& actor)
 {
   if (stopped || actor.GetParent() != &world)
     throw std::runtime_error("Quest job coordinator has stopped");
+  if (!world.IsStorageRestoreReady() || world.IsRestoring())
+    throw std::runtime_error(
+      "Campaign execution requires complete restoration");
   const auto& owner = QuestJournal::Owner(actor);
   const auto found = barriers.find(owner.GetFormId());
   if (found == barriers.end())

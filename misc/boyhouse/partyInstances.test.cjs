@@ -21,6 +21,60 @@ function fixture() {
   return { authority, scopes, outside, disabled, adapter, areas, preparations, advance: ms => time += ms };
 }
 
+test("owner recovery adopts only native-accepted exact-phase visits without preparation", () => {
+  const f = fixture(); f.scopes.set(1, "campaign:1:town");
+  const request = { userId: 7, handled: false };
+  f.adapter.resumeOwner = (actor, area, user) => {
+    assert.equal(actor, 1); assert.equal(area.id, "town"); assert.equal(user, 7);
+    assert.equal(f.authority.snapshot(actor).visit, null, "visit must follow native acceptance");
+    return { attempt: "resume-1", status: "Pending" };
+  };
+  f.adapter.setInstance = () => assert.fail("Resume cannot rebind the existing phase");
+  f.authority.recover(1, request);
+  assert.equal(request.handled, true);
+  assert.deepEqual(f.authority.snapshot(1).visit, { owner: 1, area: "town" });
+  assert.deepEqual(f.preparations, []);
+  assert.deepEqual([...f.disabled], []);
+});
+
+test("unenrolled recovery explicitly falls back only when native admission returns null", () => {
+  const f = fixture(); f.scopes.set(1, "campaign:1:town");
+  const request = { userId: 7, handled: false };
+  f.adapter.resumeOwner = () => null;
+  f.authority.recover(1, request);
+  assert.equal(request.handled, false);
+  assert.equal(f.preparations.length, 1);
+  assert.deepEqual(f.authority.snapshot(1).visit, { owner: 1, area: "town" });
+});
+
+test("invalid enrolled recovery and enrolled guest refusal never prepare a replacement history", () => {
+  for (const saved of ["campaign:1:town", "campaign:2:town"]) {
+    const f = fixture(); f.scopes.set(1, saved);
+    const request = { userId: 7, handled: false };
+    f.adapter.resumeOwner = () => { throw Error("enrolled context rejected"); };
+    assert.throws(() => f.authority.recover(1, request), /enrolled context rejected/);
+    assert.equal(request.handled, false);
+    assert.equal(f.scopes.get(1), saved);
+    assert.deepEqual(f.preparations, []);
+    assert.equal(f.authority.snapshot(1).visit, null);
+    assert.ok(f.disabled.has(1));
+  }
+});
+
+test("malformed native resume acceptance cannot publish a visit or mark spawn handled", () => {
+  for (const resumed of [undefined, {}, { attempt: "", status: "Pending" },
+    { attempt: "x", status: "Failed" }, { attempt: "x", status: "unknown" }]) {
+    const f = fixture(); f.scopes.set(1, "campaign:1:town");
+    const request = { userId: 7, handled: false };
+    f.adapter.resumeOwner = () => resumed;
+    assert.throws(() => f.authority.recover(1, request), /resume was not accepted/);
+    assert.equal(request.handled, false);
+    assert.deepEqual(f.preparations, []);
+    assert.equal(f.authority.snapshot(1).visit, null);
+    assert.ok(f.disabled.has(1));
+  }
+});
+
 test("a matching history never substitutes for party membership", () => {
   const { authority: a, scopes } = fixture();
   a.enter(1, 1, "town");
@@ -260,4 +314,20 @@ test("guests cannot enter a host whose client projection is pending", () => {
   ready = false;
   assert.deepEqual(a.reconcile(), [], "An existing guest is not revoked during a same-phase host refresh");
   assert.equal(f.scopes.get(2), f.scopes.get(1));
+});
+
+test("an invitation expires when its recipient leaves before accepting", () => {
+  const { authority } = fixture();
+  authority.enter(1, 1, "town");
+  authority.invite(1, 2);
+  authority.invite(1, 3);
+  authority.leave(2); // Disconnect cleanup runs even for a prospective member.
+  assert.equal(authority.snapshot(2).invitation, null);
+  assert.throws(() => authority.accept(2, 1), /Invitation missing or expired/);
+  assert.throws(() => authority.enter(2, 1, "town"), /Party membership required/);
+  authority.accept(3, 1);
+  authority.invite(1, 2);
+  authority.accept(2, 1);
+  authority.enter(2, 1, "town");
+  assert.deepEqual(authority.snapshot(2).visit, { owner: 1, area: "town" });
 });

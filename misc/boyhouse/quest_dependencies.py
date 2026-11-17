@@ -70,6 +70,7 @@ def summarize_record(typ, flags, form, values, groups, origins, plugin):
               "features": defaultdict(set), "unknowns": set(), "owners": set(),
               "stages": set(), "objectives": set(), "bindings": []}
     stage, context, alias, fill, vmad_seen = None, "record", None, False, False
+    has_stage_log = False
 
     def feature(name, where):
         result["features"][name].add(where)
@@ -102,6 +103,7 @@ def summarize_record(typ, flags, form, values, groups, origins, plugin):
             if len(data) != 4:
                 raise ValueError("Invalid quest stage size")
             stage = struct.unpack_from("<H", data)[0]
+            has_stage_log = False
             result["stages"].add(stage)
             context = f"stage:{stage}"
             for mask, name in ((0x02, "startup-stages"),
@@ -168,8 +170,8 @@ def summarize_record(typ, flags, form, values, groups, origins, plugin):
             op = data[0]
             index = struct.unpack_from("<H", data, 8)[0]
             run_on, reference, alias_id = struct.unpack_from("<IIi", data, 20)
-            stage_log = context.startswith("stage:") and typ == "QUST"
-            physical = index in (35, 46, 47, 71, 73)
+            stage_log = context.startswith("stage:") and typ == "QUST" and has_stage_log
+            physical = index in (35, 46, 47, 71, 73, 566)
             feature(f"condition:{index}", where)
             if op & 0x1a or op >> 5 > 5:
                 feature("condition.flags", where)
@@ -182,7 +184,7 @@ def summarize_record(typ, flags, form, values, groups, origins, plugin):
             reference_key = ref(reference, where) if run_on == 2 else None
             if stage_log and physical and run_on == 2 and reference_key:
                 feature("condition.stage-run-on:2:private-reference", where)
-            elif stage_log and index in (46, 71, 73) and run_on == 5 and alias_id >= 0:
+            elif stage_log and index in (46, 71, 73, 566) and run_on == 5 and alias_id >= 0:
                 feature("condition.stage-run-on:5:reference-alias", where)
             elif physical and run_on == 0:
                 feature("condition.run-on:0:physical", where)
@@ -190,11 +192,20 @@ def summarize_record(typ, flags, form, values, groups, origins, plugin):
                 feature(f"condition.run-on:{run_on}", where)
             if not stage_log:
                 feature("condition.non-stage-evaluation", where)
+            if index == 566:
+                # GetIsAliasRef's first argument is a quest-local signed alias
+                # ID even without UseAliases. Never remap it as a FormID, and
+                # retain alias lifecycle/fill dependencies despite the narrow
+                # condition implementation.
+                feature("alias.reference", where)
+                if struct.unpack_from("<i", data, 12)[0] < 0:
+                    feature("condition.alias-parameter", where)
             if index in (47, 56, 58, 59, 71, 73, 74, 543, 629) and not op & 0x0a:
                 ref(struct.unpack_from("<I", data, 12)[0], where)
         elif tag == b"QSDT" and typ == "QUST":
             if len(data) != 1:
                 raise ValueError("Invalid quest log flags")
+            has_stage_log = context.startswith("stage:")
             if data[0] & ~1:
                 feature("quest.log-flags", where)
         elif typ == "DIAL" and tag == b"QNAM":

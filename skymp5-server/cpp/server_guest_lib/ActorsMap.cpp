@@ -23,10 +23,15 @@ void ActorsMap::Set(Networking::UserId userId, MpActor* actor)
     ss << "UserId " << userId << " is too big to be stored in ActorsMap";
     throw std::runtime_error(ss.str());
   }
-  Erase(userId);
-  Erase(actor);
+  // Allocate the reverse entry before disturbing either existing assignment.
+  auto [entry, inserted] = userIdByActor.try_emplace(actor, userId);
+  if (!inserted)
+    actorByUserId[entry->second] = nullptr;
+  if (const auto previous = actorByUserId[userId];
+      previous && previous != actor)
+    userIdByActor.erase(previous);
+  entry->second = userId;
   actorByUserId[userId] = actor;
-  userIdByActor[actor] = userId;
 }
 
 void ActorsMap::Erase(Networking::UserId userId)

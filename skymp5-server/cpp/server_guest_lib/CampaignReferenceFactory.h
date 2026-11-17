@@ -31,6 +31,12 @@ public:
   static std::vector<uint32_t> PrepareArea(
     MpActor& owner, const std::string& areaId, uint32_t worldOrCell,
     const NiPoint3& center, float radius, uint32_t encounterLevel);
+  // Adopt only a complete, existing allocation in the owner's exact phase.
+  // This never allocates, repairs bindings, runs scripts, or changes live
+  // jobs.
+  static void ValidateExistingArea(MpActor& owner, const std::string& areaId,
+                                   uint32_t worldOrCell,
+                                   const NiPoint3& center, float radius);
 
 private:
   static std::vector<uint32_t> EnsureForInstance(

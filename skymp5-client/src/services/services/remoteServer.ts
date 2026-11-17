@@ -126,6 +126,7 @@ export class RemoteServer extends ClientListener {
     ++this.lifetime.generation;
     this.originals.clear();
     this.originalApplications.clear();
+    this.actorValueApplications.clear();
     this.sp.storage['worldModel'] = { forms: [], playerCharacterFormIdx: -1, playerCharacterRefrId: 0 };
     this.sp.storage['idManager'] = new IdManager();
     this.sp.storage['hosted'] = [];
@@ -167,6 +168,18 @@ export class RemoteServer extends ClientListener {
   private loading = false;
   private originals = new Map<number, { idx: number }>();
   private originalApplications = new Map<number, { pending: boolean; error?: string }>();
+  private actorValueApplications = new Set<{ current: () => boolean; pending: boolean; error?: string }>();
+
+  getActorValueApplicationProgress(): { ready: boolean; error?: string } {
+    // Selecting another projection epoch resets this world generation. Actor
+    // replacement also retires its queued writes, even when an idx is reused.
+    this.actorValueApplications.forEach(application => {
+      if (!application.current()) this.actorValueApplications.delete(application);
+    });
+    const entries = Array.from(this.actorValueApplications);
+    const error = entries.find(entry => entry.error)?.error;
+    return { ready: !error && entries.every(entry => !entry.pending), error };
+  }
 
   getOriginalApplicationProgress(): { ready: boolean; error?: string } {
     const entries = Array.from(this.originalApplications.values());
@@ -670,27 +683,47 @@ export class RemoteServer extends ClientListener {
   }
 
   private onChangeValuesMessage(event: ConnectionMessage<ChangeValuesMessage>): void {
-    const msg = event.message, current = this.captureActor(event.message.idx);
-
-    this.defer(() => {
-      const id = this.getIdManager().getId(msg.idx);
-      const refr = id === this.getMyActorIndex() ? Game.getPlayer() : getObjectReference(id);
-      const ac = Actor.from(refr);
-      if (!ac) {
-        return;
+    const idx = event.message.idx, values = { ...event.message.data }, current = this.captureActor(idx);
+    if (!current()) return;
+    if (this.actorValueApplications.size >= 4096) {
+      this.getActorValueApplicationProgress();
+      if (this.actorValueApplications.size >= 4096) throw Error('Too many pending actor-value applications');
+    }
+    const application: { current: () => boolean; pending: boolean; error?: string } = { current, pending: true };
+    this.actorValueApplications.add(application);
+    // A reliable frame is only delivered during epoch draining; its native
+    // work runs on a later update. Keep projection/input blocked until that
+    // work completes, including through generated-world loading.
+    const apply = () => {
+      if (!current()) { this.actorValueApplications.delete(application); return; }
+      if (this.loading) { this.controller.once('update', apply); return; }
+      try {
+        const id = this.getIdManager().getId(idx);
+        const refr = id === this.getMyActorIndex() ? Game.getPlayer() : getObjectReference(id);
+        const ac = Actor.from(refr);
+        if (!current()) return;
+        if (!ac) throw Error('Actor-value target is unavailable');
+        for (const name of ['health', 'stamina', 'magicka'] as const) {
+          if (!current()) return;
+          const value = values[name];
+          if (typeof value !== 'number') continue;
+          if (!Number.isFinite(value)) throw Error('Nonfinite actor-value percentage');
+          // Restore/DamageActorValue are non-latent; the SP bridge waits for
+          // their native completion and throws on failure.
+          setActorValuePercentage(ac, name, value);
+        }
+      } catch (error) {
+        if (current()) {
+          application.error = String(error);
+          logError(this, 'Applying actor values failed', error);
+        }
+      } finally {
+        application.pending = false;
+        if (!application.error || !current()) this.actorValueApplications.delete(application);
       }
-
-      const { health, stamina, magicka } = msg.data;
-      if (typeof health === "number") {
-        setActorValuePercentage(ac, 'health', health);
-      }
-      if (typeof stamina === "number") {
-        setActorValuePercentage(ac, 'stamina', stamina);
-      }
-      if (typeof magicka === "number") {
-        setActorValuePercentage(ac, 'magicka', magicka);
-      }
-    }, current);
+    };
+    try { this.controller.once('update', apply); }
+    catch (error) { this.actorValueApplications.delete(application); throw error; }
   }
 
   /** Packet handlers end **/

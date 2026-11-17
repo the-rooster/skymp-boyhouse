@@ -28,7 +28,8 @@ class ProjectionFeed {
       sequence: state.sequence, ...body });
   }
 
-  fail(user, error) {
+  fail(user, error, expected = this.users.get(user)) {
+    if (this.users.get(user) !== expected) return;
     this.users.delete(user);
     // Keep the native gate closed even if transport cleanup itself fails.
     if (this.adapter.connected(user)) {
@@ -43,26 +44,56 @@ class ProjectionFeed {
   }
 
   publish(user, state) {
+    if (this.users.get(user) !== state || state.publishing) return;
+    state.publishing = true;
+    try { this.publishNow(user, state); }
+    finally { state.publishing = false; }
+  }
+
+  publishNow(user, state) {
     const actor = this.adapter.actor(user);
     if (!actor || !state.session || state.visibilityHeld) return;
+    const resume = this.adapter.resume?.(user);
+    if (resume) {
+      if (typeof resume.attempt !== "string" || !resume.attempt ||
+          !["Pending", "ProjectionReady", "Failed"].includes(resume.status))
+        throw Error("Invalid native campaign resume state");
+      if (resume.status === "Failed") throw Error(resume.error || "Campaign resume failed");
+      state.resumeAttempt = resume.attempt;
+      if (resume.status === "Pending") {
+        // The native hold already blocks input. Do not rotate packet epochs
+        // or reconstruct projection bytes while its exact save is outstanding.
+        state.pending = null;
+        state.dirty = true;
+        return;
+      }
+    }
     this.adapter.block(user, true);
     const token = this.adapter.beginEpoch(user);
     if (!/^[a-f0-9]{32}$/.test(token)) throw Error("Invalid native packet epoch");
-    const manifest = this.adapter.read(actor);
+    const captured = resume ? this.adapter.captureResume(user, token) : null;
+    if (resume && (!captured || captured.attempt !== resume.attempt ||
+        typeof captured.proof !== "string" || !captured.proof))
+      throw Error("Invalid native campaign resume projection");
+    const manifest = captured ? captured.manifest : this.adapter.read(actor);
     if (!manifest || manifest.actor !== actor || !Array.isArray(manifest.references) ||
         manifest.references.length > 4096) throw Error("Invalid projection manifest");
     const encoded = JSON.stringify(manifest);
     if (Buffer.byteLength(encoded, "utf8") > 1024 * 1024) throw Error("Projection manifest is too large");
-    const baseline = this.adapter.baseline(user, token);
+    const baseline = captured ? captured.baseline : this.adapter.baseline(user, token);
     if (baseline?.schemaVersion !== 1 || baseline.actor !== actor || baseline.packetEpoch !== token ||
         !Array.isArray(baseline.messages)) throw Error("Invalid world baseline");
     const baselineText = JSON.stringify(baseline);
     if (Buffer.byteLength(baselineText, "utf8") > 2 * 1024 * 1024)
       throw Error("World baseline is too large");
+    const current = () => this.users.get(user) === state && this.adapter.connected(user) &&
+      this.adapter.actor(user) === actor && this.adapter.epoch(user) === token;
+    if (!current()) return;
     const { references, ...metadata } = manifest;
     if (state.sequence >= Number.MAX_SAFE_INTEGER) throw Error("Projection sequence exhausted");
     ++state.sequence;
-    state.pending = { token, actor, encoded };
+    const pending = { token, actor, encoded, attempt: captured?.attempt, proof: captured?.proof };
+    state.pending = pending;
     state.context = this.context(user);
     state.dirty = false;
     if (!state.deadline) state.deadline = this.now() + 30000;
@@ -70,10 +101,12 @@ class ProjectionFeed {
     this.send(user, state, { kind: "begin", token, metadata, count: references.length, chunks,
       baselineLength: baselineText.length, baselineChunks: Math.ceil(baselineText.length / BASELINE_CHUNK_SIZE) });
     for (let index = 0; index < chunks; ++index) {
+      if (!current() || state.pending !== pending) return;
       this.send(user, state, { kind: "chunk", token, index,
         references: references.slice(index * CHUNK_SIZE, (index + 1) * CHUNK_SIZE) });
     }
     for (let offset = 0; offset < baselineText.length; offset += BASELINE_CHUNK_SIZE) {
+      if (!current() || state.pending !== pending) return;
       this.send(user, state, { kind: "baseline", token, index: offset / BASELINE_CHUNK_SIZE,
         data: baselineText.slice(offset, offset + BASELINE_CHUNK_SIZE) });
     }
@@ -210,6 +243,33 @@ class ProjectionFeed {
       if (packet.action === "failed") {
         this.fail(user, Error("Client could not apply the campaign projection"));
       } else if (packet.action === "ack") {
+        if (pending.attempt) {
+          const session = state.session;
+          const sequence = state.sequence;
+          const current = () => this.users.get(user) === state && this.adapter.connected(user) &&
+            this.adapter.actor(user) === pending.actor && state.pending === pending &&
+            state.session === session && state.sequence === sequence &&
+            this.adapter.epoch(user) === pending.token;
+          if (!current()) return;
+          const accepted = this.adapter.completeResume(user, pending.attempt, pending.token, pending.proof, () => {
+            if (!current()) throw Error("Campaign resume connection changed before ready");
+            this.send(user, state, { kind: "ready", token: pending.token });
+            if (!current()) throw Error("Campaign resume connection changed during ready");
+          });
+          // Native owns release and checks its authority proof after send.
+          // In particular, never call the ordinary unblock API for this lane.
+          if (!current()) return;
+          state.pending = null;
+          state.dirty = !accepted;
+          if (accepted) { state.deadline = 0; state.resumeAttempt = null; }
+          else this.publish(user, state);
+          return;
+        }
+        if (this.adapter.resume?.(user)) {
+          state.dirty = true;
+          this.publish(user, state);
+          return;
+        }
         // State may change while the engine applies the manifest. Never release
         // against an obsolete mapping, phase, owner identity, or disabled state.
         if (this.adapter.epoch(user) !== pending.token || this.context(user) !== state.context ||
@@ -222,7 +282,7 @@ class ProjectionFeed {
         state.pending = null;
         state.deadline = 0;
       }
-    } catch (error) { this.fail(user, error); }
+    } catch (error) { this.fail(user, error, state); }
   }
 
   poll() {
@@ -236,8 +296,11 @@ class ProjectionFeed {
         // Active sessions only read their actor and phase, not every reference
         // ledger four times per second. State is checked again on each ack.
         const context = this.context(user);
-        if (context && (state.dirty || context !== state.context)) this.publish(user, state);
-      } catch (error) { this.fail(user, error); }
+        const resume = this.adapter.resume?.(user);
+        if (context && (state.dirty || context !== state.context ||
+            (resume && (resume.status === "Failed" || resume.attempt !== state.resumeAttempt))))
+          this.publish(user, state);
+      } catch (error) { this.fail(user, error, state); }
     }
   }
 }

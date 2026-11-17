@@ -252,7 +252,7 @@ function engineFixture(options = {}) {
     [0x14, { handle: 20, base: 7, actor: true, disabled: false, blocked: false }]]);
   const flags = options.flags || [true, true, true, true, false, true, true, false];
   let frame = 0, native, owned, suppression, engine, playerReady = false, spawn, viewsReady = false, nativeNoOp = false;
-  let world = { forms: [], playerCharacterFormIdx: -1 }, originalReady = true;
+  let world = { forms: [], playerCharacterFormIdx: -1 }, originalReady = true, actorValueProgress = { ready: true };
   const reference = id => {
     const state = forms.get(id); if (!state) return null;
     const captured = frame, valid = () => assert.equal(frame, captured, 'Wrapper escaped native callback');
@@ -300,7 +300,8 @@ function engineFixture(options = {}) {
     setProjectionReferences(refs) { this.aliases = structuredClone(refs); },
     getSpawnReadiness: () => ({ ready: viewsReady, failed: [] }) };
   const remote = { resetWorldModel() { world = { forms: [], playerCharacterFormIdx: -1 }; view.aliases = []; emitter.emit('worldModelReset'); },
-    getWorldModel: () => world, getOriginalApplicationProgress: () => ({ ready: originalReady }) };
+    getWorldModel: () => world, getOriginalApplicationProgress: () => ({ ready: originalReady }),
+    getActorValueApplicationProgress: () => actorValueProgress };
   const network = { applyCampaignBaseline(value) {
     calls.push('baseline'); world = { forms: value.messages.filter(message => message.t === 33), playerCharacterFormIdx: 0 };
     spawn = { generation: (spawn?.generation || 0) + 1, phase: 'pending' }; return true;
@@ -332,6 +333,7 @@ function engineFixture(options = {}) {
     begin() { engine.cancel(); engine.apply(projection, baseline('a'.repeat(32))); },
     playerReady(value = true) { playerReady = value; }, viewsReady(value = true) { viewsReady = value; },
     originalsReady(value) { originalReady = value; }, noOpControls(value) { nativeNoOp = value; },
+    actorValues(value) { actorValueProgress = value; },
   };
 }
 
@@ -356,6 +358,16 @@ test('native engine waits for self, suppression, original work, and copies while
   assert.equal(f.engine.observe().ready, false); f.viewsReady(); f.originalsReady(false);
   assert.equal(f.engine.observe().ready, false); f.originalsReady(true); assert.equal(f.engine.observe().ready, true);
   f.engine.release(); assert.deepEqual(f.flags, before); assert.equal(f.errors.length, 0);
+});
+
+test('native projection controls stay held for deferred or failed actor-value catch-up', async () => {
+  const f = engineFixture(), before = [...f.flags]; f.begin(); f.playerReady(); f.viewsReady(); await f.drain();
+  f.actorValues({ ready: false });
+  assert.equal(f.engine.observe().ready, false); assert.throws(() => f.engine.release(), /no longer ready/);
+  assert.equal(f.flags[0], false); assert.equal(f.flags[6], false);
+  f.actorValues({ ready: false, error: 'native value failed' });
+  assert.equal(f.engine.observe().error, 'native value failed'); assert.throws(() => f.engine.release(), /no longer ready/);
+  f.actorValues({ ready: true }); f.engine.release(); assert.deepEqual(f.flags, before);
 });
 
 test('cancelling while native suppression is pending drains disable and restoration before another baseline', async () => {

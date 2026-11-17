@@ -76,6 +76,13 @@ struct WorldState::Impl
   std::unordered_map<uint32_t, MpChangeForm> changeFormsForDeferredLoad;
   bool chunkLoadingInProgress = false;
   size_t restorationDepth = 0;
+  enum class RestoreState
+  {
+    Ready,
+    Loading,
+    Failed
+  };
+  RestoreState restoreState = RestoreState::Ready;
   std::vector<RelootTimeForTypesEntry> relootTimeForTypes;
   std::set<std::string> forbiddenRelootTypes;
   std::vector<std::unique_ptr<IPapyrusClassBase>> classes;
@@ -125,6 +132,40 @@ bool WorldState::IsClearing() const noexcept
   return pImpl->clearing;
 }
 
+void WorldState::BeginStorageRestore()
+{
+  if (pImpl->restoreState == Impl::RestoreState::Failed)
+    throw std::runtime_error(
+      "Clear the partially restored world before retrying");
+  if (pImpl->clearing || pImpl->tickActive || pImpl->saveTickActive ||
+      pImpl->restoreState == Impl::RestoreState::Loading)
+    throw std::runtime_error("Storage reconstruction is already active");
+  pImpl->restoreState = Impl::RestoreState::Loading;
+}
+
+void WorldState::CompleteStorageRestore()
+{
+  if (pImpl->restoreState != Impl::RestoreState::Loading)
+    throw std::runtime_error("Storage reconstruction is not active");
+  // Register recovery holds while the world is still closed to execution.
+  for (const auto& [id, form] : forms)
+    if (auto* actor = form->AsActor(); actor &&
+        actor->GetDynamicFields().GetValueDump(
+          CampaignMovementPlan::kProperty) != "null")
+      GetQuestJobs().HoldRestoredOwner(*actor);
+  pImpl->restoreState = Impl::RestoreState::Ready;
+}
+
+void WorldState::FailStorageRestore() noexcept
+{
+  pImpl->restoreState = Impl::RestoreState::Failed;
+}
+
+bool WorldState::IsStorageRestoreReady() const noexcept
+{
+  return pImpl->restoreState == Impl::RestoreState::Ready;
+}
+
 void WorldState::Clear()
 {
   if (pImpl->clearing)
@@ -170,6 +211,7 @@ void WorldState::Clear()
   pImpl->policy.reset();
   pImpl->changesByIdx.clear();
   pImpl->changesByIdxEmpty = true;
+  pImpl->restoreState = Impl::RestoreState::Ready;
   pImpl->clearing = false;
 }
 
@@ -325,7 +367,8 @@ void WorldState::AddForm(std::unique_ptr<MpForm> form, uint32_t formId,
 
 void WorldState::Tick(const std::function<void()>& afterSave)
 {
-  if (IsRestoring() || pImpl->tickActive || pImpl->clearing)
+  if (!IsStorageRestoreReady() || IsRestoring() || pImpl->tickActive ||
+      pImpl->clearing)
     return;
   struct TickGuard
   {
@@ -343,8 +386,8 @@ void WorldState::Tick(const std::function<void()>& afterSave)
       !pImpl->clearing)
     afterSave();
   TickTimers(now);
-  if (pImpl->questJobs && !IsRestoring() && !pImpl->saveTickActive &&
-      !pImpl->clearing)
+  if (pImpl->questJobs && IsStorageRestoreReady() && !IsRestoring() &&
+      !pImpl->saveTickActive && !pImpl->clearing)
     pImpl->questJobs->Pump();
 }
 
@@ -595,7 +638,7 @@ std::shared_ptr<const SaveReceipt> WorldState::CommitCampaignInventory(
 {
   if (durable)
     RequireDurableSaveStorage();
-  if (IsRestoring())
+  if (IsRestoring() || !IsStorageRestoreReady())
     throw std::runtime_error("Campaign commit during world loading");
   if (pImpl->saveStorage && !pImpl->saveStorage->SupportsAtomicBatches())
     throw std::runtime_error(
@@ -644,6 +687,9 @@ std::shared_ptr<const SaveReceipt> WorldState::CommitCampaignInventory(
     source.live.angle = movement->GetAngle();
     source.live.dynamicFields.SetValueDump(CampaignMovementPlan::kProperty,
                                            movement->GetBaselineDump());
+    if (movement->GetKind() != CampaignMovementPlan::Kind::Movement)
+      source.live.isDisabled =
+        movement->GetKind() == CampaignMovementPlan::Kind::Detach;
   }
   std::set<uint32_t> unique;
   for (const auto& change : changes) {
@@ -733,7 +779,9 @@ std::shared_ptr<const SaveReceipt> WorldState::CommitCampaignInventory(
   // unrelated callback work is not overwritten by an older world snapshot.
   std::optional<decltype(grids)> nextGrids;
   std::optional<decltype(hosters)> nextHosters;
-  if (changesVisibility) {
+  const bool recovering =
+    movement && movement->GetKind() != CampaignMovementPlan::Kind::Movement;
+  if (changesVisibility || recovering) {
     nextGrids.emplace(grids);
     nextHosters.emplace(hosters);
   }
@@ -755,6 +803,31 @@ std::shared_ptr<const SaveReceipt> WorldState::CommitCampaignInventory(
       }
     } else
       entry.reference->MoveOnGrid(*grid);
+  }
+  if (recovering) {
+    auto& source = movement->GetSource();
+    const auto id = source.GetFormId();
+    const auto cell = source.GetCellOrWorld().ToFormId(espmFiles);
+    auto& grid = nextGrids->operator[](cell).grid;
+    if (clonedGrids.insert(cell).second)
+      grid = std::make_shared<GridImpl<MpObjectReference*>>(*grid);
+    if (movement->GetKind() == CampaignMovementPlan::Kind::Detach)
+      grid->Forget(&source);
+    else {
+      const auto& pos = movement->GetPosition();
+      grid->Move(&source, int16_t(pos.x / 4096), int16_t(pos.y / 4096));
+      if (grid->GetPos(&source) !=
+          std::make_pair(int16_t(pos.x / 4096), int16_t(pos.y / 4096)))
+        throw std::runtime_error("Recovery grid placement failed");
+    }
+    // A disconnected player's old hosting authority must not survive either
+    // recovery direction. Network host notifications are reconciled later.
+    for (auto lease = nextHosters->begin(); lease != nextHosters->end();) {
+      if (lease->first == id || lease->second == id)
+        lease = nextHosters->erase(lease);
+      else
+        ++lease;
+    }
   }
   size_t size = pImpl->changesByIdx.size();
   for (auto& [id, entry] : prepared) {
@@ -1546,7 +1619,7 @@ void WorldState::TickSaveStorage(const std::chrono::system_clock::time_point&)
 
 void WorldState::TickTimers(const std::chrono::system_clock::time_point&)
 {
-  if (IsRestoring())
+  if (IsRestoring() || !IsStorageRestoreReady())
     return;
   timerEffects.TickTimers();
   timerRegular.TickTimers();

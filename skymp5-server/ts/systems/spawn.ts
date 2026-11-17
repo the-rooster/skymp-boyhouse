@@ -20,9 +20,12 @@ export class Spawn implements System {
       let actorId = ctx.svr.getActorsByProfileId(userProfileId)[0];
       if (actorId) {
         this.log("Loading character", actorId.toString(16));
-        ctx.gm.emit("beforeSpawn", actorId);
-        ctx.svr.setEnabled(actorId, true);
-        ctx.svr.setUserActor(userId, actorId);
+        const request = { userId, handled: false };
+        ctx.gm.emit("beforeSpawn", actorId, request);
+        if (!request.handled) {
+          ctx.svr.setEnabled(actorId, true);
+          ctx.svr.setUserActor(userId, actorId);
+        }
       } else {
         const idx = randomInteger(0, startPoints.length - 1);
         actorId = ctx.svr.createActor(
@@ -56,7 +59,7 @@ export class Spawn implements System {
 
   disconnect(userId: number, ctx: SystemContext): void {
     const actorId = ctx.svr.getUserActor(userId);
-    if (actorId !== 0) {
+    if (actorId !== 0 && !ctx.svr.detachCampaignActor(userId)) {
       ctx.svr.setEnabled(actorId, false);
     }
   }

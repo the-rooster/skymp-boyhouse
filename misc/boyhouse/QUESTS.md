@@ -23,13 +23,14 @@ The runner now implements:
 - Bounds-checked QUST VMAD versions 4/5, both object layouts, properties/arrays, stage/log-entry bindings, and alias script metadata. Parsed values own their storage. Alias VM objects and attached scripts now have campaign identities; world filling and lifecycle remain partial (see below).
 - Fresh, campaign-scoped quest objects and a strict VM for each transaction. Identical quest form IDs in different campaigns do not share Papyrus identities or variable maps.
 - Original PEX loading, including BSA decompression. The reader checks headers, bounds, string-table indices and call argument counts, handles absent debug information, and distinguishes parameters from locals.
-- Conditional log-entry selection using the four quest predicates, campaign globals, conditional quest script variables, and the five bounded physical/faction predicates below, in the host's context for guests. Unsupported condition functions, run-on contexts, and log flags are rejected. Matching fragments execute in log-entry order; the complete-quest log flag updates the same transaction.
+- Conditional log-entry selection using the four quest predicates, campaign globals, conditional quest script variables, and the six bounded physical/faction/reference-identity predicates below, in the host's context for guests. Unsupported condition functions, run-on contexts, and log flags are rejected. Matching fragments execute in log-entry order; the complete-quest log flag updates the same transaction.
 - Primitive variables, shared arrays, script state and quest-object references persisted with the journal. Variables are qualified by attached script and declaring class; references use stable plugin/form keys. Private VM state is omitted from client snapshots. Resetting a quest clears its saved script variables and collects arrays only when no other script references them.
 - Campaign-owned GLOB objects and `GlobalVariable.GetValue`, `GetValueInt`, `SetValue`, `SetValueInt`, and `Mod`. Defaults come from owned FLTV records; writes use float32 storage, stable plugin/form keys and the same transaction as stages/variables. A quest reset preserves global effects. The scoped runner's `GetGlobalValue` condition (index 74) sees earlier uncommitted writes, including during nested stages. Global values remain private server state; native client/NPC world projection is not implemented.
 - `GetVMQuestVariable` (index 629) reads the owned CIS2 variable name from the active campaign's conditional quest script. Int/Float/Bool declarations, case-insensitive names, inherited variables, PEX defaults and persisted values are supported. Conditional flags come from each PEX's own user-flag table. The target must be running and adapter-enabled; missing/ambiguous scripts, nonconditional variables, type mismatches and nonfinite values fail the transaction. This does not initialize a quest or run property getters.
 - Stage conditions may compare against a GLOB (`UseGlobal`). The comparison is resolved in the same campaign immediately before each log, so earlier fragments' uncommitted writes affect later branches. Other special condition flags remain unsupported. Regressions use MQ101's original faction-path conditions and CWObj's original cross-quest/global comparisons with controlled fragment bodies, including character reload, guest isolation and rollback. They are condition tests, not playthroughs of those quests.
 - `GetDisabled` (35) and `GetItemCount` (47) accept explicit Run On Reference targets; `GetDead` (46) also accepts Run On Quest Alias when the owning quest's existing alias resolver supplies a logical actor reference. Alias ID zero is valid and comes from CTDA byte 28, not the reference field at byte 24. PlayerRef resolves to the campaign owner; other evaluated targets require a bound private copy in that owner's current area. Evaluated missing copies, empty or unsupported alias fills, and nonactor `GetDead` targets fail the transaction. Implicit Subject/Target, dialogue, scenes, package conditions, and alias-fill condition execution remain unsupported.
 - Physical conditions use tracked reference snapshots and the transaction's staged inventory/visibility values. Item counts require initialized private inventories and the same concrete-item subset as inventory natives (including carryable lights, excluding FormLists, leveled lists and currently keys). Counts above signed-int32 range fail; comparisons retain exact integer counts. The compiler validates every selected-stage clause, including clauses skipped by OR. Comparison globals, item metadata and explicit target record types are checked before each log's short-circuit evaluation: non-player targets must be live placed REFR/ACHR records, and `GetDead` requires ACHR. Skipped branches do not resolve private copies or fill aliases. These predicates do not add death simulation, visibility propagation or alias lifecycle effects.
+- `GetIsAliasRef` (566) compares exact reference identities, not their base objects. It accepts explicit Run On Reference or Quest Alias and a signed nonnegative owning-quest alias ID in parameter 1; zero is valid and the parameter is never remapped as a FormID. Populated endpoints resolve to tracked campaign references. A proven empty reference alias returns false; missing aliases, location aliases, unsupported fill strategies/effects, missing private copies and cross-phase targets still fail. OR-skipped clauses do not fill aliases. Implicit subjects, other run-on contexts and non-stage evaluation remain unsupported. Owned tutorial condition fixtures do not establish their alias lifecycle or quest playability, and `GetIsID` is not enabled by this change.
 - Nested `SetStage`/`SetCurrentStageID` calls execute target fragments in the same VM, campaign, instruction budget and transaction. Cross-quest calls require the target quest's own adapter opt-in. Ordinary visited stages do not rerun; authored repeatable stages can execute again as described below. Invalid targets and failures roll back every affected quest. `Start`, `Stop` and `Reset` execution still require lifecycle/event support.
 - One in-memory commit for journal changes, script variables, supported inventory effects and the private-copy visibility subset described below. Unsupported natives, missing bindings, stale contexts, invalid property targets, invalid array access, runaway execution, and latent calls throw before publication and discard the transaction. A VM-wide instruction budget also covers nested calls and synchronous inventory handlers. Postcommit replication failures quarantine observers; they do not undo an already published reward or visibility change.
 
@@ -413,7 +414,7 @@ parents, container UI and other spatial effects are outside this transaction;
 they still need campaign-specific integration. Movement is also outside the
 script transaction. Automatic alias fills, remaining natives and latent handlers
 remain restricted. Controlled script tests do not certify any vanilla quest or
-establish throughput for 16ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ32 players.
+establish throughput for 16ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ32 players.
 
 ### Creating private reference copies
 
@@ -467,7 +468,7 @@ location playable. Automatic entry, engine-side transition application, cross-ar
 enable-parent change propagation, scale/ownership/lock overlays, NPC auto-calculated
 stats, respawns and durable lifecycle delivery remain unfinished. The factory
 currently copies the relevant world indexes during a batch; this needs measurement
-and optimization before a 16ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ32 player rollout. Requests are bounded to 4,096
+and optimization before a 16ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ32 player rollout. Requests are bounded to 4,096
 references, a radius of 65,536 units, and a 100,000-entry/8 MiB owner ledger;
 streaming and ledger partitioning are required for a full world.
 
@@ -1105,7 +1106,7 @@ yet. Recovery retains the baseline but refuses movement while restored
 subscriptions are pending: safe publication without replaying load events,
 cross-cell/grid movement, teleport/phase transitions, and general roster changes
 are still required. These restrictions are development gates, not the intended
-final gameplay. No complete quest or 16–32-player throughput is certified.
+final gameplay. No complete quest or 16Ã¢â‚¬â€œ32-player throughput is certified.
 
 Within one quest transaction, an immutable validated job-state snapshot avoids
 repeated full decoding by runtime guards. Public reads return owned copies;
@@ -1461,7 +1462,7 @@ The SQLite smoke does not certify recovery of the new enrolled movement producer
 restored subscription publication and spatial lifecycle transitions remain gated.
 The hidden occurrence benchmark passed on identical test source before and after
 the transaction snapshot change; the 18 samples per run include fixture manifest
-cost and do not certify production latency or 16–32-player throughput.
+cost and do not certify production latency or 16Ã¢â‚¬â€œ32-player throughput.
 No complete quest is certified. Skyrim, the installed client and staging were
 not launched, changed or deployed by this verification.
 Attempt-1 retains the initial base/derived pImpl compile error. Attempt-2 retains
@@ -1544,3 +1545,46 @@ not certify enrolled movement recovery. Restored subscription publication,
 reconnect, spatial transitions and remaining quest/client systems are unfinished.
 No complete quest is certified. Skyrim stayed closed; installed client and
 staging deployment were unchanged.
+
+## Reconnecting inside an altered location
+
+A returning owner with a saved movement baseline can rejoin the same configured
+area. The server checks the saved character, phase and existing reference
+allocations, then restores subscriptions and trigger occupancy. The owner's
+pending save must finish before the reconnect can publish those changes.
+Gameplay and quest timers wait until the client acknowledges its current world
+snapshot. A guest's saved location alone grants no access to the owner's phase.
+
+The SQLite integration fixtures cover both load orders for an owner saved
+inside a trigger with a sleeping script. After the owner rejoins and moves
+out, the script resumes once and receives one Leave event. Separate cases
+exercise a failed save and retry, connection replacement during acknowledgement,
+deleted reference copies, and observer visibility when disconnect and reconnect
+overlap. On restart a saved visitor whose host moved or is missing stays
+disabled. Other owners can still resume their own campaigns. A malformed
+enrolled phase keeps storage restoration closed for investigation. Broader cell
+transitions, recovery of the visitor's own movement baseline and playthroughs
+on actual Skyrim clients still need coverage.
+
+## Optional 32-connection protocol probe
+
+After building the candidate, set `BOYHOUSE_GAME_DATA` to the owned game data
+and `BOYHOUSE_STATE` to a disposable state directory. Run this from the checkout.
+
+```sh
+docker compose -p skymp-community-probe -f misc/boyhouse/compose.yaml --profile tools run --rm --no-deps verify node misc/boyhouse/protocol-smoke.cjs --projection --community
+```
+
+This opt-in scenario shares the ordinary projection smoke's login, epoch
+acknowledgement, appearance and instance helpers. It connects 32 native
+in-process bots simultaneously, checks a host/guest campaign while the other
+30 remain shared, executes the existing trusted quest-fragment fixture, then
+checks the guest's personal journal after removal and reconnect. The returning
+guest needs a fresh invitation to join the host again. It uses the
+owned `Skyrim - Misc.bsa`, an isolated temporary SQLite database and
+port 17797 inside the verification container.
+
+The probe reports the concurrent connection count at each step and the final
+character identities. Bots acknowledge the packets directly. Rendered
+visibility, sustained player traffic and complete quests require separate
+tests with Skyrim clients.

@@ -22,7 +22,8 @@ public:
     std::function<double(uint32_t)> readGlobal;
     std::function<double(uint32_t, const std::string&)> readQuestVariable;
     // Resolve through the owning quest's existing reference-alias lifecycle.
-    // Return a logical original, never a physical copy ID; empty aliases fail.
+    // Return a logical original, never a physical copy ID. Zero means a proven
+    // empty alias; missing definitions and unsupported fill modes must throw.
     std::function<uint32_t(uint32_t, uint32_t)> resolveReferenceAlias;
   };
 
@@ -48,6 +49,7 @@ private:
     FactionRank = 73,
     Global = 74,
     QuestCompleted = 543,
+    IsAliasRef = 566,
     QuestVariable = 629
   };
   enum class Selector

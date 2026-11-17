@@ -225,6 +225,49 @@ struct CampaignMovementPlan::Impl
     uint64_t epoch;
     nlohmann::json snapshot;
   };
+  struct Topology
+  {
+    std::set<MpObjectReference*> listeners, emitters, inside, publishing;
+    std::vector<MpActor*> actors;
+    std::map<MpObjectReference*, bool> occupancy;
+    std::map<MpObjectReference*, uint64_t> pending, occurrences;
+    uint64_t nextPublication = 0;
+    bool subscriptionsPending = false, initialized = false, ever = false;
+    bool operator==(const Topology&) const = default;
+  };
+  static Topology Capture(const MpObjectReference& ref)
+  {
+    Topology result;
+    result.listeners = ref.GetListeners();
+    result.emitters = ref.GetEmitters();
+    result.actors = ref.actorListenerArray;
+    if (ref.emittersWithPrimitives)
+      result.occupancy = *ref.emittersWithPrimitives;
+    if (ref.primitivesWeAreInside)
+      result.inside = *ref.primitivesWeAreInside;
+    result.pending = ref.pImpl->pendingListeners;
+    result.occurrences = ref.pImpl->listenerOccurrences;
+    result.publishing = ref.pImpl->publishingListeners;
+    result.nextPublication = ref.pImpl->nextPublication;
+    result.subscriptionsPending = ref.pImpl->subscriptionsPending;
+    result.initialized = ref.pImpl->onInitEventSent;
+    result.ever = ref.everSubscribedOrListened;
+    return result;
+  }
+  struct Graph
+  {
+    MpObjectReference* reference;
+    Topology before, after;
+    std::unique_ptr<std::set<MpObjectReference*>> listeners, emitters, inside;
+    std::unique_ptr<std::map<MpObjectReference*, bool>> occupancy;
+    std::vector<MpActor*> actors;
+    std::map<MpObjectReference*, uint64_t> pending, occurrences;
+  };
+  Kind kind = Kind::Movement;
+  std::vector<Graph> graph;
+  std::vector<SubscriptionChange> subscriptions;
+  std::set<MpObjectReference*> neighbors;
+  std::shared_ptr<const SaveReceipt> receipt;
   WorldState* world = nullptr;
   MpActor* source = nullptr;
   MpActor* requester = nullptr;
@@ -249,6 +292,17 @@ CampaignMovementPlan::CampaignMovementPlan(std::unique_ptr<Impl> impl)
 }
 
 CampaignMovementPlan::~CampaignMovementPlan() = default;
+
+CampaignMovementPlan::Kind CampaignMovementPlan::GetKind() const noexcept
+{
+  return pImpl->kind;
+}
+
+const std::vector<CampaignMovementPlan::SubscriptionChange>&
+CampaignMovementPlan::GetSubscriptionChanges() const
+{
+  return pImpl->subscriptions;
+}
 
 const std::vector<CampaignMovementPlan::Event>&
 CampaignMovementPlan::GetEvents() const
@@ -291,8 +345,21 @@ void CampaignMovementPlan::Validate(MpActor& requester) const
   }
   // This read-only preparation also rechecks bindings, initialized targets,
   // exact primitive geometry, the persistent baseline and the complete roster.
-  const auto current = pImpl->source->PrepareCampaignMovement(
-    requester, pImpl->position, pImpl->angle);
+  const auto current = pImpl->kind == Kind::Movement
+    ? pImpl->source->PrepareCampaignMovement(requester, pImpl->position,
+                                             pImpl->angle)
+    : pImpl->source->PrepareCampaignResume(requester,
+                                           pImpl->kind == Kind::Detach);
+  if (pImpl->kind != Kind::Movement) {
+    if (current->pImpl->neighbors != pImpl->neighbors ||
+        current->pImpl->graph.size() != pImpl->graph.size())
+      throw std::runtime_error("Recovery subscription roster changed");
+    for (size_t i = 0; i < pImpl->graph.size(); ++i)
+      if (current->pImpl->graph[i].reference != pImpl->graph[i].reference ||
+          current->pImpl->graph[i].before != pImpl->graph[i].before ||
+          current->pImpl->graph[i].after != pImpl->graph[i].after)
+        throw std::runtime_error("Recovery subscription topology changed");
+  }
   if (current->pImpl->owner != pImpl->owner ||
       current->pImpl->baseline != pImpl->baseline ||
       current->pImpl->emitters != pImpl->emitters ||
@@ -316,8 +383,26 @@ void CampaignMovementPlan::Publish(
 {
   auto& source = static_cast<MpObjectReference&>(*pImpl->source);
   source.CommitPreparedMovementTransform(pImpl->position, pImpl->angle);
-  source.emittersWithPrimitives.swap(pImpl->occupancy);
-  source.primitivesWeAreInside.swap(pImpl->inside);
+  if (pImpl->kind == Kind::Movement) {
+    source.emittersWithPrimitives.swap(pImpl->occupancy);
+    source.primitivesWeAreInside.swap(pImpl->inside);
+  } else {
+    for (auto& entry : pImpl->graph) {
+      auto& ref = *entry.reference;
+      ref.listeners.swap(entry.listeners);
+      ref.emitters.swap(entry.emitters);
+      ref.primitivesWeAreInside.swap(entry.inside);
+      ref.emittersWithPrimitives.swap(entry.occupancy);
+      ref.actorListenerArray.swap(entry.actors);
+      ref.pImpl->pendingListeners.swap(entry.pending);
+      ref.pImpl->listenerOccurrences.swap(entry.occurrences);
+      ref.pImpl->nextPublication = entry.after.nextPublication;
+      ref.pImpl->subscriptionsPending = entry.after.subscriptionsPending;
+      ref.pImpl->onInitEventSent = entry.after.initialized;
+      ref.everSubscribedOrListened = entry.after.ever;
+    }
+  }
+  pImpl->receipt = receipt;
   source.pImpl->campaignMovementEnrolled = true;
   source.pImpl->movementReceipt = receipt;
   for (const auto& target : pImpl->targets) {
@@ -573,6 +658,340 @@ MpObjectReference::PrepareCampaignMovement(MpActor& requester,
     captureContext->Validate(requester);
   return std::shared_ptr<CampaignMovementPlan>(
     new CampaignMovementPlan(std::move(prepared)));
+}
+
+std::shared_ptr<CampaignMovementPlan> MpObjectReference::PrepareCampaignResume(
+  MpActor& requester, bool detach)
+{
+  using Json = nlohmann::json;
+  using Topology = CampaignMovementPlan::Impl::Topology;
+  auto* world = GetParent();
+  auto* source = AsActor();
+  if (!world || !source || source != &requester || IsDeleted() ||
+      world->IsClearing() || world->IsRestoring() ||
+      !world->IsStorageRestoreReady() || HasPrimitive() ||
+      HasPendingCampaignMovement() ||
+      &QuestJournal::Owner(requester) != source || GetWorldInstance().empty())
+    throw std::runtime_error("Campaign recovery source is unavailable");
+  const auto finite = [](const NiPoint3& value) {
+    return std::isfinite(value.x) && std::isfinite(value.y) &&
+      std::isfinite(value.z);
+  };
+  if (!finite(GetPos()) || !finite(GetAngle()) ||
+      std::abs(GetPos().x / 4096) >= 32767 ||
+      std::abs(GetPos().y / 4096) >= 32767)
+    throw std::runtime_error("Invalid recovery position");
+  const auto savedDump =
+    GetDynamicFields().GetValueDump(CampaignMovementPlan::kProperty);
+  if (savedDump == "null" || savedDump.size() > 1024 * 1024)
+    throw std::runtime_error("Recovery requires a saved movement baseline");
+  const auto saved = Json::parse(savedDump);
+  if (!saved.is_object() || !saved.at("sequence").is_number_integer() ||
+      (!saved.at("sequence").is_number_unsigned() &&
+       saved.at("sequence").get<int64_t>() < 1) ||
+      !saved.at("sequence").get<uint64_t>() ||
+      saved.at("sequence").get<uint64_t>() > 9007199254740991ULL)
+    throw std::runtime_error("Malformed recovery movement baseline");
+  auto prepared = std::make_unique<CampaignMovementPlan::Impl>();
+  prepared->kind = detach ? CampaignMovementPlan::Kind::Detach
+                          : CampaignMovementPlan::Kind::Resume;
+  prepared->world = world;
+  prepared->source = source;
+  prepared->requester = source;
+  prepared->owner = source;
+  prepared->position = GetPos();
+  prepared->angle = GetAngle();
+  prepared->baseline = savedDump;
+  prepared->emitters = GetEmitters();
+  prepared->listeners = GetListeners();
+  if (emittersWithPrimitives)
+    prepared->oldOccupancy = *emittersWithPrimitives;
+  if (primitivesWeAreInside)
+    prepared->oldInside = *primitivesWeAreInside;
+  const auto cell = GetCellOrWorld().ToFormId(world->espmFiles);
+  const auto grid = world->grids.find(cell);
+  if (grid != world->grids.end()) {
+    // Grid's historical const query grows its lookup cache. Query a copy so
+    // recovery preparation itself cannot change the live spatial structure.
+    auto gridCopy = *grid->second.grid;
+    const auto [x, y] = GetGridPos(GetPos());
+    for (auto* ref : gridCopy.GetNeighboursByPosition(x, y))
+      if (ref != this && !ref->IsDisabled() && !ref->IsDeleted() &&
+          SharesWorldInstance(*ref))
+        prepared->neighbors.insert(ref);
+  }
+  prepared->neighbors.insert(this);
+  std::map<MpObjectReference*, Topology> before, after;
+  const auto add = [&](MpObjectReference* ref) {
+    if (before.contains(ref))
+      return;
+    if (!ref || before.size() >= 4096 || ref->GetParent() != world ||
+        world->LookupFormByIdNoLoad(ref->GetFormId()).get() != ref ||
+        !SharesWorldInstance(*ref) ||
+        ref->GetCellOrWorld() != GetCellOrWorld() ||
+        !ref->pImpl->publishingListeners.empty() ||
+        ref->HasPendingCampaignMovement())
+      throw std::runtime_error("Invalid recovery subscription participant");
+    before.emplace(ref, CampaignMovementPlan::Impl::Capture(*ref));
+    prepared->reads.push_back({ world->LookupFormByIdNoLoad(ref->GetFormId()),
+                                ref->GetWorldInstanceEpoch(),
+                                MpChangeForm::ToJson(ref->GetChangeForm()) });
+  };
+  for (auto* ref : prepared->neighbors)
+    add(ref);
+  // Reconcile the restored connected component, including NPC-only passive
+  // edges. Otherwise a primitive could retain a pending NPC edge forever and
+  // reject the owner's next ordinary movement despite its own edge being
+  // ready.
+  std::set<MpObjectReference*> visited;
+  size_t edges = 0;
+  while (visited.size() != before.size()) {
+    for (auto it = before.begin(); it != before.end(); ++it) {
+      if (!visited.insert(it->first).second)
+        continue;
+      if (it->second.listeners.size() + it->second.emitters.size() >
+          65536 - edges)
+        throw std::runtime_error("Recovery subscription edge limit exceeded");
+      edges += it->second.listeners.size() + it->second.emitters.size();
+      for (auto* ref : it->second.listeners)
+        add(ref);
+      for (auto* ref : it->second.emitters)
+        add(ref);
+    }
+  }
+  after = before;
+  std::optional<QuestJournal::CaptureContext> capture;
+  if (!QuestJournal::HasActiveTransaction())
+    capture.emplace(QuestJournal::CaptureReadContext(requester));
+  const auto initialized = [&](uint32_t original) {
+    return capture ? capture->ReferenceInitialized(requester, original)
+                   : QuestJournal::ReferenceInitialized(requester, original);
+  };
+  const auto ensureInitialized = [&](MpObjectReference* ref) {
+    if (ref == this ||
+        (ref->AsActor() && ref->AsActor()->GetProfileId() >= 0)) {
+      after.at(ref).initialized = true;
+      return;
+    }
+    const auto [owner, original] = CampaignReferenceBinding::Context(*ref);
+    if (owner != source || !initialized(original))
+      throw std::runtime_error(
+        "Recovery cannot replace reference initialization");
+    after.at(ref).initialized = true;
+  };
+  const auto remove = [&](MpObjectReference* emitter,
+                          MpObjectReference* listener) {
+    auto& e = after.at(emitter);
+    auto& l = after.at(listener);
+    if (!e.listeners.erase(listener))
+      return;
+    l.emitters.erase(emitter);
+    e.pending.erase(listener);
+    e.occurrences.erase(listener);
+    if (auto* actor = listener->AsActor())
+      std::erase(e.actors, actor);
+    l.occupancy.erase(emitter);
+    l.inside.erase(emitter);
+    if (!emitter->HasPrimitive() &&
+        !before.at(emitter).pending.contains(listener))
+      prepared->subscriptions.push_back(
+        { world->LookupFormByIdNoLoad(emitter->GetFormId()),
+          world->LookupFormByIdNoLoad(listener->GetFormId()), false });
+  };
+  // Tear down only this owner's relationships; other restored edges retain
+  // their scene membership and are promoted below without gameplay callbacks.
+  for (auto* ref : before.at(this).listeners)
+    remove(this, ref);
+  for (auto* ref : before.at(this).emitters)
+    remove(ref, this);
+  const auto connect = [&](MpObjectReference* emitter,
+                           MpObjectReference* listener) {
+    auto& e = after.at(emitter);
+    auto& l = after.at(listener);
+    if (!e.listeners.insert(listener).second)
+      return;
+    if (e.nextPublication == std::numeric_limits<uint64_t>::max())
+      throw std::runtime_error("Recovery subscription identity exhausted");
+    e.occurrences[listener] = ++e.nextPublication;
+    e.pending[listener] = e.nextPublication;
+    l.emitters.insert(emitter);
+  };
+  if (!detach) {
+    for (auto* ref : prepared->neighbors) {
+      connect(this, ref);
+      if (ref != this)
+        connect(ref, this);
+    }
+  }
+  const auto point = [](const NiPoint3& value) {
+    return Json::array({ value.x, value.y, value.z });
+  };
+  std::map<std::string, Json> primitives;
+  for (auto* ref : prepared->neighbors) {
+    if (ref == this || !ref->HasPrimitive())
+      continue;
+    if (primitives.size() >= 64)
+      throw std::runtime_error("Recovery primitive limit exceeded");
+    const auto& bounds = ref->pImpl->primitive->boundsDiv2;
+    if (!finite(ref->GetPos()) || !finite(ref->GetAngle()) ||
+        !finite(bounds) || bounds.x <= 0 || bounds.y <= 0 || bounds.z <= 0 ||
+        ref->GetAngle().x != 0 || ref->GetAngle().y != 0)
+      throw std::runtime_error("Invalid recovery primitive geometry");
+    const auto vertices =
+      Primitive::GetVertices(ref->GetPos(), ref->GetAngle(), bounds);
+    const auto cached = ref->pImpl->primitive->polygonProc.GetPolygon().GetV();
+    if (vertices.size() != cached.size())
+      throw std::runtime_error("Stale recovery primitive");
+    for (size_t i = 0; i < vertices.size(); ++i)
+      if (!finite(vertices[i]) || vertices[i].x != cached[i].x ||
+          vertices[i].y != cached[i].y || vertices[i].z != cached[i].z)
+        throw std::runtime_error("Stale recovery primitive");
+    const auto event = capture
+      ? QuestScriptRuntime::CaptureInteraction(requester, *ref, "OnTrigger",
+                                               requester, *capture)
+      : QuestScriptRuntime::CaptureInteraction(requester, *ref, "OnTrigger",
+                                               requester);
+    if (!primitives
+           .emplace(
+             event.target,
+             Json{ { "target", event.target },
+                   { "reference", event.targetReference },
+                   { "templates", event.targetTemplates },
+                   { "position", point(ref->GetPos()) },
+                   { "angle", point(ref->GetAngle()) },
+                   { "bounds", point(bounds) },
+                   { "inside", ref->IsPointInsidePrimitive(GetPos()) } })
+           .second)
+      throw std::runtime_error("Duplicate recovery primitive");
+    prepared->targets.push_back(world->LookupFormByIdNoLoad(ref->GetFormId()));
+  }
+  Json roster = Json::array();
+  for (const auto& [key, entry] : primitives)
+    roster.push_back(entry);
+  const Json baseline = {
+    { "schemaVersion", 1 },
+    { "source", GetChangeForm().formDesc.ToString() },
+    { "owner", requester.GetChangeForm().formDesc.ToString() },
+    { "campaignIdentity", CampaignReferenceBinding::GetIdentity(requester) },
+    { "instance", GetWorldInstance() },
+    { "cell", GetCellOrWorld().ToString() },
+    { "position", point(GetPos()) },
+    { "angle", point(GetAngle()) },
+    { "sequence", saved.at("sequence") },
+    { "primitives", roster }
+  };
+  if (saved != baseline)
+    throw std::runtime_error("Recovery baseline identity or geometry changed");
+  for (auto& [ref, state] : after) {
+    state.ever = true;
+    state.occupancy.clear();
+    state.inside.clear();
+    for (auto* emitter : state.emitters) {
+      if (!after.at(emitter).listeners.contains(ref))
+        throw std::runtime_error("Recovery subscription is not reciprocal");
+      if (emitter->HasPrimitive()) {
+        const bool inside = !(detach && ref == this) && !ref->IsDeleted() &&
+          (ref == this || !ref->IsDisabled()) &&
+          emitter->IsPointInsidePrimitive(ref->GetPos());
+        state.occupancy.emplace(emitter, inside);
+        if (inside)
+          state.inside.insert(emitter);
+      }
+    }
+    for (auto* listener : state.listeners) {
+      if (!after.at(listener).emitters.contains(ref))
+        throw std::runtime_error("Recovery subscription is not reciprocal");
+      if (listener->GetChangeForm().profileId >= 0)
+        ensureInitialized(ref);
+      if (auto* actor = listener->AsActor(); actor &&
+          std::find(state.actors.begin(), state.actors.end(), actor) ==
+            state.actors.end())
+        state.actors.push_back(actor);
+      if (state.pending.erase(listener) && !ref->HasPrimitive())
+        prepared->subscriptions.push_back(
+          { world->LookupFormByIdNoLoad(ref->GetFormId()),
+            world->LookupFormByIdNoLoad(listener->GetFormId()), true });
+    }
+  }
+  for (auto& [ref, state] : after) {
+    state.subscriptionsPending = !state.pending.empty();
+    for (auto* listener : state.listeners)
+      state.subscriptionsPending |=
+        !state.initialized && listener->GetChangeForm().profileId >= 0;
+    for (auto* emitter : state.emitters)
+      state.subscriptionsPending |= after.at(emitter).pending.contains(ref) ||
+        (!after.at(emitter).initialized &&
+         ref->GetChangeForm().profileId >= 0);
+    CampaignMovementPlan::Impl::Graph entry;
+    entry.reference = ref;
+    entry.before = before.at(ref);
+    entry.after = state;
+    entry.listeners =
+      std::make_unique<std::set<MpObjectReference*>>(state.listeners);
+    entry.emitters =
+      std::make_unique<std::set<MpObjectReference*>>(state.emitters);
+    entry.inside =
+      std::make_unique<std::set<MpObjectReference*>>(state.inside);
+    entry.occupancy =
+      std::make_unique<std::map<MpObjectReference*, bool>>(state.occupancy);
+    entry.actors = state.actors;
+    entry.pending = state.pending;
+    entry.occurrences = state.occurrences;
+    prepared->graph.push_back(std::move(entry));
+  }
+  if (capture)
+    capture->Validate(requester);
+  return std::shared_ptr<CampaignMovementPlan>(
+    new CampaignMovementPlan(std::move(prepared)));
+}
+
+void CampaignMovementPlan::ValidateCommitted(MpActor& requester) const
+{
+  if (pImpl->kind == Kind::Movement || !pImpl->published || !pImpl->receipt ||
+      pImpl->receipt->GetState() != SaveReceipt::State::Durable ||
+      &requester != pImpl->requester ||
+      requester.GetParent() != pImpl->world || pImpl->world->IsClearing() ||
+      !pImpl->world->IsStorageRestoreReady() ||
+      (pImpl->authority && !pImpl->authority()))
+    throw std::runtime_error(
+      "Recovery publication is not current and durable");
+  for (const auto& read : pImpl->reads) {
+    auto* ref = read.lifetime->AsObjectReference();
+    if (!ref ||
+        pImpl->world->LookupFormByIdNoLoad(ref->GetFormId()) !=
+          read.lifetime ||
+        ref->GetWorldInstanceEpoch() != read.epoch)
+      throw std::runtime_error(
+        "Recovery publication participant was replaced");
+    const auto current = MpChangeForm::ToJson(ref->GetChangeForm());
+    for (const auto* key : { "recType", "formDesc", "baseDesc", "position",
+                             "angle", "worldOrCellDesc", "worldInstance",
+                             "profileId", "isDeleted", "templateChain" })
+      if (current.value(key, nlohmann::json()) !=
+          read.snapshot.value(key, nlohmann::json()))
+        throw std::runtime_error(
+          "Recovery publication physical identity changed");
+    if (ref != &requester &&
+        current.at("isDisabled") != read.snapshot.at("isDisabled"))
+      throw std::runtime_error("Recovery publication visibility changed");
+    if (current.at("dynamicFields")
+          .value(CampaignReferenceBinding::kProperty, nlohmann::json()) !=
+        read.snapshot.at("dynamicFields")
+          .value(CampaignReferenceBinding::kProperty, nlohmann::json()))
+      throw std::runtime_error("Recovery publication binding changed");
+  }
+  for (const auto& entry : pImpl->graph)
+    if (Impl::Capture(*entry.reference) != entry.after)
+      throw std::runtime_error("Recovery publication topology changed");
+  if (requester.IsDisabled() != (pImpl->kind == Kind::Detach))
+    throw std::runtime_error("Recovery publication enabled state changed");
+  const auto current =
+    requester.PrepareCampaignResume(requester, pImpl->kind == Kind::Detach);
+  if (current->pImpl->baseline != pImpl->baseline ||
+      current->pImpl->neighbors != pImpl->neighbors ||
+      current->pImpl->targets != pImpl->targets)
+    throw std::runtime_error(
+      "Recovery publication identity or geometry changed");
 }
 
 namespace {

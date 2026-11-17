@@ -108,6 +108,7 @@ class PartyInstances {
   }
 
   removeMembership(actor) {
+    this.invites.delete(actor);
     const leader = this.membership.get(actor);
     if (leader === undefined) return;
     if (leader === actor) {
@@ -181,7 +182,7 @@ class PartyInstances {
     return changed;
   }
 
-  recover(actor) {
+  recover(actor, request) {
     this.actor(actor);
     const saved = this.adapter.getInstance(actor);
     if (!saved) { this.visits.delete(actor); return; }
@@ -197,6 +198,22 @@ class PartyInstances {
     const authorizedOwner = owner === actor ||
       (this.sameParty(actor, owner) && this.hostAvailable(owner, areaId)) ? owner : actor;
     try {
+      if (request && typeof this.adapter.resumeOwner === "function") {
+        if (!Number.isInteger(request.userId) || request.userId < 0 ||
+            request.userId > 0xffffffff || request.handled !== false)
+          throw new Error("Invalid campaign spawn request");
+        // Only native admission can distinguish an unenrolled character from
+        // an invalid enrolled context. The latter must never be rebound here.
+        const resumed = this.adapter.resumeOwner(actor, this.areas.get(areaId), request.userId);
+        if (resumed !== null) {
+          if (owner !== actor || !resumed || typeof resumed.attempt !== "string" ||
+              !resumed.attempt || !["Pending", "ProjectionReady"].includes(resumed.status))
+            throw new Error("Campaign resume was not accepted");
+          this.visits.set(actor, { owner, area: areaId });
+          request.handled = true;
+          return;
+        }
+      }
       if (this.adapter.isInside(actor, this.areas.get(areaId))) {
         this.transition(actor, authorizedOwner, areaId);
       } else this.transition(actor, null);

@@ -133,6 +133,13 @@ Napi::Object ScampServer::Init(Napi::Env env, Napi::Object exports)
       InstanceMethod("getGameplayBlocked", &ScampServer::GetGameplayBlocked),
       InstanceMethod("beginPacketEpoch", &ScampServer::BeginPacketEpoch),
       InstanceMethod("getPacketEpoch", &ScampServer::GetPacketEpoch),
+      InstanceMethod("resumeCampaignActor", &ScampServer::ResumeCampaignActor),
+      InstanceMethod("getCampaignResume", &ScampServer::GetCampaignResume),
+      InstanceMethod("captureCampaignResumeProjection",
+                     &ScampServer::CaptureCampaignResumeProjection),
+      InstanceMethod("completeCampaignResume",
+                     &ScampServer::CompleteCampaignResume),
+      InstanceMethod("detachCampaignActor", &ScampServer::DetachCampaignActor),
       InstanceMethod("getWorldBaseline", &ScampServer::GetWorldBaseline),
       InstanceMethod("setCampaignVisibilityCallbacks",
                      &ScampServer::SetCampaignVisibilityCallbacks),
@@ -849,6 +856,10 @@ Napi::Value ScampServer::SetGameplayBlocked(const Napi::CallbackInfo& info)
         partOne->serverState.userInfo[id]->campaignVisibilityFailed)
       throw std::runtime_error(
         "Campaign visibility failed; this connection must reconnect");
+    if (!info[1].As<Napi::Boolean>().Value() &&
+        !partOne->GetCampaignResume(id).is_null())
+      throw std::runtime_error(
+        "Cannot release gameplay during campaign recovery");
     if (!info[1].As<Napi::Boolean>().Value() && campaignVisibilityBarrier &&
         campaignVisibilityBarrier->HoldsGate(id))
       throw std::runtime_error(
@@ -1901,4 +1912,94 @@ bool ScampServer::IsGameModeInsideDeathEventHandler(
   }
 
   return true;
+}
+
+Napi::Value ScampServer::ResumeCampaignActor(const Napi::CallbackInfo& info)
+{
+  try {
+    const auto id = NapiHelper::ExtractUInt32(info[0], "userId");
+    if (info.Length() != 4 || id >= partOne->serverState.userInfo.size())
+      throw std::invalid_argument("Invalid resumeCampaignActor request");
+    auto area =
+      nlohmann::json::parse(NapiHelper::Stringify(info.Env(), info[3]));
+    return NapiHelper::ParseJson(
+      info.Env(),
+      partOne
+        ->ResumeCampaignActor(id, NapiHelper::ExtractUInt32(info[1], "actor"),
+                              info[2].As<Napi::String>().Utf8Value(), area)
+        .dump());
+  } catch (const std::exception& e) {
+    throw Napi::Error::New(info.Env(), e.what());
+  }
+}
+
+Napi::Value ScampServer::GetCampaignResume(const Napi::CallbackInfo& info)
+{
+  try {
+    const auto id = NapiHelper::ExtractUInt32(info[0], "userId");
+    if (info.Length() != 1 || id >= partOne->serverState.userInfo.size())
+      throw std::invalid_argument("Invalid getCampaignResume request");
+    return NapiHelper::ParseJson(info.Env(),
+                                 partOne->GetCampaignResume(id).dump());
+  } catch (const std::exception& e) {
+    throw Napi::Error::New(info.Env(), e.what());
+  }
+}
+
+Napi::Value ScampServer::CaptureCampaignResumeProjection(
+  const Napi::CallbackInfo& info)
+{
+  try {
+    const auto id = NapiHelper::ExtractUInt32(info[0], "userId");
+    if (info.Length() != 2 || id >= partOne->serverState.userInfo.size())
+      throw std::invalid_argument(
+        "Invalid captureCampaignResumeProjection request");
+    return NapiHelper::ParseJson(
+      info.Env(),
+      partOne
+        ->CaptureCampaignResumeProjection(
+          id, info[1].As<Napi::String>().Utf8Value())
+        .dump());
+  } catch (const std::exception& e) {
+    throw Napi::Error::New(info.Env(), e.what());
+  }
+}
+
+Napi::Value ScampServer::CompleteCampaignResume(const Napi::CallbackInfo& info)
+{
+  try {
+    const auto id = NapiHelper::ExtractUInt32(info[0], "userId");
+    if (info.Length() != 5 || id >= partOne->serverState.userInfo.size())
+      throw std::invalid_argument("Invalid completeCampaignResume request");
+    auto ready = info[4].As<Napi::Function>();
+    auto guard = [&] {
+      if (campaignVisibilityBarrier &&
+          campaignVisibilityBarrier->HoldsGate(id))
+        throw std::runtime_error("Campaign visibility transition is active");
+    };
+    guard();
+    const bool completed = partOne->CompleteCampaignResume(
+      id, info[1].As<Napi::String>().Utf8Value(),
+      info[2].As<Napi::String>().Utf8Value(),
+      info[3].As<Napi::String>().Utf8Value(), [&] {
+        guard();
+        ready.Call({});
+        guard();
+      });
+    return Napi::Boolean::New(info.Env(), completed);
+  } catch (const std::exception& e) {
+    throw Napi::Error::New(info.Env(), e.what());
+  }
+}
+
+Napi::Value ScampServer::DetachCampaignActor(const Napi::CallbackInfo& info)
+{
+  try {
+    const auto id = NapiHelper::ExtractUInt32(info[0], "userId");
+    if (info.Length() != 1 || id >= partOne->serverState.userInfo.size())
+      throw std::invalid_argument("Invalid detachCampaignActor request");
+    return Napi::Boolean::New(info.Env(), partOne->DetachCampaignActor(id));
+  } catch (const std::exception& e) {
+    throw Napi::Error::New(info.Env(), e.what());
+  }
 }

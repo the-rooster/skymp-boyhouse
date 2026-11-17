@@ -1,5 +1,6 @@
 #include "FormCallbacks.h"
 #include "MpActor.h"
+#include "PartOne.h"
 #include "WorldState.h"
 #include "save_storages/ISaveStorage.h"
 #include <algorithm>
@@ -780,4 +781,30 @@ TEST_CASE("Nested restoration preserves its outer guard through exceptions",
           std::optional<std::string>("ordinary edit after failure"));
   f.actor->ForceSubscriptionsUpdate();
   f.RequireLoadedOnce();
+}
+
+TEST_CASE("An interrupted full restore cannot flush a partial world",
+          "[CampaignResume][Restoration][SaveStorage]")
+{
+  struct InterruptedStorage : CountingStorage
+  {
+    void IterateSync(const IterateSyncCallback&) override
+    {
+      throw std::runtime_error("interrupted saved-row scan");
+    }
+  };
+  PartOne server;
+  auto storage = std::make_shared<InterruptedStorage>();
+  REQUIRE_THROWS_WITH(server.AttachSaveStorage(storage),
+                      "interrupted saved-row scan");
+  REQUIRE_FALSE(server.worldState.IsStorageRestoreReady());
+  bool afterSave = false;
+  server.worldState.Tick([&] { afterSave = true; });
+  REQUIRE_FALSE(afterSave);
+  REQUIRE(storage->ticks == 0);
+  REQUIRE(storage->submissions.empty());
+  REQUIRE_THROWS(server.AttachSaveStorage(storage));
+  server.worldState.Clear();
+  server.AttachSaveStorage(std::make_shared<CountingStorage>());
+  REQUIRE(server.worldState.IsStorageRestoreReady());
 }

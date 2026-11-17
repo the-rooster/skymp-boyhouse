@@ -56,6 +56,11 @@ public:
   Napi::Value GetGameplayBlocked(const Napi::CallbackInfo& info);
   Napi::Value BeginPacketEpoch(const Napi::CallbackInfo& info);
   Napi::Value GetPacketEpoch(const Napi::CallbackInfo& info);
+  Napi::Value ResumeCampaignActor(const Napi::CallbackInfo& info);
+  Napi::Value GetCampaignResume(const Napi::CallbackInfo& info);
+  Napi::Value CaptureCampaignResumeProjection(const Napi::CallbackInfo& info);
+  Napi::Value CompleteCampaignResume(const Napi::CallbackInfo& info);
+  Napi::Value DetachCampaignActor(const Napi::CallbackInfo& info);
   Napi::Value GetWorldBaseline(const Napi::CallbackInfo& info);
   Napi::Value SetCampaignVisibilityCallbacks(const Napi::CallbackInfo& info);
 

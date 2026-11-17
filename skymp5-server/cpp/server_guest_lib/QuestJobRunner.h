@@ -86,6 +86,17 @@ public:
     std::shared_ptr<const SaveReceipt> receipt;
     std::vector<AdmissionResult> results;
   };
+  // Connection attempts may supersede the token without releasing the owner
+  // hold or replacing any accepted save receipt.
+  using ResumeLease = std::shared_ptr<const uint8_t>;
+  ResumeLease AcquireResumeLease(MpActor& owner);
+  AdmissionBatchResult InspectResumeLease(MpActor& owner,
+                                          const ResumeLease& lease);
+  AdmissionBatchResult AdmitResume(
+    MpActor& owner, const ResumeLease& lease,
+    const std::shared_ptr<CampaignMovementPlan>& plan);
+  void CompleteResumeLease(MpActor& owner, const ResumeLease& lease);
+  bool HasResumeHold(MpActor& owner) const;
   enum class ResultKind
   {
     Stage,
@@ -200,10 +211,27 @@ public:
 
 private:
   friend class WorldState;
+  friend class QuestJournal;
   explicit QuestJobRunner(WorldState& world);
   void Stop() noexcept;
   void Pump() noexcept;
   void OnActorLoaded(MpActor& actor) noexcept;
+  void HoldRestoredOwner(MpActor& owner);
+  ResumeLease RequireJournalAccess(MpActor& actor, bool emptyAdmission);
+  void ValidateJournalAccess(MpActor& actor, const ResumeLease& lease);
+  void RequireSaveReady(MpActor& actor);
+  struct ResumeHold
+  {
+    std::weak_ptr<MpForm> owner;
+    uint64_t epoch = 0;
+    std::string instance, identity;
+    ResumeLease lease;
+    bool journalPermit = false;
+    std::shared_ptr<const SaveReceipt> sealedReceipt;
+    std::shared_ptr<CampaignMovementPlan> sealedPlan;
+  };
+  std::map<uint32_t, std::shared_ptr<ResumeHold>> resumeHolds;
+  std::shared_ptr<ResumeHold> RequireResumeLease(MpActor&, const ResumeLease&);
   struct Barrier
   {
     uint64_t job = 0, lastJob = 0, generation = 0;

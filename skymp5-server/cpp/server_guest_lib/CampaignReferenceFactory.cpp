@@ -61,7 +61,7 @@ struct Allocation
   std::map<uint32_t, bool> preparedDisabled;
   uint32_t level;
   QuestVmState vm;
-  std::mt19937 random{ std::random_device{}() };
+  std::mt19937 random;
   LeveledListUtils::Options options;
 
   Allocation(MpActor& actor, const std::string& destination,
@@ -74,6 +74,7 @@ struct Allocation
     , level(encounterLevel)
     , vm(readVm ? QuestJournal::PersonalScriptState(actor) : Json::object(),
          {}, {})
+    , random(readVm ? std::random_device{}() : 0)
   {
     const auto& saved = owner.GetDynamicFields().GetValueDump(
       CampaignReferenceFactory::kAllocations);
@@ -496,9 +497,9 @@ std::vector<uint32_t> CampaignReferenceFactory::PrepareArea(
                                center, radius, encounterLevel);
 }
 
-std::vector<uint32_t> CampaignReferenceFactory::EnsureAreaForInstance(
-  MpActor& owner, const std::string& instance, uint32_t worldOrCell,
-  const NiPoint3& center, float radius, uint32_t encounterLevel)
+namespace {
+std::vector<uint32_t> AreaOriginals(MpActor& owner, uint32_t worldOrCell,
+                                    const NiPoint3& center, float radius)
 {
   if (!owner.GetParent() || !std::isfinite(radius) || radius <= 0 ||
       radius > 65536 || !std::isfinite(center.x) || !std::isfinite(center.y) ||
@@ -552,6 +553,45 @@ std::vector<uint32_t> CampaignReferenceFactory::EnsureAreaForInstance(
       }
     }
   }
-  return EnsureForInstance(
-    owner, instance, { originals.begin(), originals.end() }, encounterLevel);
+  return { originals.begin(), originals.end() };
+}
+}
+
+std::vector<uint32_t> CampaignReferenceFactory::EnsureAreaForInstance(
+  MpActor& owner, const std::string& instance, uint32_t worldOrCell,
+  const NiPoint3& center, float radius, uint32_t encounterLevel)
+{
+  return EnsureForInstance(owner, instance,
+                           AreaOriginals(owner, worldOrCell, center, radius),
+                           encounterLevel);
+}
+
+void CampaignReferenceFactory::ValidateExistingArea(MpActor& owner,
+                                                    const std::string& areaId,
+                                                    uint32_t worldOrCell,
+                                                    const NiPoint3& center,
+                                                    float radius)
+{
+  const auto instance = Destination(owner, areaId);
+  if (!owner.GetParent() || owner.IsDeleted() ||
+      owner.GetFormId() < 0xff000000 ||
+      owner.GetParent()->LookupFormByIdNoLoad(owner.GetFormId()).get() !=
+        &owner ||
+      owner.GetWorldInstance() != instance)
+    throw std::runtime_error("Invalid existing campaign allocation owner");
+  const auto& fields = owner.GetDynamicFields();
+  if (fields.GetValueDump(kIdentity) == "null" ||
+      fields.GetValueDump(kAllocations) == "null")
+    throw std::runtime_error("Existing campaign allocation is missing");
+  Allocation allocation(owner, instance, 1, false);
+  for (const auto original :
+       AreaOriginals(owner, worldOrCell, center, radius)) {
+    // Index-only bindings may be adopted by explicit preparation, never by
+    // resume. Deleted/disabled copies still satisfy the saved allocation.
+    if (!allocation.ledger.at("copies").contains(
+          allocation.OriginalKey(original)) ||
+        !allocation.Existing(original))
+      throw std::runtime_error(
+        "Existing campaign area allocation is incomplete");
+  }
 }

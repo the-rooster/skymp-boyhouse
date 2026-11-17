@@ -74,6 +74,7 @@ CampaignCondition CampaignCondition::Compile(const espm::CTDA& data,
     case 73:
     case 74:
     case 543:
+    case 566:
     case 629:
       result.function = static_cast<Function>(data.functionIndex);
       break;
@@ -84,7 +85,8 @@ CampaignCondition CampaignCondition::Compile(const espm::CTDA& data,
     result.function == Function::Dead ||
     result.function == Function::ItemCount ||
     result.function == Function::InFaction ||
-    result.function == Function::FactionRank;
+    result.function == Function::FactionRank ||
+    result.function == Function::IsAliasRef;
   if (physical) {
     if (data.runOnType == espm::CTDA::RunOnTypeFlags::Reference) {
       result.selector = Selector::Reference;
@@ -95,7 +97,8 @@ CampaignCondition CampaignCondition::Compile(const espm::CTDA& data,
     } else if (data.runOnType == espm::CTDA::RunOnTypeFlags::QuestAlias &&
                (result.function == Function::Dead ||
                 result.function == Function::InFaction ||
-                result.function == Function::FactionRank) &&
+                result.function == Function::FactionRank ||
+                result.function == Function::IsAliasRef) &&
                data.unknown2 >= 0) {
       // TES5 CTDA: reference at byte 24; alias/data ID at byte 28. Alias 0
       // is valid and is never a FormID, even in a master override.
@@ -114,8 +117,15 @@ CampaignCondition CampaignCondition::Compile(const espm::CTDA& data,
   }
   espm::CTDA::DefaultData parameters{};
   std::memcpy(&parameters, data.functionData, sizeof(parameters));
-  if (result.function != Function::Disabled &&
-      result.function != Function::Dead)
+  if (result.function == Function::IsAliasRef) {
+    // The operand at byte 12 is another owning-quest alias ID, independent
+    // of the run-on alias at byte 28. Neither is a plugin-relative FormID.
+    if (parameters.firstParameter > INT_MAX)
+      throw std::runtime_error(
+        "GetIsAliasRef requires a nonnegative alias ID");
+    result.parameter1 = parameters.firstParameter;
+  } else if (result.function != Function::Disabled &&
+             result.function != Function::Dead)
     result.parameter1 = mapForm(parameters.firstParameter);
   result.parameter2 = parameters.secondParameter;
   result.comparison = data.GetOperator();
@@ -151,6 +161,34 @@ void CampaignCondition::Validate() const
 
 double CampaignCondition::Read(const Context& context) const
 {
+  if (function == Function::IsAliasRef) {
+    if (!context.resolveReferenceAlias)
+      throw std::runtime_error(
+        "GetIsAliasRef requires a reference alias resolver");
+    const auto resolve = [&](uint32_t original) -> MpObjectReference* {
+      if (!original)
+        return nullptr;
+      if (original >= 0xff000000)
+        throw std::runtime_error(
+          "Quest condition alias has no logical reference");
+      ValidateReference(context.actor, original, false);
+      auto& reference =
+        CampaignReferenceBinding::Resolve(context.actor, original);
+      // Track both identities through commit, including a false comparison.
+      // Equality is reference identity, never NPC/item base or template ID.
+      QuestJournal::ReadReference(context.actor, reference);
+      return &reference;
+    };
+    auto* subject = resolve(
+      selector == Selector::Alias
+        ? context.resolveReferenceAlias(context.owningQuest, referenceOrAlias)
+        : referenceOrAlias);
+    auto* operand =
+      resolve(context.resolveReferenceAlias(context.owningQuest, parameter1));
+    // Vanilla compares reference handles and requires a nonnull receiver:
+    // two empty aliases do not count as the same reference.
+    return subject && subject == operand ? 1.0 : 0.0;
+  }
   if (selector != Selector::None) {
     uint32_t original = referenceOrAlias;
     if (selector == Selector::Alias) {

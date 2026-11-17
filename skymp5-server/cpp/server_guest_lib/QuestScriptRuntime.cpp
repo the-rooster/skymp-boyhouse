@@ -1480,8 +1480,10 @@ bool QuestScriptRuntime::Execute(
             espm::QuestAliasDefinition::Kind::Reference)
         throw std::runtime_error("Condition requires a reference alias");
       const auto value = aliasTarget(*object);
+      // GetIsAliasRef treats a proven empty alias as a nonmatch. Other
+      // physical predicates still reject zero in CampaignCondition::Read.
       if (!static_cast<IGameObject*>(value))
-        throw std::runtime_error("Quest condition reference alias is empty");
+        return uint32_t{ 0 };
       return formId(value);
     };
     size_t depth = 0;

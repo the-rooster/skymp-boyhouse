@@ -392,7 +392,7 @@ class DependencyTests(unittest.TestCase):
 
     def test_physical_stage_conditions_record_reference_and_parameter_dependencies(self):
         origins = ["Skyrim.esm", "Dragonborn.esm"]
-        for function in (35, 46, 47, 71, 73):
+        for function in (35, 46, 47, 71, 73, 566):
             with self.subTest(function=function):
                 condition = bytearray(32)
                 struct.pack_into("<H", condition, 8, function)
@@ -421,7 +421,8 @@ class DependencyTests(unittest.TestCase):
 
     def test_physical_alias_selector_is_signed_offset28_not_a_form(self):
         for function, alias_id in ((46, 0), (46, 17), (46, -1), (35, 0), (47, 0),
-                                  (71, 0), (71, 17), (71, -1), (73, 0), (73, 17), (73, -1)):
+                                  (71, 0), (71, 17), (71, -1), (73, 0), (73, 17), (73, -1),
+                                  (566, 0), (566, 17), (566, -1)):
             with self.subTest(function=function, alias_id=alias_id):
                 condition = bytearray(32)
                 struct.pack_into("<H", condition, 8, function)
@@ -429,12 +430,12 @@ class DependencyTests(unittest.TestCase):
                 quest = summary(values=[(b"INDX", struct.pack("<HBB", 10, 0, 0)),
                     (b"QSDT", b"\0"), (b"CTDA", bytes(condition))])
                 self.assertEqual(quest["refs"], set())
-                supported = function in (46, 71, 73) and alias_id >= 0
+                supported = function in (46, 71, 73, 566) and alias_id >= 0
                 self.assertEqual("condition.stage-run-on:5:reference-alias" in quest["features"], supported)
                 self.assertEqual("condition.run-on:5" in quest["features"], not supported)
 
     def test_physical_implicit_and_nonstage_selectors_remain_missing(self):
-        for function in (35, 46, 47, 71, 73):
+        for function in (35, 46, 47, 71, 73, 566):
             for stage_log in (False, True):
                 for run_on in (0, 2):
                     with self.subTest(function=function, stage_log=stage_log, run_on=run_on):
@@ -460,6 +461,86 @@ class DependencyTests(unittest.TestCase):
             self.assertNotIn("condition.run-on:2", quest["features"])
             self.assertNotIn("condition.stage-run-on:2:private-reference", quest["features"])
             self.assertEqual(quest["refs"], {"Skyrim.esm:000014"})
+
+    def test_alias_reference_comparison_parameter_is_never_a_form_id(self):
+        origins = ["Skyrim.esm", "Dragonborn.esm"]
+        registry = json.loads(Path(__file__).with_name("quest_capabilities.json").read_text())
+        for alias_id in (0, 5, 0x01000031, 0x7fffffff, -1):
+            for run_on in (2, 5):
+                with self.subTest(alias_id=alias_id, run_on=run_on):
+                    condition = bytearray(32)
+                    struct.pack_into("<H", condition, 8, 566)
+                    struct.pack_into("<i", condition, 12, alias_id)
+                    struct.pack_into("<IIi", condition, 20, run_on,
+                                     0x14 if run_on == 2 else 0xdeadbeef, 0)
+                    quest = summarize_record("QUST", 0, 0x0100002a,
+                        [(b"INDX", struct.pack("<HBB", 10, 0, 0)),
+                         (b"QSDT", b"\0"), (b"CTDA", bytes(condition))],
+                        (), origins, "Dragonborn.esm")
+                    self.assertEqual(quest["refs"], {"Skyrim.esm:000014"} if run_on == 2 else set())
+                    report = analyze({quest["id"]: quest}, {}, registry)
+                    caps = {c["id"]: c["status"] for c in report["quests"][0]["capabilities"]}
+                    self.assertEqual(caps["condition:566"], "implemented-subset")
+                    self.assertEqual(caps["alias.reference"], "missing")
+                    self.assertEqual("condition.alias-parameter" in caps, alias_id < 0)
+                    if alias_id < 0:
+                        self.assertEqual(caps["condition.alias-parameter"], "missing")
+                    selector = "2:private-reference" if run_on == 2 else "5:reference-alias"
+                    self.assertEqual(caps["condition.stage-run-on:" + selector], "implemented-subset")
+                    self.assertEqual(report["summary"]["certifiedPlayable"], 0)
+
+    def test_alias_reference_comparison_preserves_nonstage_and_special_context_gaps(self):
+        registry = json.loads(Path(__file__).with_name("quest_capabilities.json").read_text())
+        stage = [(b"INDX", struct.pack("<HBB", 10, 0, 0)), (b"QSDT", b"\0")]
+        scopes = [("QUST", [], []), ("QUST", stage[:1], []),
+                  ("QUST", stage + [(b"QOBJ", struct.pack("<H", 1))], []),
+                  ("QUST", [(b"ANAM", b""), (b"ALST", struct.pack("<I", 0))], [(b"ALED", b"")]),
+                  ("INFO", [], []), ("SCEN", [], []), ("PACK", [], [])]
+        for typ, prefix, suffix in scopes:
+            condition = bytearray(32)
+            struct.pack_into("<H", condition, 8, 566)
+            struct.pack_into("<IIi", condition, 20, 5, 0xdeadbeef, 0)
+            rec = summary(typ, values=prefix + [(b"CTDA", bytes(condition))] + suffix)
+            self.assertEqual(capability_status("condition:566", registry), "implemented-subset")
+            for cap in ("condition.non-stage-evaluation", "condition.run-on:5"):
+                self.assertIn(cap, rec["features"])
+                self.assertEqual(capability_status(cap, registry), "missing")
+            self.assertNotIn("condition.stage-run-on:5:reference-alias", rec["features"])
+        for run_on in (0, 1, 3, 4, 6, 7):
+            condition = bytearray(32)
+            struct.pack_into("<H", condition, 8, 566)
+            struct.pack_into("<IIi", condition, 20, run_on, 0, 0)
+            quest = summary(values=stage + [(b"CTDA", bytes(condition))])
+            cap = "condition.run-on:0:physical" if run_on == 0 else f"condition.run-on:{run_on}"
+            self.assertIn(cap, quest["features"])
+            self.assertEqual(capability_status(cap, registry), "missing")
+        for flags in (2, 8, 0x10, 0xc0):
+            condition = bytearray(32)
+            condition[0] = flags
+            struct.pack_into("<H", condition, 8, 566)
+            struct.pack_into("<IIi", condition, 20, 2, 0x14, 0)
+            quest = summary(values=stage + [(b"CTDA", bytes(condition))])
+            self.assertIn("condition.flags", quest["features"])
+            self.assertEqual(capability_status("condition.flags", registry), "missing")
+
+    def test_alias_reference_comparison_does_not_erase_fill_dependencies(self):
+        condition = bytearray(32)
+        struct.pack_into("<H", condition, 8, 566)
+        struct.pack_into("<IIi", condition, 20, 2, 0x14, -1)
+        quest = summary(values=[(b"INDX", struct.pack("<HBB", 10, 0, 0)),
+            (b"QSDT", b"\0"), (b"CTDA", bytes(condition)), (b"ANAM", b""),
+            (b"ALST", struct.pack("<I", 0)), (b"ALCO", struct.pack("<I", 43)), (b"ALED", b"")])
+        template = summary("NPC_", form=43)
+        registry = json.loads(Path(__file__).with_name("quest_capabilities.json").read_text())
+        report = analyze({r["id"]: r for r in (quest, template)}, {}, registry)
+        row = report["quests"][0]
+        caps = {c["id"]: c["status"] for c in row["capabilities"]}
+        self.assertEqual(caps["condition:566"], "implemented-subset")
+        self.assertEqual(caps["alias.reference"], "missing")
+        self.assertEqual(caps["alias.fill.created-reference"], "missing")
+        self.assertIn(template["id"], row["referencedRecords"])
+        self.assertEqual(row["status"], "untested")
+        self.assertEqual(report["summary"]["certifiedPlayable"], 0)
 
     def test_item_and_faction_condition_alias_and_package_parameters_are_not_form_ids(self):
         for function in (47, 71, 73):

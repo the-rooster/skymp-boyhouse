@@ -38,6 +38,7 @@ public:
   private:
     friend class QuestJournal;
     friend class QuestScriptRuntime;
+    friend class MpObjectReference;
     struct Data;
     explicit CaptureContext(std::shared_ptr<const Data> data);
     bool ReferenceInitialized(MpActor& actor, uint32_t original) const;
@@ -48,6 +49,10 @@ public:
   static CaptureContext CaptureReadContext(MpActor& actor);
   static constexpr auto kProperty = "private.boyhouse.questJournal";
   static constexpr auto kEnabled = "private.boyhouse.questAdapters";
+  // Parse a private phase without looking up or authorizing its owner.
+  // Recovery additionally rejects noncanonical numeric owner spellings.
+  static uint32_t ParseCampaignOwnerId(const std::string& instance,
+                                       bool requireCanonical = false);
   static MpActor& Owner(MpActor& actor);
   static nlohmann::json Snapshot(MpActor& actor);
   static nlohmann::json Get(MpActor& actor, uint32_t questId);

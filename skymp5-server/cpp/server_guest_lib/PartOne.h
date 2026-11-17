@@ -13,6 +13,7 @@
 #include "formulas/IDamageFormula.h"
 #include "libespm/Loader.h"
 #include <functional>
+#include <map>
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <save_storages/ISaveStorage.h>
@@ -84,6 +85,18 @@ public:
   // events.
   nlohmann::json GetWorldBaseline(Networking::UserId userId,
                                   const std::string& packetEpoch);
+  nlohmann::json ResumeCampaignActor(Networking::UserId user, uint32_t actor,
+                                     const std::string& phase,
+                                     const nlohmann::json& area);
+  nlohmann::json GetCampaignResume(Networking::UserId user);
+  nlohmann::json CaptureCampaignResumeProjection(Networking::UserId user,
+                                                 const std::string& epoch);
+  bool CompleteCampaignResume(Networking::UserId user,
+                              const std::string& attempt,
+                              const std::string& epoch,
+                              const std::string& proof,
+                              const std::function<void()>& publishReady);
+  bool DetachCampaignActor(Networking::UserId user);
   std::string GetUserGuid(Networking::UserId userId);
   Networking::UserId GetUserByActor(uint32_t formId);
   void DestroyActor(uint32_t actorFormId);
@@ -166,6 +179,16 @@ private:
 
   void TickPacketHistoryPlaybacks();
   void TickDeferredMessages();
+  static std::string NewCampaignToken();
+  uint64_t projectionConfigRevision = 0;
+  struct ResumeAttempt;
+  std::map<uint32_t, std::shared_ptr<ResumeAttempt>> resumes;
+  std::shared_ptr<ResumeAttempt> CurrentResume(Networking::UserId user);
+  bool IsCurrentResume(const ResumeAttempt& attempt);
+  void TickCampaignResumes();
+  nlohmann::json ReadResumeProjectionState(ResumeAttempt& attempt);
+  void PublishResumeChange(MpObjectReference& emitter, MpActor& listener,
+                           bool added, const std::function<bool()>& valid);
 
   std::string SignJavaScriptSources(const std::string& src) const;
 

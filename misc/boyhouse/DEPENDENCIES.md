@@ -75,6 +75,12 @@ contributes its base-item dependency; `GetInFaction` and `GetFactionRank`
 contribute their FACT dependency unless the parameter uses an unsupported
 alias/package flag. Run On Quest Alias reads the signed alias ID at byte 28;
 alias zero is valid and the unused byte-24 value is never a FormID.
+`GetIsAliasRef` (566) also uses a signed quest-local alias ID for its first
+parameter at byte 12, independently of the Run On selector. That parameter
+never creates a FormID dependency. Negative IDs retain a missing parameter
+capability; reference-alias and fill dependencies remain visible even when the
+condition function has an implemented subset. Stage-log classification requires
+an actual QSDT log entry, not only an INDX stage header.
 Comparison globals have
 their own audited subset; unsupported flags and non-stage evaluation remain
 separate missing capabilities.
@@ -90,10 +96,13 @@ faction methods. Queries
 require tracked owner/private-copy snapshots; visibility additionally requires
 transactional staging and a complete observer projection barrier. The same-named
 condition functions are not enabled by these native registrations. A separate
-typed stage-log evaluator now audits five physical condition subsets:
+typed stage-log evaluator now audits six physical condition subsets:
 `GetDisabled` (35) and `GetItemCount` (47) on explicit references, and `GetDead`
 (46), `GetInFaction` (71) and `GetFactionRank` (73) on explicit references or
-safely resolved reference aliases. The registry has **eleven partial condition
+safely resolved reference aliases. `GetIsAliasRef` (566) compares exact reference
+identities using either of those selectors and an owning-quest reference alias;
+a proven empty reference alias compares false. Missing or unsupported alias
+definitions/fills still fail. The registry has **twelve partial condition
 functions**. Qualified stage-selector features mark
 only these combinations as partial; implicit physical subjects, unsupported
 alias/function combinations and non-stage evaluation retain missing gates.

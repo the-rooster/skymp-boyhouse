@@ -158,6 +158,8 @@ public:
   bool HasPendingCampaignMovement() const;
   std::shared_ptr<CampaignMovementPlan> PrepareCampaignMovement(
     MpActor& requester, const NiPoint3& position, const NiPoint3& angle);
+  std::shared_ptr<CampaignMovementPlan> PrepareCampaignResume(
+    MpActor& owner, bool detach = false);
   void RequireCampaignSpatialMutation() const;
   void Delete();
   void SetCount(uint32_t count);
