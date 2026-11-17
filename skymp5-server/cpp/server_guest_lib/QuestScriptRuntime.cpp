@@ -532,11 +532,10 @@ void QuestScriptRuntime::ExecuteJobSegment(
 {
   if (timerAnchor)
     timerAnchor->reset();
-  if (!QuestJournal::HasActiveTransaction())
-    throw std::runtime_error("Quest job execution requires its transaction");
+  QuestJournal::RequireJobExecution(actor, job.id);
   const auto jobs = QuestJournal::JobState(actor);
-  if (!jobs.active || jobs.active->id != job.id ||
-      jobs.active->generation != job.generation)
+  const auto* selected = jobs.FindLive(job.id);
+  if (!selected || selected->generation != job.generation)
     throw std::runtime_error("Quest job does not own this execution segment");
   const auto& current = job.Current();
   const auto id =
@@ -1468,6 +1467,25 @@ bool QuestScriptRuntime::Execute(
         throw std::runtime_error(stageCount == 0
                                    ? "Quest stage does not exist"
                                    : "Ambiguous duplicate quest stage index");
+      if (job &&
+          (lifecycleData.flags &
+           espm::QuestLifecycleData::AllowRepeatedStages)) {
+        const auto targetKey =
+          FormDesc::FromFormId(targetId, world.espmFiles).ToString();
+        const auto running = [&](const QuestJobState::Stage& other) {
+          // A pristine queued begin has not entered its fragment yet. Event
+          // handlers carry a root quest/stage anchor, not a stage invocation.
+          return other.cursor == "waiting" && other.quest == targetKey &&
+            other.stage == targetStage;
+        };
+        for (const auto& [otherId, other] : QuestJournal::JobState(actor).live)
+          if (otherId != job->id &&
+              (running(other) ||
+               std::any_of(other.children.begin(), other.children.end(),
+                           running)))
+            throw std::runtime_error(
+              "Repeated quest stage is executing in another live root");
+      }
       const auto logs = ReadLogs(target, targetStage, world);
       std::set<uint32_t> seen;
       for (const auto& fragment : data.fragments) {

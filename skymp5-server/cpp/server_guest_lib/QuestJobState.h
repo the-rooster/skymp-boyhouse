@@ -7,8 +7,8 @@
 #include <string>
 #include <vector>
 
-// Saved host work surrounding the Papyrus stack. One campaign advances one
-// stage job at a time; command/operation identities survive process restarts.
+// Saved host work surrounding independent Papyrus stacks. One campaign
+// commits one segment at a time; job identities survive process restarts.
 struct QuestJobState
 {
   struct Event
@@ -81,6 +81,7 @@ struct QuestJobState
     uint64_t id = 0, generation = 1, segment = 0, nextOperation = 1;
     std::string command, actor, owner, instance;
     std::string contentMode = "owned";
+    std::string environmentHash;
     bool automatic = false;
     bool sequenced = false;
     uint32_t instructions = 0, steps = 0;
@@ -97,13 +98,23 @@ struct QuestJobState
     Stage& Current();
     const Stage& Current() const;
     bool IsComplete() const;
+    bool operator==(const Job&) const = default;
+  };
+  struct RetiredRange
+  {
+    uint64_t first = 0, last = 0;
+    bool operator==(const RetiredRange&) const = default;
   };
   uint64_t generation = 1, nextJob = 1, retiredThrough = 0;
-  std::optional<Job> active;
+  std::map<uint64_t, Job> live;
+  std::vector<RetiredRange> retiredRanges;
   std::vector<Job> completed;
+  static constexpr size_t MaxLive = 16;
   static constexpr size_t MaxCompleted = 256;
   static constexpr size_t MaxRecentCompleted = 32;
   static constexpr size_t MaxRecentBytes = 1024 * 1024;
+  static constexpr size_t MaxRetiredRanges =
+    MaxLive + MaxRecentCompleted + MaxCompleted + 1;
   static constexpr size_t MaxOperations = 256;
   static constexpr size_t MaxEvents = 4096;
   static constexpr size_t MaxDepth = 128;
@@ -119,7 +130,12 @@ struct QuestJobState
   size_t RetainedSequencedBytes() const;
   // Called only at durable sequenced admission. Retire oldest sequenced work
   // until count and byte limits both permit the next pristine root.
-  void RetireForAdmission();
+  std::vector<uint64_t> RetireForAdmission();
+  Job* FindLive(uint64_t id);
+  const Job* FindLive(uint64_t id) const;
+  const Job* FindCompleted(uint64_t id) const;
+  bool IsRetired(uint64_t id) const;
+  bool HasLive() const;
   // Validate canonical heap shape plus one-to-one active job/stack ownership.
   // No object resolution or script execution occurs in this validation.
   void ValidateHeap(const nlohmann::json& heap) const;

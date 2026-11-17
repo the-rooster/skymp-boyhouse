@@ -45,6 +45,41 @@ struct Transaction
 };
 thread_local Transaction* transaction = nullptr;
 
+Json SavedContinuations(const Json& heap)
+{
+  QuestVmState state(
+    heap,
+    [](IGameObject*) -> Json {
+      throw std::runtime_error("Unexpected continuation object encoding");
+    },
+    [](const Json&) -> VarValue {
+      throw std::runtime_error("Unexpected continuation object resolution");
+    });
+  return state.Save().at("continuations");
+}
+
+void RequireUnchangedContinuations(const QuestJobState& before,
+                                   uint64_t selected, const Json& initial,
+                                   const Json& current)
+{
+  for (const auto& [id, job] : before.live) {
+    if (id == selected)
+      continue;
+    const auto check = [&](const QuestJobState::Stage& stage) {
+      if (stage.cursor == "waiting" &&
+          (!current.contains(stage.token) ||
+           initial.at(stage.token) != current.at(stage.token)))
+        throw std::runtime_error(
+          "Job transaction rewrote another root's continuation");
+    };
+    check(job);
+    if (job.handler)
+      check(*job.handler);
+    for (const auto& child : job.children)
+      check(child);
+  }
+}
+
 // Host dispatch advances one saved boundary without executing script work.
 // The native child-stack rules below govern root/handler body execution.
 bool ValidateDispatchTransition(const QuestJobState::Job& prior,
@@ -635,13 +670,35 @@ std::shared_ptr<const SaveReceipt> QuestJournal::AtomicImpl(
     ? QuestJobState::Read(initial.at("jobs"))
     : QuestJobState{};
   if (jobId) {
-    if (!*jobId || (jobs.active ? jobs.active->id : jobs.nextJob) != *jobId)
+    const auto* selected = jobs.FindLive(*jobId);
+    if (!*jobId || (!selected && jobs.nextJob != *jobId))
       throw std::runtime_error("Quest transaction does not own this job");
+    // These admission failures are known before a candidate is installed.
+    // Reject them before invoking host code, while allowing an existing
+    // migrated root to finish alone under its original execution lease.
+    if (!selected && jobs.live.size() >= QuestJobState::MaxLive)
+      throw std::runtime_error("Live quest job limit exceeded");
+    if (!selected &&
+        std::any_of(jobs.live.begin(), jobs.live.end(), [](const auto& entry) {
+          return entry.second.environmentHash.empty();
+        }))
+      throw std::runtime_error(
+        "Concurrent quest admission requires a pinned live environment");
+    if (selected &&
+        (selected->actor != actor.GetChangeForm().formDesc.ToString() ||
+         selected->owner != owner.GetChangeForm().formDesc.ToString() ||
+         selected->instance != actor.GetWorldInstance()))
+      throw std::runtime_error("Quest transaction changed its job context");
     // Admission publishes a pristine typed root before any script executes.
     // Its codec/transition checks enforce the separate legacy and numbered
     // windows; total completed count is no longer a lifetime limit.
-  } else if (jobs.active)
+  } else if (jobs.HasLive())
     throw std::runtime_error("Campaign has an active quest job");
+  // Snapshot all stack envelopes before the callback. Arrays remain shared
+  // heap nodes, so their contents may legitimately change in another root.
+  const auto initialContinuations = jobId
+    ? SavedContinuations(initial.value("vm", Json::object()))
+    : Json::object();
   const auto initialJournal = owner.GetDynamicFields().GetValueDump(kProperty);
   Transaction local{ &owner, initial, {}, {} };
   local.jobId = jobId;
@@ -683,10 +740,11 @@ std::shared_ptr<const SaveReceipt> QuestJournal::AtomicImpl(
     validateReads();
     if (jobId) {
       const auto candidate = QuestJobState::Read(local.ledger.at("jobs"));
-      if ((!candidate.active || candidate.active->id != *jobId) &&
-          (candidate.completed.empty() ||
-           candidate.completed.back().id != *jobId))
+      if (!candidate.FindLive(*jobId) && !candidate.FindCompleted(*jobId))
         throw std::runtime_error("Quest transaction did not retain its job");
+      RequireUnchangedContinuations(
+        jobs, *jobId, initialContinuations,
+        SavedContinuations(local.ledger.value("vm", Json::object())));
     }
     Validate(local.ledger);
     const auto dump = local.ledger.dump();
@@ -829,10 +887,31 @@ void QuestJournal::RequirePersonalJobAccess(MpActor& owner)
   if (!ledger.contains("jobs"))
     return;
   const auto jobs = QuestJobState::Read(ledger.at("jobs"));
-  if (jobs.active &&
-      (!transaction || transaction->owner != &owner ||
-       transaction->jobId != jobs.active->id))
+  if (transaction && transaction->owner == &owner && transaction->jobId) {
+    // The selected root can be terminal by commit-time inventory validation.
+    // Its final result still belongs to this transaction's original lease.
+    if (!jobs.FindLive(*transaction->jobId) &&
+        !jobs.FindCompleted(*transaction->jobId))
+      throw std::runtime_error("Quest job has not installed its root");
+    return;
+  }
+  if (jobs.HasLive())
     throw std::runtime_error("Campaign has an active quest job");
+}
+
+void QuestJournal::RequireJobExecution(MpActor& actor, uint64_t jobId)
+{
+  auto& owner = Owner(actor);
+  if (!jobId || !transaction || transaction->owner != &owner ||
+      transaction->jobId != jobId)
+    throw std::runtime_error("Quest runtime does not own this job lease");
+  const auto jobs = JobState(actor);
+  const auto* selected = jobs.FindLive(jobId);
+  if (!selected ||
+      selected->actor != actor.GetChangeForm().formDesc.ToString() ||
+      selected->owner != owner.GetChangeForm().formDesc.ToString() ||
+      selected->instance != actor.GetWorldInstance())
+    throw std::runtime_error("Quest runtime job context changed");
 }
 
 void QuestJournal::SetJobState(MpActor& actor, const QuestJobState& state)
@@ -849,34 +928,55 @@ void QuestJournal::SetJobState(MpActor& actor, const QuestJobState& state)
     throw std::runtime_error(
       "Job transaction already advanced its durable cursor");
   const auto id = *transaction->jobId;
-  const QuestJobState::Job* candidate = state.active ? &*state.active
-    : state.completed.empty()                        ? nullptr
-                                                     : &state.completed.back();
+  const auto* priorJob = previous.FindLive(id);
+  const auto* candidate = state.FindLive(id);
+  if (!candidate)
+    candidate = state.FindCompleted(id);
   if (!candidate || candidate->id != id ||
       state.generation != previous.generation ||
-      state.nextJob !=
-        (previous.active ? previous.nextJob : previous.nextJob + 1) ||
+      state.nextJob != (priorJob ? previous.nextJob : previous.nextJob + 1) ||
       candidate->owner != owner.GetChangeForm().formDesc.ToString() ||
       candidate->actor != actor.GetChangeForm().formDesc.ToString() ||
       candidate->instance != actor.GetWorldInstance())
     throw std::runtime_error("Job transaction changed another job identity");
-  if (!previous.active && (!state.active || state.active->cursor != "begin"))
+  if (!priorJob &&
+      (id != previous.nextJob || !state.FindLive(id) ||
+       candidate->cursor != "begin"))
     throw std::runtime_error(
       "New quest job must first install its pristine root");
+  if (!priorJob) {
+    for (const auto& [otherId, other] : previous.live)
+      if (other.environmentHash.empty() ||
+          candidate->environmentHash.empty() ||
+          other.environmentHash != candidate->environmentHash ||
+          other.contentMode != candidate->contentMode)
+        throw std::runtime_error(
+          "Concurrent quest jobs require the same pinned environment");
+  }
+  const auto expectedLive =
+    previous.live.size() + (priorJob ? 0 : 1) - (state.FindLive(id) ? 0 : 1);
+  if (state.live.size() != expectedLive)
+    throw std::runtime_error("Job transaction changed another live root");
+  for (const auto& [otherId, other] : previous.live)
+    if (otherId != id &&
+        (!state.FindLive(otherId) || *state.FindLive(otherId) != other))
+      throw std::runtime_error("Job transaction rewrote another live root");
   auto retained = previous;
-  if (!previous.active && candidate->sequenced)
+  if (!priorJob && candidate->sequenced)
     retained.RetireForAdmission();
-  if (state.retiredThrough != retained.retiredThrough)
+  if (state.retiredThrough != retained.retiredThrough ||
+      state.retiredRanges != retained.retiredRanges)
     throw std::runtime_error(
       "Job transaction changed its retirement frontier");
-  if (previous.active) {
-    const auto& prior = *previous.active;
+  if (priorJob) {
+    const auto& prior = *priorJob;
     if (candidate->id != prior.id ||
         candidate->generation != prior.generation ||
         candidate->command != prior.command ||
         candidate->sequenced != prior.sequenced ||
         candidate->automatic != prior.automatic ||
         candidate->contentMode != prior.contentMode ||
+        candidate->environmentHash != prior.environmentHash ||
         candidate->actor != prior.actor || candidate->owner != prior.owner ||
         candidate->quest != prior.quest ||
         candidate->instance != prior.instance ||
@@ -983,9 +1083,12 @@ void QuestJournal::SetJobState(MpActor& actor, const QuestJobState& state)
   }
   auto history = retained.Save().at("completed");
   auto nextHistory = saved.at("completed");
-  if (!state.active) {
-    nextHistory.erase(nextHistory.end() - 1);
-  }
+  if (!state.FindLive(id))
+    for (auto it = nextHistory.begin(); it != nextHistory.end(); ++it)
+      if (it->at("id").get<uint64_t>() == id) {
+        nextHistory.erase(it);
+        break;
+      }
   if (history != nextHistory)
     throw std::runtime_error("Job transaction rewrote another job's history");
   const auto revision = transaction->ledger.at("revision").get<uint64_t>();
@@ -1002,7 +1105,7 @@ void QuestJournal::SetJobState(MpActor& actor, const QuestJobState& state)
   // A pristine initial install exposes the new job to script/native guards.
   // Every other transition must receive its own durable receipt before the
   // next cursor can advance; repeated identical calls above remain harmless.
-  if (previous.active || !state.active || state.active->cursor != "begin")
+  if (priorJob || !state.FindLive(id) || candidate->cursor != "begin")
     transaction->jobTransitionApplied = true;
 }
 

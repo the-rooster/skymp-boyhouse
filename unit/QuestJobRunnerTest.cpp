@@ -34,6 +34,14 @@ VarValue Name(const char* value)
   return VarValue(VarValue::kType_Identifier, value);
 }
 
+std::optional<QuestJobState::Job> OnlyLive(const QuestJobState& jobs)
+{
+  REQUIRE(jobs.live.size() <= 1);
+  if (jobs.live.empty())
+    return std::nullopt;
+  return jobs.live.begin()->second;
+}
+
 FunctionInfo Reward(int count)
 {
   FunctionInfo function;
@@ -373,19 +381,20 @@ TEST_CASE("Quest jobs expose waits and results only after exact durable saves",
   REQUIRE(f.Gold() == 17);
   REQUIRE(f.Field("prefixes") == 1);
   const auto firstJob = QuestJournal::JobState(f.Owner());
-  REQUIRE(firstJob.active);
-  REQUIRE(firstJob.active->cursor == "waiting");
-  REQUIRE(firstJob.active->log == 1);
-  REQUIRE(firstJob.active->events.size() == 2);
+  REQUIRE(OnlyLive(firstJob));
+  REQUIRE(OnlyLive(firstJob)->cursor == "waiting");
+  REQUIRE(OnlyLive(firstJob)->log == 1);
+  REQUIRE(OnlyLive(firstJob)->events.size() == 2);
   const auto heap = QuestJournal::ScriptState(f.Owner());
   REQUIRE(heap.at("continuations").size() == 1);
-  REQUIRE(
-    heap.at("continuations").at(firstJob.active->token).at("callers").size() ==
-    2);
+  REQUIRE(heap.at("continuations")
+            .at(OnlyLive(firstJob)->token)
+            .at("callers")
+            .size() == 2);
   REQUIRE(heap.at("arrays").size() == 1);
   REQUIRE(f.Submit().job == submitted.job);
   REQUIRE(f.Gold() == 17);
-  REQUIRE_THROWS(f.Resume(firstJob.active->token));
+  REQUIRE_THROWS(f.Resume(OnlyLive(firstJob)->token));
   f.Tick();
   REQUIRE(f.storage->submissions.size() == 1);
   const auto firstBytes = Serialized(f.storage->submissions[0].forms);
@@ -404,7 +413,7 @@ TEST_CASE("Quest jobs expose waits and results only after exact durable saves",
   const auto first = f.Inspect();
   REQUIRE(first.status == Status::Waiting);
   REQUIRE(first.key == "first");
-  REQUIRE(first.token == firstJob.active->token);
+  REQUIRE(first.token == OnlyLive(firstJob)->token);
   REQUIRE(first.accepted);
 
   RequirePending(f.Resume(first.token));
@@ -457,17 +466,25 @@ TEST_CASE("Quest jobs expose waits and results only after exact durable saves",
   REQUIRE(f.storage->submissions.size() == saved);
 }
 
-TEST_CASE(
-  "An active quest job refuses competing mutations and changed identity",
-  "[Quest][QuestJobs]")
+TEST_CASE("Live quest jobs preserve mutation and identity checks",
+          "[Quest][QuestJobs]")
 {
   Fixture f;
   f.Submit();
   f.Tick();
   const auto waiting = f.Ack(0);
   REQUIRE(waiting.status == Status::Waiting);
+  // A second non-repeating call sees the already visited stage and completes
+  // without consuming the first job's saved continuation.
+  RequirePending(f.Submit("independent-no-op"));
+  f.Tick();
+  f.storage->Complete(1);
+  f.Tick();
+  REQUIRE(f.Jobs().Inspect(f.Owner(), "independent-no-op").status ==
+          Status::Completed);
+  REQUIRE(f.Inspect().token == waiting.token);
+  REQUIRE(f.Gold() == 17);
   const auto before = QuestJournal::Snapshot(f.Owner());
-  REQUIRE_THROWS(f.Submit("competing-command"));
   REQUIRE_THROWS(f.Submit(kCommand, 255));
   REQUIRE_THROWS(f.Jobs().Submit(f.Owner(), kCommand, 0x4e50d, kStage,
                                  f.program.metadata, f.program.Scripts()));
@@ -546,7 +563,7 @@ TEST_CASE("A quest job without awaits durably completes once",
   const auto submitted = submit();
   RequirePending(submitted);
   REQUIRE(f.Gold() == 14);
-  REQUIRE(QuestJournal::JobState(f.Owner()).active->cursor == "done");
+  REQUIRE(OnlyLive(QuestJournal::JobState(f.Owner()))->cursor == "done");
   REQUIRE(QuestJournal::JobState(f.Owner()).completed.empty());
   REQUIRE(QuestJournal::ScriptState(f.Owner()).at("continuations").empty());
   REQUIRE(submit().job == submitted.job);
@@ -662,7 +679,7 @@ TEST_CASE("Inventory event stage calls do not reuse the outer job log cursor",
   };
   RequirePending(submit());
   REQUIRE(f.Gold() == 15);
-  REQUIRE(QuestJournal::JobState(f.Owner()).active->cursor == "done");
+  REQUIRE(OnlyLive(QuestJournal::JobState(f.Owner()))->cursor == "done");
   Finish(f, command, quest);
   REQUIRE(f.Gold() == 19);
   const auto saved = f.storage->submissions.size();
@@ -681,7 +698,7 @@ TEST_CASE("Inventory event stage calls do not reuse the outer job log cursor",
   REQUIRE(QuestJournal::Get(f.Owner(), quest).at("stages") ==
           Json::array({ 10, 20 }));
   const auto jobs = QuestJournal::JobState(f.Owner());
-  REQUIRE_FALSE(jobs.active);
+  REQUIRE_FALSE(OnlyLive(jobs));
   REQUIRE(jobs.completed.size() == 1);
   REQUIRE(jobs.completed[0].stage == 10);
   REQUIRE(jobs.completed[0].log == 0);
@@ -897,7 +914,7 @@ TEST_CASE(
     REQUIRE(complete.accepted);
     REQUIRE(owner.GetInventory().GetItemCount(0xf) == 37);
     REQUIRE(QuestJournal::ScriptState(owner).at("continuations").empty());
-    REQUIRE_FALSE(QuestJournal::JobState(owner).active);
+    REQUIRE_FALSE(OnlyLive(QuestJournal::JobState(owner)));
     REQUIRE(QuestJournal::JobState(owner).completed.size() == 1);
   }
   {
@@ -1163,7 +1180,7 @@ TEST_CASE("Child stages commit their intent and result before parent progress",
   REQUIRE(InventoryOrder(f.Owner()) == 0);
   REQUIRE(
     QuestJournal::Get(f.Owner(), f.content.childQuest).at("stages").empty());
-  const auto parentToken = QuestJournal::JobState(f.Owner()).active->token;
+  const auto parentToken = OnlyLive(QuestJournal::JobState(f.Owner()))->token;
   REQUIRE_FALSE(parentToken.empty());
   RequirePending(f.Advance());
   REQUIRE_THROWS(f.ResumeChild(parentToken));
@@ -1487,7 +1504,8 @@ TEST_CASE(
                                content.metadata, content.Scripts()));
     RequireReady(WaitForDurable(server, owner, kChildCommand));
     REQUIRE(owner.GetInventory().GetItemCount(0xf) == 19);
-    REQUIRE(QuestJournal::JobState(owner).active->Current().cursor == "done");
+    REQUIRE(OnlyLive(QuestJournal::JobState(owner))->Current().cursor ==
+            "done");
   }
   {
     PartOne server;
@@ -1591,7 +1609,7 @@ TEST_CASE("Child stage VMs share the parent's cumulative instruction budget",
   REQUIRE(f.Gold() == 12);
   f.Tick();
   RequireReady(f.AckChild(0));
-  const auto active = QuestJournal::JobState(f.Owner()).active;
+  const auto active = OnlyLive(QuestJournal::JobState(f.Owner()));
   REQUIRE(active);
   REQUIRE(active->instructions >= 60000);
   REQUIRE(active->instructions < 65000);
@@ -1740,17 +1758,17 @@ TEST_CASE("Managed Utility waits preserve native millisecond conversion and "
       REQUIRE(clockReads == 0);
       REQUIRE(f.Gold() == 15);
       const auto jobs = QuestJournal::JobState(f.Owner());
-      REQUIRE(jobs.active);
-      REQUIRE(jobs.active->cursor == "done");
-      REQUIRE(jobs.active->completions.empty());
-      REQUIRE(jobs.active->nextOperation == 1);
+      REQUIRE(OnlyLive(jobs));
+      REQUIRE(OnlyLive(jobs)->cursor == "done");
+      REQUIRE(OnlyLive(jobs)->completions.empty());
+      REQUIRE(OnlyLive(jobs)->nextOperation == 1);
       f.Tick();
       RequireReady(f.AckTimer(0));
       FinishTimer(f);
       continue;
     }
     REQUIRE(f.Gold() == 12);
-    const auto job = QuestJournal::JobState(f.Owner()).active;
+    const auto job = OnlyLive(QuestJournal::JobState(f.Owner()));
     REQUIRE(job);
     REQUIRE(job->Current().timer);
     REQUIRE(job->Current().timer->issuedUnixMs == 1000000);
@@ -1852,7 +1870,7 @@ TEST_CASE(
   f.Tick();
   RequireSleeping(f.AckTimer(1));
   const auto second =
-    QuestJournal::JobState(f.Owner()).active->Current().timer;
+    OnlyLive(QuestJournal::JobState(f.Owner()))->Current().timer;
   REQUIRE(second);
   REQUIRE(second->issuedUnixMs == 1);
   REQUIRE(second->durationMs == 2000);
@@ -2023,7 +2041,7 @@ TEST_CASE("Automatic timer jobs recover and finish through server ticks alone",
     jobs.Submit(owner, kTimerCommand, kTimerQuest, 5, content.metadata,
                 content.Scripts(), true);
     RequireSleeping(WaitForDurable(server, owner, kTimerCommand));
-    REQUIRE(QuestJournal::JobState(owner).active->automatic);
+    REQUIRE(OnlyLive(QuestJournal::JobState(owner))->automatic);
     REQUIRE(owner.GetInventory().GetItemCount(0xf) == 12);
   }
   {
@@ -2272,7 +2290,7 @@ TEST_CASE(
     REQUIRE_NOTHROW(f.Tick());
   REQUIRE(replacement.GetInventory().GetItemCount(0xf) == 100);
   REQUIRE(QuestJournal::JobState(replacement).completed.empty());
-  REQUIRE_FALSE(QuestJournal::JobState(replacement).active);
+  REQUIRE_FALSE(OnlyLive(QuestJournal::JobState(replacement)));
 }
 
 TEST_CASE(
@@ -2313,7 +2331,7 @@ TEST_CASE("Automatic submissions and recovered timer continuations retain "
     REQUIRE_THROWS(f.SubmitTimer(true));
     REQUIRE(f.Gold() == 10);
     REQUIRE(QuestJournal::Snapshot(f.Owner()) == before);
-    REQUIRE_FALSE(QuestJournal::JobState(f.Owner()).active);
+    REQUIRE_FALSE(OnlyLive(QuestJournal::JobState(f.Owner())));
     REQUIRE(QuestJournal::ScriptState(f.Owner()).empty());
   }
   SECTION("fixture input cannot resume a saved owned timer with an identical "
@@ -2326,10 +2344,13 @@ TEST_CASE("Automatic submissions and recovered timer continuations retain "
     auto saved = f.Owner().GetChangeForm();
     auto journal =
       Json::parse(saved.dynamicFields.GetValueDump(QuestJournal::kProperty));
-    const auto hash = journal.at("jobs").at("active").at("contentHash");
+    auto jobState = QuestJobState::Read(journal.at("jobs"));
+    REQUIRE(jobState.live.size() == 1);
+    const auto hash = jobState.live.begin()->second.contentHash;
     // Only provider provenance differs. Matching bytes do not authorize a
     // fixture overload to enter production-owned execution.
-    journal["jobs"]["active"]["contentMode"] = "owned";
+    jobState.live.begin()->second.contentMode = "owned";
+    journal["jobs"] = jobState.Save();
     saved.dynamicFields.SetValueDump(QuestJournal::kProperty, journal.dump());
     PartOne restarted;
     restarted.AttachEspm(&GetEspmLoader());
@@ -2340,8 +2361,7 @@ TEST_CASE("Automatic submissions and recovered timer continuations retain "
     auto& jobs = restarted.worldState.GetQuestJobs();
     jobs.SetClock([] { return QuestJobTime{ 1005000, 100 }; });
     RequireReady(jobs.Inspect(actor, kTimerCommand));
-    REQUIRE(QuestJournal::JobState(actor).active->contentHash ==
-            hash.get<std::string>());
+    REQUIRE(OnlyLive(QuestJournal::JobState(actor))->contentHash == hash);
     const auto before = QuestJournal::Snapshot(actor);
     REQUIRE_THROWS(jobs.Advance(actor, kTimerCommand, f.content.metadata,
                                 f.content.Scripts()));
@@ -2581,7 +2601,7 @@ struct EventFixture : Fixture
     for (size_t boundary = 0; boundary < 32; ++boundary) {
       if (InspectEvent().status == Status::Pending)
         AckLatest();
-      const auto job = QuestJournal::JobState(Owner()).active;
+      const auto job = OnlyLive(QuestJournal::JobState(Owner()));
       REQUIRE(job);
       if (job->handler)
         return;
@@ -2607,7 +2627,7 @@ TEST_CASE(
   REQUIRE(f.Gold() == 14);
   REQUIRE(EventField(f.Owner(), "eventderived", "eventbase/prefixes") == 0);
   f.SelectFirstHandler();
-  auto selected = QuestJournal::JobState(f.Owner()).active;
+  auto selected = OnlyLive(QuestJournal::JobState(f.Owner()));
   REQUIRE(selected->eventHead == 0);
   REQUIRE(selected->handler->cursor == "begin");
   REQUIRE(selected->handler->handlerIdentity->rootScript == "EventDerived");
@@ -2617,7 +2637,7 @@ TEST_CASE(
   REQUIRE(f.Gold() == 16);
   REQUIRE(EventField(f.Owner(), "eventderived", "eventbase/prefixes") == 1);
   REQUIRE(EventField(f.Owner(), "eventobserver", "eventobserver/order") == 0);
-  const auto waiting = QuestJournal::JobState(f.Owner()).active;
+  const auto waiting = OnlyLive(QuestJournal::JobState(f.Owner()));
   REQUIRE(waiting->handler->cursor == "waiting");
   REQUIRE(waiting->handler->timer);
   const auto token = waiting->handler->token;
@@ -2642,7 +2662,8 @@ TEST_CASE(
   REQUIRE(f.Gold() == 19);
   REQUIRE(EventField(f.Owner(), "eventderived", "eventbase/suffixes") == 1);
   REQUIRE(EventField(f.Owner(), "eventobserver", "eventobserver/order") == 0);
-  REQUIRE(QuestJournal::JobState(f.Owner()).active->handler->cursor == "done");
+  REQUIRE(OnlyLive(QuestJournal::JobState(f.Owner()))->handler->cursor ==
+          "done");
   REQUIRE(f.DrainEvent().status == Status::Completed);
   REQUIRE(f.Gold() == 19);
   REQUIRE(EventField(f.Owner(), "eventderived", "eventbase/prefixes") == 1);
@@ -2672,7 +2693,7 @@ TEST_CASE(
   f.SelectFirstHandler();
   RequirePending(f.AdvanceEvent());
   REQUIRE(f.Gold() == 17);
-  auto job = QuestJournal::JobState(f.Owner()).active;
+  auto job = OnlyLive(QuestJournal::JobState(f.Owner()));
   REQUIRE(job->handler->cursor == "waiting");
   REQUIRE(job->handler->awaitKind == "stage");
   REQUIRE(job->children.size() == 1);
@@ -2704,7 +2725,7 @@ TEST_CASE(
   RequirePending(f.AdvanceEvent());
   REQUIRE(f.Gold() == 27);
   REQUIRE(EventField(f.Owner(), "eventderived", "eventbase/suffixes") == 0);
-  job = QuestJournal::JobState(f.Owner()).active;
+  job = OnlyLive(QuestJournal::JobState(f.Owner()));
   REQUIRE(job->children.back().cursor == "done");
   f.Tick();
   const auto failed = f.storage->submissions.size() - 1;
@@ -2720,7 +2741,7 @@ TEST_CASE(
   REQUIRE(f.Gold() == 30);
   REQUIRE(EventField(f.Owner(), "eventderived", "eventbase/suffixes") == 1);
   REQUIRE(EventField(f.Owner(), "eventobserver", "eventobserver/order") == 0);
-  job = QuestJournal::JobState(f.Owner()).active;
+  job = OnlyLive(QuestJournal::JobState(f.Owner()));
   REQUIRE(job->children.empty());
   REQUIRE(job->handler->cursor == "done");
   REQUIRE(job->completions.at(childToken).value);
@@ -2758,7 +2779,7 @@ TEST_CASE("Inherited inventory handlers recover from SQLite before retirement",
                                content.metadata, content.Scripts()));
     RequireSleeping(DrainStored(server, owner, kEventCommand, content.metadata,
                                 content.Scripts()));
-    const auto job = QuestJournal::JobState(owner).active;
+    const auto job = OnlyLive(QuestJournal::JobState(owner));
     REQUIRE(job->handler);
     REQUIRE(job->handler->handlerIdentity->rootScript == "EventDerived");
     REQUIRE(job->handler->handlerIdentity->implementation == "EventBase");
@@ -2797,7 +2818,8 @@ TEST_CASE("Inherited inventory handlers recover from SQLite before retirement",
     RequirePending(
       jobs.Advance(owner, kEventCommand, content.metadata, content.Scripts()));
     RequireReady(WaitForDurable(server, owner, kEventCommand));
-    REQUIRE(QuestJournal::JobState(owner).active->handler->cursor == "done");
+    REQUIRE(OnlyLive(QuestJournal::JobState(owner))->handler->cursor ==
+            "done");
     REQUIRE(owner.GetInventory().GetItemCount(0xf) == 20);
     REQUIRE(EventField(owner, "eventderived", "eventbase/prefixes") == 1);
     REQUIRE(EventField(owner, "eventderived", "eventbase/suffixes") == 1);
@@ -2807,7 +2829,8 @@ TEST_CASE("Inherited inventory handlers recover from SQLite before retirement",
     PartOne server;
     AttachDatabase(server, files);
     auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
-    REQUIRE(QuestJournal::JobState(owner).active->handler->cursor == "done");
+    REQUIRE(OnlyLive(QuestJournal::JobState(owner))->handler->cursor ==
+            "done");
     REQUIRE(owner.GetInventory().GetItemCount(0xf) == 20);
     REQUIRE(DrainStored(server, owner, kEventCommand, content.metadata,
                         content.Scripts())
@@ -2855,7 +2878,7 @@ TEST_CASE("Inventory handlers share the stage instruction budget",
   f.SubmitEvent();
   f.SelectFirstHandler();
   REQUIRE(f.Gold() == 15);
-  const auto job = QuestJournal::JobState(f.Owner()).active;
+  const auto job = OnlyLive(QuestJournal::JobState(f.Owner()));
   REQUIRE(job->instructions > 60000);
   REQUIRE(job->instructions < 65000);
   const auto before = QuestJournal::Snapshot(f.Owner());
@@ -2984,7 +3007,7 @@ TEST_CASE("Sequenced quest requests retain bounded history beyond 256 rewards",
     REQUIRE(request.sequence == index + 1);
     REQUIRE(f.Gold() == 11 + index);
     const auto jobs = QuestJournal::JobState(f.Owner());
-    REQUIRE_FALSE(jobs.active);
+    REQUIRE_FALSE(OnlyLive(jobs));
     REQUIRE(jobs.completed.size() == std::min<uint64_t>(index + 1, 32));
     REQUIRE(std::all_of(jobs.completed.begin(), jobs.completed.end(),
                         [](const auto& job) { return job.sequenced; }));
@@ -3316,7 +3339,7 @@ TEST_CASE(
                                content.metadata, content.Scripts(), true));
     RequireSleeping(WaitForDurable(server, owner, request));
     REQUIRE(owner.GetInventory().GetItemCount(0xf) == 12);
-    REQUIRE(QuestJournal::JobState(owner).active->sequenced);
+    REQUIRE(OnlyLive(QuestJournal::JobState(owner))->sequenced);
   }
   {
     PartOne server;
@@ -3349,4 +3372,483 @@ TEST_CASE(
     REQUIRE(owner.GetInventory().GetItemCount(0xf) == 15);
     REQUIRE_NOTHROW(jobs.Retry(owner, request));
   }
+}
+
+namespace {
+struct ConcurrentProgram
+{
+  Program program;
+  QuestJobRunner::MetadataOverrides metadata;
+  ConcurrentProgram(bool secondTimer = true, bool reassignArray = false,
+                    bool failSecond = false)
+  {
+    auto& object = program.script->objectTable[0];
+    object.variables = { { "ready", "Bool", 0, VarValue(false) },
+                         { "scalar", "Int", 0, VarValue(7) },
+                         { "shared", "Int[]", 0, VarValue::None() },
+                         { "aRuns", "Int", 0, VarValue(0) },
+                         { "bRuns", "Int", 0, VarValue(0) },
+                         { "aCaptured", "Int", 0, VarValue(0) },
+                         { "aSeen", "Int", 0, VarValue(0) },
+                         { "aDone", "Bool", 0, VarValue(false) },
+                         { "bDone", "Bool", 0, VarValue(false) } };
+    auto first = Reward(2);
+    first.locals.insert(first.locals.end(),
+                        { { "captured", "Int" },
+                          { "link", "Int[]" },
+                          { "seen", "Int" },
+                          { "total", "Int" } });
+    first.code.instructions.pop_back();
+    const std::vector<FunctionCode::Instruction> firstBody{
+      { FunctionCode::kOp_IAdd,
+        { Name("aRuns"), Name("aRuns"), VarValue(1) } },
+      { FunctionCode::kOp_Assign, { Name("captured"), Name("scalar") } },
+      { FunctionCode::kOp_ArrayCreate, { Name("shared"), VarValue(1) } },
+      { FunctionCode::kOp_ArraySetElement,
+        { Name("shared"), VarValue(0), VarValue(3) } },
+      { FunctionCode::kOp_Assign, { Name("link"), Name("shared") } },
+      { FunctionCode::kOp_JumpT, { Name("ready"), VarValue(3) } },
+      { FunctionCode::kOp_CallStatic,
+        { VarValue("Utility"), VarValue("Wait"), Name("temp"), VarValue(1),
+          VarValue(1.0) } },
+      { FunctionCode::kOp_Jump, { VarValue(-2) } },
+      { FunctionCode::kOp_ArrayGetElement,
+        { Name("seen"), Name("link"), VarValue(0) } },
+      { FunctionCode::kOp_IAdd,
+        { Name("total"), Name("captured"), Name("seen") } },
+      { FunctionCode::kOp_CallMethod,
+        { VarValue("AddItem"), Name("target"), Name("temp"), VarValue(3),
+          Name("gold"), Name("total"), VarValue(true) } },
+      { FunctionCode::kOp_Assign, { Name("aCaptured"), Name("captured") } },
+      { FunctionCode::kOp_Assign, { Name("aSeen"), Name("seen") } },
+      { FunctionCode::kOp_Assign, { Name("aDone"), VarValue(true) } },
+      { FunctionCode::kOp_Return, { VarValue::None() } }
+    };
+    first.code.instructions.insert(first.code.instructions.end(),
+                                   firstBody.begin(), firstBody.end());
+    auto second = Reward(3);
+    second.code.instructions.pop_back();
+    second.code.instructions.insert(
+      second.code.instructions.end(),
+      { { FunctionCode::kOp_IAdd,
+          { Name("bRuns"), Name("bRuns"), VarValue(1) } },
+        { FunctionCode::kOp_Assign, { Name("scalar"), VarValue(99) } },
+        { FunctionCode::kOp_ArraySetElement,
+          { Name("shared"), VarValue(0), VarValue(9) } },
+        { FunctionCode::kOp_Assign, { Name("ready"), VarValue(true) } } });
+    if (reassignArray)
+      second.code.instructions.insert(
+        second.code.instructions.end(),
+        { { FunctionCode::kOp_ArrayCreate, { Name("shared"), VarValue(1) } },
+          { FunctionCode::kOp_ArraySetElement,
+            { Name("shared"), VarValue(0), VarValue(99) } } });
+    if (secondTimer) {
+      second.code.instructions.push_back(
+        { FunctionCode::kOp_CallStatic,
+          { VarValue("Utility"), VarValue("WaitMenuMode"), Name("temp"),
+            VarValue(1), VarValue(2.0) } });
+      second.code.instructions.push_back(
+        { FunctionCode::kOp_CallMethod,
+          { VarValue("AddItem"), Name("target"), Name("temp"), VarValue(3),
+            Name("gold"), VarValue(4), VarValue(true) } });
+    }
+    if (failSecond)
+      second.code.instructions.push_back(
+        { FunctionCode::kOp_CallMethod,
+          { VarValue("UnsupportedConcurrentSuffix"), Name("self"),
+            Name("temp"), VarValue(0) } });
+    second.code.instructions.push_back(
+      { FunctionCode::kOp_Assign, { Name("bDone"), VarValue(true) } });
+    second.code.instructions.push_back(
+      { FunctionCode::kOp_Return, { VarValue::None() } });
+    object.states = {
+      { "",
+        { { "First", first }, { "Second", second }, { "Reward", Reward(1) } } }
+    };
+    program.metadata.fragments = { { 10, 0, 1, "JobFixture", "First" },
+                                   { 20, 0, 1, "JobFixture", "Second" } };
+    metadata[kParentQuest] = program.metadata;
+    auto repeated = program.metadata;
+    repeated.fragments = { { 10, 0, 1, "JobFixture", "Reward" } };
+    metadata[kRetentionQuest] = repeated;
+  }
+  auto Scripts() const { return program.Scripts(); }
+  void Enable(MpActor& actor) const
+  {
+    actor.SetPropertyValueDump(QuestJournal::kEnabled,
+                               "[\"4e50d:Skyrim.esm\",\"2aa57:Skyrim.esm\"]",
+                               false, false);
+  }
+};
+
+struct ConcurrentFixture : Fixture
+{
+  ConcurrentProgram content;
+  std::shared_ptr<QuestJobTime> time =
+    std::make_shared<QuestJobTime>(QuestJobTime{ 1000000, 5000 });
+  ConcurrentFixture(bool secondTimer = true, bool reassignArray = false,
+                    bool failSecond = false)
+    : content(secondTimer, reassignArray, failSecond)
+  {
+    content.Enable(Owner());
+    Jobs().SetClock([time = time] { return *time; });
+  }
+  QuestJobRunner::Result SubmitRoot(const RequestId& request, uint32_t quest,
+                                    uint16_t stage, bool automatic = false)
+  {
+    return Jobs().Submit(Owner(), request, quest, stage, content.metadata,
+                         content.Scripts(), automatic);
+  }
+  QuestJobRunner::Result AdvanceRoot(const RequestId& request)
+  {
+    return Jobs().Advance(Owner(), request, content.metadata,
+                          content.Scripts());
+  }
+  QuestJobRunner::Result InspectRoot(const RequestId& request)
+  {
+    return Jobs().Inspect(Owner(), request);
+  }
+  QuestJobRunner::Result DrainRoot(const RequestId& request)
+  {
+    return Drain(*this, request, content.metadata, content.Scripts());
+  }
+  void AckLatest()
+  {
+    Tick();
+    REQUIRE_FALSE(storage->submissions.empty());
+    storage->Complete(storage->submissions.size() - 1);
+    Tick();
+  }
+  QuestJobState::Job Live(const RequestId& request)
+  {
+    const auto jobs = QuestJournal::JobState(Owner());
+    const auto* job = jobs.FindLive(request.sequence);
+    REQUIRE(job);
+    return *job;
+  }
+};
+}
+
+TEST_CASE(
+  "Independent stage timers observe shared fields but retain their locals",
+  "[Quest][QuestJobs][ConcurrentStacks][SaveReceipt]")
+{
+  const bool reassign = GENERATE(false, true);
+  ConcurrentFixture f(true, reassign);
+  const auto first = f.Jobs().NextRequest(f.Owner());
+  RequirePending(f.SubmitRoot(first, kParentQuest, 10));
+  RequireSleeping(f.DrainRoot(first));
+  REQUIRE(f.Gold() == 12);
+  // Poll once before the other root changes ready. Only the timer rotates;
+  // the stage prefix and its saved scalar/array locals remain the same.
+  const auto initialToken = f.Live(first).token;
+  f.time->steadyMs += 1000;
+  RequirePending(f.AdvanceRoot(first));
+  RequireSleeping(f.DrainRoot(first));
+  const auto firstJob = f.Live(first);
+  REQUIRE(firstJob.token != initialToken);
+  REQUIRE(ChildField(f.Owner(), kParentQuest, "aruns").at("value") == 1);
+  const auto firstFrame = QuestJournal::ScriptState(f.Owner())
+                            .at("continuations")
+                            .at(firstJob.token);
+  const auto originalArray = ChildField(f.Owner(), kParentQuest, "shared");
+  const auto second = f.Jobs().NextRequest(f.Owner());
+  ConcurrentProgram incompatible(true, !reassign);
+  const auto before = QuestJournal::JobState(f.Owner()).Save();
+  REQUIRE_THROWS(f.Jobs().Submit(f.Owner(), second, kParentQuest, 20,
+                                 incompatible.metadata,
+                                 incompatible.Scripts()));
+  REQUIRE(QuestJournal::JobState(f.Owner()).Save() == before);
+  REQUIRE(f.Gold() == 12);
+  RequirePending(f.SubmitRoot(second, kParentQuest, 20));
+  REQUIRE(f.Gold() == 15);
+  REQUIRE(QuestJournal::JobState(f.Owner()).live.size() == 2);
+  REQUIRE(f.Live(first).environmentHash == f.Live(second).environmentHash);
+  REQUIRE(QuestJournal::ScriptState(f.Owner())
+            .at("continuations")
+            .at(firstJob.token) == firstFrame);
+  REQUIRE(f.Live(first).instructions == firstJob.instructions);
+  REQUIRE((ChildField(f.Owner(), kParentQuest, "shared") == originalArray) ==
+          !reassign);
+  REQUIRE(QuestJournal::ScriptState(f.Owner()).at("arrays").size() ==
+          (reassign ? 2 : 1));
+  f.time->steadyMs += 1000;
+  RequireReady(f.InspectRoot(first));
+  RequirePending(f.InspectRoot(second));
+  const auto pending = QuestJournal::ScriptState(f.Owner());
+  REQUIRE_THROWS(f.AdvanceRoot(first));
+  REQUIRE(QuestJournal::ScriptState(f.Owner()) == pending);
+  REQUIRE(f.Gold() == 15);
+  f.Tick();
+  const auto failed = f.storage->submissions.size() - 1;
+  const auto bytes = Serialized(f.storage->submissions[failed].forms);
+  f.storage->Complete(
+    failed, std::make_exception_ptr(std::runtime_error("second root")));
+  f.Tick();
+  REQUIRE(Serialized(f.storage->submissions.back().forms) == bytes);
+  RequireReady(f.InspectRoot(first));
+  RequirePending(f.InspectRoot(second));
+  REQUIRE_THROWS(f.AdvanceRoot(first));
+  f.storage->Complete(failed);
+  f.Tick();
+  RequirePending(f.InspectRoot(second));
+  f.AckLatest();
+  RequireReady(f.InspectRoot(first));
+  RequireSleeping(f.InspectRoot(second));
+  const auto secondJob = f.Live(second);
+  const auto secondFrame = QuestJournal::ScriptState(f.Owner())
+                             .at("continuations")
+                             .at(secondJob.token);
+  REQUIRE(firstJob.token != secondJob.token);
+  REQUIRE_THROWS(f.Jobs().Resume(f.Owner(), second, firstJob.token, true,
+                                 f.content.metadata, f.content.Scripts()));
+  RequirePending(f.AdvanceRoot(first));
+  REQUIRE(f.Gold() == 31);
+  RequireSleeping(f.InspectRoot(second));
+  REQUIRE(QuestJournal::ScriptState(f.Owner())
+            .at("continuations")
+            .at(secondJob.token) == secondFrame);
+  REQUIRE(ChildField(f.Owner(), kParentQuest, "acaptured").at("value") == 7);
+  REQUIRE(ChildField(f.Owner(), kParentQuest, "aseen").at("value") == 9);
+  REQUIRE(ChildField(f.Owner(), kParentQuest, "scalar").at("value") == 99);
+  REQUIRE(ChildField(f.Owner(), kParentQuest, "bruns").at("value") == 1);
+  REQUIRE(f.DrainRoot(first).status == Status::Completed);
+  REQUIRE(f.Live(second).instructions == secondJob.instructions);
+  f.time->steadyMs += 1000;
+  RequireReady(f.InspectRoot(second));
+  RequirePending(f.AdvanceRoot(second));
+  REQUIRE(f.DrainRoot(second).status == Status::Completed);
+  REQUIRE(f.Gold() == 35);
+  REQUIRE(ChildField(f.Owner(), kParentQuest, "adone").at("value") == true);
+  REQUIRE(ChildField(f.Owner(), kParentQuest, "bdone").at("value") == true);
+  REQUIRE(QuestJournal::ScriptState(f.Owner()).at("continuations").empty());
+  REQUIRE(QuestJournal::Get(f.Owner(), kParentQuest).at("stages") ==
+          Json::array({ 10, 20 }));
+}
+
+TEST_CASE(
+  "SQLite restores independent timers and the campaign's shared array heap",
+  "[Quest][QuestJobs][ConcurrentStacks][SQLite]")
+{
+  SqliteFiles files;
+  ConcurrentProgram content(true, true);
+  RequestId first, second;
+  std::string firstToken, secondToken;
+  Json firstFrame, secondFrame;
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    Initialize(server);
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    content.Enable(owner);
+    auto& jobs = server.worldState.GetQuestJobs();
+    jobs.SetClock([] { return QuestJobTime{ 1000000, 5000 }; });
+    first = jobs.NextRequest(owner);
+    jobs.Submit(owner, first, kParentQuest, 10, content.metadata,
+                content.Scripts());
+    RequireSleeping(
+      DrainStored(server, owner, first, content.metadata, content.Scripts()));
+    firstToken = QuestJournal::JobState(owner).FindLive(first.sequence)->token;
+    firstFrame =
+      QuestJournal::ScriptState(owner).at("continuations").at(firstToken);
+    second = jobs.NextRequest(owner);
+    jobs.Submit(owner, second, kParentQuest, 20, content.metadata,
+                content.Scripts());
+    RequireSleeping(
+      DrainStored(server, owner, second, content.metadata, content.Scripts()));
+    secondToken =
+      QuestJournal::JobState(owner).FindLive(second.sequence)->token;
+    secondFrame =
+      QuestJournal::ScriptState(owner).at("continuations").at(secondToken);
+    REQUIRE(
+      QuestJournal::ScriptState(owner).at("continuations").at(firstToken) ==
+      firstFrame);
+    REQUIRE(QuestJournal::ScriptState(owner).at("arrays").size() == 2);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 15);
+  }
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    auto& jobs = server.worldState.GetQuestJobs();
+    auto time = std::make_shared<QuestJobTime>(QuestJobTime{ 1000500, 100 });
+    jobs.SetClock([time] { return *time; });
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    REQUIRE(QuestJournal::JobState(owner).live.size() == 2);
+    RequireSleeping(jobs.Inspect(owner, first));
+    RequireSleeping(jobs.Inspect(owner, second));
+    REQUIRE(
+      QuestJournal::ScriptState(owner).at("continuations").at(firstToken) ==
+      firstFrame);
+    REQUIRE(
+      QuestJournal::ScriptState(owner).at("continuations").at(secondToken) ==
+      secondFrame);
+    time->steadyMs += 500;
+    RequireReady(jobs.Inspect(owner, first));
+    RequireSleeping(jobs.Inspect(owner, second));
+    jobs.Advance(owner, first, content.metadata, content.Scripts());
+    REQUIRE(
+      DrainStored(server, owner, first, content.metadata, content.Scripts())
+        .status == Status::Completed);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 31);
+    REQUIRE(ChildField(owner, kParentQuest, "acaptured").at("value") == 7);
+    REQUIRE(ChildField(owner, kParentQuest, "aseen").at("value") == 9);
+    REQUIRE(
+      QuestJournal::ScriptState(owner).at("continuations").at(secondToken) ==
+      secondFrame);
+    REQUIRE(QuestJournal::ScriptState(owner).at("arrays").size() == 1);
+    RequireSleeping(jobs.Inspect(owner, second));
+  }
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    auto& jobs = server.worldState.GetQuestJobs();
+    jobs.SetClock([] { return QuestJobTime{ 1003000, 50 }; });
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    REQUIRE(jobs.Inspect(owner, first).status == Status::Completed);
+    RequireReady(jobs.Inspect(owner, second));
+    jobs.Advance(owner, second, content.metadata, content.Scripts());
+    REQUIRE(
+      DrainStored(server, owner, second, content.metadata, content.Scripts())
+        .status == Status::Completed);
+    REQUIRE(jobs.Inspect(owner, first).status == Status::Completed);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 35);
+    REQUIRE(ChildField(owner, kParentQuest, "adone").at("value") == true);
+    REQUIRE(ChildField(owner, kParentQuest, "bdone").at("value") == true);
+    REQUIRE_FALSE(QuestJournal::JobState(owner).HasLive());
+    REQUIRE(QuestJournal::ScriptState(owner).at("continuations").empty());
+  }
+}
+
+TEST_CASE(
+  "Sparse retirement keeps a sleeping low request while later rewards finish",
+  "[Quest][QuestJobs][ConcurrentStacks][Retention][SaveReceipt]")
+{
+  ConcurrentFixture f(false);
+  const auto first = f.Jobs().NextRequest(f.Owner());
+  f.SubmitRoot(first, kParentQuest, 10);
+  RequireSleeping(f.DrainRoot(first));
+  const auto sleeping = f.Live(first);
+  const auto frame = QuestJournal::ScriptState(f.Owner())
+                       .at("continuations")
+                       .at(sleeping.token);
+  f.storage->submissions.clear();
+  RequestId earliestLater;
+  for (size_t index = 0; index < 301; ++index) {
+    const auto next = f.Jobs().NextRequest(f.Owner());
+    if (index == 0)
+      earliestLater = next;
+    RequirePending(f.SubmitRoot(next, kRetentionQuest, 10));
+    REQUIRE(f.DrainRoot(next).status == Status::Completed);
+    REQUIRE(f.Gold() == 13 + index);
+    const auto state = QuestJournal::JobState(f.Owner());
+    REQUIRE(state.live.size() == 1);
+    REQUIRE(state.completed.size() + state.live.size() <= 32);
+    REQUIRE(state.retiredThrough == 0);
+    REQUIRE_FALSE(state.IsRetired(first.sequence));
+    REQUIRE(state.retiredRanges.size() <= 1);
+    REQUIRE(state.FindLive(first.sequence)->instructions ==
+            sleeping.instructions);
+    REQUIRE(QuestJournal::ScriptState(f.Owner())
+              .at("continuations")
+              .at(sleeping.token) == frame);
+    REQUIRE(MpChangeForm::ToJson(f.Owner().GetChangeForm()).dump().size() <
+            256 * 1024);
+    f.storage->submissions.clear();
+  }
+  const auto sparse = QuestJournal::JobState(f.Owner());
+  REQUIRE(sparse.completed.size() == 31);
+  REQUIRE(sparse.retiredRanges.size() == 1);
+  REQUIRE(sparse.retiredRanges[0].first == 2);
+  REQUIRE(sparse.retiredRanges[0].last == 271);
+  RequireRetired(f.InspectRoot(earliestLater));
+  const auto wake = f.Jobs().NextRequest(f.Owner());
+  RequirePending(f.SubmitRoot(wake, kParentQuest, 20));
+  REQUIRE(f.DrainRoot(wake).status == Status::Completed);
+  REQUIRE(f.Gold() == 316);
+  RequireSleeping(f.InspectRoot(first));
+  REQUIRE(QuestJournal::JobState(f.Owner()).FindCompleted(wake.sequence));
+  f.time->steadyMs += 1000;
+  RequirePending(f.AdvanceRoot(first));
+  REQUIRE(f.DrainRoot(first).status == Status::Completed);
+  REQUIRE(f.Gold() == 332);
+  REQUIRE(QuestJournal::JobState(f.Owner()).completed.front().id ==
+          first.sequence);
+  REQUIRE(QuestJournal::ScriptState(f.Owner()).at("continuations").empty());
+  f.storage->submissions.clear();
+  const auto retirement = f.Jobs().NextRequest(f.Owner());
+  RequirePending(f.SubmitRoot(retirement, kRetentionQuest, 10));
+  REQUIRE(f.Gold() == 333);
+  RequirePending(f.InspectRoot(first));
+  // Merging the new retirement into the frontier must not hide sparse IDs
+  // whose own retirement receipts were already durable.
+  RequireRetired(f.InspectRoot(earliestLater));
+  REQUIRE(QuestJournal::JobState(f.Owner()).retiredThrough == 272);
+  f.Tick();
+  REQUIRE(f.storage->submissions.size() == 1);
+  const auto bytes = Serialized(f.storage->submissions[0].forms);
+  f.storage->Complete(
+    0, std::make_exception_ptr(std::runtime_error("sparse retirement")));
+  f.Tick();
+  REQUIRE(Serialized(f.storage->submissions[1].forms) == bytes);
+  RequirePending(f.InspectRoot(first));
+  RequireRetired(f.InspectRoot(earliestLater));
+  f.storage->Complete(0);
+  f.Tick();
+  RequirePending(f.InspectRoot(first));
+  f.storage->Complete(1);
+  f.Tick();
+  RequireRetired(f.InspectRoot(first));
+  RequireRetired(f.InspectRoot(earliestLater));
+  REQUIRE(f.DrainRoot(retirement).status == Status::Completed);
+  REQUIRE(f.Gold() == 333);
+  const auto before = QuestJournal::JobState(f.Owner()).Save();
+  RequireRetired(f.SubmitRoot(first, kParentQuest, 10));
+  RequireRetired(f.SubmitRoot(earliestLater, kRetentionQuest, 10));
+  REQUIRE(QuestJournal::JobState(f.Owner()).Save() == before);
+  REQUIRE(f.Gold() == 333);
+}
+
+TEST_CASE(
+  "A failed automatic root cannot quarantine a sibling in its campaign",
+  "[Quest][QuestJobs][ConcurrentStacks][Scheduler][Rollback]")
+{
+  ConcurrentFixture f(true, false, true);
+  f.storage->automatic = true;
+  f.Jobs().SetSchedulerFixtureContent(f.content.metadata, f.content.Scripts());
+  const auto first = f.Jobs().NextRequest(f.Owner());
+  f.SubmitRoot(first, kParentQuest, 10, true);
+  f.Tick();
+  RequireSleeping(f.InspectRoot(first));
+  const auto second = f.Jobs().NextRequest(f.Owner());
+  f.SubmitRoot(second, kParentQuest, 20, true);
+  f.Tick();
+  RequireSleeping(f.InspectRoot(first));
+  RequireSleeping(f.InspectRoot(second));
+  REQUIRE(f.Gold() == 15);
+  f.time->steadyMs += 1000;
+  for (size_t pass = 0;
+       pass < 64 && f.InspectRoot(first).status != Status::Completed; ++pass)
+    f.Tick();
+  REQUIRE(f.InspectRoot(first).status == Status::Completed);
+  RequireSleeping(f.InspectRoot(second));
+  REQUIRE(f.Gold() == 31);
+  const auto before = QuestJournal::ScriptState(f.Owner());
+  f.time->steadyMs += 1000;
+  for (size_t pass = 0; pass < 8; ++pass)
+    f.Tick();
+  REQUIRE(f.InspectRoot(second).status == Status::Failed);
+  REQUIRE(f.InspectRoot(second).error.find("UnsupportedConcurrentSuffix") !=
+          std::string::npos);
+  REQUIRE(f.InspectRoot(first).status == Status::Completed);
+  REQUIRE(f.Gold() == 31);
+  REQUIRE(QuestJournal::ScriptState(f.Owner()) == before);
+  REQUIRE(ChildField(f.Owner(), kParentQuest, "adone").at("value") == true);
+  REQUIRE(ChildField(f.Owner(), kParentQuest, "bdone").at("value") == false);
+  f.Jobs().Retry(f.Owner(), second);
+  REQUIRE(f.InspectRoot(first).status == Status::Completed);
+  for (size_t pass = 0; pass < 8; ++pass)
+    f.Tick();
+  REQUIRE(f.InspectRoot(second).status == Status::Failed);
+  REQUIRE(f.Gold() == 31);
+  REQUIRE(QuestJournal::ScriptState(f.Owner()) == before);
 }

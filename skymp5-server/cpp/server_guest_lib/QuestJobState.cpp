@@ -328,6 +328,8 @@ QuestJobState::Job ReadJob(const Json& saved, uint64_t version)
         "children" });
   else {
     auto fields = value;
+    if (version >= 6)
+      fields.erase("environmentHash");
     if (version >= 5)
       fields.erase("sequenced");
     if (version >= 4)
@@ -370,6 +372,13 @@ QuestJobState::Job ReadJob(const Json& saved, uint64_t version)
   job.automatic = version >= 3 ? Boolean(value.at("automatic")) : false;
   job.sequenced = version >= 5 ? Boolean(value.at("sequenced")) : false;
   job.contentMode = version >= 3 ? Text(value.at("contentMode"), 7) : "legacy";
+  job.environmentHash =
+    version >= 6 ? Text(value.at("environmentHash"), 64, true) : "";
+  if (!job.environmentHash.empty() &&
+      (job.environmentHash.size() != 64 ||
+       job.environmentHash.find_first_not_of("0123456789abcdef") !=
+         std::string::npos))
+    throw std::runtime_error("Invalid quest job environment hash");
   if ((job.contentMode != "owned" && job.contentMode != "fixture" &&
        job.contentMode != "legacy") ||
       (job.automatic && job.contentMode == "legacy"))
@@ -568,6 +577,7 @@ Json SaveJob(const QuestJobState::Job& job)
 {
   Bounded(job.command, 128);
   Bounded(job.contentMode, 7);
+  Bounded(job.environmentHash, 64);
   for (const auto* text : { &job.actor, &job.owner, &job.instance })
     Bounded(*text, 300);
   if (job.events.size() > QuestJobState::MaxEvents ||
@@ -615,6 +625,7 @@ Json SaveJob(const QuestJobState::Job& job)
       { "automatic", job.automatic },
       { "sequenced", job.sequenced },
       { "contentMode", job.contentMode },
+      { "environmentHash", job.environmentHash },
       { "children", std::move(children) },
       { "eventHead", job.eventHead },
       { "nextHandler", job.nextHandler },
@@ -666,8 +677,12 @@ std::string QuestJobState::Job::NextToken() const
 
 QuestJobState QuestJobState::Read(const nlohmann::json& value)
 {
-  const auto version = Number(value.at("schemaVersion"), 5, true);
-  if (version >= 5)
+  const auto version = Number(value.at("schemaVersion"), 6, true);
+  if (version >= 6)
+    Fields(value,
+           { "schemaVersion", "generation", "nextJob", "retiredThrough",
+             "retiredRanges", "live", "completed" });
+  else if (version >= 5)
     Fields(value,
            { "schemaVersion", "generation", "nextJob", "retiredThrough",
              "active", "completed" });
@@ -687,49 +702,107 @@ QuestJobState QuestJobState::Read(const nlohmann::json& value)
   if (!completed.is_array() ||
       completed.size() > MaxCompleted + MaxRecentCompleted)
     throw std::runtime_error("Quest job history limit exceeded");
-  uint64_t previous = 0, unretired = result.retiredThrough;
-  size_t legacyCount = 0, recentCount = 0;
+  size_t legacyCount = 0, sequencedCount = 0;
+  std::set<uint64_t> identities;
   std::set<std::pair<bool, std::string>> commands;
-  const auto identity = [&](const Job& job, bool active) {
-    if (job.generation != result.generation || job.id <= previous ||
-        job.id >= result.nextJob || job.id == result.retiredThrough ||
+  std::vector<RetiredRange> coverage;
+  const auto identity = [&](const Job& job, bool isLive) {
+    if (job.generation != result.generation || job.id >= result.nextJob ||
+        job.id == result.retiredThrough || !identities.insert(job.id).second ||
         !commands.emplace(job.sequenced, job.command).second ||
-        ((active || job.sequenced) && job.id <= result.retiredThrough))
+        ((isLive || job.sequenced) && job.id <= result.retiredThrough))
       throw std::runtime_error("Inconsistent quest job identity sequence");
-    if (job.id > result.retiredThrough) {
-      if (job.id != unretired + 1)
-        throw std::runtime_error(
-          "Quest job history has missing unretired identities");
-      unretired = job.id;
-    }
-    previous = job.id;
+    if (job.id > result.retiredThrough)
+      coverage.push_back({ job.id, job.id });
     if (!job.sequenced && ++legacyCount > MaxCompleted)
       throw std::runtime_error("Legacy quest job history is full");
-    if (job.sequenced && !active && ++recentCount > MaxRecentCompleted)
-      throw std::runtime_error("Recent sequenced quest job history is full");
-    if (job.sequenced && active && recentCount == MaxRecentCompleted)
+    if (job.sequenced && ++sequencedCount > MaxRecentCompleted)
       throw std::runtime_error(
-        "Sequenced admission must retire its oldest completion first");
+        "Sequenced live and recent quest capacity exceeded");
   };
-  for (const auto& value : completed) {
-    auto job = ReadJob(value, version);
-    if (!job.IsComplete())
-      throw std::runtime_error("Incomplete quest job in history");
+  uint64_t previous = 0;
+  for (const auto& saved : completed) {
+    auto job = ReadJob(saved, version);
+    if (!job.IsComplete() || job.id <= previous)
+      throw std::runtime_error("Incomplete or unordered quest job history");
+    previous = job.id;
     identity(job, false);
     result.completed.push_back(std::move(job));
   }
-  if (!value.at("active").is_null()) {
-    result.active = ReadJob(value.at("active"), version);
-    if (result.active->IsComplete())
-      throw std::runtime_error("Completed quest job is still active");
-    identity(*result.active, true);
+  auto live = Json::array();
+  if (version >= 6) {
+    const auto& saved = value.at("live");
+    if (!saved.is_array() || saved.size() > MaxLive)
+      throw std::runtime_error("Live quest job limit exceeded");
+    live = saved;
+  } else if (!value.at("active").is_null())
+    live.push_back(value.at("active"));
+  previous = 0;
+  for (const auto& saved : live) {
+    auto job = ReadJob(saved, version);
+    if (job.IsComplete() || job.id <= previous ||
+        (version < 6 && !result.completed.empty() &&
+         job.id <= result.completed.back().id))
+      throw std::runtime_error("Completed or unordered live quest job");
+    previous = job.id;
+    identity(job, true);
+    if (!result.live.empty()) {
+      const auto& first = result.live.begin()->second;
+      if (job.environmentHash.empty() ||
+          job.environmentHash != first.environmentHash ||
+          job.contentMode != first.contentMode || job.owner != first.owner)
+        throw std::runtime_error(
+          "Concurrent quest jobs have incompatible environments");
+    }
+    result.live.emplace(job.id, std::move(job));
   }
-  if (result.nextJob != unretired + 1)
+  if (version >= 6) {
+    const auto& ranges = value.at("retiredRanges");
+    if (!ranges.is_array() || ranges.size() > MaxRetiredRanges)
+      throw std::runtime_error("Quest retirement range limit exceeded");
+    uint64_t last = result.retiredThrough;
+    for (const auto& range : ranges) {
+      Fields(range, { "first", "last" });
+      RetiredRange parsed{ Number(range.at("first"), MaxIdentity, true),
+                           Number(range.at("last"), MaxIdentity, true) };
+      if (parsed.first > parsed.last ||
+          parsed.first <= result.retiredThrough ||
+          parsed.last >= result.nextJob ||
+          (!result.retiredRanges.empty() && parsed.first <= last + 1))
+        throw std::runtime_error("Invalid canonical quest retirement range");
+      last = parsed.last;
+      result.retiredRanges.push_back(parsed);
+      coverage.push_back(parsed);
+    }
+  }
+  // Sweep retained identities and sparse intervals, never historical IDs.
+  std::sort(coverage.begin(), coverage.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
+  auto expected = result.retiredThrough + 1;
+  for (const auto& interval : coverage) {
+    if (interval.first != expected)
+      throw std::runtime_error(
+        "Quest job history has missing or overlapping identities");
+    expected = interval.last + 1;
+  }
+  if (expected != result.nextJob)
     throw std::runtime_error("Quest job history has missing identities");
-  if (result.active && result.active->sequenced &&
-      result.RetainedSequencedBytes() > MaxRecentBytes)
-    throw std::runtime_error(
-      "Sequenced admission exceeds retained completion bytes");
+  if (version == 5 && !result.live.empty() &&
+      result.live.begin()->second.sequenced) {
+    // Schema 5 admitted exactly one root and enforced this bound throughout
+    // its lifetime. Measure its original canonical shape, before adding the
+    // schema 6 environment field, so valid near-limit saves still migrate.
+    size_t bytes = 0;
+    for (const auto& job : completed) {
+      if (!job.at("sequenced").get<bool>())
+        continue;
+      const auto size = job.dump().size();
+      if (size > MaxRecentBytes - bytes)
+        throw std::runtime_error(
+          "Legacy sequenced admission exceeds retained completion bytes");
+      bytes += size;
+    }
+  }
   return result;
 }
 
@@ -750,21 +823,20 @@ size_t QuestJobState::RetainedSequencedBytes() const
   return total;
 }
 
-void QuestJobState::RetireForAdmission()
+std::vector<uint64_t> QuestJobState::RetireForAdmission()
 {
-  if (active)
-    throw std::runtime_error("Cannot retire quest history during active work");
   Save();
   auto count = static_cast<size_t>(
     std::count_if(completed.begin(), completed.end(),
                   [](const Job& job) { return job.sequenced; }));
+  for (const auto& [id, job] : live)
+    count += job.sequenced ? 1 : 0;
   auto bytes = RetainedSequencedBytes();
-  if (count < MaxRecentCompleted && bytes <= MaxRecentBytes)
-    return;
-  // Prepare all potentially allocating moves before publishing the frontier.
-  // Permanent legacy records and every newer retained record stay unchanged.
+  // All allocating work is prepared off to the side. Legacy records and live
+  // stacks remain unchanged even if validation or allocation fails.
   auto retained = completed;
-  auto frontier = retiredThrough;
+  auto ranges = retiredRanges;
+  std::vector<uint64_t> retired;
   for (auto current = retained.begin(); current != retained.end() &&
        (count >= MaxRecentCompleted || bytes > MaxRecentBytes);) {
     if (!current->sequenced) {
@@ -773,25 +845,115 @@ void QuestJobState::RetireForAdmission()
     }
     bytes -= SaveJob(*current).dump().size();
     --count;
-    frontier = current->id;
+    retired.push_back(current->id);
+    ranges.push_back({ current->id, current->id });
     current = retained.erase(current);
   }
+  std::sort(ranges.begin(), ranges.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
+  std::vector<RetiredRange> merged;
+  for (const auto& range : ranges) {
+    if (!merged.empty() && range.first <= merged.back().last + 1)
+      merged.back().last = std::max(merged.back().last, range.last);
+    else
+      merged.push_back(range);
+  }
+  // A legacy completion can bridge retired intervals, but the prefix may
+  // end only at an actually retired numbered ID, never at a legacy receipt.
+  std::vector<RetiredRange> terminal = merged;
+  for (const auto& job : retained)
+    if (!job.sequenced && job.id > retiredThrough)
+      terminal.push_back({ job.id, job.id });
+  std::sort(terminal.begin(), terminal.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
+  auto frontier = retiredThrough;
+  auto expected = retiredThrough + 1;
+  for (const auto& interval : terminal) {
+    if (interval.first != expected)
+      break;
+    expected = interval.last + 1;
+    // Retained legacy IDs were excluded from every sparse range by Read.
+    const auto legacy = std::lower_bound(
+      retained.begin(), retained.end(), interval.last,
+      [](const Job& job, uint64_t id) { return job.id < id; });
+    if (legacy == retained.end() || legacy->id != interval.last)
+      frontier = interval.last;
+  }
+  merged.erase(std::remove_if(merged.begin(), merged.end(),
+                              [frontier](const auto& range) {
+                                return range.last <= frontier;
+                              }),
+               merged.end());
   completed.swap(retained);
+  retiredRanges.swap(merged);
   retiredThrough = frontier;
+  return retired;
+}
+
+QuestJobState::Job* QuestJobState::FindLive(uint64_t id)
+{
+  const auto found = live.find(id);
+  return found == live.end() ? nullptr : &found->second;
+}
+
+const QuestJobState::Job* QuestJobState::FindLive(uint64_t id) const
+{
+  const auto found = live.find(id);
+  return found == live.end() ? nullptr : &found->second;
+}
+
+const QuestJobState::Job* QuestJobState::FindCompleted(uint64_t id) const
+{
+  const auto found = std::lower_bound(
+    completed.begin(), completed.end(), id,
+    [](const Job& job, uint64_t value) { return job.id < value; });
+  return found == completed.end() || found->id != id ? nullptr : &*found;
+}
+
+bool QuestJobState::HasLive() const
+{
+  return !live.empty();
+}
+
+bool QuestJobState::IsRetired(uint64_t id) const
+{
+  if (!id || id >= nextJob || FindLive(id))
+    return false;
+  if (const auto* completed = FindCompleted(id); completed)
+    return false;
+  if (id <= retiredThrough)
+    return true;
+  const auto found =
+    std::lower_bound(retiredRanges.begin(), retiredRanges.end(), id,
+                     [](const RetiredRange& range, uint64_t value) {
+                       return range.last < value;
+                     });
+  return found != retiredRanges.end() && found->first <= id;
 }
 
 nlohmann::json QuestJobState::Save() const
 {
-  if (completed.size() > MaxCompleted + MaxRecentCompleted)
-    throw std::runtime_error("Quest job history limit exceeded");
+  if (completed.size() > MaxCompleted + MaxRecentCompleted ||
+      live.size() > MaxLive || retiredRanges.size() > MaxRetiredRanges)
+    throw std::runtime_error("Quest job collection limit exceeded");
   auto history = Json::array();
   for (const auto& job : completed)
     history.push_back(SaveJob(job));
-  Json result = { { "schemaVersion", 5 },
+  auto current = Json::array();
+  for (const auto& [id, job] : live) {
+    if (id != job.id)
+      throw std::runtime_error("Live quest job map identity mismatch");
+    current.push_back(SaveJob(job));
+  }
+  auto ranges = Json::array();
+  for (const auto& range : retiredRanges)
+    ranges.push_back({ { "first", range.first }, { "last", range.last } });
+  Json result = { { "schemaVersion", 6 },
                   { "generation", generation },
                   { "nextJob", nextJob },
                   { "retiredThrough", retiredThrough },
-                  { "active", active ? SaveJob(*active) : Json(nullptr) },
+                  { "retiredRanges", std::move(ranges) },
+                  { "live", std::move(current) },
                   { "completed", std::move(history) } };
   Read(
     result); // Typed candidates must satisfy the same invariants as storage.
@@ -813,22 +975,22 @@ void QuestJobState::ValidateHeap(const nlohmann::json& heap) const
   const auto& continuations = normalized.at("continuations");
   // Before the runner has ever allocated a job, preserve schema-1 journals'
   // standalone VM fixtures. Once used, the runner owns every saved stack.
-  if (generation == 1 && nextJob == 1 && retiredThrough == 0 && !active &&
-      completed.empty())
+  if (generation == 1 && nextJob == 1 && retiredThrough == 0 && live.empty() &&
+      retiredRanges.empty() && completed.empty())
     return;
-  std::vector<const Stage*> waiting;
-  if (active) {
-    if (active->cursor == "waiting")
-      waiting.push_back(&*active);
-    if (active->handler && active->handler->cursor == "waiting")
-      waiting.push_back(&*active->handler);
-    for (const auto& child : active->children)
+  std::vector<std::pair<const Job*, const Stage*>> waiting;
+  for (const auto& [id, job] : live) {
+    if (job.cursor == "waiting")
+      waiting.emplace_back(&job, &job);
+    if (job.handler && job.handler->cursor == "waiting")
+      waiting.emplace_back(&job, &*job.handler);
+    for (const auto& child : job.children)
       if (child.cursor == "waiting")
-        waiting.push_back(&child);
+        waiting.emplace_back(&job, &child);
   }
   if (continuations.size() != waiting.size())
     throw std::runtime_error("Missing or orphan quest job continuation");
-  for (const auto* stage : waiting) {
+  for (const auto& [job, stage] : waiting) {
     if (!continuations.contains(stage->token))
       throw std::runtime_error("Missing quest stage continuation");
     const auto& continuation = continuations.at(stage->token);
@@ -844,10 +1006,9 @@ void QuestJobState::ValidateHeap(const nlohmann::json& heap) const
       handler ? handler->implementation : stage->script;
     const auto& state = handler ? handler->state : std::string{};
     const auto& function = handler ? handler->function : stage->function;
-    if (continuation.at("scope") != active->Scope(*stage) || !instructions ||
-        instructions > active->instructions ||
-        (stage == &active->Current() &&
-         instructions != active->instructions) ||
+    if (continuation.at("scope") != job->Scope(*stage) || !instructions ||
+        instructions > job->instructions ||
+        (stage == &job->Current() && instructions != job->instructions) ||
         !SameScriptName(continuation.at("resultType"),
                         stage->awaitKind == "timer" ? "None" : "Bool") ||
         outer.at("kind") != "method" ||

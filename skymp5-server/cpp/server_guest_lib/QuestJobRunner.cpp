@@ -34,8 +34,9 @@ QuestJobRunner::Request RequestFor(const QuestJobState::Job& job)
 const QuestJobState::Job* Find(const QuestJobState& state,
                                const QuestJobRunner::Request& command)
 {
-  if (state.active && Matches(*state.active, command))
-    return &*state.active;
+  for (const auto& [id, job] : state.live)
+    if (Matches(job, command))
+      return &job;
   for (const auto& job : state.completed)
     if (Matches(job, command))
       return &job;
@@ -142,7 +143,9 @@ void QuestJobRunner::RequireRequest(MpActor& actor, const Request& request,
     const auto legacyId = [&](const QuestJobState::Job& job) {
       return !job.sequenced && job.id == id->sequence;
     };
-    if ((jobs.active && legacyId(*jobs.active)) ||
+    if (std::any_of(
+          jobs.live.begin(), jobs.live.end(),
+          [&](const auto& entry) { return legacyId(entry.second); }) ||
         std::any_of(jobs.completed.begin(), jobs.completed.end(), legacyId))
       throw std::runtime_error("Numbered request identifies a legacy command");
   }
@@ -152,7 +155,7 @@ std::optional<QuestJobRunner::Result> QuestJobRunner::Retired(
   MpActor& actor, const Request& request, const QuestJobState& jobs)
 {
   RequireRequest(actor, request, jobs);
-  if (!request.sequence || request.sequence->sequence > jobs.retiredThrough)
+  if (!request.sequence || !jobs.IsRetired(request.sequence->sequence))
     return std::nullopt;
   const auto id = request.sequence->sequence;
   const auto& owner = QuestJournal::Owner(actor);
@@ -165,7 +168,9 @@ std::optional<QuestJobRunner::Result> QuestJobRunner::Retired(
     // retirement before its receipt can be published.
     if (barrier.busy)
       return Result{ Status::Pending, id };
-    if (id > barrier.retiredFrom && id <= barrier.retiredThrough &&
+    if (barrier.retirementGeneration == jobs.generation &&
+        std::find(barrier.retiredIds.begin(), barrier.retiredIds.end(), id) !=
+          barrier.retiredIds.end() &&
         barrier.retirementReceipt) {
       const auto state = barrier.retirementReceipt->GetState();
       if (state == SaveReceipt::State::Pending)
@@ -214,9 +219,14 @@ QuestJobTime QuestJobRunner::Now()
 void QuestJobRunner::SetClock(QuestJobClock replacement)
 {
   if (!replacement || stopped || pumping ||
-      std::any_of(barriers.begin(), barriers.end(), [](const auto& entry) {
-        return entry.second.busy || entry.second.timer.has_value();
-      }))
+      std::any_of(barriers.begin(), barriers.end(),
+                  [](const auto& entry) { return entry.second.busy; }) ||
+      std::any_of(
+        scheduled.begin(), scheduled.end(), [](const auto& campaign) {
+          return std::any_of(
+            campaign.second.jobs.begin(), campaign.second.jobs.end(),
+            [](const auto& entry) { return entry.second.timer.has_value(); });
+        }))
     throw std::runtime_error("Cannot replace an armed quest clock");
   clock = std::move(replacement);
   lastSteadyMs.reset();
@@ -236,36 +246,48 @@ void QuestJobRunner::SetSchedulerFixtureContent(
 
 void QuestJobRunner::Track(MpActor& owner, const QuestJobState::Job& job)
 {
-  if (!job.automatic || stopped)
+  if (stopped)
     return;
   if (job.owner != owner.GetChangeForm().formDesc.ToString())
     throw std::runtime_error(
       "Quest scheduling owner does not match saved work");
-  if (!scheduled.contains(owner.GetFormId()) && scheduled.size() >= 4096)
-    throw std::runtime_error("Quest scheduler campaign limit exceeded");
-  const auto found = scheduled.find(owner.GetFormId());
-  if (found != scheduled.end() && found->second.job == job.id &&
-      found->second.generation == job.generation &&
+  const auto ownerId = owner.GetFormId();
+  auto campaign = scheduled.find(ownerId);
+  if (campaign == scheduled.end()) {
+    if (scheduled.size() >= 4096)
+      throw std::runtime_error("Quest scheduler campaign limit exceeded");
+    CampaignWork work;
+    work.owner = world.LookupFormByIdNoLoad(ownerId);
+    campaign = scheduled.emplace(ownerId, std::move(work)).first;
+  }
+  if (campaign->second.owner.lock().get() != &owner)
+    throw std::runtime_error("Quest scheduling owner was replaced");
+  auto& entries = campaign->second.jobs;
+  const auto found = entries.find(job.id);
+  if (found != entries.end() && found->second.generation == job.generation &&
       found->second.sequenced == job.sequenced &&
       found->second.command == job.command &&
       found->second.instance == job.instance &&
       found->second.contentMode == job.contentMode &&
+      found->second.automatic == job.automatic &&
       found->second.actor ==
-        FormDesc::FromString(job.actor).ToFormId(world.espmFiles) &&
-      found->second.owner.lock().get() == &owner)
+        FormDesc::FromString(job.actor).ToFormId(world.espmFiles))
     return;
+  if (found == entries.end() && entries.size() >= QuestJobState::MaxLive)
+    throw std::runtime_error("Quest scheduler live-job limit exceeded");
   Scheduled entry;
   entry.job = job.id;
   entry.generation = job.generation;
   entry.sequenced = job.sequenced;
+  entry.automatic = job.automatic;
   entry.actor = FormDesc::FromString(job.actor).ToFormId(world.espmFiles);
   entry.command = job.command;
   entry.instance = job.instance;
   entry.contentMode = job.contentMode;
   entry.waitingExternal =
     job.Current().cursor == "waiting" && job.Current().awaitKind == "bool";
-  entry.owner = world.LookupFormByIdNoLoad(owner.GetFormId());
-  scheduled.insert_or_assign(owner.GetFormId(), std::move(entry));
+  entry.owner = world.LookupFormByIdNoLoad(ownerId);
+  entries.insert_or_assign(job.id, std::move(entry));
 }
 
 void QuestJobRunner::OnActorLoaded(MpActor& actor) noexcept
@@ -274,8 +296,8 @@ void QuestJobRunner::OnActorLoaded(MpActor& actor) noexcept
     return;
   try {
     const auto jobs = QuestJournal::PersonalJobState(actor);
-    if (jobs.active)
-      Track(actor, *jobs.active);
+    for (const auto& [id, job] : jobs.live)
+      Track(actor, job);
   } catch (const std::exception& error) {
     spdlog::error("Quest job recovery refused owner {:x}: {}",
                   actor.GetFormId(), error.what());
@@ -290,32 +312,32 @@ bool QuestJobRunner::TimerReady(MpActor& actor, const QuestJobState::Job& job)
   if (work.awaitKind != "timer" || !work.timer)
     throw std::runtime_error("Quest timer has no saved request");
   auto& owner = QuestJournal::Owner(actor);
-  if (!barriers.contains(owner.GetFormId()) && barriers.size() >= 4096)
-    throw std::runtime_error("Quest coordinator campaign limit exceeded");
-  auto& barrier = barriers[owner.GetFormId()];
-  if (!barrier.job) {
-    barrier.job = job.id;
-    barrier.owner = world.LookupFormByIdNoLoad(owner.GetFormId());
-  }
+  const auto ownerId = owner.GetFormId();
+  Track(owner, job);
   const auto time = Now();
   if (stopped)
     throw std::runtime_error(
       "Quest coordinator was cleared while reading its clock");
-  if (!barrier.timer || barrier.timer->token != work.token ||
-      barrier.job != job.id) {
-    // On recovery only: trust persisted UTC to credit downtime, then switch
-    // permanently to this process's monotonic clock for the live countdown.
+  RequireContext(actor, job);
+  // Clock callbacks may clear or advance work. Reacquire scheduler entries
+  // and validate the saved token before installing a recovery anchor.
+  const auto latest = QuestJournal::JobState(actor);
+  const auto* live = latest.FindLive(job.id);
+  if (!live || live->generation != job.generation ||
+      live->Current().token != work.token)
+    throw std::runtime_error("Quest timer changed while reading its clock");
+  auto& entry = scheduled.at(ownerId).jobs.at(job.id);
+  if (entry.generation != job.generation || entry.owner.lock().get() != &owner)
+    throw std::runtime_error("Quest timer identity changed");
+  if (!entry.timer || entry.timer->token != work.token) {
     const auto remaining = work.timer->dueUnixMs > time.unixMs
       ? std::min(work.timer->dueUnixMs - time.unixMs, work.timer->durationMs)
       : 0;
     if (remaining > std::numeric_limits<uint64_t>::max() - time.steadyMs)
       throw std::runtime_error("Quest steady deadline overflow");
-    barrier.timer =
-      QuestJobTimerAnchor{ work.token, time.steadyMs + remaining };
-    barrier.job = job.id;
-    barrier.owner = world.LookupFormByIdNoLoad(owner.GetFormId());
+    entry.timer = QuestJobTimerAnchor{ work.token, time.steadyMs + remaining };
   }
-  return time.steadyMs >= barrier.timer->dueSteadyMs;
+  return time.steadyMs >= entry.timer->dueSteadyMs;
 }
 
 void QuestJobRunner::Retry(MpActor& actor, const Request& command)
@@ -324,21 +346,20 @@ void QuestJobRunner::Retry(MpActor& actor, const Request& command)
     const auto observed = Inspect(actor, command);
     if (observed.status == Status::Completed ||
         observed.status == Status::Retired)
-      return; // Terminal numbered work cannot be reopened or clear another
-              // job.
+      return;
   }
   RequireReady(actor);
   const auto jobs = QuestJournal::JobState(actor);
   RequireRequest(actor, command, jobs);
-  if (!jobs.active || !Matches(*jobs.active, command))
+  const auto* job = Find(jobs, command);
+  if (!job || !jobs.FindLive(job->id))
     throw std::runtime_error("No active quest job to retry");
-  RequireContext(actor, *jobs.active);
-  Track(QuestJournal::Owner(actor), *jobs.active);
-  const auto entry = scheduled.find(QuestJournal::Owner(actor).GetFormId());
-  if (entry != scheduled.end()) {
-    entry->second.error.clear();
-    entry->second.quarantined = false;
-  }
+  RequireContext(actor, *job);
+  auto& owner = QuestJournal::Owner(actor);
+  Track(owner, *job);
+  auto& entry = scheduled.at(owner.GetFormId()).jobs.at(job->id);
+  entry.error.clear();
+  entry.quarantined = false;
 }
 
 void QuestJobRunner::Pump() noexcept
@@ -347,8 +368,8 @@ void QuestJobRunner::Pump() noexcept
       scheduled.empty())
     return;
   BusyGuard guard(pumping);
-  // Bound both idle lookups and execution. Round robin advances even past a
-  // blocked campaign, and each campaign is considered once in this pass.
+  // One execution attempt per campaign per pass; round robin within a
+  // campaign prevents a polling root from starving another ready root.
   const auto candidates = std::min<size_t>(64, scheduled.size());
   std::array<uint32_t, 64> owners{};
   auto next = scheduled.upper_bound(lastPumpedOwner);
@@ -358,96 +379,121 @@ void QuestJobRunner::Pump() noexcept
     owners[index] = next->first;
     ++next;
   }
+  const auto blocked = [&](uint32_t ownerId) {
+    const auto barrier = barriers.find(ownerId);
+    return barrier != barriers.end() &&
+      (barrier->second.busy ||
+       (barrier->second.receipt &&
+        barrier->second.receipt->GetState() != SaveReceipt::State::Durable));
+  };
   size_t executed = 0;
   for (size_t index = 0; index < candidates && executed < 8 && !stopped;
        ++index) {
-    auto entry = scheduled.find(owners[index]);
-    if (entry == scheduled.end())
+    const auto ownerId = owners[index];
+    auto campaign = scheduled.find(ownerId);
+    if (campaign == scheduled.end())
       continue;
-    lastPumpedOwner = entry->first;
-    if (entry->second.quarantined)
+    lastPumpedOwner = ownerId;
+    if (blocked(ownerId))
       continue;
-    const auto ownerId = entry->first;
-    const auto jobId = entry->second.job;
-    const auto expectedOwner = entry->second.owner;
-    auto quarantine = [&](const char* reason) noexcept {
-      if (stopped)
-        return;
-      const auto current = scheduled.find(ownerId);
-      if (current == scheduled.end() || current->second.job != jobId ||
-          current->second.owner.lock().get() != expectedOwner.lock().get())
-        return;
-      current->second.quarantined = true;
-      try {
-        current->second.error = std::string(reason).substr(0, 1024);
-        spdlog::error("Quest job {} for owner {:x} quarantined: {}", jobId,
-                      ownerId, current->second.error);
-      } catch (...) {
-        // Keep the nonallocating quarantine bit even under allocation failure.
-      }
-    };
-    try {
-      // No references into scheduled survive a callback: clocks and host
-      // hooks may clear the world, which stops and erases this coordinator.
-      const auto work = entry->second;
-      if (work.waitingExternal ||
-          (work.contentMode == "fixture" && !schedulerFixture))
+    std::array<uint64_t, QuestJobState::MaxLive> ids{};
+    const auto count = std::min(ids.size(), campaign->second.jobs.size());
+    auto nextJob =
+      campaign->second.jobs.upper_bound(campaign->second.lastPumpedJob);
+    for (size_t i = 0; i < count; ++i) {
+      if (nextJob == campaign->second.jobs.end())
+        nextJob = campaign->second.jobs.begin();
+      ids[i] = nextJob->first;
+      ++nextJob;
+    }
+    for (size_t i = 0; i < count && !stopped; ++i) {
+      campaign = scheduled.find(ownerId);
+      if (campaign == scheduled.end())
+        break;
+      const auto entry = campaign->second.jobs.find(ids[i]);
+      if (entry == campaign->second.jobs.end())
         continue;
-      if (const auto barrier = barriers.find(ownerId);
-          barrier != barriers.end() && barrier->second.job == jobId) {
-        if (barrier->second.busy ||
-            (barrier->second.receipt &&
-             barrier->second.receipt->GetState() ==
-               SaveReceipt::State::Pending))
-          continue;
-        if (barrier->second.timer) {
-          const auto deadline = barrier->second.timer->dueSteadyMs;
+      campaign->second.lastPumpedJob = ids[i];
+      if (!entry->second.automatic || entry->second.quarantined ||
+          entry->second.waitingExternal ||
+          (entry->second.contentMode == "fixture" && !schedulerFixture))
+        continue;
+      const auto jobId = entry->first;
+      const auto generation = entry->second.generation;
+      const auto expectedOwner = entry->second.owner;
+      const auto quarantine = [&](const char* reason) noexcept {
+        if (stopped)
+          return;
+        const auto ownerWork = scheduled.find(ownerId);
+        if (ownerWork == scheduled.end())
+          return;
+        const auto current = ownerWork->second.jobs.find(jobId);
+        if (current == ownerWork->second.jobs.end() ||
+            current->second.generation != generation ||
+            current->second.owner.lock().get() != expectedOwner.lock().get())
+          return;
+        current->second.quarantined = true;
+        try {
+          current->second.error = std::string(reason).substr(0, 1024);
+          spdlog::error("Quest job {} for owner {:x} quarantined: {}", jobId,
+                        ownerId, current->second.error);
+        } catch (...) {
+        }
+      };
+      bool attempted = false;
+      try {
+        // No scheduler references survive a clock or host callback.
+        const auto work = entry->second;
+        if (work.timer) {
           const auto time = Now();
           if (stopped)
             return;
-          if (time.steadyMs < deadline)
+          if (time.steadyMs < work.timer->dueSteadyMs)
             continue;
         }
+        const auto ownerForm = world.LookupFormByIdNoLoad(ownerId);
+        const auto actorForm = world.LookupFormByIdNoLoad(work.actor);
+        auto* owner = ownerForm ? ownerForm->AsActor() : nullptr;
+        auto* actor = actorForm ? actorForm->AsActor() : nullptr;
+        if (!owner || !actor || owner->IsDeleted() || actor->IsDeleted())
+          continue;
+        if (work.owner.lock().get() != owner)
+          throw std::runtime_error("Scheduled quest owner was replaced");
+        if (actor->GetWorldInstance() != work.instance)
+          continue;
+        const auto jobs = QuestJournal::PersonalJobState(*owner);
+        const auto* job = jobs.FindLive(work.job);
+        if (!job || job->generation != work.generation ||
+            job->sequenced != work.sequenced || !job->automatic) {
+          scheduled.at(ownerId).jobs.erase(jobId);
+          continue;
+        }
+        try {
+          RequireContext(*actor, *job);
+        } catch (const std::exception&) {
+          continue;
+        }
+        const auto request = RequestFor(*job);
+        const auto observed = Inspect(*actor, request);
+        if (blocked(ownerId))
+          break;
+        if (observed.status != Status::Ready)
+          continue;
+        RequireReady(*actor);
+        ++executed;
+        attempted = true;
+        if (job->contentMode == "fixture")
+          Advance(*actor, request, schedulerFixture->metadata,
+                  schedulerFixture->scripts);
+        else
+          Advance(*actor, request);
+      } catch (const std::exception& error) {
+        quarantine(error.what());
+      } catch (...) {
+        quarantine("Unknown quest scheduler failure");
       }
-      const auto ownerForm = world.LookupFormByIdNoLoad(ownerId);
-      const auto actorForm = world.LookupFormByIdNoLoad(work.actor);
-      auto* owner = ownerForm ? ownerForm->AsActor() : nullptr;
-      auto* actor = actorForm ? actorForm->AsActor() : nullptr;
-      if (!owner || !actor || owner->IsDeleted() || actor->IsDeleted())
-        continue;
-      if (work.owner.lock().get() != owner)
-        throw std::runtime_error("Scheduled quest owner was replaced");
-      if (actor->GetWorldInstance() != work.instance)
-        continue;
-      const auto jobs = QuestJournal::PersonalJobState(*owner);
-      if (!jobs.active || jobs.active->id != work.job ||
-          jobs.active->generation != work.generation ||
-          jobs.active->sequenced != work.sequenced ||
-          !jobs.active->automatic) {
-        scheduled.erase(ownerId);
-        continue;
-      }
-      if (jobs.active->contentMode == "fixture" && !schedulerFixture)
-        continue;
-      try {
-        RequireContext(*actor, *jobs.active);
-      } catch (const std::exception&) {
-        continue; // The initiating actor must return to the original context.
-      }
-      const auto request = RequestFor(*jobs.active);
-      const auto observed = Inspect(*actor, request);
-      if (observed.status != Status::Ready)
-        continue;
-      ++executed;
-      if (jobs.active->contentMode == "fixture")
-        Advance(*actor, request, schedulerFixture->metadata,
-                schedulerFixture->scripts);
-      else
-        Advance(*actor, request);
-    } catch (const std::exception& error) {
-      quarantine(error.what());
-    } catch (...) {
-      quarantine("Unknown quest scheduler failure");
+      if (attempted || blocked(ownerId))
+        break;
     }
   }
 }
@@ -530,29 +576,34 @@ QuestJobRunner::Result QuestJobRunner::Inspect(MpActor& actor,
     const auto& barrier = found->second;
     if (barrier.owner.lock().get() != &owner)
       throw std::runtime_error("Quest job owner was replaced");
-    if (barrier.job == job->id &&
+    if (barrier.job == job->id && barrier.generation == job->generation &&
         (barrier.busy ||
          (barrier.receipt &&
           barrier.receipt->GetState() == SaveReceipt::State::Pending)))
       return { Status::Pending, job->id };
-    if (barrier.job == job->id && barrier.receipt &&
+    if (barrier.job == job->id && barrier.generation == job->generation &&
+        barrier.receipt &&
         barrier.receipt->GetState() == SaveReceipt::State::Abandoned)
       return {
         Status::Failed, job->id, false, {}, {}, "Quest save was abandoned"
       };
   }
   const auto& current = job->Current();
-  if (const auto scheduledJob = scheduled.find(owner.GetFormId());
-      scheduledJob != scheduled.end() && scheduledJob->second.job == job->id &&
-      scheduledJob->second.quarantined)
-    return { Status::Failed,
-             job->id,
-             false,
-             {},
-             {},
-             scheduledJob->second.error.empty()
-               ? "Quest scheduler quarantined this job"
-               : scheduledJob->second.error };
+  if (const auto campaign = scheduled.find(owner.GetFormId());
+      campaign != scheduled.end()) {
+    const auto scheduledJob = campaign->second.jobs.find(job->id);
+    if (scheduledJob != campaign->second.jobs.end() &&
+        scheduledJob->second.generation == job->generation &&
+        scheduledJob->second.quarantined)
+      return { Status::Failed,
+               job->id,
+               false,
+               {},
+               {},
+               scheduledJob->second.error.empty()
+                 ? "Quest scheduler quarantined this job"
+                 : scheduledJob->second.error };
+  }
   if (!current.failure.empty())
     return { Status::Failed, job->id, false, {}, {}, current.failure };
   if (job->IsComplete())
@@ -638,8 +689,10 @@ QuestJobRunner::Result QuestJobRunner::SubmitWithContent(
   RequireReady(actor);
   const auto legacyCount =
     std::count_if(jobs.completed.begin(), jobs.completed.end(),
-                  [](const auto& job) { return !job.sequenced; });
-  if (jobs.active ||
+                  [](const auto& job) { return !job.sequenced; }) +
+    std::count_if(jobs.live.begin(), jobs.live.end(),
+                  [](const auto& entry) { return !entry.second.sequenced; });
+  if (jobs.live.size() >= QuestJobState::MaxLive ||
       (!command.sequence && legacyCount >= QuestJobState::MaxCompleted) ||
       jobs.nextJob >= MaxIdentity)
     throw std::runtime_error(
@@ -647,9 +700,14 @@ QuestJobRunner::Result QuestJobRunner::SubmitWithContent(
   if (command.sequence && command.sequence->sequence != jobs.nextJob)
     throw std::runtime_error(
       "Quest request is not the next admission identity");
-  const auto previousFrontier = jobs.retiredThrough;
-  if (command.sequence)
-    jobs.RetireForAdmission();
+  const auto environment = QuestJobContent::Environment(world, hashManifest);
+  for (const auto& [id, live] : jobs.live)
+    if (live.environmentHash.empty() || live.environmentHash != environment ||
+        live.contentMode != (fixtureAwait ? "fixture" : "owned"))
+      throw std::runtime_error(
+        "Concurrent quest jobs require one pinned environment");
+  auto retiredIds =
+    command.sequence ? jobs.RetireForAdmission() : std::vector<uint64_t>{};
   QuestJournal::RequireAdapter(actor, quest);
   QuestJobState::Job job;
   job.id = jobs.nextJob++;
@@ -658,6 +716,7 @@ QuestJobRunner::Result QuestJobRunner::SubmitWithContent(
   job.sequenced = command.sequence.has_value();
   job.automatic = automatic;
   job.contentMode = fixtureAwait ? "fixture" : "owned";
+  job.environmentHash = environment;
   job.actor =
     FormDesc::FromFormId(actor.GetFormId(), world.espmFiles).ToString();
   job.owner =
@@ -667,18 +726,21 @@ QuestJobRunner::Result QuestJobRunner::SubmitWithContent(
   job.contentHash = hash;
   job.stage = stage;
   RequireContext(actor, job);
-  jobs.active = std::move(job);
+  const auto jobId = job.id;
+  jobs.live.emplace(jobId, std::move(job));
   jobs.Save();
-  return RunSegment(actor, std::move(jobs), sources, overrides, hashManifest,
-                    {}, fixtureAwait, true, false,
-                    command.sequence ? std::optional(previousFrontier)
-                                     : std::nullopt);
+  return RunSegment(actor, std::move(jobs), jobId, sources, overrides,
+                    hashManifest, {}, fixtureAwait, true, false,
+                    std::move(retiredIds));
 }
 
 void QuestJobRunner::ValidateContent(const QuestJobState::Job& job,
                                      const MetadataOverrides& overrides,
                                      const std::string& hashManifest) const
 {
+  if (!job.environmentHash.empty() &&
+      job.environmentHash != QuestJobContent::Environment(world, hashManifest))
+    throw std::runtime_error("Quest shared environment changed");
   const auto check = [&](const QuestJobState::Stage& work) {
     const auto quest =
       FormDesc::FromString(work.quest).ToFormId(world.espmFiles);
@@ -755,14 +817,16 @@ QuestJobRunner::Result QuestJobRunner::ResumeWithContent(
     return Inspect(actor, command);
   }
   RequireReady(actor);
-  if (!jobs.active || !Matches(*jobs.active, command))
+  const auto* live = jobs.FindLive(prior->id);
+  if (!live)
     throw std::runtime_error("Quest completion does not match active work");
-  const auto& current = jobs.active->Current();
+  const auto& current = live->Current();
   if (current.cursor != "waiting" || current.awaitKind != "bool" ||
       current.child || current.token != token || !current.failure.empty())
     throw std::runtime_error("Quest completion does not match external work");
-  return RunSegment(actor, std::move(jobs), sources, overrides, hashManifest,
-                    completion, fixtureAwait, false);
+  const auto jobId = prior->id;
+  return RunSegment(actor, std::move(jobs), jobId, sources, overrides,
+                    hashManifest, completion, fixtureAwait, false);
 }
 
 QuestJobRunner::Result QuestJobRunner::Advance(MpActor& actor,
@@ -804,44 +868,55 @@ QuestJobRunner::Result QuestJobRunner::AdvanceWithContent(
   if (observed.status != Status::Ready)
     return observed;
   RequireReady(actor);
-  const auto& current = jobs.active->Current();
+  // Inspect may call an injected clock. Resume from fresh committed state.
+  jobs = QuestJournal::JobState(actor);
+  prior = Find(jobs, command);
+  if (!prior || !jobs.FindLive(prior->id))
+    throw std::runtime_error("Quest work changed during inspection");
+  RequireContext(actor, *prior);
+  RequireMode(*prior, fixtureAwait);
+  ValidateContent(*prior, overrides, hashManifest);
+  const auto* live = jobs.FindLive(prior->id);
+  const auto& current = live->Current();
   const bool consumeChild = current.node && current.cursor == "done";
   const bool timer =
     current.cursor == "waiting" && current.awaitKind == "timer";
-  const bool hostWork = jobs.active->cursor == "done" &&
-    jobs.active->children.empty() && current.cursor == "done";
+  const bool hostWork = live->cursor == "done" && live->children.empty() &&
+    current.cursor == "done";
   if (current.cursor != "begin" && !consumeChild && !timer && !hostWork)
     throw std::runtime_error("Quest job has no internal work ready");
-  return RunSegment(actor, std::move(jobs), sources, overrides, hashManifest,
-                    timer ? std::optional(QuestJobState::Completion::None())
-                          : std::nullopt,
-                    fixtureAwait, false, consumeChild);
+  const auto jobId = prior->id;
+  return RunSegment(
+    actor, std::move(jobs), jobId, sources, overrides, hashManifest,
+    timer ? std::optional(QuestJobState::Completion::None()) : std::nullopt,
+    fixtureAwait, false, consumeChild);
 }
 
 QuestJobRunner::Result QuestJobRunner::RunSegment(
-  MpActor& actor, QuestJobState jobs,
+  MpActor& actor, QuestJobState jobs, uint64_t jobId,
   const std::vector<PexScript::Lazy>& sources,
   const MetadataOverrides& overrides, const std::string& hashManifest,
   std::optional<QuestJobState::Completion> completion, bool fixtureAwait,
-  bool submit, bool consumeChild, std::optional<uint64_t> retirementFrom)
+  bool submit, bool consumeChild, std::vector<uint64_t> retiredIds)
 {
   auto& owner = QuestJournal::Owner(actor);
-  auto& job = *jobs.active;
+  auto& job = jobs.live.at(jobId);
   const auto ownerId = owner.GetFormId();
   const auto command = RequestFor(job);
-  const auto retiredThrough = jobs.retiredThrough;
-  Track(owner, job);
-  // Preallocate the barrier before committing effects. Publishing its exact
-  // receipt must not allocate or throw after AtomicJob has committed.
-  if (!barriers.contains(owner.GetFormId()) && barriers.size() >= 4096)
+  if (!barriers.contains(ownerId) && barriers.size() >= 4096)
     throw std::runtime_error("Quest coordinator campaign limit exceeded");
-  auto& barrier = barriers[owner.GetFormId()];
+  Barrier initialBarrier;
+  initialBarrier.owner = world.LookupFormByIdNoLoad(ownerId);
+  auto& barrier =
+    barriers.try_emplace(ownerId, std::move(initialBarrier)).first->second;
+  Track(owner, job);
   barrier.job = job.id;
-  barrier.owner = world.LookupFormByIdNoLoad(owner.GetFormId());
-  {
+  barrier.generation = job.generation;
+  barrier.owner = world.LookupFormByIdNoLoad(ownerId);
+  try {
     BusyGuard guard(barrier.busy);
     std::optional<QuestJobTimerAnchor> timerAnchor;
-    const auto receipt = QuestJournal::AtomicJob(actor, job.id, [&] {
+    const auto receipt = QuestJournal::AtomicJob(actor, jobId, [&] {
       const auto requireAdapter = [&](const QuestJobState::Stage& stage) {
         QuestJournal::RequireAdapter(
           actor, FormDesc::FromString(stage.quest).ToFormId(world.espmFiles));
@@ -870,25 +945,42 @@ QuestJobRunner::Result QuestJobRunner::RunSegment(
         &timerAnchor);
       ++job.segment;
       if (job.IsComplete()) {
-        jobs.completed.push_back(job);
-        jobs.active.reset();
+        const auto where = std::lower_bound(
+          jobs.completed.begin(), jobs.completed.end(), job.id,
+          [](const auto& retained, uint64_t id) { return retained.id < id; });
+        jobs.completed.insert(where, job);
+        jobs.live.erase(jobId);
       }
       QuestJournal::SetJobState(actor, jobs);
     });
-    barrier.timer = std::move(timerAnchor);
+    // All post-commit publication below is nonallocating.
     barrier.receipt = receipt;
-    if (retirementFrom && retiredThrough > *retirementFrom) {
-      barrier.retiredFrom = *retirementFrom;
-      barrier.retiredThrough = retiredThrough;
+    if (!retiredIds.empty()) {
+      barrier.retiredIds = std::move(retiredIds);
+      barrier.retirementGeneration = jobs.generation;
       barrier.retirementReceipt = receipt;
     }
-    const auto scheduledJob = scheduled.find(ownerId);
-    if (scheduledJob != scheduled.end() &&
-        scheduledJob->second.command == command.command &&
-        scheduledJob->second.sequenced == command.sequence.has_value())
-      scheduledJob->second.waitingExternal = jobs.active &&
-        jobs.active->Current().cursor == "waiting" &&
-        jobs.active->Current().awaitKind == "bool";
+    const auto campaign = scheduled.find(ownerId);
+    if (campaign != scheduled.end()) {
+      const auto entry = campaign->second.jobs.find(jobId);
+      if (entry != campaign->second.jobs.end()) {
+        if (const auto* live = jobs.FindLive(jobId)) {
+          entry->second.timer = std::move(timerAnchor);
+          entry->second.waitingExternal =
+            live->Current().cursor == "waiting" &&
+            live->Current().awaitKind == "bool";
+        } else
+          campaign->second.jobs.erase(entry);
+      }
+    }
+  } catch (...) {
+    // An admission that rolled back must not consume a live scheduler slot.
+    if (submit) {
+      const auto campaign = scheduled.find(ownerId);
+      if (campaign != scheduled.end())
+        campaign->second.jobs.erase(jobId);
+    }
+    throw;
   }
   return Inspect(actor, command);
 }

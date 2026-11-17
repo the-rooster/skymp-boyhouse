@@ -98,12 +98,12 @@ private:
   void OnActorLoaded(MpActor& actor) noexcept;
   struct Barrier
   {
-    uint64_t job = 0;
+    uint64_t job = 0, generation = 0;
     std::weak_ptr<MpForm> owner;
     std::shared_ptr<const SaveReceipt> receipt;
     bool busy = false;
-    std::optional<QuestJobTimerAnchor> timer;
-    uint64_t retiredFrom = 0, retiredThrough = 0;
+    std::vector<uint64_t> retiredIds;
+    uint64_t retirementGeneration = 0;
     std::shared_ptr<const SaveReceipt> retirementReceipt;
   };
   struct Scheduled
@@ -113,6 +113,14 @@ private:
     uint32_t actor = 0;
     std::string command, error, instance, contentMode;
     bool waitingExternal = false, quarantined = false, sequenced = false;
+    bool automatic = false;
+    std::optional<QuestJobTimerAnchor> timer;
+    std::weak_ptr<MpForm> owner;
+  };
+  struct CampaignWork
+  {
+    std::map<uint64_t, Scheduled> jobs;
+    uint64_t lastPumpedJob = 0;
     std::weak_ptr<MpForm> owner;
   };
   struct FixtureContent
@@ -144,12 +152,12 @@ private:
                             bool fixtureAwait);
   void ValidateContent(const QuestJobState::Job&, const MetadataOverrides&,
                        const std::string&) const;
-  Result RunSegment(MpActor&, QuestJobState,
+  Result RunSegment(MpActor&, QuestJobState, uint64_t jobId,
                     const std::vector<PexScript::Lazy>&,
                     const MetadataOverrides&, const std::string&,
                     std::optional<QuestJobState::Completion>,
                     bool fixtureAwait, bool submit, bool consumeChild = false,
-                    std::optional<uint64_t> retirementFrom = std::nullopt);
+                    std::vector<uint64_t> retiredIds = {});
   WorldState& world;
   bool stopped = false;
   bool pumping = false;
@@ -157,7 +165,7 @@ private:
   QuestJobClock clock;
   std::optional<uint64_t> lastSteadyMs;
   std::optional<FixtureContent> schedulerFixture;
-  std::map<uint32_t, Scheduled> scheduled;
+  std::map<uint32_t, CampaignWork> scheduled;
   std::map<uint32_t, Barrier> barriers;
   std::vector<PexScript::Lazy> scripts;
   std::string manifest;

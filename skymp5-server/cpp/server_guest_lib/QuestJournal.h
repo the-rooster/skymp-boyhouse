@@ -46,6 +46,9 @@ public:
   static QuestJobState JobState(MpActor& actor);
   static QuestJobState PersonalJobState(MpActor& owner);
   static void SetJobState(MpActor& actor, const QuestJobState& state);
+  // A saved live root is not itself an execution lease. Runtime entry must
+  // match the selected job of the current campaign transaction.
+  static void RequireJobExecution(MpActor& actor, uint64_t jobId);
   // Only quest/journal mutation is leased; ordinary physical gameplay is not.
   static void RequireJobAccess(MpActor& actor);
   // Personal allocation/recovery must not borrow the visited host's lease.

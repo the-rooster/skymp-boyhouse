@@ -2,6 +2,7 @@
 #include "QuestJournal.h"
 #include "TestUtils.hpp"
 #include "save_storages/ISaveStorage.h"
+#include <algorithm>
 #include <catch2/catch_all.hpp>
 #include <functional>
 
@@ -10,6 +11,16 @@ extern espm::Loader& GetEspmLoader();
 namespace {
 using Json = nlohmann::json;
 constexpr uint32_t kJobQuest = 0x4e50d;
+
+QuestJobState::Job* Single(QuestJobState& state)
+{
+  return state.live.empty() ? nullptr : &state.live.begin()->second;
+}
+
+const QuestJobState::Job* Single(const QuestJobState& state)
+{
+  return state.live.empty() ? nullptr : &state.live.begin()->second;
+}
 
 QuestJobState Begin()
 {
@@ -21,7 +32,7 @@ QuestJobState Begin()
   job.quest = "4e50d:Skyrim.esm";
   job.contentHash = std::string(64, 'a');
   job.stage = 10;
-  state.active = job;
+  state.live.emplace(job.id, job);
   state.nextJob = 2;
   return state;
 }
@@ -29,7 +40,7 @@ QuestJobState Begin()
 QuestJobState Waiting()
 {
   auto state = Begin();
-  auto& job = *state.active;
+  auto& job = *Single(state);
   job.cursor = "waiting";
   job.accepted = true;
   job.segment = 1;
@@ -47,7 +58,7 @@ QuestJobState Waiting()
 
 QuestJobState Done(QuestJobState state)
 {
-  auto job = *state.active;
+  auto job = *Single(state);
   if (!job.token.empty())
     job.completions[job.token] = job.awaitKind == "timer"
       ? QuestJobState::Completion::None()
@@ -62,7 +73,7 @@ QuestJobState Done(QuestJobState state)
   job.timer.reset();
   job.failure.clear();
   job.eventHead = static_cast<uint32_t>(job.events.size());
-  state.active.reset();
+  state.live.clear();
   state.completed.push_back(job);
   return state;
 }
@@ -106,7 +117,7 @@ Json Heap(const QuestJobState::Job& job,
 QuestJobState Nested(bool waitingChild = false)
 {
   auto state = Waiting();
-  auto& job = *state.active;
+  auto& job = *Single(state);
   job.child = 1;
   job.awaitKey = "quest-stage";
   job.awaitKind = "stage";
@@ -168,9 +179,16 @@ Json Legacy(const QuestJobState& state, uint64_t version = 1)
 {
   auto saved = state.Save();
   saved["schemaVersion"] = version;
-  saved.erase("retiredThrough");
+  REQUIRE(saved["live"].size() <= 1);
+  saved["active"] = saved["live"].empty() ? Json(nullptr) : saved["live"][0];
+  saved.erase("live");
+  saved.erase("retiredRanges");
+  if (version < 5)
+    saved.erase("retiredThrough");
   auto strip = [version](Json& job) {
-    job.erase("sequenced");
+    job.erase("environmentHash");
+    if (version < 5)
+      job.erase("sequenced");
     if (version < 4) {
       for (const char* field : { "handlerIdentity", "eventHead", "nextHandler",
                                  "dispatch", "handler" })
@@ -206,14 +224,19 @@ Json Legacy(const QuestJobState& state, uint64_t version = 1)
 
 QuestJobState MigratedLegacy(QuestJobState state, uint64_t version = 1)
 {
-  state.retiredThrough = 0;
-  if (state.active) {
-    state.active->sequenced = false;
+  if (version < 5)
+    state.retiredThrough = 0;
+  for (auto& [id, job] : state.live) {
+    job.environmentHash.clear();
+    if (version < 5)
+      job.sequenced = false;
     if (version < 3)
-      state.active->contentMode = "legacy";
+      job.contentMode = "legacy";
   }
   for (auto& job : state.completed) {
-    job.sequenced = false;
+    job.environmentHash.clear();
+    if (version < 5)
+      job.sequenced = false;
     if (version < 3)
       job.contentMode = "legacy";
     if (version < 4) {
@@ -227,9 +250,9 @@ QuestJobState MigratedLegacy(QuestJobState state, uint64_t version = 1)
 QuestJobState TimerWaiting()
 {
   auto state = Waiting();
-  state.active->awaitKind = "timer";
-  state.active->awaitKey = "Utility.Wait";
-  state.active->timer =
+  Single(state)->awaitKind = "timer";
+  Single(state)->awaitKey = "Utility.Wait";
+  Single(state)->timer =
     QuestJobState::Timer{ 1700000000000, 1700000000100, 100 };
   return state;
 }
@@ -237,7 +260,7 @@ QuestJobState TimerWaiting()
 QuestJobState BodyDone()
 {
   auto state = Begin();
-  auto& job = *state.active;
+  auto& job = *Single(state);
   job.cursor = "done";
   job.accepted = true;
   job.segment = job.steps = job.instructions = 1;
@@ -255,7 +278,7 @@ void HostStep(QuestJobState::Job& job, uint32_t instructions = 0)
 QuestJobState Dispatching(bool captured = false)
 {
   auto state = BodyDone();
-  auto& job = *state.active;
+  auto& job = *Single(state);
   job.dispatch = QuestJobState::Dispatch{};
   job.dispatch->recipients = { job.events.front().target };
   HostStep(job, 1);
@@ -272,7 +295,7 @@ QuestJobState Dispatching(bool captured = false)
 QuestJobState SelectedHandler(bool waiting = false, bool alias = false)
 {
   auto state = Dispatching(true);
-  auto& job = *state.active;
+  auto& job = *Single(state);
   auto& dispatch = *job.dispatch;
   if (alias) {
     dispatch.recipients.push_back(Json{
@@ -311,7 +334,7 @@ QuestJobState SelectedHandler(bool waiting = false, bool alias = false)
 
 Json DispatchHeap(const QuestJobState::Job& job)
 {
-  auto heap = Heap(*Waiting().active);
+  auto heap = Heap(*Single(Waiting()));
   heap["continuations"].clear();
   const auto add = [&](const QuestJobState::Stage& stage) {
     if (stage.cursor != "waiting")
@@ -374,14 +397,74 @@ QuestJobState ByteHeavyHistory()
 
 void AddPending(QuestJobState& state, bool sequenced)
 {
-  auto job = *Begin().active;
+  auto job = *Single(Begin());
   job.id = state.nextJob++;
   job.generation = state.generation;
   job.sequenced = sequenced;
   job.command = sequenced ? "quest-request:" + std::to_string(job.generation) +
       ":" + std::to_string(job.id)
                           : "legacy-" + std::to_string(job.id);
-  state.active = job;
+  state.live.emplace(job.id, job);
+}
+
+QuestJobState::Job Numbered(QuestJobState::Job job, uint64_t id,
+                            bool sequenced = true)
+{
+  const auto oldScope = job.Scope();
+  job.id = id;
+  job.sequenced = sequenced;
+  job.command = sequenced ? "quest-request:" + std::to_string(job.generation) +
+      ":" + std::to_string(id)
+                          : "legacy-" + std::to_string(id);
+  job.environmentHash = std::string(64, 'e');
+  const auto remap = [&](std::string token) {
+    return token.empty() ? token : job.Scope() + token.substr(oldScope.size());
+  };
+  job.token = remap(job.token);
+  if (job.handler)
+    job.handler->token = remap(job.handler->token);
+  for (auto& child : job.children)
+    child.token = remap(child.token);
+  std::map<std::string, QuestJobState::Completion> completions;
+  for (const auto& [token, result] : job.completions)
+    completions.emplace(remap(token), result);
+  job.completions = std::move(completions);
+  return job;
+}
+
+void CompleteLive(QuestJobState& state, uint64_t id)
+{
+  auto job = state.live.at(id);
+  REQUIRE(job.children.empty());
+  REQUIRE_FALSE(job.handler);
+  REQUIRE_FALSE(job.dispatch);
+  if (!job.token.empty())
+    job.completions[job.token] = job.awaitKind == "timer"
+      ? QuestJobState::Completion::None()
+      : QuestJobState::Completion(true);
+  QuestJobState::Stage done;
+  done.quest = job.quest;
+  done.contentHash = job.contentHash;
+  done.stage = job.stage;
+  done.cursor = "done";
+  done.accepted = job.accepted;
+  static_cast<QuestJobState::Stage&>(job) = done;
+  job.eventHead = static_cast<uint32_t>(job.events.size());
+  state.live.erase(id);
+  state.completed.insert(
+    std::lower_bound(
+      state.completed.begin(), state.completed.end(), id,
+      [](const auto& item, uint64_t wanted) { return item.id < wanted; }),
+    std::move(job));
+}
+
+Json AllLiveHeap(const QuestJobState& state)
+{
+  auto heap = Heap(*Single(Waiting()));
+  heap["continuations"].clear();
+  for (const auto& [id, job] : state.live)
+    heap["continuations"].update(DispatchHeap(job)["continuations"]);
+  return heap;
 }
 
 struct JobStorage
@@ -450,7 +533,7 @@ struct Fixture
   }
   void PublishJobs(const QuestJobState& jobs)
   {
-    const auto id = jobs.active ? jobs.active->id : jobs.completed.back().id;
+    const auto id = Single(jobs) ? Single(jobs)->id : jobs.completed.back().id;
     const auto receipt = QuestJournal::AtomicJob(
       *actor, id, [&] { QuestJournal::SetJobState(*actor, jobs); });
     REQUIRE(receipt);
@@ -476,13 +559,13 @@ TEST_CASE("Quest job codec round trips begin waiting and completed work",
   for (const auto& state : { Begin(), Waiting(), Done(Waiting()) })
     REQUIRE(QuestJobState::Read(state.Save()).Save() == state.Save());
   auto state = Waiting();
-  REQUIRE(state.active->Scope() == "quest-job:1:1");
-  REQUIRE(state.active->NextToken() == "quest-job:1:1:2");
-  state.active->completions[state.active->token] = false;
-  state.active->token = state.active->NextToken();
-  ++state.active->nextOperation;
-  state.active->segment = 2;
-  REQUIRE(state.active->token == "quest-job:1:1:2");
+  REQUIRE(Single(state)->Scope() == "quest-job:1:1");
+  REQUIRE(Single(state)->NextToken() == "quest-job:1:1:2");
+  Single(state)->completions[Single(state)->token] = false;
+  Single(state)->token = Single(state)->NextToken();
+  ++Single(state)->nextOperation;
+  Single(state)->segment = 2;
+  REQUIRE(Single(state)->token == "quest-job:1:1:2");
   REQUIRE_NOTHROW(state.Save());
 }
 
@@ -492,41 +575,41 @@ TEST_CASE("Quest jobs reject corrupt exact fields identities and cursor state",
   const auto original = Waiting().Save();
   std::vector<std::function<void(Json&)>> corrupt = {
     [](Json& v) { v["unknown"] = 1; },
-    [](Json& v) { v.erase("active"); },
-    [](Json& v) { v["schemaVersion"] = 6; },
+    [](Json& v) { v.erase("live"); },
+    [](Json& v) { v["schemaVersion"] = 7; },
     [](Json& v) { v["generation"] = 0; },
     [](Json& v) { v["nextJob"] = 1; },
     [](Json& v) { v["nextJob"] = UINT64_MAX; },
-    [](Json& v) { v["active"]["id"] = 1.0; },
-    [](Json& v) { v["active"]["generation"] = 2; },
-    [](Json& v) { v["active"]["actor"] = "03000"; },
-    [](Json& v) { v["active"]["owner"] = "3000:Skyrim.esm"; },
-    [](Json& v) { v["active"]["quest"] = "4e50d"; },
-    [](Json& v) { v["active"]["quest"] = "1000000:Skyrim.esm"; },
-    [](Json& v) { v["active"]["command"] = ""; },
-    [](Json& v) { v["active"]["command"] = std::string(129, 'a'); },
-    [](Json& v) { v["active"]["instance"] = std::string(301, 'a'); },
-    [](Json& v) { v["active"]["contentHash"] = std::string(64, 'A'); },
-    [](Json& v) { v["active"]["script"] = std::string("a\0b", 3); },
-    [](Json& v) { v["active"]["function"] = ""; },
-    [](Json& v) { v["active"]["awaitKey"] = ""; },
-    [](Json& v) { v["active"]["accepted"] = false; },
-    [](Json& v) { v["active"]["segment"] = 0; },
-    [](Json& v) { v["active"]["instructions"] = 0; },
-    [](Json& v) { v["active"]["instructions"] = 100001; },
-    [](Json& v) { v["active"]["steps"] = 100001; },
-    [](Json& v) { v["active"]["log"] = -1; },
-    [](Json& v) { v["active"]["token"] = "quest-job:1:2:1"; },
-    [](Json& v) { v["active"]["cursor"] = "begin"; },
-    [](Json& v) { v["active"]["cursor"] = "done"; },
-    [](Json& v) { v["active"]["completions"]["quest-job:1:1:2"] = true; },
-    [](Json& v) { v["active"]["events"][0]["target"] = "3000"; },
-    [](Json& v) { v["active"]["events"][0]["count"] = 0; },
+    [](Json& v) { v["live"][0]["id"] = 1.0; },
+    [](Json& v) { v["live"][0]["generation"] = 2; },
+    [](Json& v) { v["live"][0]["actor"] = "03000"; },
+    [](Json& v) { v["live"][0]["owner"] = "3000:Skyrim.esm"; },
+    [](Json& v) { v["live"][0]["quest"] = "4e50d"; },
+    [](Json& v) { v["live"][0]["quest"] = "1000000:Skyrim.esm"; },
+    [](Json& v) { v["live"][0]["command"] = ""; },
+    [](Json& v) { v["live"][0]["command"] = std::string(129, 'a'); },
+    [](Json& v) { v["live"][0]["instance"] = std::string(301, 'a'); },
+    [](Json& v) { v["live"][0]["contentHash"] = std::string(64, 'A'); },
+    [](Json& v) { v["live"][0]["script"] = std::string("a\0b", 3); },
+    [](Json& v) { v["live"][0]["function"] = ""; },
+    [](Json& v) { v["live"][0]["awaitKey"] = ""; },
+    [](Json& v) { v["live"][0]["accepted"] = false; },
+    [](Json& v) { v["live"][0]["segment"] = 0; },
+    [](Json& v) { v["live"][0]["instructions"] = 0; },
+    [](Json& v) { v["live"][0]["instructions"] = 100001; },
+    [](Json& v) { v["live"][0]["steps"] = 100001; },
+    [](Json& v) { v["live"][0]["log"] = -1; },
+    [](Json& v) { v["live"][0]["token"] = "quest-job:1:2:1"; },
+    [](Json& v) { v["live"][0]["cursor"] = "begin"; },
+    [](Json& v) { v["live"][0]["cursor"] = "done"; },
+    [](Json& v) { v["live"][0]["completions"]["quest-job:1:1:2"] = true; },
+    [](Json& v) { v["live"][0]["events"][0]["target"] = "3000"; },
+    [](Json& v) { v["live"][0]["events"][0]["count"] = 0; },
     [](Json& v) {
-      v["active"]["events"][0]["count"] = uint64_t(INT32_MAX) + 1;
+      v["live"][0]["events"][0]["count"] = uint64_t(INT32_MAX) + 1;
     },
-    [](Json& v) { v["active"]["events"][0]["added"] = 1; },
-    [](Json& v) { v["active"]["events"][0]["extra"] = false; }
+    [](Json& v) { v["live"][0]["events"][0]["added"] = 1; },
+    [](Json& v) { v["live"][0]["events"][0]["extra"] = false; }
   };
   for (size_t index = 0; index < corrupt.size(); ++index) {
     INFO("Corruption " << index);
@@ -542,17 +625,17 @@ TEST_CASE("Typed quest job saves enforce history uniqueness and limits",
   auto state = Waiting();
   SECTION("invalid typed identity")
   {
-    state.active->id = 0;
+    Single(state)->id = 0;
   }
   SECTION("pending event overflow")
   {
-    state.active->events.resize(4097);
+    Single(state)->events.resize(4097);
   }
   SECTION("operation overflow")
   {
     for (size_t n = 1; n <= 257; ++n)
-      state.active
-        ->completions[state.active->Scope() + ":" + std::to_string(n)] = true;
+      Single(state)
+        ->completions[Single(state)->Scope() + ":" + std::to_string(n)] = true;
   }
   SECTION("completed history overflow")
   {
@@ -562,8 +645,8 @@ TEST_CASE("Typed quest job saves enforce history uniqueness and limits",
   {
     auto old = Done(Begin()).completed.front();
     state.completed.push_back(old);
-    state.active->id = 2;
-    state.active->token = state.active->Scope() + ":1";
+    Single(state)->id = 2;
+    Single(state)->token = Single(state)->Scope() + ":1";
     state.nextJob = 3;
   }
   SECTION("completed work cannot retain a failure")
@@ -578,7 +661,7 @@ TEST_CASE("Job heap cross links require the unique owning outer frame",
           "[Quest][QuestJob]")
 {
   const auto state = Waiting();
-  const auto job = *state.active;
+  const auto job = *Single(state);
   auto heap = Heap(job);
   REQUIRE_NOTHROW(state.ValidateHeap(heap));
   SECTION("missing continuation")
@@ -625,7 +708,7 @@ TEST_CASE("Only untouched runner state preserves standalone VM continuations",
           "[Quest][QuestJob]")
 {
   const auto waiting = Waiting();
-  const auto heap = Heap(*waiting.active);
+  const auto heap = Heap(*Single(waiting));
   REQUIRE_NOTHROW(QuestJobState{}.ValidateHeap(heap));
   REQUIRE_THROWS(Begin().ValidateHeap(heap));
   REQUIRE_THROWS(Done(waiting).ValidateHeap(heap));
@@ -638,7 +721,7 @@ TEST_CASE("Job heap ownership follows the outer frame of nested calls",
           "[Quest][QuestJob]")
 {
   const auto state = Waiting();
-  const auto& job = *state.active;
+  const auto& job = *Single(state);
   auto heap = Heap(job);
   auto& leaf = heap["continuations"][job.token];
   auto caller = leaf;
@@ -657,7 +740,7 @@ TEST_CASE("Job fragment ownership follows Papyrus case insensitive names",
           "[Quest][QuestJob]")
 {
   const auto state = Waiting();
-  const auto& job = *state.active;
+  const auto& job = *Single(state);
   auto heap = Heap(job);
   auto& frame = heap["continuations"][job.token];
   frame["rootScript"] = "qf_test";
@@ -675,7 +758,7 @@ TEST_CASE(
   "[Quest][QuestJob]")
 {
   Fixture f;
-  auto initialHeap = Heap(*Waiting().active);
+  auto initialHeap = Heap(*Single(Waiting()));
   initialHeap["continuations"].clear();
   QuestJournal::Atomic(
     *f.actor, [&] { QuestJournal::SetScriptState(*f.actor, initialHeap); });
@@ -718,13 +801,13 @@ TEST_CASE("Owning jobs permit intermediate cursor heap changes but commit "
   Fixture f;
   f.Start();
   auto waiting = Waiting();
-  waiting.active->events.clear();
+  Single(waiting)->events.clear();
   const auto before = f.Saved();
   REQUIRE_THROWS(QuestJournal::AtomicJob(
     *f.actor, 1, [&] { QuestJournal::SetJobState(*f.actor, waiting); }));
   REQUIRE(f.Saved() == before);
   REQUIRE_NOTHROW(QuestJournal::AtomicJob(*f.actor, 1, [&] {
-    QuestJournal::SetScriptState(*f.actor, Heap(*waiting.active));
+    QuestJournal::SetScriptState(*f.actor, Heap(*Single(waiting)));
     QuestJournal::Apply(
       *f.actor,
       { { "quest", kJobQuest }, { "op", "setStage" }, { "index", 10 } });
@@ -806,9 +889,9 @@ TEST_CASE("Personal job ownership remains locked while visiting another host",
   REQUIRE_NOTHROW(QuestJournal::RequireJobAccess(*f.actor));
   REQUIRE_NOTHROW(QuestJournal::RequirePersonalJobAccess(host));
   REQUIRE_THROWS(QuestJournal::RequirePersonalJobAccess(*f.actor));
-  REQUIRE_FALSE(QuestJournal::JobState(*f.actor).active);
+  REQUIRE_FALSE(QuestJournal::JobState(*f.actor).HasLive());
   REQUIRE(QuestJournal::PersonalJobState(*f.actor).Save() == Begin().Save());
-  REQUIRE_FALSE(QuestJournal::PersonalJobState(host).active);
+  REQUIRE_FALSE(QuestJournal::PersonalJobState(host).HasLive());
 }
 
 TEST_CASE(
@@ -819,10 +902,10 @@ TEST_CASE(
     const auto legacy = Legacy(state);
     const auto migrated = QuestJobState::Read(legacy);
     REQUIRE(migrated.Save() == MigratedLegacy(state).Save());
-    REQUIRE(migrated.Save()["schemaVersion"] == 5);
+    REQUIRE(migrated.Save()["schemaVersion"] == 6);
   }
   auto external = Waiting();
-  external.active->awaitKey = "quest-stage";
+  Single(external)->awaitKey = "quest-stage";
   REQUIRE(QuestJobState::Read(Legacy(external)).Save() ==
           MigratedLegacy(external).Save());
   auto legacy = Legacy(Waiting());
@@ -847,7 +930,7 @@ TEST_CASE("Nested quest stages retain separate scopes and one global "
           "[Quest][QuestJob]")
 {
   for (auto state : { Nested(), Nested(true) }) {
-    const auto& job = *state.active;
+    const auto& job = *Single(state);
     REQUIRE(&job.Current() == &job.children.back());
     REQUIRE(job.Scope(job) == "quest-job:1:1");
     REQUIRE(job.Scope(job.Current()) == "quest-job:1:1:node:1");
@@ -855,13 +938,13 @@ TEST_CASE("Nested quest stages retain separate scopes and one global "
     REQUIRE_NOTHROW(state.ValidateHeap(NestedHeap(job)));
   }
   auto state = Nested(true);
-  FinishChild(*state.active);
+  FinishChild(*Single(state));
   REQUIRE_NOTHROW(state.Save());
-  REQUIRE_NOTHROW(state.ValidateHeap(NestedHeap(*state.active)));
-  REQUIRE_FALSE(state.active->events.empty());
-  REQUIRE(state.active->completions.at("quest-job:1:1:2") ==
+  REQUIRE_NOTHROW(state.ValidateHeap(NestedHeap(*Single(state))));
+  REQUIRE_FALSE(Single(state)->events.empty());
+  REQUIRE(Single(state)->completions.at("quest-job:1:1:2") ==
           QuestJobState::Completion(true));
-  REQUIRE(state.active->NextToken() == "quest-job:1:1:3");
+  REQUIRE(Single(state)->NextToken() == "quest-job:1:1:3");
 }
 
 TEST_CASE("Nested stage codecs reject broken links reused tokens and "
@@ -870,25 +953,25 @@ TEST_CASE("Nested stage codecs reject broken links reused tokens and "
 {
   const auto original = Nested(true).Save();
   const std::vector<std::function<void(Json&)>> corrupt = {
-    [](Json& v) { v["active"]["node"] = 1; },
-    [](Json& v) { v["active"]["child"] = 2; },
-    [](Json& v) { v["active"]["awaitKey"] = "external"; },
-    [](Json& v) { v["active"]["children"][0]["node"] = 0; },
-    [](Json& v) { v["active"]["children"][0]["node"] = 2; },
-    [](Json& v) { v["active"]["children"][0]["child"] = 2; },
-    [](Json& v) { v["active"]["children"][0]["extra"] = 1; },
-    [](Json& v) { v["active"]["children"][0]["token"] = "quest-job:1:1:1"; },
+    [](Json& v) { v["live"][0]["node"] = 1; },
+    [](Json& v) { v["live"][0]["child"] = 2; },
+    [](Json& v) { v["live"][0]["awaitKey"] = "external"; },
+    [](Json& v) { v["live"][0]["children"][0]["node"] = 0; },
+    [](Json& v) { v["live"][0]["children"][0]["node"] = 2; },
+    [](Json& v) { v["live"][0]["children"][0]["child"] = 2; },
+    [](Json& v) { v["live"][0]["children"][0]["extra"] = 1; },
+    [](Json& v) { v["live"][0]["children"][0]["token"] = "quest-job:1:1:1"; },
     [](Json& v) {
-      v["active"]["children"][0]["token"] = "quest-job:1:1:node:1:2";
+      v["live"][0]["children"][0]["token"] = "quest-job:1:1:node:1:2";
     },
-    [](Json& v) { v["active"]["children"][0]["token"] = "quest-job:1:1:02"; },
-    [](Json& v) { v["active"]["children"].clear(); },
-    [](Json& v) { v["active"]["nextOperation"] = 4; },
-    [](Json& v) { v["active"]["nextOperation"] = 258; },
-    [](Json& v) { v["active"]["completions"]["quest-job:1:1:2"] = true; },
-    [](Json& v) { v["active"]["children"][0]["cursor"] = "begin"; },
-    [](Json& v) { v["active"]["children"][0]["cursor"] = "done"; },
-    [](Json& v) { v["active"]["children"][0]["quest"] = "3000"; }
+    [](Json& v) { v["live"][0]["children"][0]["token"] = "quest-job:1:1:02"; },
+    [](Json& v) { v["live"][0]["children"].clear(); },
+    [](Json& v) { v["live"][0]["nextOperation"] = 4; },
+    [](Json& v) { v["live"][0]["nextOperation"] = 258; },
+    [](Json& v) { v["live"][0]["completions"]["quest-job:1:1:2"] = true; },
+    [](Json& v) { v["live"][0]["children"][0]["cursor"] = "begin"; },
+    [](Json& v) { v["live"][0]["children"][0]["cursor"] = "done"; },
+    [](Json& v) { v["live"][0]["children"][0]["quest"] = "3000"; }
   };
   for (size_t index = 0; index < corrupt.size(); ++index) {
     INFO("Nested corruption " << index);
@@ -903,7 +986,7 @@ TEST_CASE("Nested heap validation requires every waiting node and exact "
           "[Quest][QuestJob]")
 {
   const auto state = Nested(true);
-  const auto& job = *state.active;
+  const auto& job = *Single(state);
   const auto childToken = job.children.back().token;
   auto heap = NestedHeap(job);
   REQUIRE(heap["continuations"][job.token]["executedInstructions"] == 3);
@@ -940,7 +1023,7 @@ TEST_CASE("Quest stage depth and operation bounds include pending ancestors",
           "[Quest][QuestJob]")
 {
   auto state = Waiting();
-  auto& job = *state.active;
+  auto& job = *Single(state);
   for (uint64_t node = 1; node < QuestJobState::MaxDepth; ++node) {
     auto& parent = job.Current();
     parent.child = node;
@@ -980,7 +1063,7 @@ TEST_CASE(
   f.Start();
   const auto publish = [&](const QuestJobState& state) {
     QuestJournal::AtomicJob(*f.actor, 1, [&] {
-      QuestJournal::SetScriptState(*f.actor, NestedHeap(*state.active));
+      QuestJournal::SetScriptState(*f.actor, NestedHeap(*Single(state)));
       QuestJournal::SetJobState(*f.actor, state);
     });
   };
@@ -988,9 +1071,9 @@ TEST_CASE(
   REQUIRE_NOTHROW(publish(state));
   state = Nested(true);
   REQUIRE_NOTHROW(publish(state));
-  FinishChild(*state.active);
+  FinishChild(*Single(state));
   REQUIRE_NOTHROW(publish(state));
-  auto& job = *state.active;
+  auto& job = *Single(state);
   job.completions[job.token] = job.children.back().accepted;
   job.children.pop_back();
   job.child = job.nextOperation;
@@ -1020,15 +1103,15 @@ TEST_CASE("Journal refuses rewriting live children ancestors or unrequested "
   // New children must first commit their begin cursor.
   const auto begin = Nested();
   QuestJournal::AtomicJob(*f.actor, 1, [&] {
-    QuestJournal::SetScriptState(*f.actor, NestedHeap(*begin.active));
+    QuestJournal::SetScriptState(*f.actor, NestedHeap(*Single(begin)));
     QuestJournal::SetJobState(*f.actor, begin);
   });
   QuestJournal::AtomicJob(*f.actor, 1, [&] {
-    QuestJournal::SetScriptState(*f.actor, NestedHeap(*state.active));
+    QuestJournal::SetScriptState(*f.actor, NestedHeap(*Single(state)));
     QuestJournal::SetJobState(*f.actor, state);
   });
   const auto before = f.Saved();
-  auto& job = *state.active;
+  auto& job = *Single(state);
   SECTION("live child identity")
   {
     job.children.back().quest = "2aa58:Skyrim.esm";
@@ -1079,21 +1162,21 @@ TEST_CASE("A job transaction cannot cross two durable child boundaries",
   REQUIRE_NOTHROW(QuestJournal::AtomicJob(*f.actor, 1, [&] {
     QuestJournal::SetJobState(*f.actor, begin);
     QuestJournal::SetJobState(*f.actor, begin);
-    QuestJournal::SetScriptState(*f.actor, NestedHeap(*nested.active));
+    QuestJournal::SetScriptState(*f.actor, NestedHeap(*Single(nested)));
     QuestJournal::SetJobState(*f.actor, nested);
     QuestJournal::SetJobState(*f.actor, nested);
   }));
   const auto before = f.Saved();
   auto doneChild = nested;
-  FinishChild(*doneChild.active);
+  FinishChild(*Single(doneChild));
   auto sibling = doneChild;
-  auto& job = *sibling.active;
+  auto& job = *Single(sibling);
   job.completions[job.token] = true;
   job.children.pop_back();
   job.child = job.nextOperation;
   job.token = job.NextToken();
   ++job.nextOperation;
-  auto child = nested.active->children.front();
+  auto child = Single(nested)->children.front();
   child.node = job.child;
   job.children.push_back(child);
   REQUIRE_NOTHROW(doneChild.Save());
@@ -1113,13 +1196,13 @@ TEST_CASE(
   Fixture f;
   f.Start();
   auto state = Waiting();
-  state.active->log = 10;
+  Single(state)->log = 10;
   QuestJournal::AtomicJob(*f.actor, 1, [&] {
-    QuestJournal::SetScriptState(*f.actor, Heap(*state.active));
+    QuestJournal::SetScriptState(*f.actor, Heap(*Single(state)));
     QuestJournal::SetJobState(*f.actor, state);
   });
   const auto before = f.Saved();
-  auto& job = *state.active;
+  auto& job = *Single(state);
   job.completions[job.token] = true;
   job.token = job.NextToken();
   ++job.nextOperation;
@@ -1148,7 +1231,7 @@ TEST_CASE(
   "[Quest][QuestJob]")
 {
   auto state = Waiting();
-  auto& job = *state.active;
+  auto& job = *Single(state);
   for (uint64_t operation = 1; operation < QuestJobState::MaxOperations;
        ++operation)
     job.completions[job.Scope() + ":" + std::to_string(operation)] = true;
@@ -1170,15 +1253,15 @@ TEST_CASE("Schema two jobs migrate typed completions and pending kinds",
     const auto migrated = QuestJobState::Read(Legacy(state, 2));
     REQUIRE(migrated.Save() == MigratedLegacy(state).Save());
     const auto& job =
-      migrated.active ? *migrated.active : migrated.completed.back();
+      Single(migrated) ? *Single(migrated) : migrated.completed.back();
     REQUIRE_FALSE(job.automatic);
     REQUIRE_FALSE(job.timer);
     for (const auto& [token, completion] : job.completions)
       REQUIRE(completion.kind == QuestJobState::Completion::Kind::Boolean);
   }
   auto external = Waiting();
-  external.active->awaitKey = "quest-stage";
-  REQUIRE(QuestJobState::Read(Legacy(external, 2)).active->awaitKind ==
+  Single(external)->awaitKey = "quest-stage";
+  REQUIRE(Single(QuestJobState::Read(Legacy(external, 2)))->awaitKind ==
           "bool");
   auto corrupt = Legacy(Nested(), 2);
   corrupt["active"]["children"][0]["timer"] = nullptr;
@@ -1189,24 +1272,24 @@ TEST_CASE("Timer jobs round trip UTC deadlines and typed None completions",
           "[Quest][QuestJob]")
 {
   auto state = TimerWaiting();
-  state.active->automatic = true;
+  Single(state)->automatic = true;
   for (const auto& value : { state, Done(state) })
     REQUIRE(QuestJobState::Read(value.Save()).Save() == value.Save());
   const auto saved = state.Save();
-  REQUIRE(saved["schemaVersion"] == 5);
-  REQUIRE(saved["active"]["timer"]["policy"] == "utc-deadline-v1");
+  REQUIRE(saved["schemaVersion"] == 6);
+  REQUIRE(saved["live"][0]["timer"]["policy"] == "utc-deadline-v1");
   const auto done = Done(state);
   const auto& job = done.completed.front();
   REQUIRE(job.completions.at("quest-job:1:1:1") ==
           QuestJobState::Completion::None());
   REQUIRE((done.Save()["completed"][0]["completions"]["quest-job:1:1:1"] ==
            Json{ { "kind", "none" } }));
-  REQUIRE_NOTHROW(state.ValidateHeap(Heap(*state.active)));
+  REQUIRE_NOTHROW(state.ValidateHeap(Heap(*Single(state))));
   REQUIRE_NOTHROW(done.ValidateHeap(Json::object()));
   constexpr uint64_t max = 9007199254740991ULL;
-  state.active->timer = QuestJobState::Timer{ max - 86400000, max, 86400000 };
+  Single(state)->timer = QuestJobState::Timer{ max - 86400000, max, 86400000 };
   REQUIRE_NOTHROW(state.Save());
-  state.active->timer = QuestJobState::Timer{ max, max, 0 };
+  Single(state)->timer = QuestJobState::Timer{ max, max, 0 };
   REQUIRE_NOTHROW(state.Save());
 }
 
@@ -1216,26 +1299,26 @@ TEST_CASE(
 {
   const auto original = TimerWaiting().Save();
   const std::vector<std::function<void(Json&)>> corrupt = {
-    [](Json& v) { v["active"]["automatic"] = 1; },
-    [](Json& v) { v["active"].erase("automatic"); },
-    [](Json& v) { v["active"]["awaitKind"] = ""; },
-    [](Json& v) { v["active"]["awaitKind"] = "other"; },
-    [](Json& v) { v["active"]["awaitKind"] = "bool"; },
-    [](Json& v) { v["active"]["awaitKind"] = "stage"; },
-    [](Json& v) { v["active"]["child"] = 1; },
-    [](Json& v) { v["active"]["timer"] = nullptr; },
-    [](Json& v) { v["active"]["timer"] = false; },
-    [](Json& v) { v["active"]["timer"]["extra"] = 0; },
-    [](Json& v) { v["active"]["timer"].erase("policy"); },
-    [](Json& v) { v["active"]["timer"]["policy"] = "game-time"; },
-    [](Json& v) { v["active"]["timer"]["issuedUnixMs"] = -1; },
-    [](Json& v) { v["active"]["timer"]["issuedUnixMs"] = 1.0; },
-    [](Json& v) { v["active"]["timer"]["dueUnixMs"] = 1700000000101ULL; },
-    [](Json& v) { v["active"]["timer"]["dueUnixMs"] = 9007199254740992ULL; },
-    [](Json& v) { v["active"]["timer"]["durationMs"] = 86400001; },
+    [](Json& v) { v["live"][0]["automatic"] = 1; },
+    [](Json& v) { v["live"][0].erase("automatic"); },
+    [](Json& v) { v["live"][0]["awaitKind"] = ""; },
+    [](Json& v) { v["live"][0]["awaitKind"] = "other"; },
+    [](Json& v) { v["live"][0]["awaitKind"] = "bool"; },
+    [](Json& v) { v["live"][0]["awaitKind"] = "stage"; },
+    [](Json& v) { v["live"][0]["child"] = 1; },
+    [](Json& v) { v["live"][0]["timer"] = nullptr; },
+    [](Json& v) { v["live"][0]["timer"] = false; },
+    [](Json& v) { v["live"][0]["timer"]["extra"] = 0; },
+    [](Json& v) { v["live"][0]["timer"].erase("policy"); },
+    [](Json& v) { v["live"][0]["timer"]["policy"] = "game-time"; },
+    [](Json& v) { v["live"][0]["timer"]["issuedUnixMs"] = -1; },
+    [](Json& v) { v["live"][0]["timer"]["issuedUnixMs"] = 1.0; },
+    [](Json& v) { v["live"][0]["timer"]["dueUnixMs"] = 1700000000101ULL; },
+    [](Json& v) { v["live"][0]["timer"]["dueUnixMs"] = 9007199254740992ULL; },
+    [](Json& v) { v["live"][0]["timer"]["durationMs"] = 86400001; },
     [](Json& v) {
-      v["active"]["timer"]["issuedUnixMs"] = 9007199254740991ULL;
-      v["active"]["timer"]["dueUnixMs"] = 9007199254740991ULL;
+      v["live"][0]["timer"]["issuedUnixMs"] = 9007199254740991ULL;
+      v["live"][0]["timer"]["dueUnixMs"] = 9007199254740991ULL;
     }
   };
   for (size_t index = 0; index < corrupt.size(); ++index) {
@@ -1245,7 +1328,7 @@ TEST_CASE(
     REQUIRE_THROWS(QuestJobState::Read(value));
   }
   auto begin = Begin();
-  begin.active->timer = TimerWaiting().active->timer;
+  Single(begin)->timer = Single(TimerWaiting())->timer;
   REQUIRE_THROWS(begin.Save());
   auto done = Done(TimerWaiting());
   done.completed.front().awaitKind = "timer";
@@ -1284,7 +1367,7 @@ TEST_CASE(
   "[Quest][QuestJob]")
 {
   for (const auto& state : { Waiting(), TimerWaiting(), Nested() }) {
-    const auto& job = *state.active;
+    const auto& job = *Single(state);
     auto heap = Heap(job);
     REQUIRE_NOTHROW(state.ValidateHeap(heap));
     auto& leaf = heap["continuations"][job.token];
@@ -1306,21 +1389,21 @@ TEST_CASE("Journal consumes timer waits only with typed None results",
   Fixture f;
   f.Start();
   auto waiting = TimerWaiting();
-  waiting.active->events.clear();
+  Single(waiting)->events.clear();
   QuestJournal::AtomicJob(*f.actor, 1, [&] {
-    QuestJournal::SetScriptState(*f.actor, Heap(*waiting.active));
+    QuestJournal::SetScriptState(*f.actor, Heap(*Single(waiting)));
     QuestJournal::SetJobState(*f.actor, waiting);
   });
   const auto before = f.Saved();
   auto done = Done(waiting);
-  done.completed.front().completions[waiting.active->token] = false;
+  done.completed.front().completions[Single(waiting)->token] = false;
   REQUIRE_NOTHROW(done.Save());
   REQUIRE_THROWS(QuestJournal::AtomicJob(*f.actor, 1, [&] {
     QuestJournal::SetScriptState(*f.actor, Json::object());
     QuestJournal::SetJobState(*f.actor, done);
   }));
   REQUIRE(f.Saved() == before);
-  done.completed.front().completions[waiting.active->token] =
+  done.completed.front().completions[Single(waiting)->token] =
     QuestJobState::Completion::None();
   REQUIRE_NOTHROW(QuestJournal::AtomicJob(*f.actor, 1, [&] {
     QuestJournal::SetScriptState(*f.actor, Json::object());
@@ -1337,36 +1420,36 @@ TEST_CASE(
   f.Start();
   auto state = TimerWaiting();
   QuestJournal::AtomicJob(*f.actor, 1, [&] {
-    QuestJournal::SetScriptState(*f.actor, Heap(*state.active));
+    QuestJournal::SetScriptState(*f.actor, Heap(*Single(state)));
     QuestJournal::SetJobState(*f.actor, state);
   });
   const auto before = f.Saved();
   SECTION("deadline")
   {
-    ++state.active->timer->issuedUnixMs;
-    ++state.active->timer->dueUnixMs;
+    ++Single(state)->timer->issuedUnixMs;
+    ++Single(state)->timer->dueUnixMs;
   }
   SECTION("duration")
   {
-    ++state.active->timer->durationMs;
-    ++state.active->timer->dueUnixMs;
+    ++Single(state)->timer->durationMs;
+    ++Single(state)->timer->dueUnixMs;
   }
   SECTION("wait kind")
   {
-    state.active->awaitKind = "bool";
-    state.active->timer.reset();
+    Single(state)->awaitKind = "bool";
+    Single(state)->timer.reset();
   }
   SECTION("automatic policy")
   {
-    state.active->automatic = true;
+    Single(state)->automatic = true;
   }
   SECTION("content provenance")
   {
-    state.active->contentMode = "fixture";
+    Single(state)->contentMode = "fixture";
   }
   REQUIRE_NOTHROW(state.Save());
   REQUIRE_THROWS(QuestJournal::AtomicJob(*f.actor, 1, [&] {
-    QuestJournal::SetScriptState(*f.actor, Heap(*state.active));
+    QuestJournal::SetScriptState(*f.actor, Heap(*Single(state)));
     QuestJournal::SetJobState(*f.actor, state);
   }));
   REQUIRE(f.Saved() == before);
@@ -1381,32 +1464,32 @@ TEST_CASE("Journal rejects None for Boolean waits and child-stage results",
   SECTION("external Boolean")
   {
     waiting = Waiting();
-    waiting.active->events.clear();
+    Single(waiting)->events.clear();
     QuestJournal::AtomicJob(*f.actor, 1, [&] {
-      QuestJournal::SetScriptState(*f.actor, Heap(*waiting.active));
+      QuestJournal::SetScriptState(*f.actor, Heap(*Single(waiting)));
       QuestJournal::SetJobState(*f.actor, waiting);
     });
   }
   SECTION("child stage")
   {
     waiting = Nested();
-    waiting.active->events.clear();
+    Single(waiting)->events.clear();
     QuestJournal::AtomicJob(*f.actor, 1, [&] {
-      QuestJournal::SetScriptState(*f.actor, NestedHeap(*waiting.active));
+      QuestJournal::SetScriptState(*f.actor, NestedHeap(*Single(waiting)));
       QuestJournal::SetJobState(*f.actor, waiting);
     });
-    FinishChild(*waiting.active);
+    FinishChild(*Single(waiting));
     QuestJournal::AtomicJob(*f.actor, 1, [&] {
-      QuestJournal::SetScriptState(*f.actor, NestedHeap(*waiting.active));
+      QuestJournal::SetScriptState(*f.actor, NestedHeap(*Single(waiting)));
       QuestJournal::SetJobState(*f.actor, waiting);
     });
   }
   const auto before = f.Saved();
   auto candidate = waiting;
-  candidate.active->children.clear();
-  candidate.active->child = 0;
+  Single(candidate)->children.clear();
+  Single(candidate)->child = 0;
   candidate = Done(candidate);
-  candidate.completed.front().completions[waiting.active->token] =
+  candidate.completed.front().completions[Single(waiting)->token] =
     QuestJobState::Completion::None();
   REQUIRE_NOTHROW(candidate.Save());
   REQUIRE_THROWS(QuestJournal::AtomicJob(*f.actor, 1, [&] {
@@ -1422,18 +1505,18 @@ TEST_CASE(
 {
   auto state = TimerWaiting();
   for (const auto* mode : { "owned", "fixture", "legacy" }) {
-    state.active->contentMode = mode;
+    Single(state)->contentMode = mode;
     REQUIRE(QuestJobState::Read(state.Save()).Save() == state.Save());
   }
-  state.active->automatic = true;
+  Single(state)->automatic = true;
   REQUIRE_THROWS(state.Save());
-  state.active->contentMode = "fixture";
+  Single(state)->contentMode = "fixture";
   REQUIRE_NOTHROW(state.Save());
   auto missing = state.Save();
-  missing["active"].erase("contentMode");
+  missing["live"][0].erase("contentMode");
   REQUIRE_THROWS(QuestJobState::Read(missing));
   for (const auto* invalid : { "", "mod", "OWNED" }) {
-    state.active->contentMode = invalid;
+    Single(state)->contentMode = invalid;
     REQUIRE_THROWS(state.Save());
   }
 }
@@ -1444,17 +1527,17 @@ TEST_CASE("Saved event dispatch keeps the completed quest body active",
   for (const auto& state :
        { BodyDone(), Dispatching(), Dispatching(true), SelectedHandler(),
          SelectedHandler(true), SelectedHandler(true, true) }) {
-    const auto& job = *state.active;
+    const auto& job = *Single(state);
     REQUIRE(job.cursor == "done");
     REQUIRE_FALSE(job.IsComplete());
     REQUIRE(QuestJobState::Read(state.Save()).Save() == state.Save());
     REQUIRE_NOTHROW(state.ValidateHeap(DispatchHeap(job)));
   }
   const auto state = SelectedHandler();
-  REQUIRE(&state.active->Current() == &*state.active->handler);
-  REQUIRE(state.active->Scope(*state.active->handler) ==
+  REQUIRE(&Single(state)->Current() == &*Single(state)->handler);
+  REQUIRE(Single(state)->Scope(*Single(state)->handler) ==
           "quest-job:1:1:handler:1");
-  REQUIRE(state.active->NextToken() == "quest-job:1:1:1");
+  REQUIRE(Single(state)->NextToken() == "quest-job:1:1:1");
 }
 
 TEST_CASE(
@@ -1466,7 +1549,7 @@ TEST_CASE(
     const auto migrated = QuestJobState::Read(Legacy(state, 3));
     REQUIRE(migrated.Save() == MigratedLegacy(state, 3).Save());
     const auto& job =
-      migrated.active ? *migrated.active : migrated.completed.back();
+      Single(migrated) ? *Single(migrated) : migrated.completed.back();
     REQUIRE_FALSE(job.handler);
     REQUIRE_FALSE(job.dispatch);
     REQUIRE(job.eventHead == 0);
@@ -1483,44 +1566,48 @@ TEST_CASE(
 {
   const auto original = SelectedHandler(true).Save();
   const std::vector<std::function<void(Json&)>> corrupt = {
-    [](Json& v) { v["active"]["dispatch"]["recipients"] = Json::array(); },
+    [](Json& v) { v["live"][0]["dispatch"]["recipients"] = Json::array(); },
     [](Json& v) {
-      v["active"]["dispatch"]["recipients"][0] = "15:Skyrim.esm";
+      v["live"][0]["dispatch"]["recipients"][0] = "15:Skyrim.esm";
     },
     [](Json& v) {
-      v["active"]["dispatch"]["recipients"].push_back("15:Skyrim.esm");
+      v["live"][0]["dispatch"]["recipients"].push_back("15:Skyrim.esm");
     },
     [](Json& v) {
-      v["active"]["dispatch"]["recipients"].push_back("14:Skyrim.esm");
+      v["live"][0]["dispatch"]["recipients"].push_back("14:Skyrim.esm");
     },
-    [](Json& v) { v["active"]["dispatch"]["recipient"] = 1; },
-    [](Json& v) { v["active"]["dispatch"]["attachment"] = 1; },
-    [](Json& v) { v["active"]["dispatch"]["captured"] = false; },
-    [](Json& v) { v["active"]["dispatch"]["reference"] = "14:Skyrim.esm"; },
-    [](Json& v) { v["active"]["dispatch"]["reference"] = ""; },
-    [](Json& v) { v["active"]["dispatch"]["templates"][0] = "3000"; },
-    [](Json& v) { v["active"]["dispatch"]["roots"].push_back("childscript"); },
-    [](Json& v) { v["active"]["dispatch"]["unknown"] = true; },
-    [](Json& v) { v["active"]["eventHead"] = 1; },
-    [](Json& v) { v["active"]["nextHandler"] = 1; },
-    [](Json& v) { v["active"]["nextHandler"] = 4098; },
-    [](Json& v) { v["active"]["handler"]["node"] = 1; },
-    [](Json& v) { v["active"]["handler"]["quest"] = "2aa57:Skyrim.esm"; },
-    [](Json& v) { v["active"]["handler"]["handlerIdentity"] = nullptr; },
+    [](Json& v) { v["live"][0]["dispatch"]["recipient"] = 1; },
+    [](Json& v) { v["live"][0]["dispatch"]["attachment"] = 1; },
+    [](Json& v) { v["live"][0]["dispatch"]["captured"] = false; },
+    [](Json& v) { v["live"][0]["dispatch"]["reference"] = "14:Skyrim.esm"; },
+    [](Json& v) { v["live"][0]["dispatch"]["reference"] = ""; },
+    [](Json& v) { v["live"][0]["dispatch"]["templates"][0] = "3000"; },
     [](Json& v) {
-      v["active"]["handler"]["handlerIdentity"]["rootScript"] = "Other";
+      v["live"][0]["dispatch"]["roots"].push_back("childscript");
     },
-    [](Json& v) { v["active"]["handler"]["handlerIdentity"]["sequence"] = 2; },
+    [](Json& v) { v["live"][0]["dispatch"]["unknown"] = true; },
+    [](Json& v) { v["live"][0]["eventHead"] = 1; },
+    [](Json& v) { v["live"][0]["nextHandler"] = 1; },
+    [](Json& v) { v["live"][0]["nextHandler"] = 4098; },
+    [](Json& v) { v["live"][0]["handler"]["node"] = 1; },
+    [](Json& v) { v["live"][0]["handler"]["quest"] = "2aa57:Skyrim.esm"; },
+    [](Json& v) { v["live"][0]["handler"]["handlerIdentity"] = nullptr; },
     [](Json& v) {
-      v["active"]["handler"]["handlerIdentity"]["receiver"] = "3000";
+      v["live"][0]["handler"]["handlerIdentity"]["rootScript"] = "Other";
     },
     [](Json& v) {
-      v["active"]["handler"]["handlerIdentity"]["function"] = "OnItemRemoved";
+      v["live"][0]["handler"]["handlerIdentity"]["sequence"] = 2;
     },
-    [](Json& v) { v["active"]["handler"]["script"] = "Other"; },
     [](Json& v) {
-      v["active"]["handlerIdentity"] =
-        v["active"]["handler"]["handlerIdentity"];
+      v["live"][0]["handler"]["handlerIdentity"]["receiver"] = "3000";
+    },
+    [](Json& v) {
+      v["live"][0]["handler"]["handlerIdentity"]["function"] = "OnItemRemoved";
+    },
+    [](Json& v) { v["live"][0]["handler"]["script"] = "Other"; },
+    [](Json& v) {
+      v["live"][0]["handlerIdentity"] =
+        v["live"][0]["handler"]["handlerIdentity"];
     }
   };
   for (size_t index = 0; index < corrupt.size(); ++index) {
@@ -1530,10 +1617,10 @@ TEST_CASE(
     REQUIRE_THROWS(QuestJobState::Read(value));
   }
   auto alias = SelectedHandler(true, true).Save();
-  alias["active"]["dispatch"]["reference"] = "3000";
+  alias["live"][0]["dispatch"]["reference"] = "3000";
   REQUIRE_THROWS(QuestJobState::Read(alias));
   alias = SelectedHandler(true, true).Save();
-  alias["active"]["dispatch"]["recipients"][1]["id"] = 2147483648ULL;
+  alias["live"][0]["dispatch"]["recipients"][1]["id"] = 2147483648ULL;
   REQUIRE_THROWS(QuestJobState::Read(alias));
 }
 
@@ -1542,7 +1629,7 @@ TEST_CASE(
   "[Quest][QuestJob]")
 {
   const auto state = SelectedHandler(true, true);
-  const auto& job = *state.active;
+  const auto& job = *Single(state);
   auto heap = DispatchHeap(job);
   REQUIRE_NOTHROW(state.ValidateHeap(heap));
   auto& frame = heap["continuations"][job.handler->token];
@@ -1578,11 +1665,11 @@ TEST_CASE(
   "[Quest][QuestJob]")
 {
   auto state = SelectedHandler(true);
-  auto& job = *state.active;
+  auto& job = *Single(state);
   job.handler->child = 1;
   job.handler->awaitKind = "stage";
   job.handler->awaitKey = "quest-stage";
-  auto child = Nested().active->children.front();
+  auto child = Single(Nested())->children.front();
   job.children.push_back(child);
   REQUIRE_NOTHROW(state.Save());
   REQUIRE_NOTHROW(state.ValidateHeap(DispatchHeap(job)));
@@ -1590,11 +1677,11 @@ TEST_CASE(
   REQUIRE(job.Scope(*job.handler) == "quest-job:1:1:handler:1");
   REQUIRE(job.Scope(job.Current()) == "quest-job:1:1:node:1");
   auto invalid = state;
-  invalid.active->children.back().handlerIdentity =
+  Single(invalid)->children.back().handlerIdentity =
     job.handler->handlerIdentity;
   REQUIRE_THROWS(invalid.Save());
   invalid = state;
-  invalid.active->handler.reset();
+  Single(invalid)->handler.reset();
   REQUIRE_THROWS(invalid.Save());
 }
 
@@ -1607,8 +1694,9 @@ TEST_CASE(
   const auto publish = [&](const QuestJobState& state) {
     QuestJournal::AtomicJob(*f.actor, 1, [&] {
       QuestJournal::SetJobState(*f.actor, state);
-      QuestJournal::SetScriptState(
-        *f.actor, state.active ? DispatchHeap(*state.active) : Json::object());
+      QuestJournal::SetScriptState(*f.actor,
+                                   Single(state) ? DispatchHeap(*Single(state))
+                                                 : Json::object());
     });
   };
   auto state = BodyDone();
@@ -1623,9 +1711,9 @@ TEST_CASE(
     REQUIRE_NOTHROW(publish(state));
     state = SelectedHandler(true);
     REQUIRE_NOTHROW(publish(state));
-    auto& job = *state.active;
+    auto& job = *Single(state);
     job.completions[job.handler->token] = true;
-    auto complete = *SelectedHandler().active->handler;
+    auto complete = *Single(SelectedHandler())->handler;
     complete.cursor = "done";
     complete.accepted = true;
     job.handler = complete;
@@ -1638,11 +1726,11 @@ TEST_CASE(
   }
   SECTION("absent handler advances exactly one attachment")
   {
-    ++state.active->dispatch->attachment;
-    HostStep(*state.active, 1);
+    ++Single(state)->dispatch->attachment;
+    HostStep(*Single(state), 1);
     REQUIRE_NOTHROW(publish(state));
   }
-  auto& job = *state.active;
+  auto& job = *Single(state);
   ++job.dispatch->recipient;
   job.dispatch->attachment = 0;
   job.dispatch->captured = false;
@@ -1656,7 +1744,7 @@ TEST_CASE(
   HostStep(job);
   REQUIRE(job.IsComplete());
   state.completed.push_back(job);
-  state.active.reset();
+  state.live.clear();
   REQUIRE_NOTHROW(publish(state));
   const auto saved = QuestJournal::JobState(*f.actor);
   REQUIRE(saved.completed.front().events.size() == 1);
@@ -1673,7 +1761,7 @@ TEST_CASE(
   const auto publish = [&](const QuestJobState& state) {
     QuestJournal::AtomicJob(*f.actor, 1, [&] {
       QuestJournal::SetJobState(*f.actor, state);
-      QuestJournal::SetScriptState(*f.actor, DispatchHeap(*state.active));
+      QuestJournal::SetScriptState(*f.actor, DispatchHeap(*Single(state)));
     });
   };
   for (const auto& state : { BodyDone(), Dispatching(), Dispatching(true),
@@ -1681,7 +1769,7 @@ TEST_CASE(
     publish(state);
   const auto before = f.Saved();
   auto state = SelectedHandler(true);
-  auto& job = *state.active;
+  auto& job = *Single(state);
   SECTION("payload count")
   {
     ++job.events.front().count;
@@ -1745,7 +1833,7 @@ TEST_CASE("Journal disallows skipping event host saves or installing advanced "
   SECTION("snapshot omitted shared instruction accounting")
   {
     auto state = Dispatching();
-    --state.active->instructions;
+    --Single(state)->instructions;
     REQUIRE_THROWS(QuestJournal::AtomicJob(
       *f.actor, 1, [&] { QuestJournal::SetJobState(*f.actor, state); }));
   }
@@ -1767,11 +1855,11 @@ TEST_CASE(
   --state.completed.front().eventHead;
   REQUIRE_THROWS(state.Save());
   auto active = SelectedHandler();
-  active.active->dispatch->roots.resize(QuestJobState::MaxAttachments + 1,
-                                        "Root");
+  Single(active)->dispatch->roots.resize(QuestJobState::MaxAttachments + 1,
+                                         "Root");
   REQUIRE_THROWS(active.Save());
   active = SelectedHandler();
-  active.active->segment = QuestJobState::MaxSegments + 1;
+  Single(active)->segment = QuestJobState::MaxSegments + 1;
   REQUIRE_THROWS(active.Save());
 }
 
@@ -1786,19 +1874,19 @@ TEST_CASE(
     auto migrated = QuestJobState::Read(legacy);
     REQUIRE(migrated.Save() == original.Save());
     REQUIRE(migrated.retiredThrough == 0);
-    REQUIRE(migrated.Save()["schemaVersion"] == 5);
-    if (migrated.active) {
-      REQUIRE_FALSE(migrated.active->sequenced);
-      REQUIRE(migrated.active->Scope() == original.active->Scope());
-      REQUIRE(migrated.active->NextToken() == original.active->NextToken());
-      REQUIRE_NOTHROW(migrated.ValidateHeap(DispatchHeap(*migrated.active)));
+    REQUIRE(migrated.Save()["schemaVersion"] == 6);
+    if (Single(migrated)) {
+      REQUIRE_FALSE(Single(migrated)->sequenced);
+      REQUIRE(Single(migrated)->Scope() == Single(original)->Scope());
+      REQUIRE(Single(migrated)->NextToken() == Single(original)->NextToken());
+      REQUIRE_NOTHROW(migrated.ValidateHeap(DispatchHeap(*Single(migrated))));
     }
     for (const auto& job : migrated.completed)
       REQUIRE_FALSE(job.sequenced);
   }
   auto legacy = Legacy(Waiting(), 4);
   legacy["active"]["command"] = "quest-request:1:1";
-  REQUIRE_FALSE(QuestJobState::Read(legacy).active->sequenced);
+  REQUIRE_FALSE(Single(QuestJobState::Read(legacy))->sequenced);
   legacy["active"]["sequenced"] = false;
   REQUIRE_THROWS(QuestJobState::Read(legacy));
 }
@@ -1808,20 +1896,20 @@ TEST_CASE("Sequenced commands are canonical while legacy command names stay "
           "[Quest][QuestJob]")
 {
   auto state = Waiting();
-  state.active->sequenced = true;
-  state.active->command = "quest-request:1:1";
+  Single(state)->sequenced = true;
+  Single(state)->command = "quest-request:1:1";
   REQUIRE_NOTHROW(state.Save());
-  REQUIRE_NOTHROW(state.ValidateHeap(Heap(*state.active)));
+  REQUIRE_NOTHROW(state.ValidateHeap(Heap(*Single(state))));
   for (const auto* command :
        { "", "quest-request:01:1", "quest-request:1:01", "quest-request:1:2",
          "quest-request:2:1", "quest-request:+1:1", "Quest-request:1:1",
          "command-one" }) {
     auto invalid = state;
-    invalid.active->command = command;
+    Single(invalid)->command = command;
     REQUIRE_THROWS(invalid.Save());
   }
   auto value = state.Save();
-  value["active"]["sequenced"] = 1;
+  value["live"][0]["sequenced"] = 1;
   REQUIRE_THROWS(QuestJobState::Read(value));
   auto mixed = History(1, 1);
   mixed.completed.front().command = mixed.completed.back().command;
@@ -1860,8 +1948,8 @@ TEST_CASE("Retired histories preserve sorted permanent legacy records and a "
       v["completed"][0]["command"] = "quest-request:1:1";
     },
     [](Json& v) {
-      v["active"]["id"] = 2;
-      v["active"]["command"] = "quest-request:1:2";
+      v["live"][0]["id"] = 2;
+      v["live"][0]["command"] = "quest-request:1:2";
     },
     [](Json& v) { v["completed"][1]["id"] = 1; },
     [](Json& v) { v["completed"][2]["generation"] = 2; }
@@ -1934,15 +2022,16 @@ TEST_CASE("Admission retirement removes only the oldest sequenced completion",
   REQUIRE(state.Save()["completed"][1] == before["completed"][2]);
 }
 
-TEST_CASE("Retirement refuses active or malformed typed state without "
-          "changing history",
+TEST_CASE("Retirement preserves live work and refuses malformed typed state",
           "[Quest][QuestJob]")
 {
   auto active = History(1, QuestJobState::MaxRecentCompleted - 1);
   AddPending(active, true);
   const auto before = active.Save();
-  REQUIRE_THROWS(active.RetireForAdmission());
-  REQUIRE(active.Save() == before);
+  REQUIRE(active.RetireForAdmission() == std::vector<uint64_t>{ 2 });
+  REQUIRE(active.Save()["live"] == before["live"]);
+  REQUIRE(active.retiredThrough == 2);
+  REQUIRE(active.completed.size() + 1 == before["completed"].size());
   auto state = History(2, 4);
   const auto untouched = state.Save();
   state.RetireForAdmission();
@@ -1965,7 +2054,7 @@ TEST_CASE(
   state.RetireForAdmission();
   REQUIRE(state.retiredThrough == 1);
   REQUIRE_NOTHROW(state.ValidateHeap(Json::object()));
-  REQUIRE_THROWS(state.ValidateHeap(Heap(*Waiting().active)));
+  REQUIRE_THROWS(state.ValidateHeap(Heap(*Single(Waiting()))));
   const auto saved = state.Save();
   auto migrated = QuestJobState::Read(saved);
   REQUIRE(migrated.retiredThrough == state.retiredThrough);
@@ -2000,12 +2089,12 @@ TEST_CASE("Active Journal jobs cannot retire history or change permanent "
   }
   SECTION("reclassify active sequenced request as legacy")
   {
-    candidate.active->sequenced = false;
+    Single(candidate)->sequenced = false;
   }
   // These candidates are individually well-formed: the Journal must reject
   // their relationship to the already-published history.
   REQUIRE_NOTHROW(candidate.Save());
-  REQUIRE_THROWS(QuestJournal::AtomicJob(*f.actor, candidate.active->id, [&] {
+  REQUIRE_THROWS(QuestJournal::AtomicJob(*f.actor, Single(candidate)->id, [&] {
     QuestJournal::SetJobState(*f.actor, candidate);
   }));
   REQUIRE(f.Saved() == before);
@@ -2054,7 +2143,7 @@ TEST_CASE("Journal admission permits only the exact required oldest-request "
     REQUIRE_NOTHROW(candidate.Save());
   else
     REQUIRE_THROWS(candidate.Save());
-  REQUIRE_THROWS(QuestJournal::AtomicJob(*f.actor, candidate.active->id, [&] {
+  REQUIRE_THROWS(QuestJournal::AtomicJob(*f.actor, Single(candidate)->id, [&] {
     QuestJournal::SetJobState(*f.actor, candidate);
   }));
   REQUIRE(f.Saved() == before);
@@ -2072,7 +2161,7 @@ TEST_CASE("Journal admits sequenced work beyond all permanent legacy slots "
   for (uint64_t admission = 0; admission < 2; ++admission) {
     state.RetireForAdmission();
     AddPending(state, true);
-    const auto id = state.active->id;
+    const auto id = Single(state)->id;
     REQUIRE(id > QuestJobState::MaxCompleted);
     REQUIRE_NOTHROW(f.PublishJobs(state));
     REQUIRE(QuestJournal::JobState(*f.actor).Save() == state.Save());
@@ -2102,11 +2191,12 @@ TEST_CASE("Sequenced admission retires by canonical byte budget before "
       canonicalBytes += job.dump().size();
   REQUIRE(state.RetainedSequencedBytes() == canonicalBytes);
   REQUIRE(canonicalBytes > QuestJobState::MaxRecentBytes);
-  // A just-completed large result may exceed the window while still at rest.
+  // A completion may exceed the byte window even while another root is live.
+  // Exact admission-time retirement is enforced by Journal transitions.
   REQUIRE(QuestJobState::Read(original).Save() == original);
   auto admission = state;
   AddPending(admission, true);
-  REQUIRE_THROWS(admission.Save());
+  REQUIRE_NOTHROW(admission.Save());
   auto legacyAdmission = state;
   AddPending(legacyAdmission, false);
   REQUIRE_NOTHROW(legacyAdmission.Save());
@@ -2139,7 +2229,7 @@ TEST_CASE("Journal admits only the exact byte-triggered retirement and "
   excessive.retiredThrough = excessive.completed[2].id;
   excessive.completed.erase(excessive.completed.begin() + 2);
   REQUIRE_NOTHROW(excessive.Save());
-  REQUIRE_THROWS(QuestJournal::AtomicJob(*f.actor, excessive.active->id, [&] {
+  REQUIRE_THROWS(QuestJournal::AtomicJob(*f.actor, Single(excessive)->id, [&] {
     QuestJournal::SetJobState(*f.actor, excessive);
   }));
   REQUIRE(f.Saved() == before);
@@ -2150,4 +2240,338 @@ TEST_CASE("Journal admits only the exact byte-triggered retirement and "
   REQUIRE(saved.RetainedSequencedBytes() <= QuestJobState::MaxRecentBytes);
   REQUIRE(saved.Save()["completed"][0] == before["jobs"]["completed"][0]);
   REQUIRE(saved.Save()["completed"][1] == before["jobs"]["completed"][2]);
+}
+
+TEST_CASE(
+  "Schema five migration preserves numbered identities and retired history",
+  "[Quest][QuestJob]")
+{
+  auto history = History(2, QuestJobState::MaxRecentCompleted);
+  history.RetireForAdmission();
+  AddPending(history, true);
+  for (const auto& original :
+       { history, Waiting(), Nested(true), SelectedHandler(true) }) {
+    const auto legacy = Legacy(original, 5);
+    const auto migrated = QuestJobState::Read(legacy);
+    REQUIRE(migrated.Save() == MigratedLegacy(original, 5).Save());
+    REQUIRE(migrated.retiredRanges.empty());
+    REQUIRE(migrated.live.size() == 1);
+    REQUIRE(Single(migrated)->environmentHash.empty());
+    REQUIRE(Single(migrated)->Scope() == Single(original)->Scope());
+    REQUIRE_NOTHROW(migrated.ValidateHeap(AllLiveHeap(migrated)));
+  }
+  auto legacy = Legacy(history, 5);
+  legacy["active"]["environmentHash"] = "";
+  REQUIRE_THROWS(QuestJobState::Read(legacy));
+  auto numbered = Waiting();
+  Single(numbered)->sequenced = true;
+  Single(numbered)->command = "quest-request:1:1";
+  auto migrated = QuestJobState::Read(Legacy(numbered, 5));
+  auto newJob = Numbered(*Single(Begin()), migrated.nextJob++);
+  migrated.live.emplace(newJob.id, newJob);
+  REQUIRE_THROWS(
+    migrated.Save()); // An unpinned migrated root must finish alone.
+}
+
+TEST_CASE("Independent live roots round trip and complete out of order",
+          "[Quest][QuestJob]")
+{
+  QuestJobState state;
+  for (uint64_t id = 1; id <= 3; ++id) {
+    state.live.emplace(id, Numbered(*Single(Begin()), id));
+    ++state.nextJob;
+  }
+  const auto original = state.Save();
+  REQUIRE(original["live"].size() == 3);
+  REQUIRE(QuestJobState::Read(original).Save() == original);
+  REQUIRE(state.HasLive());
+  const auto first = *state.FindLive(1);
+  CompleteLive(state, 3);
+  CompleteLive(state, 2);
+  REQUIRE(state.FindLive(1));
+  REQUIRE(*state.FindLive(1) == first);
+  REQUIRE_FALSE(state.FindLive(2));
+  REQUIRE(state.FindCompleted(2)->id == 2);
+  REQUIRE(state.completed[0].id == 2);
+  REQUIRE(state.completed[1].id == 3);
+  REQUIRE_NOTHROW(state.Save());
+  CompleteLive(state, 1);
+  REQUIRE_FALSE(state.HasLive());
+  REQUIRE(state.completed.front().id == 1);
+  REQUIRE(QuestJobState::Read(state.Save()).Save() == state.Save());
+}
+
+TEST_CASE(
+  "Concurrent roots require one pinned environment and bounded capacity",
+  "[Quest][QuestJob]")
+{
+  QuestJobState state;
+  for (uint64_t id = 1; id <= QuestJobState::MaxLive; ++id) {
+    state.live.emplace(id, Numbered(*Single(Begin()), id));
+    ++state.nextJob;
+  }
+  REQUIRE_NOTHROW(state.Save());
+  const auto valid = state.Save();
+  const std::vector<std::function<void(Json&)>> corrupt = {
+    [](Json& v) { v["live"][0]["environmentHash"] = ""; },
+    [](Json& v) { v["live"][1]["environmentHash"] = std::string(64, 'f'); },
+    [](Json& v) { v["live"][1]["environmentHash"] = std::string(64, 'E'); },
+    [](Json& v) { v["live"][1]["environmentHash"] = std::string(63, 'e'); },
+    [](Json& v) { v["live"][1]["contentMode"] = "fixture"; },
+    [](Json& v) { v["live"][1]["owner"] = "3001"; },
+    [](Json& v) { std::swap(v["live"][0], v["live"][1]); },
+    [](Json& v) { v["live"][1] = v["live"][0]; },
+    [](Json& v) { v["live"] = Json::object(); },
+    [](Json& v) { v["live"][0].erase("environmentHash"); }
+  };
+  for (size_t index = 0; index < corrupt.size(); ++index) {
+    INFO("Concurrent root corruption " << index);
+    auto saved = valid;
+    corrupt[index](saved);
+    REQUIRE_THROWS(QuestJobState::Read(saved));
+  }
+  auto tooMany = state;
+  auto job = Numbered(*Single(Begin()), tooMany.nextJob++);
+  tooMany.live.emplace(job.id, job);
+  REQUIRE_THROWS(tooMany.Save());
+  auto wrongKey = state;
+  wrongKey.live.at(1).id = 20;
+  REQUIRE_THROWS(wrongKey.Save());
+  auto reserved = state;
+  for (size_t index = 0;
+       index < QuestJobState::MaxRecentCompleted - QuestJobState::MaxLive;
+       ++index)
+    reserved.completed.push_back(CompletedRecord(reserved.nextJob++, true));
+  REQUIRE_NOTHROW(reserved.Save());
+  CompleteLive(reserved, 2); // Completion consumes its already-reserved slot.
+  REQUIRE_NOTHROW(reserved.Save());
+  reserved.completed.push_back(CompletedRecord(reserved.nextJob++, true));
+  REQUIRE_THROWS(reserved.Save());
+}
+
+TEST_CASE("Sparse retirement lets a low numbered root outlive hundreds of "
+          "later results",
+          "[Quest][QuestJob]")
+{
+  QuestJobState state;
+  state.live.emplace(1, Numbered(*Single(TimerWaiting()), 1));
+  state.nextJob = 2;
+  const auto sleeping = *state.FindLive(1);
+  for (uint64_t id = 2; id <= 340; ++id) {
+    state.RetireForAdmission();
+    REQUIRE(state.nextJob == id);
+    state.live.emplace(id, Numbered(*Single(Begin()), state.nextJob++));
+    CompleteLive(state, id);
+    REQUIRE(state.completed.size() < QuestJobState::MaxRecentCompleted);
+  }
+  REQUIRE(*state.FindLive(1) == sleeping);
+  REQUIRE(state.retiredThrough == 0);
+  REQUIRE(state.retiredRanges ==
+          std::vector<QuestJobState::RetiredRange>{ { 2, 309 } });
+  REQUIRE_FALSE(state.IsRetired(0));
+  REQUIRE_FALSE(state.IsRetired(1));
+  REQUIRE(state.IsRetired(2));
+  REQUIRE(state.IsRetired(309));
+  REQUIRE_FALSE(state.IsRetired(310));
+  REQUIRE_FALSE(state.IsRetired(state.nextJob));
+  REQUIRE_NOTHROW(state.ValidateHeap(AllLiveHeap(state)));
+  REQUIRE(QuestJobState::Read(state.Save()).Save() == state.Save());
+  CompleteLive(state, 1);
+  REQUIRE(state.completed.front().id == 1);
+  const auto delta = state.RetireForAdmission();
+  REQUIRE(delta == std::vector<uint64_t>{ 1 });
+  REQUIRE(state.retiredThrough == 309);
+  REQUIRE(state.retiredRanges.empty());
+  REQUIRE(state.IsRetired(1));
+  REQUIRE(state.IsRetired(309));
+  REQUIRE_NOTHROW(state.Save());
+}
+
+TEST_CASE("Sparse retirement normalizes legacy bridges without retiring them",
+          "[Quest][QuestJob]")
+{
+  QuestJobState state;
+  state.nextJob = 7;
+  state.live.emplace(3, Numbered(*Single(Begin()), 3, false));
+  state.retiredRanges = { { 1, 2 }, { 4, 6 } };
+  REQUIRE_NOTHROW(state.Save());
+  REQUIRE(state.RetireForAdmission().empty());
+  REQUIRE(state.retiredThrough == 2);
+  REQUIRE(state.retiredRanges ==
+          std::vector<QuestJobState::RetiredRange>{ { 4, 6 } });
+  REQUIRE_FALSE(state.IsRetired(3));
+  CompleteLive(state, 3);
+  const auto legacy = *state.FindCompleted(3);
+  REQUIRE_NOTHROW(
+    state.Save()); // A non-maximal prefix is valid between admissions.
+  REQUIRE(state.RetireForAdmission().empty());
+  REQUIRE(state.retiredThrough == 6);
+  REQUIRE(state.retiredRanges.empty());
+  REQUIRE(*state.FindCompleted(3) == legacy);
+  REQUIRE_FALSE(state.IsRetired(3));
+  REQUIRE(state.IsRetired(4));
+  REQUIRE_NOTHROW(state.Save());
+}
+
+TEST_CASE(
+  "Sparse ranges reject gaps overlaps noncanonical bounds and hidden records",
+  "[Quest][QuestJob]")
+{
+  QuestJobState state;
+  state.nextJob = 11;
+  state.live.emplace(1, Numbered(*Single(Begin()), 1));
+  state.live.emplace(10, Numbered(*Single(Begin()), 10));
+  state.completed.push_back(CompletedRecord(6, false));
+  state.retiredRanges = { { 2, 5 }, { 7, 9 } };
+  const auto valid = state.Save();
+  const std::vector<std::function<void(Json&)>> corrupt = {
+    [](Json& v) { v["retiredThrough"] = 1; },
+    [](Json& v) { v["retiredThrough"] = 6; },
+    [](Json& v) { v["retiredRanges"][0]["first"] = 0; },
+    [](Json& v) { v["retiredRanges"][0]["last"] = 1; },
+    [](Json& v) { v["retiredRanges"][0]["first"] = 3; },
+    [](Json& v) { v["retiredRanges"][0]["last"] = 6; },
+    [](Json& v) { v["retiredRanges"][0]["last"] = 7; },
+    [](Json& v) { v["retiredRanges"][1]["last"] = 10; },
+    [](Json& v) { v["retiredRanges"][1]["last"] = 11; },
+    [](Json& v) { v["retiredRanges"][0]["first"] = 2.0; },
+    [](Json& v) { v["retiredRanges"][0]["extra"] = 0; },
+    [](Json& v) { v["retiredRanges"][0].erase("last"); },
+    [](Json& v) { std::swap(v["retiredRanges"][0], v["retiredRanges"][1]); },
+    [](Json& v) {
+      v["retiredRanges"] = Json::array({ { { "first", 2 }, { "last", 3 } },
+                                         { { "first", 4 }, { "last", 5 } },
+                                         { { "first", 7 }, { "last", 9 } } });
+    },
+    [](Json& v) { v["completed"].clear(); },
+    [](Json& v) { v["retiredRanges"] = Json::array(); },
+    [](Json& v) { v["retiredRanges"] = Json::object(); }
+  };
+  for (size_t index = 0; index < corrupt.size(); ++index) {
+    INFO("Sparse corruption " << index);
+    auto saved = valid;
+    corrupt[index](saved);
+    REQUIRE_THROWS(QuestJobState::Read(saved));
+  }
+  constexpr uint64_t max = 9007199254740991ULL;
+  state.live.erase(10);
+  state.completed.clear();
+  state.nextJob = max;
+  state.retiredRanges = { { 2, max - 2 } };
+  state.completed.push_back(CompletedRecord(max - 1, true));
+  REQUIRE_NOTHROW(
+    state.Save()); // Validation work does not scale with the range span.
+  REQUIRE(state.IsRetired(max - 2));
+  REQUIRE_FALSE(state.IsRetired(max - 1));
+  auto oversized = state;
+  oversized.retiredRanges.resize(QuestJobState::MaxRetiredRanges + 1);
+  REQUIRE_THROWS(oversized.Save());
+}
+
+TEST_CASE(
+  "Shared heap validates every live root against its own stack and budget",
+  "[Quest][QuestJob]")
+{
+  QuestJobState state;
+  state.nextJob = 4;
+  state.live.emplace(1, Numbered(*Single(TimerWaiting()), 1));
+  state.live.emplace(2, Numbered(*Single(Nested(true)), 2));
+  state.live.emplace(3, Numbered(*Single(SelectedHandler(true, true)), 3));
+  const auto valid = AllLiveHeap(state);
+  REQUIRE(valid["continuations"].size() == 4);
+  REQUIRE_NOTHROW(state.ValidateHeap(valid));
+  const auto timerToken = state.live.at(1).token;
+  const auto childToken = state.live.at(2).Current().token;
+  const auto handlerToken = state.live.at(3).Current().token;
+  const std::vector<std::function<void(Json&)>> corrupt = {
+    [&](Json& v) { v["continuations"].erase(timerToken); },
+    [&](Json& v) {
+      v["continuations"][timerToken]["scope"] = state.live.at(2).Scope();
+    },
+    [&](Json& v) {
+      v["continuations"][childToken]["executedInstructions"] = 3;
+    },
+    [&](Json& v) {
+      v["continuations"][timerToken]["executedInstructions"] = 7;
+    },
+    [&](Json& v) { v["continuations"][timerToken]["resultType"] = "Bool"; },
+    [&](Json& v) {
+      v["continuations"][handlerToken]["receiver"]["value"]["id"] = 0;
+    },
+    [&](Json& v) {
+      v["continuations"][handlerToken]["rootScript"] = "AnotherRoot";
+    }
+  };
+  for (size_t index = 0; index < corrupt.size(); ++index) {
+    INFO("Multi-root heap corruption " << index);
+    auto heap = valid;
+    corrupt[index](heap);
+    REQUIRE_THROWS(state.ValidateHeap(heap));
+  }
+  CompleteLive(state, 1);
+  REQUIRE_THROWS(state.ValidateHeap(valid));
+  auto completedHeap = valid;
+  completedHeap["continuations"].erase(timerToken);
+  REQUIRE_NOTHROW(state.ValidateHeap(completedHeap));
+}
+
+TEST_CASE("Schema five retains its single-live ordering and byte restrictions",
+          "[Quest][QuestJob]")
+{
+  auto oversized = ByteHeavyHistory();
+  AddPending(oversized, true);
+  REQUIRE_NOTHROW(oversized.Save());
+  REQUIRE_THROWS(QuestJobState::Read(Legacy(oversized, 5)));
+  auto outOfOrder = Waiting();
+  outOfOrder.completed.push_back(CompletedRecord(outOfOrder.nextJob++, true));
+  REQUIRE_NOTHROW(outOfOrder.Save());
+  REQUIRE_THROWS(QuestJobState::Read(Legacy(outOfOrder, 5)));
+  // The old limit counts the old JSON shape, not the newly introduced field.
+  auto boundary = History(0, 1);
+  auto& record = boundary.completed.front();
+  record.events.assign(
+    QuestJobState::MaxEvents,
+    QuestJobState::Event{ "14:Skyrim.esm", "f:Skyrim.esm", "", 1, true });
+  record.eventHead = static_cast<uint32_t>(record.events.size());
+  AddPending(boundary, true);
+  auto legacy = Legacy(boundary, 5);
+  auto& events = legacy["completed"][0]["events"];
+  size_t remaining =
+    QuestJobState::MaxRecentBytes - legacy["completed"][0].dump().size();
+  for (auto& event : events) {
+    if (!remaining)
+      break;
+    const auto length = std::min<size_t>(remaining, 240);
+    event["item"] = "f:" + std::string(length, 'x') + "Skyrim.esm";
+    remaining -= length;
+  }
+  REQUIRE(remaining == 0);
+  REQUIRE(legacy["completed"][0].dump().size() ==
+          QuestJobState::MaxRecentBytes);
+  const auto migrated = QuestJobState::Read(legacy);
+  REQUIRE(migrated.RetainedSequencedBytes() > QuestJobState::MaxRecentBytes);
+  REQUIRE_NOTHROW(migrated.Save());
+}
+
+TEST_CASE("Byte retirement preserves several live roots and returns only "
+          "removed receipts",
+          "[Quest][QuestJob]")
+{
+  QuestJobState state;
+  state.nextJob = 5;
+  state.live.emplace(1, Numbered(*Single(TimerWaiting()), 1));
+  state.live.emplace(4, Numbered(*Single(Begin()), 4));
+  state.completed = { LargeCompletion(2, true), LargeCompletion(3, true) };
+  REQUIRE(state.RetainedSequencedBytes() > QuestJobState::MaxRecentBytes);
+  REQUIRE_NOTHROW(state.Save());
+  const auto sleeping = state.live;
+  const auto newest = state.completed.back();
+  REQUIRE(state.RetireForAdmission() == std::vector<uint64_t>{ 2 });
+  REQUIRE(state.live == sleeping);
+  REQUIRE(state.completed == std::vector<QuestJobState::Job>{ newest });
+  REQUIRE(state.retiredThrough == 0);
+  REQUIRE(state.retiredRanges ==
+          std::vector<QuestJobState::RetiredRange>{ { 2, 2 } });
+  REQUIRE(state.RetainedSequencedBytes() <= QuestJobState::MaxRecentBytes);
+  REQUIRE_NOTHROW(state.ValidateHeap(AllLiveHeap(state)));
 }

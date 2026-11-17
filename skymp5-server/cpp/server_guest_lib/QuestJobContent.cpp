@@ -228,6 +228,24 @@ std::string QuestJobContent::Hash(WorldState& world, uint32_t questId,
   return hash.Finish();
 }
 
+std::string QuestJobContent::Environment(WorldState& world,
+                                         const std::string& scriptManifest)
+{
+  Hasher hash("skymp.quest.environment.v1");
+  hash.Text(Digest(scriptManifest));
+  hash.Count(world.espmFiles.size());
+  for (const auto& file : world.espmFiles)
+    hash.Text(file);
+  const auto& masters = world.GetEspm().GetContentHashes();
+  hash.Count(masters.size());
+  for (const auto& master : masters) {
+    hash.Text(master.fileName);
+    hash.Number(master.size, 8);
+    hash.Text(master.sha256);
+  }
+  return hash.Finish();
+}
+
 std::string QuestJobContent::Hash(WorldState& world, uint32_t questId,
                                   const espm::QuestScriptData& metadata,
                                   const std::vector<PexScript::Lazy>& scripts)

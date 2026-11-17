@@ -186,7 +186,7 @@ void WorldState::AttachSaveStorage(
       if (auto* actor = form->AsActor(); actor &&
           actor->GetDynamicFields().GetValueDump(QuestJournal::kProperty) !=
             "null" &&
-          QuestJournal::PersonalJobState(*actor).active)
+          QuestJournal::PersonalJobState(*actor).HasLive())
         throw std::runtime_error(
           "Cannot replace save storage with active quest jobs");
     }

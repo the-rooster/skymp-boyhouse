@@ -13,11 +13,13 @@ class QuestScriptRuntime
 {
 public:
   static std::vector<PexScript::Lazy> LoadScripts(WorldState& world);
-  // Called within the coordinator's AtomicJob segment. The caller persists
-  // the updated job alongside the heap; this function never dispatches an
-  // awaited operation. Fixture awaits are explicitly opt-in test injection.
-  // timerAnchor is provisional output: publish it only after AtomicJob
-  // succeeds, and never resume it before that segment's durable receipt.
+  // Called within the selected root's AtomicJob lease. Other live roots share
+  // the current campaign heap but retain their own saved stacks and budgets.
+  // The caller persists the updated job alongside the heap. It never
+  // dispatches an awaited operation. Fixture awaits are explicitly opt-in test
+  // injection. timerAnchor is provisional output: publish it only after
+  // AtomicJob succeeds, and never resume it before that segment's durable
+  // receipt.
   static void ExecuteJobSegment(
     MpActor& actor, QuestJobState::Job& job,
     const espm::QuestScriptData& metadata,

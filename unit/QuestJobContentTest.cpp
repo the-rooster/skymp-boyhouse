@@ -438,3 +438,60 @@ TEST_CASE("Quest override manifests reject invalid maps and source digests",
       fixture.server.worldState, manifest, overrides));
   }
 }
+
+TEST_CASE(
+  "Shared quest environments pin masters mapping and all fixture content",
+  "[Quest][QuestJobContent][MultiJob]")
+{
+  ContentFixture fixture(Plugin() + Record("QUST", 0x300, QuestFields()));
+  auto& world = fixture.server.worldState;
+  const auto manifest = QuestJobContent::ScriptManifest(fixture.Scripts());
+  std::map<uint32_t, espm::QuestScriptData> overrides{
+    { 0x100, fixture.metadata }, { 0x300, fixture.metadata }
+  };
+  const auto pin =
+    QuestJobContent::WithMetadataOverrides(world, manifest, overrides);
+  const auto environment = QuestJobContent::Environment(world, pin);
+  REQUIRE(environment.size() == 64);
+  REQUIRE(QuestJobContent::Hash(world, 0x100, fixture.metadata, pin) !=
+          QuestJobContent::Hash(world, 0x300, fixture.metadata, pin));
+  REQUIRE(QuestJobContent::Environment(world, pin) == environment);
+  SECTION("another root's fixture metadata")
+  {
+    ++overrides.at(0x300).scripts[0].properties[0].value.integer;
+    REQUIRE(QuestJobContent::Environment(
+              world,
+              QuestJobContent::WithMetadataOverrides(
+                world, manifest, overrides)) != environment);
+  }
+  SECTION("unrelated master content")
+  {
+    ContentFixture changed(Plugin(QuestFields(), 4) +
+                           Record("QUST", 0x300, QuestFields()));
+    REQUIRE(QuestJobContent::Environment(changed.server.worldState, pin) !=
+            environment);
+  }
+  SECTION("ordered plugin mapping")
+  {
+    world.espmFiles.push_back("Other.esm");
+    const auto extended = QuestJobContent::Environment(world, pin);
+    REQUIRE(extended != environment);
+    std::reverse(world.espmFiles.begin(), world.espmFiles.end());
+    REQUIRE(QuestJobContent::Environment(world, pin) != extended);
+  }
+  SECTION("executable content")
+  {
+    fixture.script->objectTable[0]
+      .states[0]
+      .functions[0]
+      .function.code.instructions[0]
+      .args[0] = VarValue(8);
+    const auto changed = QuestJobContent::WithMetadataOverrides(
+      world, QuestJobContent::ScriptManifest(fixture.Scripts()), overrides);
+    REQUIRE(QuestJobContent::Environment(world, changed) != environment);
+  }
+  SECTION("invalid manifest")
+  {
+    REQUIRE_THROWS(QuestJobContent::Environment(world, std::string(64, 'g')));
+  }
+}

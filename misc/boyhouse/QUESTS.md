@@ -148,14 +148,16 @@ another segment executes. Master files must not change while loaded. Changed con
 not migrated. The initial full script parse/hash is not yet a performance-tested
 startup path.
 
-One job owns a campaign at a time. Ordinary quest mutation and private-reference
-allocation cannot overwrite active work, including a character's personal
-history while visiting another host. This does not provide a global gameplay
-lease over every physical action between segments. Completed history currently
-has a hard 256-command limit with no eviction; new work is refused at capacity
-to avoid replaying old rewards. Scalable deduplication retention, real external
-operation delivery, latent event cursors, lifecycle
-semantics and real-client playthroughs remain required for full quest support.
+Up to 16 stage roots can remain live in one campaign, each with its own
+continuation and timer. Exactly one transaction executes at a time, and every
+mutating admission or segment waits for the owner's latest save receipt.
+Ordinary quest mutation and private-reference allocation cannot overwrite live
+work, including a character's personal history while visiting another host.
+This does not provide a global gameplay lease over every physical action.
+Legacy command history retains its 256-entry cap; numbered requests use bounded
+recent results and permanent compact retirement records. Real event ingress,
+causal inventory notification release, lifecycle semantics and real-client
+playthroughs remain required for full quest support.
 
 ### Elapsed waits and automatic scheduling
 
@@ -184,7 +186,9 @@ guarantee is claimed. Clock objects/VM stacks/native callbacks are never saved.
 Owned-content submissions opt into `WorldState::Tick` scheduling. Loaded owners
 are indexed once; the pump does not scan all world forms. Each pass considers
 at most 64 campaigns and executes at most eight segments, with one attempt per
-campaign in round-robin order. Pending receipts, sleeping timers and external
+campaign in round-robin order, then rotates across that campaign's live roots.
+Each root has a separate monotonic timer anchor and quarantine. Pending receipts,
+sleeping timers and external
 waits use cached fast paths. The original initiating actor and campaign context
 must still be available; another actor is never substituted. Content, adapter,
 or script failures quarantine that job without stopping other campaigns.
@@ -786,35 +790,69 @@ the result is retained. The sequence is the campaign's global job ID, including
 IDs consumed by older string-keyed commands. Keep the typed ID across retries;
 its diagnostic command spelling is not an interchangeable legacy key.
 
-Schema5 preserves old command identities, scopes and continuations. Completed
-string-keyed commands remain permanent and retain their existing 256-command
-admission cap. Numbered work has no such lifetime cap: a new numbered admission
-retires oldest numbered completions until fewer than 32 remain and their full
-canonical serialized records occupy at most 1 MiB. All legacy records and newer
-numbered records remain unchanged. The completed result window can hold up to 32
-records; large results can be retired sooner. A newly completed large result
-is subject to this byte check on the next numbered admission. The overall 8 MiB
-journal and active-job/VM resource limits still apply independently.
+Schema6 migrates schemas1-5 without changing command identities, scopes or
+continuations. Completed string-keyed commands remain permanent; live plus
+completed legacy commands retain the 256-command cap. Numbered live roots reserve
+a recent-result slot: at most 32 numbered live roots and full completed records
+combined are retained. Before numbered admission, retire the oldest completed
+numbered records until that sum is below 32 and canonical completed numbered
+records occupy at most 1 MiB. Completion transfers its reserved slot into history;
+it can push completed bytes above 1 MiB until the next admission. Legacy data,
+live stacks and the overall 8 MiB journal/VM limits remain independent.
 
-Retirement and the new job's first segment share one atomic save. A newly
-retired request remains Pending until that exact receipt is Durable. Failed
-writes retry the same snapshot; a failed execution leaves the previous frontier
-and effects unchanged. Older durable retirements remain observable during later
-pending saves. Reentrant observations during a busy transaction conservatively
-return Pending. Abandoned retirement receipts require recovery.
+Out-of-order completion uses sorted sparse retired intervals above a contiguous
+frontier. A sleeping low-numbered request remains live while later completions
+are compacted. Retired intervals never include retained legacy identities and
+never cross live or recent numbered records. Validation sweeps bounded records
+and ranges rather than iterating all historical IDs.
 
-At or below the durable retirement frontier, a typed retry returns Retired and
-never executes. Retired carries no accepted result and cannot validate the old
-payload, original actor, phase or content mode after those details are erased.
-It still validates the current campaign owner/generation and rejects retained
-legacy IDs in the numbered namespace. Recent completions keep their exact
-context/content/Boolean-result checks. Retry of a numbered Completed or Retired
-request is a no-op. Request IDs and native operation scopes are never reused.
+Retirement and the new job's first segment share one atomic save. Only the exact
+newly retired IDs remain Pending until that receipt is Durable. Merging an older
+durable sparse interval into an advancing frontier does not hide those older
+retirements. Failed writes retry the same snapshot; failed execution leaves
+previous retirement and effects unchanged. Reentrant observations during a busy
+transaction conservatively return Pending. Abandoned receipts require recovery.
 
-This is the retention prerequisite for continuing server event traffic. It does
-not yet provide an inbox or independent sleeping root stacks. An interaction
-queued solely behind a quest waiting for that interaction can deadlock; those
-stacks must share the campaign heap while executing serial durable segments.
+A retired typed retry never executes. Retired carries no accepted result and
+cannot validate an erased payload, original actor, phase or content mode. It
+still validates the current campaign owner/generation and rejects retained
+legacy IDs in the numbered namespace. Recent completions keep exact
+context/content/Boolean-result checks. Retry of numbered Completed or Retired
+work is a no-op. Request IDs and native operation scopes are never reused.
+
+## Independent stage execution
+
+The live-root map contains independently suspended stage jobs. Each retains its
+initiating actor, context, native child stack, inventory FIFO, budget and tokens.
+They share one campaign VM heap. A resumed script reads current shared fields
+and globals while retaining captured scalar locals and object/frame identities.
+Shared array IDs remain shared across suspended stacks; rebinding a field to a
+new array does not retarget a saved local referring to the old array.
+
+Every segment starts from current committed state. Journal validation permits
+only the selected root's transition and preserves other live roots and their
+continuation envelopes. Shared array contents can change deliberately. Completing
+a newer root before an older root inserts its receipt in identity order.
+One pinned environment covers the full master/script/fixture manifest for all
+concurrent roots. A migrated root without an environment pin may finish alone;
+concurrent admission waits until it finishes. Same-stage repeated execution
+overlapping another entered live stage remains refused.
+
+Per-root timer anchors and quarantine are separate from the campaign-wide write
+barrier. Inspect can report an older root's durable status while another save is
+Pending, but Advance/Resume cannot execute through that pending owner barrier.
+Round-robin scheduling considers up to 64 owners, scans at most 16 roots per
+owner and attempts at most eight segments, one per owner per pass. These are
+work-count limits, not measured production latency guarantees.
+
+This batch supports concurrent trusted stage submissions. It does not yet admit
+independent reference/interaction event roots or connect client actions to durable
+delivery. Existing scripted inventory notifications still drain after their
+producer body completes. A body waiting on its own queued OnItemAdded, or a
+handler waiting on a later event in its own FIFO, remains unsupported. Independent
+event roots, causal outbox release with shared lineage budgets, load/OnInit
+generations, quest lifecycle and client integration remain required. No complete
+quest is certified playable.
 
 ## Verification commands
 
@@ -951,3 +989,16 @@ retain full recent result checks and prove that retired requests cannot replay
 rewards. These are runtime/storage fixtures, not full quest playthroughs or
 production latency evidence. No quest is certified playable. Skyrim was not
 launched; the installed client and staging deployment were unchanged.
+
+The independent-stage-roots batch passed the Linux server build and full
+verification on 2026-11-17 UTC: 772 native cases / 482,056 assertions,
+368 JavaScript tests, 47 Python tests, addon and both protocol
+smokes, and SQLite recovery of 32 characters. Its 123 focused cases
+(29,119 assertions) cover shared-variable wake-ups between stage
+roots, captured scalar/array identity, independent timers, failed-save blocking,
+fresh-server multi-stack recovery, sparse retirement while a low-ID root sleeps,
+exact newly-retired receipt deltas and unrelated-stack mutation rejection.
+Migration retains the original schema5 byte boundary. Runtime/storage fixtures
+do not certify full quests or establish production latency. Independent player
+event ingress and causal notification release still need implementation. Skyrim
+was not launched; the installed client and staging deployment were unchanged.
