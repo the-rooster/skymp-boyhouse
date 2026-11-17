@@ -1169,6 +1169,35 @@ additionally validates canonical bindings, templates and recipient membership.
 This is an admission optimization and integrity check; it does not provide the
 remaining spatial lifecycle, quest systems or in-game acceptance.
 
+### Shared reads during event capture
+
+An explicit external CaptureContext owns one validated job snapshot,
+initialization membership and the exact source journal bytes. It pins the
+requesting actor and campaign owner, their phase epochs, campaign identity and
+plugin mapping. Batch occurrence capture shares that context during a
+synchronous read pass without reserving identities or discovering recipients.
+Scalar capture constructs a fresh context for its call. Each movement-plan
+reconstruction also constructs a fresh context; all existing reconstruction
+and final commit checks remain.
+
+Contexts cannot authorize reads inside a journal transaction. Transactional
+initialization queries instead borrow the current transaction ledger directly.
+External contexts reject same-revision journal edits, actor replacement and
+phase round trips. Every endpoint still resolves the current binding index,
+checks uniqueness and registration, and reads its actual templates and source
+context. No context survives script loading or an authority callback in the
+production path. Full initial/final journal, heap and physical validation and
+the exact admission save receipt remain independent of this optimization.
+
+The opt-in QuestCapturePerformance benchmark separates context construction,
+scalar and batch endpoint capture, movement-plan preparation and one plan
+revalidation. Its owned trigger fixtures use 1, 2 or 16 distinct bindings, with
+zero-event and crossing layouts. Setup, prospective scalar identity lookup,
+handler execution, persistence, packets and clients are outside its measured
+regions. Batch endpoint timing excludes its separately reported context cost;
+plan timing includes a fresh context. These measurements do not establish
+community-server capacity or complete quest playability.
+
 ## Verification commands
 
 ```sh
@@ -1469,3 +1498,49 @@ the enrolled movement producer. Restored subscription publication, reconnect,
 spatial transitions, remaining quest systems and in-game acceptance remain
 unfinished. No complete quest is certified. Skyrim, the installed client and
 staging were not launched, changed or deployed by this verification.
+
+The capture-context changes passed the Linux build and complete verification on
+2026-11-17 UTC: 880 native cases / 512,552 assertions, 368 JavaScript
+tests, 47 Python tests, addon and both protocol smokes, and the existing
+SQLite recovery suite for 32 characters. The focused run passed 43
+cases / 5,225 assertions. New cases check scalar/batch equivalence
+for owner, guest and NPC sources; stale actors and endpoints; phase round trips;
+binding ambiguity; exact journal changes without revision changes; rejection of
+external contexts within transactions; and actual script-loader reentry.
+
+The unchanged historical occurrence benchmark ran 18 samples per version.
+Median scalar-loop capture milliseconds (previous -> context) were:
+
+| Existing live roots | Events | Previous capture | Context capture |
+| ---: | ---: | ---: | ---: |
+| 1 | 1 | 1.089 | 0.757 |
+| 1 | 16 | 12.067 | 6.542 |
+| 1 | 64 | 47.309 | 24.922 |
+| 33 | 1 | 13.601 | 9.361 |
+| 33 | 16 | 147.004 | 79.866 |
+| 33 | 64 | 572.218 | 306.171 |
+
+The new capture/plan benchmark ran three samples per layout. These are current
+path measurements with no live jobs, not a before/after native-movement study.
+The batch column includes context construction plus endpoint capture. The scalar
+column includes its per-call contexts but excludes prospective-ID lookup. Plan
+preparation and one revalidation each include a fresh context. All values are
+median milliseconds:
+
+| Primitives | Layout | Physical events | Context + batch endpoints | Scalar endpoints | Plan | One revalidation |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | outside_all | 0 | 0.021 | 0.019 | 0.110 | 0.213 |
+| 1 | alternating_crossings | 1 | 0.020 | 0.018 | 0.106 | 0.211 |
+| 2 | outside_all | 0 | 0.032 | 0.040 | 0.143 | 0.273 |
+| 2 | alternating_crossings | 3 | 0.031 | 0.040 | 0.140 | 0.266 |
+| 16 | outside_all | 0 | 0.243 | 0.938 | 0.660 | 1.121 |
+| 16 | alternating_crossings | 24 | 0.242 | 0.943 | 0.663 | 1.127 |
+
+The timed endpoint list contains one OnTrigger per primitive; the complete
+physical event sequence is checked outside timing. These controlled tests exclude
+network/client work, native action dispatch, handlers and production persistence.
+They do not establish 16-32-player capacity. The existing SQLite smoke still does
+not certify enrolled movement recovery. Restored subscription publication,
+reconnect, spatial transitions and remaining quest/client systems are unfinished.
+No complete quest is certified. Skyrim stayed closed; installed client and
+staging deployment were unchanged.

@@ -528,15 +528,8 @@ void Validate(const Json& ledger, bool validateHeap = true)
   }
 }
 
-Json Read(MpActor& owner)
+Json ReadDump(const std::string& dump)
 {
-  if (transaction) {
-    if (transaction->owner != &owner)
-      throw std::runtime_error("Cross-campaign quest transaction");
-    return transaction->ledger;
-  }
-  const auto& dump =
-    owner.GetDynamicFields().GetValueDump(QuestJournal::kProperty);
   if (dump == "null") {
     return { { "schemaVersion", 1 },
              { "revision", uint64_t(0) },
@@ -547,6 +540,17 @@ Json Read(MpActor& owner)
   auto ledger = Json::parse(dump);
   Validate(ledger);
   return ledger;
+}
+
+Json Read(MpActor& owner)
+{
+  if (transaction) {
+    if (transaction->owner != &owner)
+      throw std::runtime_error("Cross-campaign quest transaction");
+    return transaction->ledger;
+  }
+  return ReadDump(
+    owner.GetDynamicFields().GetValueDump(QuestJournal::kProperty));
 }
 
 struct Definition
@@ -580,6 +584,105 @@ Definition Lookup(MpActor& owner, uint32_t id)
     world.GetEspmCache());
   return def;
 }
+}
+
+struct QuestJournal::CaptureContext::Data
+{
+  WorldState* world = nullptr;
+  std::shared_ptr<MpForm> actor, owner;
+  uint64_t actorEpoch = 0, ownerEpoch = 0;
+  std::string actorIdentity, ownerIdentity, campaignIdentity, instance;
+  std::string journal;
+  std::vector<std::string> files;
+  QuestJobState jobs;
+  nlohmann::json initialized;
+};
+
+QuestJournal::CaptureContext::CaptureContext(std::shared_ptr<const Data> value)
+  : data(std::move(value))
+{
+}
+
+void QuestJournal::CaptureContext::Validate(MpActor& actor) const
+{
+  if (!data || transaction || actor.GetParent() != data->world ||
+      data->actor.get() != &actor || actor.IsDeleted() ||
+      data->world->LookupFormByIdNoLoad(actor.GetFormId()) != data->actor ||
+      actor.GetWorldInstanceEpoch() != data->actorEpoch ||
+      actor.GetWorldInstance() != data->instance ||
+      data->world->espmFiles != data->files)
+    throw std::runtime_error("Quest capture actor context changed");
+  auto* owner = data->owner->AsActor();
+  if (!owner || owner->GetParent() != data->world || owner->IsDeleted() ||
+      data->world->LookupFormByIdNoLoad(owner->GetFormId()) != data->owner ||
+      owner->GetWorldInstanceEpoch() != data->ownerEpoch ||
+      &QuestJournal::Owner(actor) != owner ||
+      CampaignReferenceBinding::GetIdentity(*owner) !=
+        data->campaignIdentity ||
+      owner->GetDynamicFields().GetValueDump(QuestJournal::kProperty) !=
+        data->journal)
+    throw std::runtime_error("Quest capture campaign context changed");
+}
+
+const QuestJobState& QuestJournal::CaptureContext::Jobs() const
+{
+  return data->jobs;
+}
+const std::string& QuestJournal::CaptureContext::ActorIdentity() const
+{
+  return data->actorIdentity;
+}
+const std::string& QuestJournal::CaptureContext::OwnerIdentity() const
+{
+  return data->ownerIdentity;
+}
+const std::string& QuestJournal::CaptureContext::CampaignIdentity() const
+{
+  return data->campaignIdentity;
+}
+const std::string& QuestJournal::CaptureContext::Instance() const
+{
+  return data->instance;
+}
+
+QuestJournal::CaptureContext QuestJournal::CaptureReadContext(MpActor& actor)
+{
+  if (transaction || !actor.GetParent())
+    throw std::runtime_error("Quest capture snapshot requires external reads");
+  auto value = std::make_shared<CaptureContext::Data>();
+  auto& world = *actor.GetParent();
+  value->world = &world;
+  value->actor = world.LookupFormByIdNoLoad(actor.GetFormId());
+  if (value->actor.get() != &actor || actor.IsDeleted())
+    throw std::runtime_error("Unregistered quest capture actor");
+  auto& owner = Owner(actor);
+  value->owner = world.LookupFormByIdNoLoad(owner.GetFormId());
+  if (value->owner.get() != &owner || owner.IsDeleted())
+    throw std::runtime_error("Unregistered quest capture owner");
+  value->actorEpoch = actor.GetWorldInstanceEpoch();
+  value->ownerEpoch = owner.GetWorldInstanceEpoch();
+  value->instance = actor.GetWorldInstance();
+  value->files = world.espmFiles;
+  const auto identity = [&](const MpForm& form) {
+    return world.espmFiles.empty()
+      ? FormDesc(form.GetFormId(), "").ToString()
+      : FormDesc::FromFormId(form.GetFormId(), world.espmFiles).ToString();
+  };
+  value->actorIdentity = identity(actor);
+  value->ownerIdentity = identity(owner);
+  value->campaignIdentity = CampaignReferenceBinding::GetIdentity(owner);
+  const auto& sourceJournal = owner.GetDynamicFields().GetValueDump(kProperty);
+  if (sourceJournal.size() > 8 * 1024 * 1024)
+    throw std::runtime_error("Campaign journal too large");
+  value->journal = sourceJournal;
+  const auto ledger = ReadDump(value->journal);
+  value->jobs = ledger.contains("jobs")
+    ? QuestJobState::Read(ledger.at("jobs"))
+    : QuestJobState{};
+  value->initialized = ledger.value("referenceInit", Json::object());
+  CaptureContext result(std::move(value));
+  result.Validate(actor);
+  return result;
 }
 
 MpActor& QuestJournal::Owner(MpActor& actor)
@@ -1684,9 +1787,23 @@ std::string ReferenceKey(MpActor& actor, uint32_t original)
 bool QuestJournal::ReferenceInitialized(MpActor& actor, uint32_t original)
 {
   const auto key = ReferenceKey(actor, original);
-  const auto ledger = Read(Owner(actor));
+  auto& owner = Owner(actor);
+  if (transaction) {
+    if (transaction->owner != &owner)
+      throw std::runtime_error("Cross-campaign quest transaction");
+    const auto& ledger = transaction->ledger;
+    return ledger.contains("referenceInit") &&
+      ledger.at("referenceInit").contains(key);
+  }
+  const auto ledger = Read(owner);
   return ledger.contains("referenceInit") &&
     ledger.at("referenceInit").contains(key);
+}
+
+bool QuestJournal::CaptureContext::ReferenceInitialized(
+  MpActor& actor, uint32_t original) const
+{
+  return data->initialized.contains(ReferenceKey(actor, original));
 }
 
 void QuestJournal::MarkReferenceInitialized(MpActor& actor, uint32_t original)

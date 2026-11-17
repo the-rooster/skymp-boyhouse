@@ -1,6 +1,7 @@
 #pragma once
 #include "QuestJobClock.h"
 #include "QuestJobState.h"
+#include "QuestJournal.h"
 #include "SaveReceipt.h"
 #include "libespm/QuestScriptData.h"
 #include "papyrus-vm/PexScript.h"
@@ -62,6 +63,11 @@ public:
     QuestJobState::Interaction interaction;
     bool operator==(const CapturedOccurrence&) const = default;
   };
+  struct OccurrenceTarget
+  {
+    MpObjectReference* target = nullptr;
+    std::string name;
+  };
   enum class AdmissionStatus
   {
     Pending,
@@ -105,6 +111,14 @@ public:
                                        MpObjectReference& target,
                                        const std::string& name,
                                        MpObjectReference& source);
+  // Capture a fresh contiguous prospective range without loading scripts or
+  // reserving identities. A shared context belongs only to this read pass.
+  std::vector<CapturedOccurrence> CaptureOccurrences(
+    MpActor& actor, const QuestJournal::CaptureContext& context,
+    const std::vector<OccurrenceTarget>& targets, MpObjectReference& source);
+  std::vector<CapturedOccurrence> CaptureOccurrences(
+    MpActor& actor, const std::vector<OccurrenceTarget>& targets,
+    MpObjectReference& source);
   AdmissionResult AdmitOccurrence(MpActor& actor,
                                   const CapturedOccurrence& occurrence);
   AdmissionResult AdmitOccurrence(MpActor& actor,

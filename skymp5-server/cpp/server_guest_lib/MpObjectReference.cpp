@@ -450,6 +450,14 @@ MpObjectReference::PrepareCampaignMovement(MpActor& requester,
   std::vector<Target> targets;
   if (emittersWithPrimitives && emittersWithPrimitives->size() > maxPrimitives)
     throw std::runtime_error("Campaign movement primitive limit exceeded");
+  // Each reconstruction gets its own validated read snapshot. Do not carry
+  // it across authority callbacks or reuse it in another validation pass.
+  // Inside a journal transaction initialization reads already borrow the
+  // current ledger, so an external snapshot is neither needed nor allowed.
+  std::optional<QuestJournal::CaptureContext> captureContext;
+  if (!QuestJournal::HasActiveTransaction() && emittersWithPrimitives &&
+      !emittersWithPrimitives->empty())
+    captureContext.emplace(QuestJournal::CaptureReadContext(requester));
   if (emittersWithPrimitives)
     for (const auto& [emitter, oldInside] : *emittersWithPrimitives) {
       if (!emitter || !emitter->pImpl->primitive || emitter->IsDisabled() ||
@@ -475,8 +483,11 @@ MpObjectReference::PrepareCampaignMovement(MpActor& requester,
             vertices[index].y != cached[index].y ||
             vertices[index].z != cached[index].z)
           throw std::runtime_error("Campaign primitive geometry is stale");
-      const auto captured = QuestScriptRuntime::CaptureInteraction(
-        requester, *emitter, "OnTrigger", *source);
+      const auto captured = captureContext
+        ? QuestScriptRuntime::CaptureInteraction(
+            requester, *emitter, "OnTrigger", *source, *captureContext)
+        : QuestScriptRuntime::CaptureInteraction(requester, *emitter,
+                                                 "OnTrigger", *source);
       read(*emitter);
       const bool before = emitter->IsPointInsidePrimitive(GetPos());
       const bool after = emitter->IsPointInsidePrimitive(position);
@@ -558,6 +569,8 @@ MpObjectReference::PrepareCampaignMovement(MpActor& requester,
   prepared->baseline = baseline.dump();
   if (prepared->baseline.size() > maxBaselineBytes)
     throw std::runtime_error("Campaign movement baseline is too large");
+  if (captureContext)
+    captureContext->Validate(requester);
   return std::shared_ptr<CampaignMovementPlan>(
     new CampaignMovementPlan(std::move(prepared)));
 }

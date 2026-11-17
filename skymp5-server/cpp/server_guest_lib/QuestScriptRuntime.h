@@ -1,6 +1,7 @@
 #pragma once
 #include "QuestJobClock.h"
 #include "QuestJobState.h"
+#include "QuestJournal.h"
 #include "libespm/QuestScriptData.h"
 #include "papyrus-vm/PexScript.h"
 #include <nlohmann/json.hpp>
@@ -19,6 +20,9 @@ public:
   static QuestJobState::Interaction CaptureInteraction(
     MpActor& actor, MpObjectReference& target, const std::string& name,
     MpObjectReference& source);
+  static QuestJobState::Interaction CaptureInteraction(
+    MpActor& actor, MpObjectReference& target, const std::string& name,
+    MpObjectReference& source, const QuestJournal::CaptureContext& context);
   static void ValidateInteraction(MpActor& actor,
                                   const QuestJobState::Interaction& event);
   // Load work belongs to the campaign owner and may precede initialization.

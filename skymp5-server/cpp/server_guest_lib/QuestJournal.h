@@ -21,6 +21,31 @@ class QuestScriptRuntime;
 class QuestJournal
 {
 public:
+  // An explicit, owned snapshot for one callback-free capture pass. It is not
+  // a transaction or an admission lease. Consumers validate its exact source
+  // bytes and registered context before/after use; no global cache is
+  // installed.
+  class CaptureContext
+  {
+  public:
+    void Validate(MpActor& actor) const;
+    const QuestJobState& Jobs() const;
+    const std::string& ActorIdentity() const;
+    const std::string& OwnerIdentity() const;
+    const std::string& CampaignIdentity() const;
+    const std::string& Instance() const;
+
+  private:
+    friend class QuestJournal;
+    friend class QuestScriptRuntime;
+    struct Data;
+    explicit CaptureContext(std::shared_ptr<const Data> data);
+    bool ReferenceInitialized(MpActor& actor, uint32_t original) const;
+    std::shared_ptr<const Data> data;
+  };
+  // External reads only. Active transactions use their current owned ledger,
+  // and cannot borrow a snapshot created outside that transaction.
+  static CaptureContext CaptureReadContext(MpActor& actor);
   static constexpr auto kProperty = "private.boyhouse.questJournal";
   static constexpr auto kEnabled = "private.boyhouse.questAdapters";
   static MpActor& Owner(MpActor& actor);

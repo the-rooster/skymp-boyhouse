@@ -405,8 +405,8 @@ ReferenceEventContext ReadInteraction(MpActor* requestedActor,
     throw std::runtime_error("Campaign interaction reference is unavailable");
   const auto [owner, original] = CampaignReferenceBinding::Context(target);
   auto* player = source.AsActor();
-  const bool playerSource = player &&
-    (player->GetBaseId() == 7 || player->GetChangeForm().profileId >= 0);
+  const bool playerSource =
+    player && (player->GetBaseId() == 7 || player->GetProfileId() >= 0);
   auto* actor = playerSource ? player : owner;
   if (!actor || (requestedActor && requestedActor != actor) ||
       actor->GetParent() != world || actor->IsDeleted() ||
@@ -425,7 +425,9 @@ ReferenceEventContext ReadInteraction(MpActor* requestedActor,
 
 std::vector<std::string> ReferenceTemplates(const MpObjectReference& reference)
 {
-  const auto& chain = reference.GetChangeForm().templateChain;
+  const auto* actor = reference.AsActor();
+  const auto chain = actor ? actor->GetTemplateChain()
+                           : reference.GetChangeForm().templateChain;
   if (chain.size() > 128)
     throw std::runtime_error("Campaign reference template limit exceeded");
   std::vector<std::string> result;
@@ -433,6 +435,26 @@ std::vector<std::string> ReferenceTemplates(const MpObjectReference& reference)
   for (const auto& entry : chain)
     result.push_back(entry.ToString());
   return result;
+}
+
+QuestJobState::Interaction InteractionPayload(
+  MpActor& actor, MpObjectReference& target, const std::string& name,
+  MpObjectReference& source, const ReferenceEventContext& context)
+{
+  auto& world = *actor.GetParent();
+  const auto physical = [&](const MpObjectReference& reference) {
+    return world.espmFiles.empty()
+      ? FormDesc(reference.GetFormId(), "").ToString()
+      : FormDesc::FromFormId(reference.GetFormId(), world.espmFiles)
+          .ToString();
+  };
+  return { name,
+           FormDesc::FromFormId(context.target, world.espmFiles).ToString(),
+           FormDesc::FromFormId(context.source, world.espmFiles).ToString(),
+           physical(target),
+           physical(source),
+           ReferenceTemplates(target),
+           ReferenceTemplates(source) };
 }
 
 ReferenceEventContext ReadReferenceEvent(MpObjectReference& target,
@@ -503,14 +525,31 @@ QuestJobState::Interaction QuestScriptRuntime::CaptureInteraction(
   if (!QuestJournal::ReferenceInitialized(actor, context.target))
     throw std::runtime_error(
       "Campaign interaction requires reference initialization");
+  return InteractionPayload(actor, target, name, source, context);
+}
+
+QuestJobState::Interaction QuestScriptRuntime::CaptureInteraction(
+  MpActor& actor, MpObjectReference& target, const std::string& name,
+  MpObjectReference& source, const QuestJournal::CaptureContext& snapshot)
+{
+  snapshot.Validate(actor);
   auto& world = *actor.GetParent();
-  return { name,
-           FormDesc::FromFormId(context.target, world.espmFiles).ToString(),
-           FormDesc::FromFormId(context.source, world.espmFiles).ToString(),
-           target.GetChangeForm().formDesc.ToString(),
-           source.GetChangeForm().formDesc.ToString(),
-           ReferenceTemplates(target),
-           ReferenceTemplates(source) };
+  const auto targetLifetime = world.LookupFormByIdNoLoad(target.GetFormId());
+  const auto sourceLifetime = world.LookupFormByIdNoLoad(source.GetFormId());
+  const auto targetEpoch = target.GetWorldInstanceEpoch();
+  const auto sourceEpoch = source.GetWorldInstanceEpoch();
+  const auto context = ReadInteraction(&actor, target, name, source);
+  if (!snapshot.ReferenceInitialized(actor, context.target))
+    throw std::runtime_error(
+      "Campaign interaction requires reference initialization");
+  auto result = InteractionPayload(actor, target, name, source, context);
+  snapshot.Validate(actor);
+  if (world.LookupFormByIdNoLoad(target.GetFormId()) != targetLifetime ||
+      world.LookupFormByIdNoLoad(source.GetFormId()) != sourceLifetime ||
+      target.GetWorldInstanceEpoch() != targetEpoch ||
+      source.GetWorldInstanceEpoch() != sourceEpoch)
+    throw std::runtime_error("Campaign capture endpoint changed");
+  return result;
 }
 
 void QuestScriptRuntime::ValidateInteraction(

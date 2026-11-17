@@ -158,6 +158,20 @@ QuestJobRunner::CapturedOccurrence QuestJobRunner::CaptureOccurrence(
   MpActor& actor, const OccurrenceId& id, MpObjectReference& target,
   const std::string& name, MpObjectReference& source)
 {
+  if (!QuestJournal::HasActiveTransaction()) {
+    const auto context = QuestJournal::CaptureReadContext(actor);
+    RequireOccurrence(actor, id, context.Jobs());
+    RequireReady(actor);
+    if (world.IsRestoring())
+      throw std::runtime_error(
+        "Cannot capture quest occurrence during restoration");
+    if (name != "OnTriggerEnter" && name != "OnTriggerLeave" &&
+        name != "OnTrigger")
+      throw std::invalid_argument("Unsupported native quest occurrence");
+    return { id, context.ActorIdentity(), context.Instance(),
+             QuestScriptRuntime::CaptureInteraction(actor, target, name,
+                                                    source, context) };
+  }
   const auto jobs = QuestJournal::JobState(actor);
   RequireOccurrence(actor, id, jobs);
   RequireReady(actor);
@@ -171,6 +185,53 @@ QuestJobRunner::CapturedOccurrence QuestJobRunner::CaptureOccurrence(
     id, actor.GetChangeForm().formDesc.ToString(), actor.GetWorldInstance(),
     QuestScriptRuntime::CaptureInteraction(actor, target, name, source)
   };
+}
+
+std::vector<QuestJobRunner::CapturedOccurrence>
+QuestJobRunner::CaptureOccurrences(
+  MpActor& actor, const QuestJournal::CaptureContext& context,
+  const std::vector<OccurrenceTarget>& targets, MpObjectReference& source)
+{
+  context.Validate(actor);
+  RequireReady(actor);
+  if (world.IsRestoring())
+    throw std::runtime_error(
+      "Cannot capture quest occurrence during restoration");
+  const auto& jobs = context.Jobs();
+  OccurrenceId id{ context.OwnerIdentity(), context.CampaignIdentity(),
+                   jobs.generation, jobs.ingress.next };
+  RequireOccurrence(actor, id, jobs);
+  if (targets.size() > QuestJobState::MaxBatchOccurrences ||
+      targets.size() > MaxIdentity - id.sequence ||
+      targets.size() > MaxIdentity - jobs.nextJob ||
+      targets.size() > QuestJobState::MaxLive - jobs.live.size())
+    throw std::runtime_error("Campaign has no native occurrence capacity");
+  std::vector<CapturedOccurrence> result;
+  result.reserve(targets.size());
+  for (const auto& target : targets) {
+    if (!target.target ||
+        (target.name != "OnTriggerEnter" && target.name != "OnTriggerLeave" &&
+         target.name != "OnTrigger"))
+      throw std::invalid_argument("Unsupported native quest occurrence");
+    result.push_back(
+      { id, context.ActorIdentity(), context.Instance(),
+        QuestScriptRuntime::CaptureInteraction(
+          actor, *target.target, target.name, source, context) });
+    ++id.sequence;
+  }
+  context.Validate(actor);
+  RequireReady(actor);
+  return result;
+}
+
+std::vector<QuestJobRunner::CapturedOccurrence>
+QuestJobRunner::CaptureOccurrences(
+  MpActor& actor, const std::vector<OccurrenceTarget>& targets,
+  MpObjectReference& source)
+{
+  RequireReady(actor);
+  const auto context = QuestJournal::CaptureReadContext(actor);
+  return CaptureOccurrences(actor, context, targets, source);
 }
 
 QuestJobRunner::AdmissionResult QuestJobRunner::InspectOccurrence(
@@ -406,22 +467,16 @@ QuestJobRunner::CaptureMovement(
     throw std::runtime_error("Movement occurrence batch limit exceeded");
   std::vector<CapturedOccurrence> captured;
   if (!events.empty()) {
-    auto id = NextOccurrence(requester);
-    const auto jobs = QuestJournal::JobState(requester);
-    if (events.size() > QuestJobState::MaxLive - jobs.live.size() ||
-        events.size() > MaxIdentity - jobs.nextJob ||
-        events.size() > MaxIdentity - id.sequence)
-      throw std::runtime_error("Campaign has no movement occurrence capacity");
-    captured.reserve(events.size());
+    std::vector<OccurrenceTarget> targets;
+    targets.reserve(events.size());
     for (const auto& event : events) {
       auto* target =
         event.target ? event.target->AsObjectReference() : nullptr;
       if (!target)
         throw std::runtime_error("Movement occurrence lost its target");
-      captured.push_back(CaptureOccurrence(requester, id, *target, event.name,
-                                           movement->GetSource()));
-      ++id.sequence;
+      targets.push_back({ target, event.name });
     }
+    captured = CaptureOccurrences(requester, targets, movement->GetSource());
   }
   movement->Validate(requester);
   if (PrepareOccurrences(requester, captured))
