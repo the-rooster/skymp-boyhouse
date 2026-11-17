@@ -18,6 +18,7 @@
 #include "gamemode_events/UpdateEquipmentAttemptEvent.h"
 #include "script_objects/EspmGameObject.h"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -38,28 +39,44 @@ uint32_t LongToNormal(uint64_t longFormId)
 }
 }
 
-MpActor* ActionListener::SendToNeighbours(uint32_t idx,
-                                          Networking::UserId userId,
-                                          Networking::PacketData data,
-                                          size_t length, bool reliable)
+std::optional<ActionListener::ActorUpdateContext>
+ActionListener::AuthorizeActorUpdate(uint32_t idx, Networking::UserId userId)
 {
   MpActor* myActor = partOne.serverState.ActorByUser(userId);
   // The old behavior is doing nothing in that case. This is covered by tests
   if (!myActor) {
     spdlog::warn("SendToNeighbours - No actor assigned to user");
-    return nullptr;
+    return std::nullopt;
   }
 
   MpForm* form = partOne.worldState.LookupFormByIdx(idx);
   MpActor* actor = form ? form->AsActor() : nullptr;
   if (!actor) {
     spdlog::error("SendToNeighbours - Target actor doesn't exist");
-    return nullptr;
+    return std::nullopt;
+  }
+
+  // Rejection sends may invoke host callbacks too. Hold both native objects
+  // before any send and never let a reused form ID inherit this authority.
+  auto& world = partOne.worldState;
+  ActorUpdateContext context;
+  context.actor = world.LookupFormByIdNoLoad(actor->GetFormId());
+  context.requester = world.LookupFormByIdNoLoad(myActor->GetFormId());
+  if (context.actor.get() != actor || context.requester.get() != myActor)
+    return std::nullopt;
+  context.userId = userId;
+  context.idx = idx;
+  context.actorEpoch = actor->GetWorldInstanceEpoch();
+  context.requesterEpoch = myActor->GetWorldInstanceEpoch();
+  const auto& users = partOne.serverState.userInfo;
+  if (userId < users.size() && users[userId]) {
+    context.connection = users[userId]->connectionIdentity;
+    context.packetEpoch = users[userId]->packetEpoch;
   }
 
   if (!myActor->SharesWorldInstance(*actor)) {
     partOne.SendHostStop(userId, *actor);
-    return nullptr;
+    return std::nullopt;
   }
 
   if (idx != myActor->GetIdx()) {
@@ -71,10 +88,10 @@ MpActor* ActionListener::SendToNeighbours(uint32_t idx,
       spdlog::error("SendToNeighbours - No permission to update actor {:x} "
                     "(already owned by user {})",
                     actor->GetFormId(), actorsOwningUserId);
-      partOne.SendHostStop(userId, *actor);
-
+      // Revoke the rejected lease before a send callback can create another.
       partOne.worldState.hosters.erase(actor->GetFormId());
-      return nullptr;
+      partOne.SendHostStop(userId, *actor);
+      return std::nullopt;
     }
 
     auto it = partOne.worldState.hosters.find(actor->GetFormId());
@@ -88,18 +105,122 @@ MpActor* ActionListener::SendToNeighbours(uint32_t idx,
         "SendToNeighbours - No permission to update actor {:x} (not a hoster)",
         actor->GetFormId());
       partOne.SendHostStop(userId, *actor);
+      return std::nullopt;
+    }
+  }
+
+  return context;
+}
+
+bool ActionListener::IsActorUpdateCurrent(
+  const ActorUpdateContext& context) const
+{
+  auto* actor = context.actor->AsActor();
+  auto* requester = context.requester->AsActor();
+  auto& world = partOne.worldState;
+  auto& state = partOne.serverState;
+  if (!actor || !requester || actor->GetParent() != &world ||
+      requester->GetParent() != &world ||
+      world.LookupFormByIdNoLoad(actor->GetFormId()) != context.actor ||
+      world.LookupFormByIdNoLoad(requester->GetFormId()) !=
+        context.requester ||
+      world.LookupFormByIdx(context.idx) != actor ||
+      actor->GetIdx() != context.idx ||
+      state.ActorByUser(context.userId) != requester ||
+      actor->GetWorldInstanceEpoch() != context.actorEpoch ||
+      requester->GetWorldInstanceEpoch() != context.requesterEpoch ||
+      !actor->SharesWorldInstance(*requester))
+    return false;
+  const auto* user = context.userId < state.userInfo.size()
+    ? state.userInfo[context.userId].get()
+    : nullptr;
+  if (context.connection) {
+    if (!user || user->connectionIdentity != context.connection ||
+        user->packetEpoch != context.packetEpoch)
+      return false;
+  } else if (user)
+    return false;
+  if (actor != requester) {
+    const auto lease = world.hosters.find(actor->GetFormId());
+    if (state.UserByActor(actor) != Networking::InvalidUserId ||
+        lease == world.hosters.end() ||
+        lease->second != requester->GetFormId())
+      return false;
+  }
+  return true;
+}
+
+MpActor* ActionListener::PublishToNeighbours(
+  const ActorUpdateContext& context, Networking::PacketData data,
+  size_t length, bool reliable, const std::function<bool()>& stillCurrent)
+{
+  const auto current = [&] {
+    return IsActorUpdateCurrent(context) && (!stillCurrent || stillCurrent());
+  };
+  if (!current())
+    return nullptr;
+  auto* actor = context.actor->AsActor();
+  auto& world = partOne.worldState;
+  auto& state = partOne.serverState;
+  struct Recipient
+  {
+    std::shared_ptr<MpForm> lifetime;
+    uint64_t epoch;
+    Networking::UserId userId;
+    std::shared_ptr<const uint8_t> connection;
+    std::string packetEpoch;
+  };
+  std::vector<Recipient> recipients;
+  for (auto* listener : actor->GetActorListeners()) {
+    const auto userId = state.UserByActor(listener);
+    if (userId == Networking::InvalidUserId)
+      continue;
+    const auto lifetime = world.LookupFormByIdNoLoad(listener->GetFormId());
+    if (lifetime.get() != listener)
+      continue;
+    const auto* user =
+      userId < state.userInfo.size() ? state.userInfo[userId].get() : nullptr;
+    recipients.push_back({ lifetime, listener->GetWorldInstanceEpoch(), userId,
+                           user ? user->connectionIdentity : nullptr,
+                           user ? user->packetEpoch : std::string{} });
+  }
+
+  for (const auto& recipient : recipients) {
+    if (!current())
       return nullptr;
-    }
+    auto* listener = recipient.lifetime->AsActor();
+    const auto* user = recipient.userId < state.userInfo.size()
+      ? state.userInfo[recipient.userId].get()
+      : nullptr;
+    const bool sameConnection = recipient.connection
+      ? user && user->connectionIdentity == recipient.connection &&
+        user->packetEpoch == recipient.packetEpoch
+      : !user;
+    const auto& listeners = actor->GetActorListeners();
+    if (!sameConnection || !listener || listener->IsDeleted() ||
+        listener->IsDisabled() ||
+        world.LookupFormByIdNoLoad(listener->GetFormId()) !=
+          recipient.lifetime ||
+        listener->GetWorldInstanceEpoch() != recipient.epoch ||
+        !listener->SharesWorldInstance(*actor) ||
+        state.ActorByUser(recipient.userId) != listener ||
+        std::find(listeners.begin(), listeners.end(), listener) ==
+          listeners.end())
+      continue;
+    partOne.GetSendTarget().Send(recipient.userId, data, length, reliable);
   }
 
-  for (auto listener : actor->GetActorListeners()) {
-    auto targetuserId = partOne.serverState.UserByActor(listener);
-    if (targetuserId != Networking::InvalidUserId) {
-      partOne.GetSendTarget().Send(targetuserId, data, length, reliable);
-    }
-  }
+  return current() ? actor : nullptr;
+}
 
-  return actor;
+MpActor* ActionListener::SendToNeighbours(uint32_t idx,
+                                          Networking::UserId userId,
+                                          Networking::PacketData data,
+                                          size_t length, bool reliable)
+{
+  const auto context = AuthorizeActorUpdate(idx, userId);
+  return context ? PublishToNeighbours(*context, data, length, reliable)
+                 : nullptr;
 }
 
 MpActor* ActionListener::SendToNeighbours(uint32_t idx,
@@ -166,71 +287,127 @@ void ActionListener::OnCustomPacket(const RawMessageData& rawMsgData,
 void ActionListener::OnUpdateMovement(const RawMessageData& rawMsgData,
                                       const UpdateMovementMessage& msg)
 {
-  auto actor = SendToNeighbours(msg.idx, rawMsgData);
-  if (actor) {
-    bool teleportFlag = actor->GetTeleportFlag();
-    actor->SetTeleportFlag(false);
+  // Binary packets can carry NaN/infinity even where JSON cannot. Reject all
+  // nonfinite input before permission side effects, correction or mutation.
+  const auto finite = [](float value) { return std::isfinite(value); };
+  const auto finitePoint = [&](const std::array<float, 3>& point) {
+    return std::all_of(point.begin(), point.end(), finite);
+  };
+  if (!finitePoint(msg.data.pos) || !finitePoint(msg.data.rot) ||
+      !finite(msg.data.direction) || !finite(msg.data.healthPercentage) ||
+      !finite(msg.data.speed) ||
+      (msg.data.lookAt && !finitePoint(*msg.data.lookAt)))
+    return;
 
-    static const NiPoint3 kInfinityPos = {
-      std::numeric_limits<float>::infinity(),
-      std::numeric_limits<float>::infinity(),
-      std::numeric_limits<float>::infinity()
-    };
-
-    auto& espmFiles = actor->GetParent()->espmFiles;
-
-    const auto& currentPos = actor->GetPos();
-    const auto& currentRot = actor->GetAngle();
-    const auto& currentCellOrWorld = actor->GetCellOrWorld();
-
-    if (!MovementValidation::Validate(
-          partOne, currentPos, currentRot, currentCellOrWorld,
-          teleportFlag
-            ? kInfinityPos
-            : NiPoint3{ msg.data.pos[0], msg.data.pos[1], msg.data.pos[2] },
-          FormDesc::FromFormId(msg.data.worldOrCell, espmFiles),
-          rawMsgData.userId, actor, espmFiles)) {
-      return;
+  const auto context = AuthorizeActorUpdate(msg.idx, rawMsgData.userId);
+  if (!context)
+    return;
+  auto* actor = context->actor->AsActor();
+  auto* requester = context->requester->AsActor();
+  const auto currentPos = actor->GetPos();
+  const auto currentRot = actor->GetAngle();
+  const auto currentCellOrWorld = actor->GetCellOrWorld();
+  const NiPoint3 requestedPos{ msg.data.pos[0], msg.data.pos[1],
+                               msg.data.pos[2] };
+  const NiPoint3 requestedRot{ msg.data.rot[0], msg.data.rot[1],
+                               msg.data.rot[2] };
+  std::shared_ptr<const uint8_t> invocation;
+  const auto current = [&](const NiPoint3& position,
+                           const NiPoint3& rotation) {
+    if (invocation) {
+      const auto active = activeMovements.find(actor);
+      if (active == activeMovements.end() || active->second != invocation)
+        return false;
     }
+    if (!IsActorUpdateCurrent(*context) || actor->IsDeleted() ||
+        actor->IsDisabled() || requester->IsDeleted() ||
+        requester->IsDisabled() ||
+        actor->GetCellOrWorld() != currentCellOrWorld ||
+        actor->GetPos() != position || actor->GetAngle() != rotation ||
+        !IsMessageAllowed(rawMsgData.userId, MsgType::UpdateMovement,
+                          rawMsgData.hasVerifiedEpoch))
+      return false;
+    const auto& users = partOne.serverState.userInfo;
+    return rawMsgData.userId >= users.size() || !users[rawMsgData.userId] ||
+      (!users[rawMsgData.userId]->isDisconnecting &&
+       !users[rawMsgData.userId]->campaignVisibilityFailed);
+  };
+  if (!current(currentPos, currentRot))
+    return;
 
-    if (!msg.data.isBlocking) {
-      actor->IncreaseBlockCount();
-    } else {
-      actor->ResetBlockCount();
+  const bool teleportFlag = actor->GetTeleportFlag();
+  actor->SetTeleportFlag(false);
+  // A server teleport intentionally corrects/rejects one finite packet.
+  // This internal sentinel is not client movement input.
+  static const NiPoint3 kInfinityPos = {
+    std::numeric_limits<float>::infinity(),
+    std::numeric_limits<float>::infinity(),
+    std::numeric_limits<float>::infinity()
+  };
+  const auto& espmFiles = partOne.worldState.espmFiles;
+  if (!MovementValidation::Validate(
+        partOne, currentPos, currentRot, currentCellOrWorld,
+        teleportFlag ? kInfinityPos : requestedPos,
+        FormDesc::FromFormId(msg.data.worldOrCell, espmFiles),
+        rawMsgData.userId, actor, espmFiles))
+    return;
+
+  // Supersede an outer packet only after this one passes validation. A newer
+  // accepted call can have exactly the same transform but different flags.
+  invocation = std::make_shared<const uint8_t>(0);
+  struct MovementInvocation
+  {
+    decltype(activeMovements)& active;
+    MpActor* actor;
+    std::shared_ptr<const uint8_t> token;
+    ~MovementInvocation()
+    {
+      const auto found = active.find(actor);
+      if (found != active.end() && found->second == token)
+        active.erase(found);
     }
+  } invocationGuard{ activeMovements, actor, invocation };
+  activeMovements.insert_or_assign(actor, invocation);
 
-    actor->SetPos(
-      NiPoint3{ msg.data.pos[0], msg.data.pos[1], msg.data.pos[2] },
-      SetPosMode::CalledByUpdateMovement);
-    actor->SetAngle(
-      NiPoint3{ msg.data.rot[0], msg.data.rot[1], msg.data.rot[2] },
-      SetAngleMode::CalledByUpdateMovement);
-    actor->SetAnimationVariableBool(
-      AnimationVariableBool::kVariable_bInJumpState, msg.data.isInJumpState);
-    actor->SetAnimationVariableBool(
-      AnimationVariableBool::kVariable__skymp_isWeapDrawn,
-      msg.data.isWeapDrawn);
-    actor->SetAnimationVariableBool(
-      AnimationVariableBool::kVariable_IsBlocking, msg.data.isBlocking);
-    actor->SetAnimationVariableBool(
-      AnimationVariableBool::kVariable_IsSneaking, msg.data.isSneaking);
+  actor->SetPos(requestedPos, SetPosMode::CalledByUpdateMovement);
+  // Subscription and trigger callbacks can replace, move or reassign either
+  // participant. Preserve their changes instead of applying the packet tail.
+  if (!current(requestedPos, currentRot))
+    return;
+  actor->SetAngle(requestedRot, SetAngleMode::CalledByUpdateMovement);
+  if (!current(requestedPos, requestedRot))
+    return;
 
-    if (actor->GetBlockCount() == 5) {
-      actor->SetIsBlockActive(false);
-      actor->ResetBlockCount();
-    }
-
-    if (msg.data.runMode != "Standing") {
-      actor->SetLastAnimEvent(std::nullopt);
-    }
-
-    if (partOne.worldState.lastMovUpdateByIdx.size() <= msg.idx) {
-      auto newSize = static_cast<size_t>(msg.idx) + 1;
-      partOne.worldState.lastMovUpdateByIdx.resize(newSize);
-    }
-    partOne.worldState.lastMovUpdateByIdx[msg.idx] =
-      std::chrono::system_clock::now();
+  if (!msg.data.isBlocking)
+    actor->IncreaseBlockCount();
+  else
+    actor->ResetBlockCount();
+  actor->SetAnimationVariableBool(
+    AnimationVariableBool::kVariable_bInJumpState, msg.data.isInJumpState);
+  actor->SetAnimationVariableBool(
+    AnimationVariableBool::kVariable__skymp_isWeapDrawn, msg.data.isWeapDrawn);
+  actor->SetAnimationVariableBool(AnimationVariableBool::kVariable_IsBlocking,
+                                  msg.data.isBlocking);
+  actor->SetAnimationVariableBool(AnimationVariableBool::kVariable_IsSneaking,
+                                  msg.data.isSneaking);
+  if (actor->GetBlockCount() == 5) {
+    actor->SetIsBlockActive(false);
+    actor->ResetBlockCount();
   }
+  if (msg.data.runMode != "Standing")
+    actor->SetLastAnimEvent(std::nullopt);
+  if (partOne.worldState.lastMovUpdateByIdx.size() <= msg.idx) {
+    auto newSize = static_cast<size_t>(msg.idx) + 1;
+    partOne.worldState.lastMovUpdateByIdx.resize(newSize);
+  }
+  partOne.worldState.lastMovUpdateByIdx[msg.idx] =
+    std::chrono::system_clock::now();
+
+  // Publish only accepted movement, using the resulting listener set. Each
+  // send can reenter host code; no actor writes follow publication.
+  PublishToNeighbours(*context, rawMsgData.unparsed, rawMsgData.unparsedLength,
+                      false,
+                      [&] { return current(requestedPos, requestedRot); });
 }
 
 void ActionListener::OnUpdateAnimation(const RawMessageData& rawMsgData,

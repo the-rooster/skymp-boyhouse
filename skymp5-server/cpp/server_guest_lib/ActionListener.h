@@ -9,7 +9,10 @@
 #include "SpellCastData.h"
 #include "SweetHidePlayerNamesService.h"
 #include "libespm/Loader.h"
+#include <functional>
+#include <map>
 #include <memory>
+#include <optional>
 
 class ServerState;
 class WorldState;
@@ -102,7 +105,25 @@ private:
   void SendPapyrusOnHitEvent(MpActor* aggressor, MpObjectReference* target,
                              const HitData& hitData);
 
-  // Returns user's actor if there is attached one
+  struct ActorUpdateContext
+  {
+    std::shared_ptr<MpForm> actor, requester;
+    Networking::UserId userId = Networking::InvalidUserId;
+    uint32_t idx = 0;
+    uint64_t actorEpoch = 0, requesterEpoch = 0;
+    std::shared_ptr<const uint8_t> connection;
+    std::string packetEpoch;
+  };
+  std::optional<ActorUpdateContext> AuthorizeActorUpdate(
+    uint32_t idx, Networking::UserId userId);
+  bool IsActorUpdateCurrent(const ActorUpdateContext& context) const;
+  MpActor* PublishToNeighbours(const ActorUpdateContext& context,
+                               Networking::PacketData data, size_t length,
+                               bool reliable,
+                               const std::function<bool()>& stillCurrent = {});
+
+  // Other messages retain their authorize-then-forward behavior. Movement
+  // performs its validation and state update between these two operations.
   MpActor* SendToNeighbours(uint32_t idx, Networking::UserId userId,
                             Networking::PacketData data, size_t length,
                             bool reliable);
@@ -111,6 +132,9 @@ private:
                             bool reliable = false);
 
   PartOne& partOne;
+  // Only active accepted calls are tracked. A nested accepted packet replaces
+  // its caller's token; finishing it must never revive the stale caller.
+  std::map<MpActor*, std::shared_ptr<const uint8_t>> activeMovements;
 
   // TODO: inverse dependency
   std::shared_ptr<CraftService> craftService;

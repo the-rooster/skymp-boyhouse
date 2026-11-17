@@ -1007,6 +1007,40 @@ references can recover across restart; new durable incarnation/reset semantics a
 not inferred from transient native pointers or phase epochs. No complete quest is
 certified playable by these backend fixtures.
 
+## Production movement validation and publication
+
+OnUpdateMovement checks every position, rotation, look-at, direction, health and
+speed float for finiteness before authorization side effects, teleport correction
+or physical changes. This also covers binary NaN/infinity. Existing ownership,
+phase and NPC-host authority checks remain required. Distance/cell rejection sends
+the existing correction only for the requesting player's own actor, without
+relaying the rejected movement to peers. The existing teleport flag still rejects
+and corrects one finite authorized packet; malformed floats do not consume it.
+
+Authorization and packet publication are separate operations. Movement applies
+SetPos, rechecks the captured actor/requester registrations, phase epochs,
+connection identity, packet epoch, authority and expected transform, and only then
+updates the remaining movement fields. A callback that invalidates that context
+prevents the old packet tail and movement relay from running. An active per-actor
+invocation identity also prevents a newer accepted nested movement at the same
+transform from being overwritten by the outer packet. Invalid nested input does
+not supersede an accepted movement. These identities exist only while calls are
+active; they are not durable packet IDs or a client chronology protocol.
+
+Movement publication uses the resulting listener set. Held recipient identities,
+connection/packet epochs, phase and current membership are checked before each
+send. Source validity is checked between sends, and no actor writes follow the
+movement relay. Already-sent packets cannot be recalled. Other message wrappers
+retain their existing authorize-then-forward ordering; their own action tails are
+not made transactional by this helper change. Final-transform equality alone
+does not detect arbitrary same-phase move-away-and-back chronology.
+
+This fixes production packet ordering and callback safety. Position, primitive
+occupancy, captured trigger occurrences and persistence receipts still need one
+atomic physical acceptance boundary. The existing synchronous OnTrigger and
+subscription/load paths, native lifecycle eligibility, durable event production,
+and full quest/client/performance validation remain unfinished.
+
 ## Verification commands
 
 ```sh
@@ -1217,4 +1251,20 @@ physical movement/occupancy/packet acceptance is not yet atomic with admission.
 Production movement and subscription routing remain unchanged. Native load
 eligibility/ordering, quest lifecycle and full multi-client playthrough and
 performance validation remain required. No complete quest is certified playable.
+Skyrim was not launched; the installed client and staging were unchanged.
+
+The production-movement-admission batch passed the Linux build and full
+verification on 2026-11-17 UTC: 839 native cases / 507,184 assertions,
+368 JavaScript tests, 47 Python tests, addon and both protocol
+smokes, and SQLite recovery of 32 characters. The focused run passed
+82 cases / 2,560 assertions. The initial focused
+run passed 81 of 82 cases; the wrong-cell fixture lacked a plugin identity list.
+Declaring Skyrim.esm lets it reach movement validation without weakening its
+state-preservation, correction and no-peer-relay assertions. Production movement
+now rejects nonfinite fields before side effects and separates authorization
+from forwarding. Accepted state updates precede movement publication; current
+actor, connection, phase and recipient checks prevent stale callback work.
+The existing one-shot teleport correction is preserved. These packet-path
+fixtures do not make physical movement or trigger delivery durable, establish
+native event ordering, or certify complete quests or 32-player performance.
 Skyrim was not launched; the installed client and staging were unchanged.
