@@ -1041,7 +1041,7 @@ TEST_CASE(
   AliasProperty(restart);
   REQUIRE(restart.Run(restored, 20));
   REQUIRE(Counter(restored) == 0x1a677);
-  REQUIRE(QuestJournal::ScriptState(restored)["schemaVersion"] == 5);
+  REQUIRE(QuestJournal::ScriptState(restored)["schemaVersion"] == 6);
 }
 
 TEST_CASE("Alias binding failures roll back and unsupported optional fills "

@@ -6,18 +6,33 @@
 #include <utility>
 #include <vector>
 
-// Data captured at an explicitly admitted native await. The campaign codec
-// replaces receiver/local object pointers with stable identities before save.
-// This is one leaf frame, not a complete quest job or a serializable promise.
-struct PapyrusContinuation
+struct PapyrusFunctionIdentity
 {
-  std::string scope;
+  // method, static, propertyGet or propertySet; empty means that a legacy
+  // host entry has not supplied a resumable function identity.
+  std::string kind, state, function;
+};
+
+// One suspended Papyrus frame. The campaign codec replaces object pointers
+// with stable identities before save; C++ native frames are never serialized.
+struct PapyrusFrame
+{
   VarValue receiver;
+  std::string kind = "method";
   std::string rootScript, script, state, function;
   std::vector<std::pair<std::string, std::string>> contentHashes;
-  std::string token, resultType;
-  uint32_t instruction = 0, executedInstructions = 0;
+  std::string resultType;
+  uint32_t instruction = 0;
   std::vector<std::pair<std::string, VarValue>> locals;
+};
+
+struct PapyrusContinuation : PapyrusFrame
+{
+  std::string scope, token;
+  uint32_t executedInstructions = 0;
+  // Nearest caller first, outermost entry last. The inherited frame is the
+  // suspended leaf. One operation token and budget cover the complete stack.
+  std::vector<PapyrusFrame> callers;
 };
 
 struct PapyrusExecutionResult

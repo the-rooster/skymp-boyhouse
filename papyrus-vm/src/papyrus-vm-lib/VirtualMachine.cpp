@@ -29,9 +29,9 @@ void VirtualMachine::RequestSuspension(const std::string& token,
   if (!strictExecution || !checkpointFrame)
     throw std::runtime_error(
       "Papyrus suspension requires an explicit host entry");
-  if (activeFrames != 1 || g_nativeInvocationDepth != 1)
+  if (!activeFrames || activeFrames > 128 || g_nativeInvocationDepth != 1)
     throw std::runtime_error(
-      "Nested Papyrus suspension requires a caller chain");
+      "Papyrus suspension cannot preserve a native caller chain");
   if (token.empty() || token.size() > 256 ||
       token.find('\0') != std::string::npos || resultType.empty() ||
       resultType.size() > 1024 || resultType.find('\0') != std::string::npos)
@@ -350,6 +350,7 @@ VarValue VirtualMachine::CallMethod(
       !Utils::stricmp(methodName, "OnEndState");
     std::shared_ptr<ActivePexInstance> selected;
     FunctionInfo function;
+    std::string selectedState;
     bool sharedEngineHelper = false;
     bool matchingType = !receiverType || !receiverType[0];
     for (const auto& root : instances) {
@@ -366,9 +367,12 @@ VarValue VirtualMachine::CallMethod(
       const auto state = stateFunction ? "" : root->GetActiveStateName();
       for (auto entry = root; entry && entry->IsValid();
            entry = entry->GetParentInstance()) {
-        auto candidate = entry->GetFunctionByName(methodName, state);
-        if (!candidate.valid && !state.empty())
-          candidate = entry->GetFunctionByName(methodName, "");
+        auto candidateState = state;
+        auto candidate = entry->GetFunctionByName(methodName, candidateState);
+        if (!candidate.valid && !candidateState.empty()) {
+          candidateState.clear();
+          candidate = entry->GetFunctionByName(methodName, candidateState);
+        }
         if (!candidate.valid)
           continue;
         if (selected) {
@@ -389,6 +393,7 @@ VarValue VirtualMachine::CallMethod(
         }
         selected = entry;
         function = candidate;
+        selectedState = std::move(candidateState);
         break;
       }
     }
@@ -423,7 +428,9 @@ VarValue VirtualMachine::CallMethod(
           throw std::runtime_error("Papyrus native argument count mismatch");
         declaredNative = selected->GetSourcePexName();
       } else
-        return selected->StartFunction(function, arguments, stackData);
+        return selected->StartFunction(
+          function, arguments, stackData,
+          { "method", selectedState, methodName });
     } else if (stateEvent) {
       if (!arguments.empty())
         throw std::runtime_error(
@@ -578,6 +585,9 @@ VarValue VirtualMachine::CallStatic(const std::string& className,
   function = instance->GetFunctionByName(functionName.c_str(), "");
 
   if (function.valid) {
+    if (checkpointFrame && !function.IsGlobal())
+      throw std::runtime_error(
+        "Non-global Papyrus function called as a static checkpoint");
     if (function.IsNative()) {
       if (strictExecution)
         throw std::runtime_error("Unimplemented native: " + className + "." +
@@ -587,7 +597,10 @@ VarValue VirtualMachine::CallStatic(const std::string& className,
       return VarValue::None();
     }
 
-    result = instance->StartFunction(function, arguments, stackData);
+    result = strictExecution
+      ? instance->StartFunction(function, arguments, stackData,
+                                { "static", "", functionName })
+      : instance->StartFunction(function, arguments, stackData);
   }
   if (!function.valid) {
     if (strictExecution)

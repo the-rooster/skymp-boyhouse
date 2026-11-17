@@ -20,6 +20,8 @@ class StackData;
 
 class ActivePexInstance
 {
+  friend class VirtualMachine;
+
 public:
   using Local = std::pair<std::string, VarValue>;
 
@@ -42,10 +44,11 @@ public:
 
   VarValue StartFunction(const FunctionInfo& function,
                          std::vector<VarValue>& arguments,
-                         std::shared_ptr<StackData> stackData);
+                         std::shared_ptr<StackData> stackData,
+                         const PapyrusFunctionIdentity& identity = {});
 
-  // Explicit host entry points for a single attached leaf function. They do
-  // not enable latent quest stages/events or persist the surrounding job.
+  // Explicit host entry points for an attached function and its callers. They
+  // do not enable latent quest stages/events or persist the surrounding job.
   PapyrusExecutionResult StartResumableFunction(
     const std::string& scope, const std::string& state,
     const std::string& function, std::vector<VarValue> arguments,
@@ -93,9 +96,16 @@ private:
                              const std::vector<VarValue*>& arguments);
 
   std::shared_ptr<ActivePexInstance> GetAttachedRoot() const;
-  PapyrusContinuation DescribeContinuation(const std::string& scope,
-                                           const std::string& state,
-                                           const std::string& function) const;
+  PapyrusFrame DescribeFrame(const PapyrusFunctionIdentity& identity) const;
+  FunctionInfo FrameFunction(const PapyrusFunctionIdentity& identity) const;
+  void ValidateResumableFunction(
+    const FunctionInfo& function, const std::vector<VarValue>& arguments,
+    const PapyrusFunctionIdentity& identity) const;
+  void ValidateCheckpointEntry(const std::string& scope) const;
+  void ValidateCallResult(const FunctionCode::Instruction& call,
+                          std::vector<Local>& locals,
+                          const VarValue& completion);
+  std::shared_ptr<ActivePexInstance> ResolveFrame(const PapyrusFrame& frame);
   void ValidateFrameValue(const VarValue& value, const std::string& type,
                           bool discard = false) const;
 

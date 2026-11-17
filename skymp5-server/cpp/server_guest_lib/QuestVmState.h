@@ -24,7 +24,7 @@ public:
   void SetGlobal(const std::string& key, double value);
   std::optional<Json> GetAliasBinding(const std::string& key) const;
   void SetAliasBinding(const std::string& key, Json value);
-  // Capture a leaf frame using this campaign's stable object/array identities.
+  // Capture a stack using this campaign's stable object/array identities.
   // A completion consumes its token once; the caller must atomically commit
   // consumption together with resumed effects and durable event delivery.
   void PutContinuation(const PapyrusContinuation& continuation);
@@ -38,8 +38,11 @@ private:
   static void Collect(Json& saved);
   static void ValidateScalar(const Json& value);
   static void ValidateValue(const Json& value, const Json& arrays);
+  static void ValidateFrame(const Json& value, const Json& arrays);
   static void ValidateContinuation(const std::string& token, const Json& value,
                                    const Json& arrays);
+  Json EncodeFrame(const PapyrusFrame& frame);
+  PapyrusFrame DecodeFrame(const Json& frame);
   Json state;
   EncodeObject encodeObject;
   DecodeObject decodeObject;

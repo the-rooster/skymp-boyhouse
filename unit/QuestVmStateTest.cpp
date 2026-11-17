@@ -78,6 +78,18 @@ PapyrusContinuation Continuation(std::shared_ptr<IGameObject> object)
   result.locals.emplace_back("count", count);
   return result;
 }
+PapyrusFrame Caller(std::shared_ptr<IGameObject> object,
+                    const std::string& kind = "method")
+{
+  PapyrusFrame result = Continuation(std::move(object));
+  result.kind = kind;
+  result.function = kind + "Caller";
+  if (kind == "static") {
+    result.receiver = VarValue::None();
+    result.rootScript = result.script = "StaticHelper";
+  }
+  return result;
+}
 }
 
 TEST_CASE("Campaign heap retains shared arrays across scripts and restarts",
@@ -163,7 +175,7 @@ TEST_CASE("Legacy inline quest arrays migrate without merging equal values",
   REQUIRE(a.pArray != b.pArray);
   REQUIRE(static_cast<int>((*a.pArray)[0]) == 7);
   REQUIRE(static_cast<int>(migrated.Decode(values["count"])) == 4);
-  REQUIRE(migrated.Save()["schemaVersion"] == 5);
+  REQUIRE(migrated.Save()["schemaVersion"] == 6);
   REQUIRE(old["quest/a"]["values"]["a"].contains("value"));
 }
 
@@ -306,7 +318,7 @@ TEST_CASE("Heap schema two migrates without changing shared allocations",
   const auto values = migrated.GetScript("quest/a")["values"];
   REQUIRE(migrated.Decode(values["a"]).pArray ==
           migrated.Decode(values["b"]).pArray);
-  REQUIRE(migrated.Save()["schemaVersion"] == 5);
+  REQUIRE(migrated.Save()["schemaVersion"] == 6);
   REQUIRE(migrated.Save()["globals"].empty());
 }
 
@@ -341,7 +353,7 @@ TEST_CASE("Schema three migrates globals without inventing alias bindings",
   old["schemaVersion"] = 3;
   old.erase("aliases");
   const auto saved = Heap(old).Save();
-  REQUIRE(saved["schemaVersion"] == 5);
+  REQUIRE(saved["schemaVersion"] == 6);
   REQUIRE(saved["globals"]["17424:Skyrim.esm"] == 3);
   REQUIRE(saved["aliases"].empty());
   auto bad = saved;
@@ -373,7 +385,7 @@ TEST_CASE("Continuation locals share field arrays across reload and consumption"
   frame.locals.emplace_back("object", localObject);
   heap.PutContinuation(frame);
   auto saved = heap.Save();
-  REQUIRE(saved["schemaVersion"] == 5);
+  REQUIRE(saved["schemaVersion"] == 6);
   REQUIRE(saved["arrays"].size() == 2);
   REQUIRE(saved["continuations"].size() == 1);
   REQUIRE(saved["continuations"][frame.token]["receiver"]["value"] ==
@@ -558,12 +570,24 @@ TEST_CASE("Malformed persisted continuations cannot be consumed or reset",
   heap.PutContinuation(frame);
   auto saved = heap.Save();
   auto& node = saved["continuations"][frame.token];
-  SECTION("unknown VM version") { saved["schemaVersion"] = 6; }
-  SECTION("fractional VM version") { saved["schemaVersion"] = 5.0; }
+  SECTION("unknown VM version")
+  {
+    saved["schemaVersion"] = 7;
+  }
+  SECTION("fractional VM version")
+  {
+    saved["schemaVersion"] = 6.0;
+  }
   SECTION("wrong container") { saved["continuations"] = Json::array(); }
   SECTION("missing container") { saved.erase("continuations"); }
-  SECTION("unknown frame version") { node["schemaVersion"] = 2; }
-  SECTION("fractional frame version") { node["schemaVersion"] = 1.0; }
+  SECTION("unknown frame version")
+  {
+    node["schemaVersion"] = 3;
+  }
+  SECTION("fractional frame version")
+  {
+    node["schemaVersion"] = 2.0;
+  }
   SECTION("missing frame version") { node.erase("schemaVersion"); }
   SECTION("unknown frame field") { node["futureJob"] = true; }
   SECTION("missing field") { node.erase("rootScript"); }
@@ -649,7 +673,7 @@ TEST_CASE("Heap versions two through four gain an empty continuation table",
   const auto original = old;
   auto migrated = Heap(old);
   const auto saved = migrated.Save();
-  REQUIRE(saved["schemaVersion"] == 5);
+  REQUIRE(saved["schemaVersion"] == 6);
   REQUIRE(saved["continuations"].empty());
   REQUIRE(saved["arrays"].size() == 1);
   const auto values = migrated.GetScript("a:Skyrim.esm/Quest")["values"];
@@ -760,5 +784,534 @@ TEST_CASE("Late continuation resolution failures preserve prior heap identities"
   auto resumed = restarted.TakeContinuation(frame.scope, frame.token);
   REQUIRE(static_cast<int>((*resumed.locals[1].second.pArray)[0]) == 8);
   REQUIRE(static_cast<IGameObject*>(resumed.locals[2].second) == object.get());
+  REQUIRE(restarted.Save()["continuations"].empty());
+}
+
+TEST_CASE("Nested continuation frames share heap roots and retain their order",
+          "[Quest][QuestVM][QuestHeap][Continuation]")
+{
+  auto object = std::make_shared<ContinuationObject>();
+  auto heap = ContinuationHeap(object);
+  auto frame = Continuation(object);
+  auto shared = Integers(7), callerOnly = Integers(9);
+  auto outerOnly = Integers(13);
+  shared.objectType = callerOnly.objectType = outerOnly.objectType = "Int[]";
+  heap.SetScript("a:Skyrim.esm/ChildQuest",
+                 Script({ { "field", heap.Encode(shared) } }));
+  frame.locals.emplace_back("shared", shared);
+  frame.callers = { Caller(object, "propertyGet"), Caller(object, "static"),
+                    Caller(object, "propertySet"), Caller(object) };
+  frame.callers[0].resultType = "Int";
+  frame.callers[1].resultType = "String";
+  frame.callers[2].resultType = "None";
+  frame.callers[3].resultType = "Quest[]";
+  frame.callers[0].locals.emplace_back("shared", shared);
+  frame.callers[0].locals.emplace_back("private", callerOnly);
+  frame.callers[1].locals.emplace_back("private", callerOnly);
+  frame.callers[2].locals.emplace_back("outer", outerOnly);
+  VarValue nullObject = VarValue::None();
+  nullObject.objectType = "ObjectReference";
+  frame.callers[3].locals.emplace_back("null", nullObject);
+  heap.PutContinuation(frame);
+  auto saved = heap.Save();
+  REQUIRE(saved["schemaVersion"] == 6);
+  REQUIRE(saved["continuations"][frame.token]["schemaVersion"] == 2);
+  REQUIRE(saved["arrays"].size() == 3);
+  REQUIRE(saved["continuations"][frame.token]["callers"][0].size() == 10);
+  auto restarted = ContinuationHeap(object, saved);
+  auto field = restarted.Decode(
+    restarted.GetScript("a:Skyrim.esm/ChildQuest")["values"]["field"]);
+  auto resumed = restarted.TakeContinuation(frame.scope, frame.token);
+  REQUIRE(resumed.callers.size() == 4);
+  for (size_t i = 0; i < frame.callers.size(); ++i) {
+    const auto& before = frame.callers[i];
+    const auto& after = resumed.callers[i];
+    REQUIRE(after.kind == before.kind);
+    REQUIRE(after.rootScript == before.rootScript);
+    REQUIRE(after.script == before.script);
+    REQUIRE(after.state == before.state);
+    REQUIRE(after.function == before.function);
+    REQUIRE(after.resultType == before.resultType);
+    REQUIRE(after.instruction == before.instruction);
+    REQUIRE(after.contentHashes == before.contentHashes);
+    REQUIRE(static_cast<IGameObject*>(after.receiver) ==
+            static_cast<IGameObject*>(before.receiver));
+    REQUIRE(after.locals.size() == before.locals.size());
+    for (size_t j = 0; j < before.locals.size(); ++j) {
+      REQUIRE(after.locals[j].first == before.locals[j].first);
+      REQUIRE(after.locals[j].second.objectType ==
+              before.locals[j].second.objectType);
+    }
+  }
+  REQUIRE(resumed.locals[1].second.pArray == field.pArray);
+  REQUIRE(resumed.callers[0].locals[1].second.pArray == field.pArray);
+  REQUIRE(resumed.callers[0].locals[2].second.pArray ==
+          resumed.callers[1].locals[1].second.pArray);
+  REQUIRE(static_cast<int>((*resumed.callers[2].locals[1].second.pArray)[0]) ==
+          13);
+  (*resumed.callers[0].locals[1].second.pArray)[0] = VarValue(17);
+  auto consumed = restarted.Save();
+  REQUIRE(consumed["arrays"].size() == 1);
+  REQUIRE(consumed["continuations"].empty());
+  REQUIRE(static_cast<int>((*field.pArray)[0]) == 17);
+  resumed.token = "nested-await-2";
+  restarted.PutContinuation(resumed);
+  REQUIRE(restarted.Save()["arrays"].size() == 3);
+}
+
+TEST_CASE("Static continuation leaves need no object resolver",
+          "[Quest][QuestVM][QuestHeap][Continuation]")
+{
+  auto object = std::make_shared<ContinuationObject>();
+  auto frame = Continuation(object);
+  static_cast<PapyrusFrame&>(frame) = Caller(object, "static");
+  auto heap = Heap();
+  heap.PutContinuation(frame);
+  auto restarted = Heap(heap.Save());
+  const auto resumed = restarted.TakeContinuation(frame.scope, frame.token);
+  REQUIRE(resumed.kind == "static");
+  REQUIRE(static_cast<IGameObject*>(resumed.receiver) == nullptr);
+  REQUIRE(resumed.state.empty());
+  REQUIRE(resumed.rootScript == resumed.script);
+  REQUIRE(static_cast<int>(resumed.locals[0].second) == 42);
+}
+
+TEST_CASE("Malformed caller metadata never replaces pending work",
+          "[Quest][QuestVM][QuestHeap][Continuation]")
+{
+  auto object = std::make_shared<ContinuationObject>();
+  auto heap = ContinuationHeap(object);
+  auto frame = Continuation(object);
+  frame.callers.push_back(Caller(object));
+  heap.PutContinuation(frame);
+  const auto original = heap.Save();
+  frame.token = "invalid-nested-await";
+  auto array = Integers(7);
+  array.objectType = "Int[]";
+  frame.locals.emplace_back("array", array);
+  auto& caller = frame.callers[0];
+  SECTION("unknown kind")
+  {
+    caller.kind = "native";
+  }
+  SECTION("empty kind")
+  {
+    caller.kind.clear();
+  }
+  SECTION("method receiver missing")
+  {
+    caller.receiver = VarValue::None();
+  }
+  SECTION("property receiver missing")
+  {
+    caller.kind = "propertyGet";
+    caller.receiver = VarValue::None();
+  }
+  SECTION("static receiver present")
+  {
+    caller.kind = "static";
+  }
+  SECTION("static with active state")
+  {
+    caller = Caller(object, "static");
+    caller.state = "Busy";
+  }
+  SECTION("static with differing root")
+  {
+    caller = Caller(object, "static");
+    caller.rootScript = "Other";
+  }
+  SECTION("invalid result declaration")
+  {
+    caller.resultType.clear();
+  }
+  SECTION("invalid local declaration")
+  {
+    caller.locals[0].second.objectType.clear();
+  }
+  SECTION("caller object encoding fails after leaf array")
+  {
+    VarValue unknown(std::make_shared<ContinuationObject>());
+    unknown.objectType = "Quest";
+    caller.locals.emplace_back("unknown", unknown);
+  }
+  SECTION("too many hashes")
+  {
+    caller.contentHashes.resize(129, caller.contentHashes[0]);
+  }
+  SECTION("too many callers")
+  {
+    frame.callers.resize(128, caller);
+  }
+  REQUIRE_THROWS(heap.PutContinuation(frame));
+  REQUIRE(heap.Save() == original);
+  heap.SetScript("a:Skyrim.esm/fresh",
+                 Script({ { "array", heap.Encode(array) } }));
+  REQUIRE(heap.Save()["arrays"].contains("1"));
+}
+
+TEST_CASE("Persisted caller stacks enforce frame shape and shared "
+          "local bounds",
+          "[Quest][QuestVM][QuestHeap][Continuation]")
+{
+  auto object = std::make_shared<ContinuationObject>();
+  auto heap = ContinuationHeap(object);
+  auto frame = Continuation(object);
+  frame.callers.push_back(Caller(object));
+  heap.PutContinuation(frame);
+  auto saved = heap.Save();
+  auto& node = saved["continuations"][frame.token];
+  auto& caller = node["callers"][0];
+  SECTION("missing callers")
+  {
+    node.erase("callers");
+  }
+  SECTION("wrong callers container")
+  {
+    node["callers"] = Json::object();
+  }
+  SECTION("too many callers")
+  {
+    node["callers"] = std::vector<Json>(128, caller);
+  }
+  SECTION("unknown kind")
+  {
+    caller["kind"] = "unknown";
+  }
+  SECTION("wrong kind type")
+  {
+    caller["kind"] = 1;
+  }
+  SECTION("missing kind")
+  {
+    caller.erase("kind");
+  }
+  SECTION("caller operation token")
+  {
+    caller["token"] = "second-token";
+  }
+  SECTION("caller private budget")
+  {
+    caller["executedInstructions"] = 1;
+  }
+  SECTION("caller nested list")
+  {
+    caller["callers"] = Json::array();
+  }
+  SECTION("caller schema override")
+  {
+    caller["schemaVersion"] = 1;
+  }
+  SECTION("caller null receiver")
+  {
+    caller["receiver"]["value"] = nullptr;
+  }
+  SECTION("caller scalar receiver")
+  {
+    caller["receiver"] = { { "type", 3 }, { "value", 1 } };
+  }
+  SECTION("caller invalid instruction")
+  {
+    caller["instruction"] = 100000;
+  }
+  SECTION("caller missing type")
+  {
+    caller["locals"][0].erase("declaredType");
+  }
+  SECTION("caller dangling array")
+  {
+    caller["locals"][0]["value"] = { { "type", 13 }, { "array", "999" } };
+  }
+  SECTION("static receiver not empty")
+  {
+    caller["kind"] = "static";
+    caller["rootScript"] = caller["script"];
+  }
+  SECTION("static state not empty")
+  {
+    caller["kind"] = "static";
+    caller["receiver"]["value"] = nullptr;
+    caller["rootScript"] = caller["script"];
+    caller["state"] = "Busy";
+  }
+  SECTION("static root mismatch")
+  {
+    caller["kind"] = "static";
+    caller["receiver"]["value"] = nullptr;
+  }
+  SECTION("combined locals exceed limit")
+  {
+    auto local = caller["locals"][0];
+    for (size_t i = 1; i < 65535; ++i) {
+      local["name"] = "local-" + std::to_string(i);
+      caller["locals"].push_back(local);
+    }
+  }
+  const auto original = saved;
+  REQUIRE_THROWS(ContinuationHeap(object, saved));
+  REQUIRE_THROWS(QuestVmState::ResetQuest(saved, "a:Skyrim.esm/"));
+  REQUIRE(saved == original);
+}
+
+TEST_CASE("Caller count and total local limits include the leaf frame",
+          "[Quest][QuestVM][QuestHeap][Continuation]")
+{
+  auto object = std::make_shared<ContinuationObject>();
+  auto frame = Continuation(object);
+  frame.callers.resize(127, Caller(object));
+  auto& locals = frame.callers[0].locals;
+  const auto local = locals[0].second;
+  for (size_t i = 1; i < 65408; ++i)
+    locals.emplace_back("local-" + std::to_string(i), local);
+  // 65408 in the nearest caller, 126 in others, one in the leaf = 65535.
+  auto heap = ContinuationHeap(object);
+  heap.PutContinuation(frame);
+  const auto saved = heap.Save();
+  auto restarted = ContinuationHeap(object, saved);
+  const auto restored = restarted.TakeContinuation(frame.scope, frame.token);
+  REQUIRE(restored.callers.size() == 127);
+  REQUIRE(restored.callers[0].locals.size() == 65408);
+  frame.token = "overflow-locals";
+  frame.callers.back().locals.emplace_back("extra", local);
+  REQUIRE_THROWS(heap.PutContinuation(frame));
+  REQUIRE(heap.Save() == saved);
+}
+
+TEST_CASE("Schema five leaf checkpoints migrate without losing array roots",
+          "[Quest][QuestVM][QuestHeap][Continuation]")
+{
+  auto object = std::make_shared<ContinuationObject>();
+  auto heap = ContinuationHeap(object);
+  auto frame = Continuation(object);
+  auto array = Integers(8);
+  array.objectType = "Int[]";
+  frame.locals.emplace_back("array", array);
+  heap.SetScript("a:Skyrim.esm/ChildQuest",
+                 Script({ { "field", heap.Encode(array) } }));
+  heap.PutContinuation(frame);
+  auto old = heap.Save();
+  old["schemaVersion"] = 5;
+  auto& node = old["continuations"][frame.token];
+  node["schemaVersion"] = 1;
+  node.erase("kind");
+  node.erase("callers");
+  const auto original = old;
+  auto migrated = ContinuationHeap(object, old);
+  const auto saved = migrated.Save();
+  REQUIRE(old == original);
+  REQUIRE(saved["schemaVersion"] == 6);
+  REQUIRE(saved["continuations"][frame.token]["schemaVersion"] == 2);
+  REQUIRE(saved["continuations"][frame.token]["kind"] == "method");
+  REQUIRE(saved["continuations"][frame.token]["callers"].empty());
+  auto field = migrated.Decode(
+    migrated.GetScript("a:Skyrim.esm/ChildQuest")["values"]["field"]);
+  const auto resumed = migrated.TakeContinuation(frame.scope, frame.token);
+  REQUIRE(resumed.locals[1].second.pArray == field.pArray);
+  REQUIRE(resumed.locals[1].second.objectType == "Int[]");
+  REQUIRE(resumed.kind == "method");
+  REQUIRE(resumed.callers.empty());
+}
+
+TEST_CASE("Schema five migration refuses unrecognized or malformed "
+          "pending work",
+          "[Quest][QuestVM][QuestHeap][Continuation]")
+{
+  auto object = std::make_shared<ContinuationObject>();
+  auto heap = ContinuationHeap(object);
+  auto frame = Continuation(object);
+  heap.PutContinuation(frame);
+  auto old = heap.Save();
+  old["schemaVersion"] = 5;
+  auto& node = old["continuations"][frame.token];
+  node["schemaVersion"] = 1;
+  node.erase("kind");
+  node.erase("callers");
+  SECTION("invented empty callers")
+  {
+    node["callers"] = Json::array();
+  }
+  SECTION("invented caller work")
+  {
+    node["callers"] = Json::array({ node });
+  }
+  SECTION("invented kind")
+  {
+    node["kind"] = "static";
+  }
+  SECTION("unknown node version")
+  {
+    node["schemaVersion"] = 2;
+  }
+  SECTION("fractional node version")
+  {
+    node["schemaVersion"] = 1.0;
+  }
+  SECTION("missing type")
+  {
+    node["locals"][0].erase("declaredType");
+  }
+  SECTION("null receiver")
+  {
+    node["receiver"]["value"] = nullptr;
+  }
+  SECTION("unknown field")
+  {
+    node["futureWork"] = true;
+  }
+  SECTION("missing locals")
+  {
+    node.erase("locals");
+  }
+  const auto original = old;
+  REQUIRE_THROWS(ContinuationHeap(object, old));
+  REQUIRE_THROWS(QuestVmState::ResetQuest(old, "a:Skyrim.esm/"));
+  REQUIRE(old == original);
+}
+
+TEST_CASE("Caller decoding failures preserve tokens after the leaf "
+          "was decoded",
+          "[Quest][QuestVM][QuestHeap][Continuation]")
+{
+  auto object = std::make_shared<ContinuationObject>();
+  auto heap = ContinuationHeap(object);
+  auto frame = Continuation(object);
+  auto shared = Integers(8);
+  shared.objectType = "Int[]";
+  frame.locals.emplace_back("array", shared);
+  frame.callers.push_back(Caller(object));
+  frame.callers[0].locals.emplace_back("array", shared);
+  VarValue reference(object);
+  reference.objectType = "Quest";
+  frame.callers[0].locals.emplace_back("reference", reference);
+  heap.PutContinuation(frame);
+  auto saved = heap.Save();
+  auto& caller = saved["continuations"][frame.token]["callers"][0];
+  SECTION("caller receiver")
+  {
+    caller["receiver"]["value"] = "missing";
+  }
+  SECTION("caller local")
+  {
+    caller["locals"][2]["value"]["value"] = "missing";
+  }
+  bool missing = true;
+  size_t resolutions = 0;
+  QuestVmState restarted(
+    saved, [](IGameObject*) -> Json { return "a:Skyrim.esm"; },
+    [&missing, &resolutions, object](const Json& value) -> VarValue {
+      ++resolutions;
+      if (value == "missing" && missing)
+        throw std::runtime_error("Caller object unavailable");
+      return VarValue(object);
+    });
+  REQUIRE_THROWS(restarted.TakeContinuation(frame.scope, frame.token));
+  REQUIRE(resolutions >= 2);
+  REQUIRE(restarted.Save() == saved);
+  missing = false;
+  const auto resumed = restarted.TakeContinuation(frame.scope, frame.token);
+  REQUIRE(resumed.locals[1].second.pArray ==
+          resumed.callers[0].locals[1].second.pArray);
+  REQUIRE(static_cast<IGameObject*>(resumed.callers[0].receiver) ==
+          object.get());
+  REQUIRE(restarted.Save()["continuations"].empty());
+}
+
+TEST_CASE("Invalid caller object array resolution preserves the token and "
+          "permits a clean retry",
+          "[Quest][QuestVM][QuestHeap][Continuation]")
+{
+  auto object = std::make_shared<ContinuationObject>();
+  auto heap = ContinuationHeap(object);
+  auto frame = Continuation(object);
+  auto shared = Integers(8);
+  shared.objectType = "Int[]";
+  heap.SetScript("a:Skyrim.esm/ChildQuest",
+                 Script({ { "field", heap.Encode(shared) } }));
+  frame.locals.emplace_back("shared", shared);
+  VarValue references(static_cast<uint8_t>(VarValue::kType_ObjectArray));
+  references.objectType = "Quest[]";
+  references.pArray =
+    std::make_shared<std::vector<VarValue>>(std::initializer_list<VarValue>{
+      VarValue(object), VarValue(object), VarValue::None() });
+  frame.callers = { Caller(object), Caller(object) };
+  for (auto& caller : frame.callers)
+    caller.locals.emplace_back("references", references);
+  heap.PutContinuation(frame);
+  auto saved = heap.Save();
+  const auto id = saved["continuations"][frame.token]["callers"][0]["locals"]
+                       [1]["value"]["array"]
+                         .get<std::string>();
+  saved["arrays"][id]["values"][1]["value"] = "unavailable";
+  VarValue invalid = VarValue::None();
+  SECTION("scalar resolver result")
+  {
+    invalid = VarValue(7);
+  }
+  SECTION("latent resolver result")
+  {
+    invalid = VarValue(object);
+    invalid.promise = std::make_shared<Viet::Promise<VarValue>>();
+  }
+  SECTION("nonnull identity resolves to None")
+  {
+  }
+  bool fail = true;
+  size_t unavailableResolutions = 0;
+  QuestVmState restarted(
+    saved, [](IGameObject*) -> Json { return "a:Skyrim.esm"; },
+    [object, &invalid, &fail, &unavailableResolutions](const Json& value) {
+      if (value == "unavailable") {
+        ++unavailableResolutions;
+        if (fail)
+          return invalid;
+      }
+      return VarValue(object);
+    });
+  auto field = restarted.Decode(
+    restarted.GetScript("a:Skyrim.esm/ChildQuest")["values"]["field"]);
+  REQUIRE_THROWS(restarted.TakeContinuation(frame.scope, frame.token));
+  REQUIRE(unavailableResolutions == 1);
+  REQUIRE(restarted.Save() == saved);
+  fail = false;
+  const auto resumed = restarted.TakeContinuation(frame.scope, frame.token);
+  REQUIRE(unavailableResolutions == 2);
+  REQUIRE(resumed.locals[1].second.pArray == field.pArray);
+  const auto& restored = resumed.callers[0].locals[1].second;
+  REQUIRE(restored.pArray == resumed.callers[1].locals[1].second.pArray);
+  REQUIRE(restored.pArray->size() == 3);
+  REQUIRE(static_cast<IGameObject*>((*restored.pArray)[0]) == object.get());
+  REQUIRE(static_cast<IGameObject*>((*restored.pArray)[1]) == object.get());
+  REQUIRE(static_cast<IGameObject*>((*restored.pArray)[2]) == nullptr);
+  REQUIRE_FALSE((*restored.pArray)[1].promise);
+  REQUIRE(restarted.Save()["continuations"].empty());
+}
+
+TEST_CASE("Nonnull caller object locals cannot silently resolve to None",
+          "[Quest][QuestVM][QuestHeap][Continuation]")
+{
+  auto object = std::make_shared<ContinuationObject>();
+  auto heap = ContinuationHeap(object);
+  auto frame = Continuation(object);
+  frame.callers.push_back(Caller(object));
+  VarValue reference(object);
+  reference.objectType = "Quest";
+  frame.callers[0].locals.emplace_back("reference", reference);
+  heap.PutContinuation(frame);
+  auto saved = heap.Save();
+  saved["continuations"][frame.token]["callers"][0]["locals"][1]["value"]
+       ["value"] = "unavailable";
+  bool fail = true;
+  QuestVmState restarted(
+    saved, [](IGameObject*) -> Json { return "a:Skyrim.esm"; },
+    [object, &fail](const Json& value) {
+      return value == "unavailable" && fail ? VarValue::None()
+                                            : VarValue(object);
+    });
+  REQUIRE_THROWS(restarted.TakeContinuation(frame.scope, frame.token));
+  REQUIRE(restarted.Save() == saved);
+  fail = false;
+  const auto resumed = restarted.TakeContinuation(frame.scope, frame.token);
+  REQUIRE(static_cast<IGameObject*>(resumed.callers[0].locals[1].second) ==
+          object.get());
   REQUIRE(restarted.Save()["continuations"].empty());
 }

@@ -51,13 +51,14 @@ settings explicitly choose SQLite. Initialization never replaces existing settin
   change. Persistent execution of external events, complete world-effect staging
   and durable acknowledgements remain required. Switching drivers alone does not
   make arbitrary world-effect natives safe to enable.
-- VM schema 5 can store a leaf script checkpoint and preserve arrays held only
-  by its locals. Its codec consumes a pending completion token once within the
+- VM schema 6 can store a nested script checkpoint and preserve arrays held only
+  by any saved caller's locals. Its codec consumes a pending completion token once within the
   candidate heap. The caller still has to commit token consumption, resumed
   effects and the next checkpoint together, and wait for storage acknowledgement
   before acknowledging durable delivery. JSON/fresh-VM recovery tests do not
   establish that crash boundary. Production stage/event execution remains
-  synchronous until its caller stacks and work cursors are also persistent.
+  synchronous until its work cursors, lifecycle jobs and commit acknowledgements
+  are also persistent.
 - Change forms now store maximum attributes and regeneration values as well as
   percentages. Legacy saves without the optional `actorValues` object retain
   the previous default attributes; missing members in a present object are an

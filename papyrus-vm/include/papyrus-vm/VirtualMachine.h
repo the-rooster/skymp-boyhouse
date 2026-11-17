@@ -154,8 +154,10 @@ private:
     }
   };
   size_t activeFrames = 0;
+  size_t checkpointLocals = 0;
   std::optional<PapyrusContinuation> checkpointFrame;
   bool checkpointSuspended = false;
+  std::string suspendedReturnType;
   bool strictExecution = false;
   size_t executedInstructions = 0;
   CIMap<PexScript::Lazy> allLoadedScripts;

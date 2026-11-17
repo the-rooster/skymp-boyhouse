@@ -65,6 +65,31 @@ void InstructionCount(const Json& value, bool executed)
   if (number < (executed ? 1 : 0) || number > (executed ? 100000 : 99999))
     throw std::runtime_error("Invalid continuation instruction count");
 }
+void ValidateDecodedContinuationValue(const Json& saved,
+                                      const VarValue& decoded,
+                                      const Json& arrays)
+{
+  const auto type = Type(saved);
+  if (decoded.promise || decoded.GetType() != type)
+    throw std::runtime_error("Continuation local could not be resolved");
+  if (type == VarValue::kType_Object && !saved.at("value").is_null() &&
+      !static_cast<IGameObject*>(decoded))
+    throw std::runtime_error(
+      "Continuation object identity could not be resolved");
+  if (!IsArray(type) || saved.at("array").is_null())
+    return;
+  const auto& elements =
+    arrays.at(saved.at("array").get<std::string>()).at("values");
+  if (!decoded.pArray || decoded.pArray->size() != elements.size())
+    throw std::runtime_error("Continuation array could not be resolved");
+  // DecodeObject is supplied by the host. Check its results inside object
+  // arrays too, before TakeContinuation publishes a cached allocation or
+  // consumes the token. Saved null references remain valid; a nonnull stable
+  // identity must not silently become None while restoring suspended work.
+  for (size_t i = 0; i < elements.size(); ++i)
+    ValidateDecodedContinuationValue(elements[i], (*decoded.pArray)[i],
+                                     arrays);
+}
 }
 
 void QuestVmState::ValidateScalar(const Json& value)
@@ -109,10 +134,12 @@ QuestVmState::Json QuestVmState::Normalize(Json saved)
   if (saved.contains("schemaVersion")) {
     if (!saved.at("schemaVersion").is_number_integer())
       throw std::runtime_error("Invalid saved quest VM version");
-    if (saved.at("schemaVersion") != 5 && saved.contains("continuations") &&
+    if (saved.at("schemaVersion") != 5 && saved.at("schemaVersion") != 6 &&
+        saved.contains("continuations") &&
         (!saved.at("continuations").is_object() ||
          !saved.at("continuations").empty()))
-      throw std::runtime_error("Continuations require quest VM version five");
+      throw std::runtime_error(
+        "Continuations require quest VM version five or six");
     if (saved.at("schemaVersion") == 2) {
       saved["schemaVersion"] = 3;
       if (!saved.contains("globals"))
@@ -125,7 +152,28 @@ QuestVmState::Json QuestVmState::Normalize(Json saved)
     if (saved.at("schemaVersion") == 4) {
       saved["schemaVersion"] = 5;
       saved["continuations"] = Json::object();
-    } else if (saved.at("schemaVersion") != 5) {
+    }
+    if (saved.at("schemaVersion") == 5) {
+      if (!saved.at("continuations").is_object() ||
+          saved.at("continuations").size() > 256)
+        throw std::runtime_error("Invalid saved quest continuations");
+      for (auto& value : saved["continuations"]) {
+        // Only the old single-frame shape is migratable. In particular, never
+        // erase invented caller data or an unrecognized future node version.
+        Fields(value,
+               { "schemaVersion", "scope", "receiver", "rootScript", "script",
+                 "state", "function", "contentHashes", "resultType",
+                 "instruction", "executedInstructions", "locals" });
+        if (!value.at("schemaVersion").is_number_integer() ||
+            value.at("schemaVersion") != 1)
+          throw std::runtime_error(
+            "Unsupported legacy quest continuation version");
+        value["schemaVersion"] = 2;
+        value["kind"] = "method";
+        value["callers"] = Json::array();
+      }
+      saved["schemaVersion"] = 6;
+    } else if (saved.at("schemaVersion") != 6) {
       throw std::runtime_error("Unsupported saved quest VM version");
     }
     Validate(saved);
@@ -134,12 +182,11 @@ QuestVmState::Json QuestVmState::Normalize(Json saved)
   // Legacy scripts stored inline, non-shared arrays. Assign a distinct heap
   // identity to each of those allocations; never deduplicate by array
   // contents.
-  Json result = { { "schemaVersion", 5 },
-                  { "scripts", saved },
-                  { "arrays", Json::object() },
-                  { "globals", Json::object() },
-                  { "aliases", Json::object() },
-                  { "continuations", Json::object() } };
+  Json result = {
+    { "schemaVersion", 6 },        { "scripts", saved },
+    { "arrays", Json::object() },  { "globals", Json::object() },
+    { "aliases", Json::object() }, { "continuations", Json::object() }
+  };
   uint64_t id = 1;
   for (auto& [key, script] : result["scripts"].items()) {
     if (!script.is_object() || script.at("schemaVersion") != 1 ||
@@ -170,7 +217,7 @@ QuestVmState::Json QuestVmState::Normalize(Json saved)
 void QuestVmState::Validate(const Json& saved)
 {
   if (!saved.at("schemaVersion").is_number_integer() ||
-      saved.at("schemaVersion") != 5 || !saved.at("scripts").is_object() ||
+      saved.at("schemaVersion") != 6 || !saved.at("scripts").is_object() ||
       !saved.at("arrays").is_object() || saved["arrays"].size() > 100000)
     throw std::runtime_error("Invalid saved quest heap");
   {
@@ -236,24 +283,54 @@ void QuestVmState::ValidateContinuation(const std::string& token,
                                        const Json& value, const Json& arrays)
 {
   BoundedString(token, 256);
-  Fields(value, { "schemaVersion", "scope", "receiver", "rootScript",
-                  "script", "state", "function", "contentHashes",
-                  "resultType", "instruction", "executedInstructions",
-                  "locals" });
+  Fields(value,
+         { "schemaVersion", "scope", "receiver", "kind", "rootScript",
+           "script", "state", "function", "contentHashes", "resultType",
+           "instruction", "executedInstructions", "locals", "callers" });
   if (!value.at("schemaVersion").is_number_integer() ||
-      value.at("schemaVersion") != 1)
+      value.at("schemaVersion") != 2)
     throw std::runtime_error("Unsupported quest continuation version");
   BoundedString(value.at("scope"), 300);
+  InstructionCount(value.at("executedInstructions"), true);
+  ValidateFrame(value, arrays);
+  const auto& callers = value.at("callers");
+  if (!callers.is_array() || callers.size() > 127)
+    throw std::runtime_error("Invalid continuation caller stack");
+  size_t totalLocals = value.at("locals").size();
+  for (const auto& caller : callers) {
+    // Caller frames share the node's schema version. They have no operation
+    // token, scope, budget, or nested caller list of their own.
+    Fields(caller,
+           { "receiver", "kind", "rootScript", "script", "state", "function",
+             "contentHashes", "resultType", "instruction", "locals" });
+    ValidateFrame(caller, arrays);
+    if (caller.at("locals").size() > 65535 - totalLocals)
+      throw std::runtime_error("Continuation stack local limit exceeded");
+    totalLocals += caller.at("locals").size();
+  }
+}
+
+void QuestVmState::ValidateFrame(const Json& value, const Json& arrays)
+{
+  const auto& kind = value.at("kind");
+  if (kind != "method" && kind != "static" && kind != "propertyGet" &&
+      kind != "propertySet")
+    throw std::runtime_error("Unsupported continuation frame kind");
   for (const auto* field : { "rootScript", "script", "function", "resultType" })
     BoundedString(value.at(field), 1024);
   BoundedString(value.at("state"), 1024, true);
   InstructionCount(value.at("instruction"), false);
-  InstructionCount(value.at("executedInstructions"), true);
   const auto& receiver = value.at("receiver");
-  if (Type(receiver) != VarValue::kType_Object ||
-      receiver.at("value").is_null())
-    throw std::runtime_error("Continuation requires a nonnull receiver");
+  if (Type(receiver) != VarValue::kType_Object)
+    throw std::runtime_error("Continuation frame receiver must be an object");
   ValidateScalar(receiver);
+  if (kind == "static") {
+    if (!receiver.at("value").is_null() || value.at("state") != "" ||
+        value.at("rootScript") != value.at("script"))
+      throw std::runtime_error("Invalid static continuation frame");
+  } else if (receiver.at("value").is_null()) {
+    throw std::runtime_error("Continuation frame requires a nonnull receiver");
+  }
   const auto& hashes = value.at("contentHashes");
   if (!hashes.is_array() || hashes.size() > 128)
     throw std::runtime_error("Invalid continuation content hashes");
@@ -290,12 +367,18 @@ void QuestVmState::Collect(Json& saved)
     for (const auto& value : script["values"])
       if (IsArray(Type(value)) && !value.at("array").is_null())
         reachable.insert(value.at("array").get<std::string>());
-  for (const auto& continuation : saved["continuations"])
-    for (const auto& local : continuation["locals"]) {
+  auto collectFrame = [&](const Json& frame) {
+    for (const auto& local : frame["locals"]) {
       const auto& value = local.at("value");
       if (IsArray(Type(value)) && !value.at("array").is_null())
         reachable.insert(value.at("array").get<std::string>());
     }
+  };
+  for (const auto& continuation : saved["continuations"]) {
+    collectFrame(continuation);
+    for (const auto& caller : continuation["callers"])
+      collectFrame(caller);
+  }
   auto& arrays = saved["arrays"];
   for (auto it = arrays.begin(); it != arrays.end();)
     if (!reachable.count(it.key()))
@@ -468,36 +551,55 @@ void QuestVmState::PutContinuation(const PapyrusContinuation& continuation)
     throw std::runtime_error("Duplicate quest continuation token");
   if (state["continuations"].size() >= 256 ||
       continuation.locals.size() > 65535 ||
-      continuation.contentHashes.size() > 128)
+      continuation.contentHashes.size() > 128 ||
+      continuation.callers.size() > 127)
     throw std::runtime_error("Quest continuation limit exceeded");
-  if (continuation.receiver.GetType() != VarValue::kType_Object ||
-      !static_cast<IGameObject*>(continuation.receiver))
-    throw std::runtime_error("Continuation requires a nonnull receiver");
+  size_t totalLocals = continuation.locals.size();
+  for (const auto& caller : continuation.callers) {
+    if (caller.locals.size() > 65535 - totalLocals ||
+        caller.contentHashes.size() > 128)
+      throw std::runtime_error("Quest continuation stack limit exceeded");
+    totalLocals += caller.locals.size();
+  }
 
   // Encoding can allocate heap identities, and saving checks all live arrays.
   // Publish those changes only after the entire candidate has been validated.
   auto updated = *this;
-  Json value = { { "schemaVersion", 1 },
-                 { "scope", continuation.scope },
-                 { "receiver", updated.Encode(continuation.receiver) },
-                 { "rootScript", continuation.rootScript },
-                 { "script", continuation.script },
-                 { "state", continuation.state },
-                 { "function", continuation.function },
-                 { "contentHashes", Json::array() },
-                 { "resultType", continuation.resultType },
-                 { "instruction", continuation.instruction },
-                 { "executedInstructions", continuation.executedInstructions },
-                 { "locals", Json::array() } };
-  for (const auto& [script, hash] : continuation.contentHashes)
-    value["contentHashes"].push_back({ { "script", script }, { "hash", hash } });
-  for (const auto& [name, local] : continuation.locals)
-    value["locals"].push_back({ { "name", name },
-                                { "declaredType", local.objectType },
-                                { "value", updated.Encode(local) } });
+  auto value = updated.EncodeFrame(continuation);
+  value["schemaVersion"] = 2;
+  value["scope"] = continuation.scope;
+  value["executedInstructions"] = continuation.executedInstructions;
+  value["callers"] = Json::array();
+  for (const auto& caller : continuation.callers)
+    value["callers"].push_back(updated.EncodeFrame(caller));
   updated.state["continuations"][continuation.token] = std::move(value);
   updated.Save();
   *this = std::move(updated);
+}
+
+QuestVmState::Json QuestVmState::EncodeFrame(const PapyrusFrame& frame)
+{
+  if (frame.receiver.GetType() != VarValue::kType_Object ||
+      (frame.kind == "static") !=
+        (static_cast<IGameObject*>(frame.receiver) == nullptr))
+    throw std::runtime_error("Invalid continuation frame receiver");
+  Json value = { { "receiver", Encode(frame.receiver) },
+                 { "kind", frame.kind },
+                 { "rootScript", frame.rootScript },
+                 { "script", frame.script },
+                 { "state", frame.state },
+                 { "function", frame.function },
+                 { "contentHashes", Json::array() },
+                 { "resultType", frame.resultType },
+                 { "instruction", frame.instruction },
+                 { "locals", Json::array() } };
+  for (const auto& [script, hash] : frame.contentHashes)
+    value["contentHashes"].push_back({ { "script", script }, { "hash", hash } });
+  for (const auto& [name, local] : frame.locals)
+    value["locals"].push_back({ { "name", name },
+                                { "declaredType", local.objectType },
+                                { "value", Encode(local) } });
+  return value;
 }
 
 PapyrusContinuation QuestVmState::TakeContinuation(const std::string& scope,
@@ -512,12 +614,28 @@ PapyrusContinuation QuestVmState::TakeContinuation(const std::string& scope,
     throw std::runtime_error("Quest continuation scope or token mismatch");
   const auto& value = pending.at(token);
   PapyrusContinuation result;
+  static_cast<PapyrusFrame&>(result) = updated.DecodeFrame(value);
   result.scope = scope;
   result.token = token;
-  result.receiver = updated.Decode(value.at("receiver"));
+  result.executedInstructions =
+    value.at("executedInstructions").get<uint32_t>();
+  for (const auto& caller : value.at("callers"))
+    result.callers.push_back(updated.DecodeFrame(caller));
+  updated.state["continuations"].erase(token);
+  Collect(updated.state);
+  *this = std::move(updated);
+  return result;
+}
+
+PapyrusFrame QuestVmState::DecodeFrame(const Json& value)
+{
+  PapyrusFrame result;
+  result.kind = value.at("kind").get<std::string>();
+  result.receiver = Decode(value.at("receiver"));
   if (result.receiver.promise ||
       result.receiver.GetType() != VarValue::kType_Object ||
-      !static_cast<IGameObject*>(result.receiver))
+      (result.kind == "static") !=
+        (static_cast<IGameObject*>(result.receiver) == nullptr))
     throw std::runtime_error("Continuation receiver could not be resolved");
   result.rootScript = value.at("rootScript").get<std::string>();
   result.script = value.at("script").get<std::string>();
@@ -525,20 +643,16 @@ PapyrusContinuation QuestVmState::TakeContinuation(const std::string& scope,
   result.function = value.at("function").get<std::string>();
   result.resultType = value.at("resultType").get<std::string>();
   result.instruction = value.at("instruction").get<uint32_t>();
-  result.executedInstructions = value.at("executedInstructions").get<uint32_t>();
   for (const auto& hash : value.at("contentHashes"))
     result.contentHashes.emplace_back(hash.at("script").get<std::string>(),
                                       hash.at("hash").get<std::string>());
   for (const auto& local : value.at("locals")) {
-    auto decoded = updated.Decode(local.at("value"));
-    if (decoded.promise || decoded.GetType() != Type(local.at("value")))
-      throw std::runtime_error("Continuation local could not be resolved");
+    auto decoded = Decode(local.at("value"));
+    ValidateDecodedContinuationValue(local.at("value"), decoded,
+                                     state.at("arrays"));
     decoded.objectType = local.at("declaredType").get<std::string>();
     result.locals.emplace_back(local.at("name").get<std::string>(), decoded);
   }
-  updated.state["continuations"].erase(token);
-  Collect(updated.state);
-  *this = std::move(updated);
   return result;
 }
 

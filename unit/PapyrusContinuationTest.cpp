@@ -2,6 +2,7 @@
 #include "papyrus-vm/ActivePexInstance.h"
 #include "papyrus-vm/VirtualMachine.h"
 #include <catch2/catch_all.hpp>
+#include <functional>
 #include <map>
 
 namespace {
@@ -70,7 +71,8 @@ public:
   void Save()
   {
     for (const auto& [script, fields] : values) {
-      auto encoded = Json::object();
+      const auto previous = heap.GetScript("quest/" + script);
+      auto encoded = previous.empty() ? Json::object() : previous.at("values");
       for (const auto& [name, value] : fields)
         encoded[name] = heap.Encode(value);
       heap.SetScript("quest/" + script,
@@ -124,13 +126,15 @@ struct CheckpointHost
 {
   std::shared_ptr<PexScript> script = Program();
   std::shared_ptr<PexScript> base = std::make_shared<PexScript>();
+  std::vector<std::shared_ptr<PexScript>> extraScripts;
   std::shared_ptr<CheckpointObject> object =
     std::make_shared<CheckpointObject>();
   QuestVmState heap;
   std::shared_ptr<CheckpointVariables> variables;
   std::unique_ptr<VirtualMachine> vm;
   size_t awaitCalls = 0;
-  CheckpointHost(Json saved = Json::object())
+  using Configure = std::function<void(CheckpointHost&)>;
+  CheckpointHost(Json saved = Json::object(), Configure configure = {})
     : heap(
         std::move(saved),
         [](IGameObject* object) -> Json { return object->GetStringID(); },
@@ -144,9 +148,12 @@ struct CheckpointHost
     Object baseObject;
     baseObject.NameIndex = "Quest";
     base->objectTable.push_back(baseObject);
+    if (configure)
+      configure(*this);
     variables = std::make_shared<CheckpointVariables>(heap);
-    vm = std::make_unique<VirtualMachine>(
-      std::vector<std::shared_ptr<PexScript>>{ script, base });
+    std::vector<std::shared_ptr<PexScript>> scripts{ script, base };
+    scripts.insert(scripts.end(), extraScripts.begin(), extraScripts.end());
+    vm = std::make_unique<VirtualMachine>(scripts);
     vm->SetStrictExecution(true);
     vm->AddObject(object, { { script->source, variables } });
     vm->RegisterFunction(
@@ -166,10 +173,10 @@ struct CheckpointHost
   {
     return std::shared_ptr<StackData>(new StackData{ StackIdHolder{ *vm } });
   }
-  PapyrusExecutionResult Start()
+  PapyrusExecutionResult Start(const std::string& state = "")
   {
-    return object->scripts[0]->StartResumableFunction("campaign:1", "", "Run",
-                                                      {}, Stack());
+    return object->scripts[0]->StartResumableFunction("campaign:1", state,
+                                                      "Run", {}, Stack());
   }
   PapyrusExecutionResult Resume(const PapyrusContinuation& frame, int result)
   {
@@ -187,6 +194,453 @@ struct CheckpointHost
     return heap.Save().dump();
   }
 };
+
+FunctionInfo WaitingHelper()
+{
+  FunctionInfo helper;
+  helper.valid = true;
+  helper.returnType = "Int";
+  helper.params = { { "array", "Int[]" } };
+  helper.locals = { { "result", "Int" },
+                    { "private", "Int[]" },
+                    { "extra", "Int" } };
+  helper.code.instructions = {
+    { FunctionCode::kOp_ArrayCreate, { Name("private"), VarValue(1) } },
+    { FunctionCode::kOp_ArraySetElement,
+      { Name("private"), VarValue(0), VarValue(7) } },
+    { FunctionCode::kOp_CallStatic,
+      { VarValue("CheckpointHost"), VarValue("Await"), Name("result"),
+        VarValue(1), VarValue("first") } },
+    { FunctionCode::kOp_ArraySetElement,
+      { Name("array"), VarValue(0), Name("result") } },
+    { FunctionCode::kOp_CallStatic,
+      { VarValue("CheckpointHost"), VarValue("Await"), Name("result"),
+        VarValue(1), VarValue("second") } },
+    { FunctionCode::kOp_ArrayGetElement,
+      { Name("extra"), Name("private"), VarValue(0) } },
+    { FunctionCode::kOp_IAdd,
+      { Name("result"), Name("result"), Name("extra") } },
+    { FunctionCode::kOp_Return, { Name("result") } }
+  };
+  return helper;
+}
+
+void NestedProgram(CheckpointHost& host, const std::string& mode)
+{
+  auto helper = WaitingHelper();
+  FunctionInfo outer;
+  outer.valid = true;
+  outer.returnType = "Int";
+  outer.locals = { { "result", "Int" }, { "outerShared", "Int[]" } };
+  FunctionCode::Instruction call{ FunctionCode::kOp_CallMethod,
+                                  { VarValue("Inner"), Name("self"),
+                                    Name("result"), VarValue(1),
+                                    Name("outerShared") } };
+  auto& object = host.script->objectTable[0];
+  object.states[0].functions.clear();
+  if (mode == "static") {
+    auto script = std::make_shared<PexScript>();
+    script->source = "StaticHelper";
+    Object staticObject;
+    staticObject.NameIndex = script->source;
+    helper.flags = 1;
+    staticObject.states.push_back({ "", { { "Inner", helper } } });
+    script->objectTable.push_back(staticObject);
+    host.extraScripts.push_back(script);
+    call = { FunctionCode::kOp_CallStatic,
+             { VarValue("StaticHelper"), VarValue("Inner"), Name("result"),
+               VarValue(1), Name("outerShared") } };
+  } else if (mode == "parent") {
+    host.base->objectTable[0].states.push_back(
+      { "", { { "Inner", helper } } });
+    call = { FunctionCode::kOp_CallParent,
+             { VarValue("Inner"), Name("result"), VarValue(1),
+               Name("outerShared") } };
+  } else {
+    object.states[0].functions.push_back({ "Inner", helper });
+  }
+  outer.code.instructions = {
+    { FunctionCode::kOp_IAdd,
+      { Name("reward"), Name("reward"), VarValue(1) } },
+    { FunctionCode::kOp_Assign, { Name("outerShared"), Name("shared") } },
+    call,
+    { FunctionCode::kOp_IAdd,
+      { Name("reward"), Name("reward"), Name("result") } },
+    { FunctionCode::kOp_Return, { Name("reward") } }
+  };
+  if (mode == "fallback") {
+    object.autoStateName = "Busy";
+    object.states.push_back({ "Busy", { { "Run", outer } } });
+  } else {
+    object.states[0].functions.push_back({ "Run", outer });
+  }
+}
+
+void PropertyProgram(CheckpointHost& host, bool write)
+{
+  auto& object = host.script->objectTable[0];
+  auto handler = object.states[0].functions[0].function;
+  // Reader::FillFuncInfo leaves property handlers' valid flag unset.
+  handler.valid = false;
+  Object::PropInfo property;
+  property.name = "WaitForValue";
+  property.type = "Int";
+  property.flags =
+    write ? Object::PropInfo::kFlags_Write : Object::PropInfo::kFlags_Read;
+  if (write) {
+    handler.params = { { "value", "Int" } };
+    handler.returnType = "None";
+    handler.code.instructions.back() = {
+      FunctionCode::kOp_IAdd, { Name("reward"), Name("reward"), Name("value") }
+    };
+    handler.code.instructions.push_back(
+      { FunctionCode::kOp_Return, { VarValue::None() } });
+    property.writeHandler = handler;
+  } else {
+    property.readHandler = handler;
+  }
+  object.properties.push_back(property);
+  FunctionInfo outer;
+  outer.valid = true;
+  outer.returnType = "Int";
+  outer.locals = { { "input", "Int" }, { "result", "Int" } };
+  outer.code.instructions = {
+    { FunctionCode::kOp_Assign, { Name("input"), VarValue(13) } },
+    write ? FunctionCode::Instruction{ FunctionCode::kOp_PropSet,
+                                       { VarValue("WaitForValue"),
+                                         Name("self"), Name("input") } }
+          : FunctionCode::Instruction{ FunctionCode::kOp_PropGet,
+                                       { VarValue("WaitForValue"),
+                                         Name("self"), Name("result") } },
+    { FunctionCode::kOp_IAdd,
+      { Name("reward"), Name("reward"), Name(write ? "input" : "result") } },
+    { FunctionCode::kOp_Return, { Name(write ? "input" : "reward") } }
+  };
+  object.states[0].functions = { { "Run", outer } };
+}
+
+void DeepProgram(CheckpointHost& host)
+{
+  NestedProgram(host, "method");
+  auto& functions = host.script->objectTable[0].states[0].functions;
+  functions[1].name = "Middle";
+  auto& middleCode = functions[1].function.code.instructions;
+  middleCode.insert(middleCode.end() - 1,
+                    { FunctionCode::kOp_CallStatic,
+                      { VarValue("CheckpointHost"), VarValue("Await"),
+                        Name("result"), VarValue(1), VarValue("outer") } });
+  middleCode.insert(middleCode.end() - 1,
+                    { FunctionCode::kOp_IAdd,
+                      { Name("reward"), Name("reward"), Name("result") } });
+  FunctionInfo outer;
+  outer.valid = true;
+  outer.returnType = "Int";
+  outer.locals = { { "result", "Int" } };
+  outer.code.instructions = {
+    { FunctionCode::kOp_IAdd,
+      { Name("reward"), Name("reward"), VarValue(100) } },
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("Middle"), Name("self"), Name("result"), VarValue(0) } },
+    { FunctionCode::kOp_IAdd,
+      { Name("reward"), Name("reward"), Name("result") } },
+    { FunctionCode::kOp_Return, { Name("reward") } }
+  };
+  functions.push_back({ "Run", outer });
+}
+}
+
+TEST_CASE("Nested method static parent and fallback calls resume after "
+          "fresh VM reloads with shared arrays",
+          "[Quest][QuestVM][PapyrusContinuation]")
+{
+  const std::string mode = GENERATE("method", "static", "parent", "fallback");
+  auto configure = [mode](CheckpointHost& host) { NestedProgram(host, mode); };
+  std::string saved;
+  std::weak_ptr<IGameObject> previousObject;
+  {
+    CheckpointHost first(Json::object(), configure);
+    previousObject = first.object;
+    const auto result = first.Start(mode == "fallback" ? "Busy" : "");
+    REQUIRE(result.continuation);
+    const auto& frame = *result.continuation;
+    REQUIRE(frame.function == "Inner");
+    REQUIRE(frame.kind == (mode == "static" ? "static" : "method"));
+    REQUIRE(frame.state.empty());
+    REQUIRE(frame.callers.size() == 1);
+    REQUIRE(frame.callers[0].function == "Run");
+    REQUIRE(frame.callers[0].state == (mode == "fallback" ? "Busy" : ""));
+    if (mode == "parent") {
+      REQUIRE(frame.script == "Quest");
+      REQUIRE(frame.rootScript == "ResumeFixture");
+    }
+    REQUIRE(first.Reward() == 1);
+    saved = first.Save(frame);
+    REQUIRE(Json::parse(saved)["arrays"].size() == 2);
+  }
+  REQUIRE(previousObject.expired());
+  {
+    CheckpointHost second(Json::parse(saved), configure);
+    previousObject = second.object;
+    const auto frame = second.heap.TakeContinuation("campaign:1", "first");
+    auto& shared =
+      *second.variables->GetVariableByName("shared", *second.script);
+    REQUIRE(frame.locals[3].second.pArray == shared.pArray);
+    REQUIRE(frame.callers[0].locals[1].second.pArray == shared.pArray);
+    REQUIRE(frame.locals[1].second.pArray != shared.pArray);
+    const auto result = second.Resume(frame, 12);
+    REQUIRE(result.continuation);
+    REQUIRE(result.continuation->token == "second");
+    REQUIRE(result.continuation->callers.size() == 1);
+    REQUIRE(result.continuation->callers[0].function == "Run");
+    REQUIRE(static_cast<int>(shared.pArray->at(0)) == 12);
+    REQUIRE(second.Reward() == 1);
+    REQUIRE(second.awaitCalls == 1);
+    saved = second.Save(*result.continuation);
+  }
+  REQUIRE(previousObject.expired());
+  CheckpointHost third(Json::parse(saved), configure);
+  const auto frame = third.heap.TakeContinuation("campaign:1", "second");
+  const auto result = third.Resume(frame, 20);
+  REQUIRE_FALSE(result.continuation);
+  REQUIRE(static_cast<int>(result.value) == 28);
+  REQUIRE(third.Reward() == 28);
+  REQUIRE(third.awaitCalls == 0);
+  third.variables->Save();
+  const auto final = third.heap.Save();
+  REQUIRE(final["continuations"].empty());
+  REQUIRE(final["arrays"].size() == 1);
+}
+
+TEST_CASE(
+  "Property handlers resume and return without overwriting setter input",
+  "[Quest][QuestVM][PapyrusContinuation]")
+{
+  const bool write = GENERATE(false, true);
+  auto configure = [write](CheckpointHost& host) {
+    PropertyProgram(host, write);
+  };
+  std::string saved;
+  {
+    CheckpointHost first(Json::object(), configure);
+    const auto result = first.Start();
+    REQUIRE(result.continuation);
+    REQUIRE(result.continuation->kind ==
+            (write ? "propertySet" : "propertyGet"));
+    REQUIRE(result.continuation->function == "WaitForValue");
+    REQUIRE(result.continuation->callers.size() == 1);
+    REQUIRE(result.continuation->callers[0].resultType ==
+            (write ? "None" : "Int"));
+    REQUIRE(first.Reward() == 1);
+    saved = first.Save(*result.continuation);
+  }
+  {
+    CheckpointHost second(Json::parse(saved), configure);
+    auto frame = second.heap.TakeContinuation("campaign:1", "first");
+    REQUIRE(static_cast<int>(frame.callers[0].locals[0].second) == 13);
+    const auto result = second.Resume(frame, 12);
+    REQUIRE(result.continuation);
+    REQUIRE(second.Reward() == 8);
+    saved = second.Save(*result.continuation);
+  }
+  CheckpointHost third(Json::parse(saved), configure);
+  const auto frame = third.heap.TakeContinuation("campaign:1", "second");
+  const auto result = third.Resume(frame, 20);
+  REQUIRE_FALSE(result.continuation);
+  REQUIRE(static_cast<int>(result.value) == (write ? 13 : 56));
+  REQUIRE(third.Reward() == (write ? 54 : 56));
+  REQUIRE(third.awaitCalls == 0);
+}
+
+TEST_CASE("Resuspending a middle frame preserves its unexecuted outer caller",
+          "[Quest][QuestVM][PapyrusContinuation]")
+{
+  std::string saved;
+  {
+    CheckpointHost first(Json::object(), DeepProgram);
+    const auto result = first.Start();
+    REQUIRE(result.continuation);
+    REQUIRE(result.continuation->callers.size() == 2);
+    REQUIRE(result.continuation->callers[0].function == "Middle");
+    REQUIRE(result.continuation->callers[1].function == "Run");
+    REQUIRE(first.Reward() == 101);
+    saved = first.Save(*result.continuation);
+  }
+  {
+    CheckpointHost second(Json::parse(saved), DeepProgram);
+    const auto frame = second.heap.TakeContinuation("campaign:1", "first");
+    const auto result = second.Resume(frame, 12);
+    REQUIRE(result.continuation);
+    REQUIRE(result.continuation->callers.size() == 2);
+    saved = second.Save(*result.continuation);
+  }
+  {
+    CheckpointHost third(Json::parse(saved), DeepProgram);
+    const auto frame = third.heap.TakeContinuation("campaign:1", "second");
+    const auto result = third.Resume(frame, 20);
+    REQUIRE(result.continuation);
+    REQUIRE(result.continuation->token == "outer");
+    REQUIRE(result.continuation->function == "Middle");
+    REQUIRE(result.continuation->callers.size() == 1);
+    REQUIRE(result.continuation->callers[0].function == "Run");
+    REQUIRE(third.Reward() == 128);
+    saved = third.Save(*result.continuation);
+    REQUIRE(Json::parse(saved)["arrays"].size() == 1);
+  }
+  CheckpointHost fourth(Json::parse(saved), DeepProgram);
+  const auto frame = fourth.heap.TakeContinuation("campaign:1", "outer");
+  const auto result = fourth.Resume(frame, 5);
+  REQUIRE_FALSE(result.continuation);
+  REQUIRE(static_cast<int>(result.value) == 266);
+  REQUIRE(fourth.Reward() == 266);
+  REQUIRE(fourth.awaitCalls == 0);
+}
+
+TEST_CASE(
+  "Corrupt outer frames and caller links fail before resumed leaf effects",
+  "[Quest][QuestVM][PapyrusContinuation]")
+{
+  auto configure = [](CheckpointHost& host) {
+    NestedProgram(host, "method");
+    auto& functions = host.script->objectTable[0].states[0].functions;
+    functions.push_back({ "Other", functions[0].function });
+  };
+  std::string saved;
+  {
+    CheckpointHost first(Json::object(), configure);
+    saved = first.Save(*first.Start().continuation);
+  }
+  CheckpointHost host(Json::parse(saved), configure);
+  auto frame = host.heap.TakeContinuation("campaign:1", "first");
+  SECTION("outer content hash")
+  {
+    auto& hash = frame.callers[0].contentHashes[0].second;
+    hash[0] = hash[0] == '0' ? '1' : '0';
+  }
+  SECTION("outer instruction is not a call")
+  {
+    frame.callers[0].instruction = 0;
+  }
+  SECTION("outer return link type")
+  {
+    frame.callers[0].resultType = "Bool";
+  }
+  SECTION("outer local type")
+  {
+    frame.callers[0].locals[0].second = VarValue("wrong");
+  }
+  SECTION("same-layout function is not the caller target")
+  {
+    frame.function = "Other";
+  }
+  SECTION("self target is not another attached receiver")
+  {
+    auto other = std::make_shared<CheckpointObject>();
+    other->id = "campaign:1/quest:other";
+    auto variables = std::make_shared<CheckpointVariables>(host.heap);
+    host.vm->AddObject(other, { { host.script->source, variables } });
+    frame.receiver = VarValue(other.get());
+  }
+  SECTION("budget is exhausted")
+  {
+    frame.executedInstructions = 100000;
+  }
+  SECTION("caller stack is too deep")
+  {
+    frame.callers.resize(128, frame.callers[0]);
+  }
+  SECTION("combined locals exceed the stack bound")
+  {
+    frame.callers[0].locals.resize(65535, frame.callers[0].locals[0]);
+  }
+  REQUIRE_THROWS(host.Resume(frame, 12));
+  REQUIRE(host.Reward() == 1);
+  const auto& shared =
+    *host.variables->GetVariableByName("shared", *host.script);
+  REQUIRE(static_cast<int>(shared.pArray->at(0)) == 9);
+  REQUIRE(host.awaitCalls == 0);
+}
+
+TEST_CASE("Nested checkpoint admission enforces live stack depth and locals",
+          "[Quest][QuestVM][PapyrusContinuation]")
+{
+  SECTION("recursive Papyrus frames stop at the depth limit")
+  {
+    auto configure = [](CheckpointHost& host) {
+      NestedProgram(host, "method");
+      auto& inner =
+        host.script->objectTable[0].states[0].functions[0].function;
+      inner.code.instructions = {
+        { FunctionCode::kOp_CallMethod,
+          { VarValue("Inner"), Name("self"), Name("result"), VarValue(1),
+            Name("array") } },
+        { FunctionCode::kOp_Return, { Name("result") } }
+      };
+    };
+    CheckpointHost host(Json::object(), configure);
+    REQUIRE_THROWS_WITH(host.Start(),
+                        Catch::Matchers::ContainsSubstring("depth"));
+    REQUIRE(host.awaitCalls == 0);
+    REQUIRE(host.heap.Save()["continuations"].empty());
+  }
+  SECTION("locals are counted across active frames")
+  {
+    auto configure = [](CheckpointHost& host) {
+      NestedProgram(host, "method");
+      auto& functions = host.script->objectTable[0].states[0].functions;
+      for (size_t i = 0; i < 33000; ++i) {
+        const auto name = "extra" + std::to_string(i);
+        functions[0].function.locals.push_back({ name, "Int" });
+        functions[1].function.locals.push_back({ name, "Int" });
+      }
+    };
+    CheckpointHost host(Json::object(), configure);
+    REQUIRE_THROWS_WITH(host.Start(),
+                        Catch::Matchers::ContainsSubstring("local"));
+    REQUIRE(host.awaitCalls == 0);
+    REQUIRE(host.heap.Save()["continuations"].empty());
+  }
+}
+
+TEST_CASE("A caller receiver field may change after the child was dispatched",
+          "[Quest][QuestVM][PapyrusContinuation]")
+{
+  auto configure = [](CheckpointHost& host) {
+    NestedProgram(host, "method");
+    auto& object = host.script->objectTable[0];
+    object.variables.push_back(
+      { "target", "ResumeFixture", 0, VarValue::None() });
+    auto& inner = object.states[0].functions[0].function.code.instructions;
+    inner.insert(
+      inner.begin(),
+      { FunctionCode::kOp_Assign, { Name("target"), VarValue::None() } });
+    object.states[0].functions[1].function.code.instructions[2].args[1] =
+      Name("target");
+  };
+  std::string saved;
+  {
+    CheckpointHost first(Json::object(), configure);
+    *first.variables->GetVariableByName("target", *first.script) =
+      VarValue(first.object.get());
+    const auto result = first.Start();
+    REQUIRE(result.continuation);
+    REQUIRE(static_cast<IGameObject*>(*first.variables->GetVariableByName(
+              "target", *first.script)) == nullptr);
+    saved = first.Save(*result.continuation);
+  }
+  {
+    CheckpointHost second(Json::parse(saved), configure);
+    const auto frame = second.heap.TakeContinuation("campaign:1", "first");
+    const auto result = second.Resume(frame, 12);
+    REQUIRE(result.continuation);
+    REQUIRE(second.Reward() == 1);
+    saved = second.Save(*result.continuation);
+  }
+  CheckpointHost third(Json::parse(saved), configure);
+  const auto frame = third.heap.TakeContinuation("campaign:1", "second");
+  const auto result = third.Resume(frame, 20);
+  REQUIRE_FALSE(result.continuation);
+  REQUIRE(static_cast<int>(result.value) == 28);
+  REQUIRE(third.Reward() == 28);
 }
 
 TEST_CASE("Papyrus leaf checkpoints survive two VM destructions without "
@@ -475,8 +929,8 @@ TEST_CASE("Saved object parameters and typed None locals rebind to the new "
   REQUIRE(restored.Resume(frame, 12).continuation);
 }
 
-TEST_CASE("Checkpoint admission does not silently enable promises or lose "
-          "nested Papyrus callers",
+TEST_CASE("Checkpoint admission requires explicit host entry and refuses "
+          "native caller stacks",
           "[Quest][QuestVM][PapyrusContinuation]")
 {
   CheckpointHost host;
@@ -519,35 +973,6 @@ TEST_CASE("Checkpoint admission does not silently enable promises or lose "
       [&](VarValue, std::vector<VarValue> args) -> VarValue {
         return host.vm->CallStatic("CheckpointHost", "InnerAwait", args);
       });
-    REQUIRE_THROWS_WITH(host.Start(),
-                        Catch::Matchers::ContainsSubstring("caller chain"));
-  }
-  SECTION("nested script body")
-  {
-    auto& functions = host.script->objectTable[0].states[0].functions;
-    functions.push_back({ "Inner", functions[0].function });
-    functions[0].function.code.instructions = {
-      { FunctionCode::kOp_CallMethod,
-        { VarValue("Inner"), Name("self"), Name("result"), VarValue(0) } },
-      { FunctionCode::kOp_Return, { Name("result") } }
-    };
-    REQUIRE_THROWS_WITH(host.Start(),
-                        Catch::Matchers::ContainsSubstring("caller chain"));
-  }
-  SECTION("nested property handler")
-  {
-    auto& object = host.script->objectTable[0];
-    Object::PropInfo property;
-    property.name = "WaitForValue";
-    property.type = "Int";
-    property.flags = Object::PropInfo::kFlags_Read;
-    property.readHandler = object.states[0].functions[0].function;
-    object.properties.push_back(property);
-    object.states[0].functions[0].function.code.instructions = {
-      { FunctionCode::kOp_PropGet,
-        { VarValue("WaitForValue"), Name("self"), Name("result") } },
-      { FunctionCode::kOp_Return, { Name("result") } }
-    };
     REQUIRE_THROWS_WITH(host.Start(),
                         Catch::Matchers::ContainsSubstring("caller chain"));
   }
