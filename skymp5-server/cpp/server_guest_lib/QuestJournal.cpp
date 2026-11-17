@@ -42,11 +42,12 @@ struct Transaction
   std::map<uint32_t, ReferenceEdit> references;
   std::optional<uint64_t> jobId;
   bool jobTransitionApplied = false;
+  bool admissionOnly = false, admissionRuntimeEntered = false;
   const Json* initialLedger = nullptr;
 };
 thread_local Transaction* transaction = nullptr;
 
-Json SavedContinuations(const Json& heap)
+Json SavedHeap(const Json& heap)
 {
   QuestVmState state(
     heap,
@@ -56,7 +57,50 @@ Json SavedContinuations(const Json& heap)
     [](const Json&) -> VarValue {
       throw std::runtime_error("Unexpected continuation object resolution");
     });
-  return state.Save().at("continuations");
+  return state.Save();
+}
+
+Json SavedContinuations(const Json& heap)
+{
+  return SavedHeap(heap).at("continuations");
+}
+
+void RequireAdmissionHeap(const Json& before, const Json& after)
+{
+  if (before.at("continuations") != after.at("continuations") ||
+      before.at("globals") != after.at("globals"))
+    throw std::runtime_error("Admission changed existing VM work");
+  // Recipient discovery may initialize missing scripts/properties and alias
+  // bindings, but it cannot write any existing value or shared array node.
+  for (const auto* field : { "arrays", "aliases" })
+    for (const auto& [key, value] : before.at(field).items())
+      if (!after.at(field).contains(key) || after.at(field).at(key) != value)
+        throw std::runtime_error("Admission changed existing VM data");
+  for (const auto& [key, script] : before.at("scripts").items()) {
+    if (!after.at("scripts").contains(key))
+      throw std::runtime_error("Admission removed an existing script");
+    const auto& next = after.at("scripts").at(key);
+    for (const auto& [field, value] : script.items()) {
+      if (field == "values") {
+        for (const auto& [name, oldValue] : value.items())
+          if (!next.at("values").contains(name) ||
+              next.at("values").at(name) != oldValue)
+            throw std::runtime_error("Admission wrote an existing variable");
+      } else if (!next.contains(field) || next.at(field) != value)
+        throw std::runtime_error("Admission changed a script identity");
+    }
+  }
+}
+
+bool IsAdmissionSnapshot(const QuestJobState::Job& job)
+{
+  return job.kind == QuestJobState::Kind::Interaction && job.occurrence &&
+    job.sequenced && job.segment == 1 && job.steps == 1 && job.dispatch &&
+    !job.dispatch->captured && job.dispatch->recipient == 0 &&
+    job.dispatch->attachment == 0 && !job.handler && job.children.empty() &&
+    job.events.empty() && job.completions.empty() && job.eventHead == 0 &&
+    job.nextHandler == 1 && job.nextOperation == 1 && !job.interactionDone &&
+    job.cursor == "done" && job.token.empty();
 }
 
 void RequireUnchangedContinuations(const QuestJobState& before,
@@ -706,9 +750,46 @@ std::shared_ptr<const SaveReceipt> QuestJournal::AtomicJob(
   return AtomicImpl(actor, execute, true, jobId);
 }
 
+std::shared_ptr<const SaveReceipt> QuestJournal::AtomicJobAdmissions(
+  MpActor& actor, const std::vector<uint64_t>& jobIds,
+  const std::function<void()>& prepare,
+  const std::function<void(uint64_t)>& initializeOne)
+{
+  if (jobIds.size() > QuestJobState::MaxBatchOccurrences)
+    throw std::runtime_error("Native admission batch exceeds capacity");
+  // Host callbacks must not invalidate the transaction's selected-ID plan.
+  const auto ids = jobIds;
+  return AtomicImpl(
+    actor,
+    [&] {
+      const auto beforePrepare = transaction->ledger;
+      prepare();
+      if (transaction->ledger != beforePrepare)
+        throw std::runtime_error("Admission preparation changed the journal");
+      for (const auto id : ids) {
+        transaction->jobId = id;
+        transaction->jobTransitionApplied = false;
+        transaction->admissionRuntimeEntered = false;
+        const auto beforeHeap =
+          SavedHeap(transaction->ledger.value("vm", Json::object()));
+        initializeOne(id);
+        RequireAdmissionHeap(
+          beforeHeap,
+          SavedHeap(transaction->ledger.value("vm", Json::object())));
+        const auto jobs = JobState(actor);
+        const auto* job = jobs.FindLive(id);
+        if (!job || !IsAdmissionSnapshot(*job) ||
+            !transaction->jobTransitionApplied)
+          throw std::runtime_error(
+            "Admission did not save its initial recipient snapshot");
+      }
+    },
+    true, std::nullopt, &ids);
+}
+
 std::shared_ptr<const SaveReceipt> QuestJournal::AtomicImpl(
   MpActor& actor, const std::function<void()>& execute, bool durable,
-  std::optional<uint64_t> jobId)
+  std::optional<uint64_t> jobId, const std::vector<uint64_t>* admissions)
 {
   if (transaction)
     throw std::runtime_error("Nested quest transaction");
@@ -754,16 +835,31 @@ std::shared_ptr<const SaveReceipt> QuestJournal::AtomicImpl(
     // Admission publishes a pristine typed root before any script executes.
     // Its codec/transition checks enforce the separate legacy and numbered
     // windows; total completed count is no longer a lifetime limit.
+  } else if (admissions) {
+    if (admissions->size() > QuestJobState::MaxBatchOccurrences ||
+        admissions->size() > QuestJobState::MaxLive - jobs.live.size() ||
+        admissions->size() > kMaxRevision - jobs.nextJob)
+      throw std::runtime_error("Native admission batch exceeds capacity");
+    for (size_t index = 0; index < admissions->size(); ++index)
+      if ((*admissions)[index] != jobs.nextJob + index)
+        throw std::runtime_error("Admission IDs must be contiguous new jobs");
+    if (!admissions->empty() &&
+        std::any_of(jobs.live.begin(), jobs.live.end(), [](const auto& entry) {
+          return entry.second.environmentHash.empty();
+        }))
+      throw std::runtime_error(
+        "Concurrent admission requires a pinned live environment");
   } else if (jobs.HasLive())
     throw std::runtime_error("Campaign has an active quest job");
   // Snapshot all stack envelopes before the callback. Arrays remain shared
   // heap nodes, so their contents may legitimately change in another root.
-  const auto initialContinuations = jobId
+  const auto initialContinuations = (jobId || admissions)
     ? SavedContinuations(initial.value("vm", Json::object()))
     : Json::object();
   const auto initialJournal = owner.GetDynamicFields().GetValueDump(kProperty);
   Transaction local{ &owner, initial, {}, {} };
   local.jobId = jobId;
+  local.admissionOnly = admissions != nullptr;
   local.initialLedger = &initial;
   transaction = &local;
   try {
@@ -808,6 +904,33 @@ std::shared_ptr<const SaveReceipt> QuestJournal::AtomicImpl(
       RequireUnchangedContinuations(
         jobs, *jobId, initialContinuations,
         SavedContinuations(local.ledger.value("vm", Json::object())));
+    }
+    if (admissions) {
+      const auto finalJobs = local.ledger.contains("jobs")
+        ? QuestJobState::Read(local.ledger.at("jobs"))
+        : QuestJobState{};
+      if (finalJobs.nextJob != jobs.nextJob + admissions->size())
+        throw std::runtime_error("Admission batch lost its job identities");
+      RequireUnchangedContinuations(
+        jobs, 0, initialContinuations,
+        SavedContinuations(local.ledger.value("vm", Json::object())));
+      RequireAdmissionHeap(
+        SavedHeap(initial.value("vm", Json::object())),
+        SavedHeap(local.ledger.value("vm", Json::object())));
+      auto before = initial, after = local.ledger;
+      for (const auto* key : { "jobs", "vm", "revision", "schemaVersion" }) {
+        before.erase(key);
+        after.erase(key);
+      }
+      if (before != after || (admissions->empty() && initial != local.ledger))
+        throw std::runtime_error("Admission batch changed gameplay state");
+      for (const auto& [id, edit] : local.inventories)
+        if (edit.initial != edit.current)
+          throw std::runtime_error("Admission batch changed inventory");
+      for (const auto& [id, edit] : local.references)
+        if (MpChangeForm::ToJson(edit.initial) !=
+            MpChangeForm::ToJson(edit.current))
+          throw std::runtime_error("Admission batch changed a reference");
     }
     Validate(local.ledger);
     const auto dump = local.ledger.dump();
@@ -977,6 +1100,22 @@ void QuestJournal::RequireJobExecution(MpActor& actor, uint64_t jobId)
     throw std::runtime_error("Quest runtime job context changed");
 }
 
+void QuestJournal::RequireJobExecution(MpActor& actor,
+                                       const QuestJobState::Job& job)
+{
+  RequireJobExecution(actor, job.id);
+  if (transaction->admissionOnly) {
+    const auto jobs = JobState(actor);
+    const auto* selected = jobs.FindLive(job.id);
+    if (transaction->admissionRuntimeEntered || !selected ||
+        *selected != job || !job.IsPristine() ||
+        job.kind != QuestJobState::Kind::Interaction || !job.occurrence)
+      throw std::runtime_error(
+        "Admission runtime may only capture one pristine recipient roster");
+    transaction->admissionRuntimeEntered = true;
+  }
+}
+
 void QuestJournal::SetJobState(MpActor& actor, const QuestJobState& state)
 {
   auto& owner = Owner(actor);
@@ -1027,6 +1166,10 @@ void QuestJournal::SetJobState(MpActor& actor, const QuestJobState& state)
   auto retained = previous;
   if (!priorJob && candidate->sequenced)
     retained.RetireForAdmission();
+  if (priorJob && !state.FindLive(id)) {
+    retained.live.at(id) = *candidate;
+    retained.CompleteJob(id);
+  }
   if (state.retiredThrough != retained.retiredThrough ||
       state.retiredRanges != retained.retiredRanges)
     throw std::runtime_error(
@@ -1175,12 +1318,6 @@ void QuestJournal::SetJobState(MpActor& actor, const QuestJobState& state)
   }
   auto history = retained.Save().at("completed");
   auto nextHistory = saved.at("completed");
-  if (!state.FindLive(id))
-    for (auto it = nextHistory.begin(); it != nextHistory.end(); ++it)
-      if (it->at("id").get<uint64_t>() == id) {
-        nextHistory.erase(it);
-        break;
-      }
   if (history != nextHistory)
     throw std::runtime_error("Job transaction rewrote another job's history");
   const auto revision = transaction->ledger.at("revision").get<uint64_t>();

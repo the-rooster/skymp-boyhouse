@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <catch2/catch_all.hpp>
 #include <functional>
+#include <set>
 
 extern espm::Loader& GetEspmLoader();
 
@@ -592,12 +593,8 @@ void CompleteLive(QuestJobState& state, uint64_t id)
   done.accepted = job.accepted;
   static_cast<QuestJobState::Stage&>(job) = done;
   job.eventHead = static_cast<uint32_t>(job.events.size());
-  state.live.erase(id);
-  state.completed.insert(
-    std::lower_bound(
-      state.completed.begin(), state.completed.end(), id,
-      [](const auto& item, uint64_t wanted) { return item.id < wanted; }),
-    std::move(job));
+  state.live.at(id) = std::move(job);
+  state.CompleteJob(id);
 }
 
 Json AllLiveHeap(const QuestJobState& state)
@@ -607,6 +604,21 @@ Json AllLiveHeap(const QuestJobState& state)
   for (const auto& [id, job] : state.live)
     heap["continuations"].update(DispatchHeap(job)["continuations"]);
   return heap;
+}
+
+QuestJobState SleepingOccurrences(size_t count)
+{
+  QuestJobState state;
+  state.ingress.identity = std::string(32, 'a');
+  for (size_t index = 0; index < count; ++index) {
+    auto job = Numbered(*Single(InteractionHandler(true)), state.nextJob++);
+    job.occurrence = state.ingress.next++;
+    job.interaction->name = "OnTriggerEnter";
+    job.handler->handlerIdentity->function = "OnTriggerEnter";
+    job.handler->function = "OnTriggerEnter";
+    state.live.emplace(job.id, std::move(job));
+  }
+  return state;
 }
 
 struct JobStorage
@@ -718,7 +730,7 @@ TEST_CASE("Quest jobs reject corrupt exact fields identities and cursor state",
   std::vector<std::function<void(Json&)>> corrupt = {
     [](Json& v) { v["unknown"] = 1; },
     [](Json& v) { v.erase("live"); },
-    [](Json& v) { v["schemaVersion"] = 10; },
+    [](Json& v) { v["schemaVersion"] = 11; },
     [](Json& v) { v["generation"] = 0; },
     [](Json& v) { v["nextJob"] = 1; },
     [](Json& v) { v["nextJob"] = UINT64_MAX; },
@@ -1044,7 +1056,7 @@ TEST_CASE(
     const auto legacy = Legacy(state);
     const auto migrated = QuestJobState::Read(legacy);
     REQUIRE(migrated.Save() == MigratedLegacy(state).Save());
-    REQUIRE(migrated.Save()["schemaVersion"] == 9);
+    REQUIRE(migrated.Save()["schemaVersion"] == 10);
   }
   auto external = Waiting();
   Single(external)->awaitKey = "quest-stage";
@@ -1418,7 +1430,7 @@ TEST_CASE("Timer jobs round trip UTC deadlines and typed None completions",
   for (const auto& value : { state, Done(state) })
     REQUIRE(QuestJobState::Read(value.Save()).Save() == value.Save());
   const auto saved = state.Save();
-  REQUIRE(saved["schemaVersion"] == 9);
+  REQUIRE(saved["schemaVersion"] == 10);
   REQUIRE(saved["live"][0]["timer"]["policy"] == "utc-deadline-v1");
   const auto done = Done(state);
   const auto& job = done.completed.front();
@@ -2016,7 +2028,7 @@ TEST_CASE(
     auto migrated = QuestJobState::Read(legacy);
     REQUIRE(migrated.Save() == original.Save());
     REQUIRE(migrated.retiredThrough == 0);
-    REQUIRE(migrated.Save()["schemaVersion"] == 9);
+    REQUIRE(migrated.Save()["schemaVersion"] == 10);
     if (Single(migrated)) {
       REQUIRE_FALSE(Single(migrated)->sequenced);
       REQUIRE(Single(migrated)->Scope() == Single(original)->Scope());
@@ -2114,7 +2126,7 @@ TEST_CASE(
   REQUIRE_NOTHROW(state.Save());
   auto activeSequence = state;
   AddPending(activeSequence, true);
-  REQUIRE_THROWS(activeSequence.Save());
+  REQUIRE_NOTHROW(activeSequence.Save());
   auto activeLegacy = state;
   AddPending(activeLegacy, false);
   REQUIRE_THROWS(activeLegacy.Save());
@@ -2167,7 +2179,7 @@ TEST_CASE("Admission retirement removes only the oldest sequenced completion",
 TEST_CASE("Retirement preserves live work and refuses malformed typed state",
           "[Quest][QuestJob]")
 {
-  auto active = History(1, QuestJobState::MaxRecentCompleted - 1);
+  auto active = History(1, QuestJobState::MaxRecentCompleted);
   AddPending(active, true);
   const auto before = active.Save();
   REQUIRE(active.RetireForAdmission() == std::vector<uint64_t>{ 2 });
@@ -2258,7 +2270,8 @@ TEST_CASE("Journal admission permits only the exact required oldest-request "
   {
     candidate = initial;
     AddPending(candidate, true);
-    validCodec = false;
+    // Schema ten permits 32 completed results alongside live work. The
+    // Journal must still enforce retirement at this admission boundary.
   }
   SECTION("retire two sequenced results")
   {
@@ -2325,7 +2338,7 @@ TEST_CASE("Sequenced admission retires by canonical byte budget before "
           "[Quest][QuestJob]")
 {
   auto state = ByteHeavyHistory();
-  REQUIRE(state.completed.size() < QuestJobState::MaxRecentCompleted);
+  REQUIRE(state.completed.size() <= QuestJobState::MaxRecentCompleted);
   const auto original = state.Save();
   size_t canonicalBytes = 0;
   for (const auto& job : original["completed"])
@@ -2485,7 +2498,10 @@ TEST_CASE(
        ++index)
     reserved.completed.push_back(CompletedRecord(reserved.nextJob++, true));
   REQUIRE_NOTHROW(reserved.Save());
-  CompleteLive(reserved, 2); // Completion consumes its already-reserved slot.
+  CompleteLive(reserved, 2);
+  REQUIRE_NOTHROW(reserved.Save());
+  while (reserved.completed.size() < QuestJobState::MaxRecentCompleted)
+    reserved.completed.push_back(CompletedRecord(reserved.nextJob++, true));
   REQUIRE_NOTHROW(reserved.Save());
   reserved.completed.push_back(CompletedRecord(reserved.nextJob++, true));
   REQUIRE_THROWS(reserved.Save());
@@ -2504,17 +2520,17 @@ TEST_CASE("Sparse retirement lets a low numbered root outlive hundreds of "
     REQUIRE(state.nextJob == id);
     state.live.emplace(id, Numbered(*Single(Begin()), state.nextJob++));
     CompleteLive(state, id);
-    REQUIRE(state.completed.size() < QuestJobState::MaxRecentCompleted);
+    REQUIRE(state.completed.size() <= QuestJobState::MaxRecentCompleted);
   }
   REQUIRE(*state.FindLive(1) == sleeping);
   REQUIRE(state.retiredThrough == 0);
   REQUIRE(state.retiredRanges ==
-          std::vector<QuestJobState::RetiredRange>{ { 2, 309 } });
+          std::vector<QuestJobState::RetiredRange>{ { 2, 308 } });
   REQUIRE_FALSE(state.IsRetired(0));
   REQUIRE_FALSE(state.IsRetired(1));
   REQUIRE(state.IsRetired(2));
-  REQUIRE(state.IsRetired(309));
-  REQUIRE_FALSE(state.IsRetired(310));
+  REQUIRE(state.IsRetired(308));
+  REQUIRE_FALSE(state.IsRetired(309));
   REQUIRE_FALSE(state.IsRetired(state.nextJob));
   REQUIRE_NOTHROW(state.ValidateHeap(AllLiveHeap(state)));
   REQUIRE(QuestJobState::Read(state.Save()).Save() == state.Save());
@@ -2731,7 +2747,7 @@ TEST_CASE("Schema six histories migrate as stages without changing stacks or "
                                 SelectedHandler(true), multiple }) {
     const auto migrated = QuestJobState::Read(Legacy(original, 6));
     REQUIRE(migrated.Save() == original.Save());
-    REQUIRE(migrated.Save()["schemaVersion"] == 9);
+    REQUIRE(migrated.Save()["schemaVersion"] == 10);
     for (const auto& [id, job] : migrated.live) {
       REQUIRE(job.kind == QuestJobState::Kind::Stage);
       REQUIRE_FALSE(job.interaction);
@@ -3007,7 +3023,7 @@ TEST_CASE(
       id <= QuestJobState::MaxStageLive ? Begin() : InteractionBegin();
     state.live.emplace(id, Numbered(*Single(initial), state.nextJob++));
   }
-  REQUIRE(state.live.size() == 20);
+  REQUIRE(state.live.size() == QuestJobState::MaxLive);
   REQUIRE_NOTHROW(state.Save());
   REQUIRE_NOTHROW(state.ValidateHeap(Json::object()));
   auto tooManyStages = state;
@@ -3050,7 +3066,7 @@ TEST_CASE(
          interactionDone }) {
     const auto migrated = QuestJobState::Read(Legacy(original, 7));
     REQUIRE(migrated.Save() == original.Save());
-    REQUIRE(migrated.Save()["schemaVersion"] == 9);
+    REQUIRE(migrated.Save()["schemaVersion"] == 10);
     for (const auto& [id, job] : migrated.live) {
       REQUIRE_FALSE(job.referenceLoad);
       REQUIRE(job.loadPhase == QuestJobState::LoadPhase::Done);
@@ -3354,7 +3370,16 @@ TEST_CASE("Reference-load target is unique among live roots but can be loaded "
   REQUIRE_THROWS(
     state.Save()); // Generated inventory work still owns the live load slot.
   first.eventHead = 1;
+  const auto original = first.referenceLoad->target;
+  const auto duplicate = state;
+  REQUIRE_THROWS(state.CompleteJob(1));
+  REQUIRE(state.live == duplicate.live);
+  REQUIRE(state.completed == duplicate.completed);
+  // Retract the invalid concurrent load before completing the first root;
+  // only then can the second root claim the original logical target.
+  state.live.at(2).referenceLoad->target = "11:Skyrim.esm";
   CompleteLive(state, 1);
+  state.live.at(2).referenceLoad->target = original;
   REQUIRE_NOTHROW(state.Save());
   state.live.emplace(3, Numbered(*Single(InteractionBegin()), 3));
   state.nextJob = 4;
@@ -3362,9 +3387,10 @@ TEST_CASE("Reference-load target is unique among live roots but can be loaded "
     state.Save()); // Independent interactions use their own root identity.
 }
 
-TEST_CASE("Reference-load roots share the twenty live slots while stage slots "
-          "remain reserved",
-          "[Quest][QuestJob]")
+TEST_CASE(
+  "Reference-load roots share the bounded live slots while stage slots "
+  "remain reserved",
+  "[Quest][QuestJob]")
 {
   QuestJobState state;
   for (uint64_t id = 1; id <= QuestJobState::MaxLive; ++id) {
@@ -3387,7 +3413,7 @@ TEST_CASE(
 {
   auto state = NativeOccurrences();
   const auto saved = state.Save();
-  REQUIRE(saved["schemaVersion"] == 9);
+  REQUIRE(saved["schemaVersion"] == 10);
   REQUIRE(saved["completed"][0]["occurrence"].is_null());
   REQUIRE(saved["completed"][1]["occurrence"] == 1);
   REQUIRE(saved["live"][0]["occurrence"] == 2);
@@ -3451,7 +3477,6 @@ TEST_CASE(
       v["completed"][1]["occurrence"] = 2;
     },
     [](Json& v) { v["live"][0]["sequenced"] = false; },
-    [](Json& v) { v["live"][0]["interaction"]["name"] = "OnTrigger"; },
     [](Json& v) { v["live"][0]["interaction"]["name"] = "OnActivate"; }
   };
   for (size_t index = 0; index < corrupt.size(); ++index) {
@@ -3497,14 +3522,14 @@ TEST_CASE("Native sparse retirement preserves an old live occurrence beyond "
   REQUIRE(state.completed.front() == legacy);
   REQUIRE(state.retiredThrough == 0);
   REQUIRE(state.retiredRanges ==
-          std::vector<QuestJobState::RetiredRange>{ { 3, 310 } });
+          std::vector<QuestJobState::RetiredRange>{ { 3, 309 } });
   REQUIRE(state.ingress.retiredThrough == 0);
   REQUIRE(state.ingress.retiredRanges ==
-          std::vector<QuestJobState::RetiredRange>{ { 2, 309 } });
+          std::vector<QuestJobState::RetiredRange>{ { 2, 308 } });
   REQUIRE_FALSE(state.IsOccurrenceRetired(1));
   REQUIRE(state.IsOccurrenceRetired(2));
-  REQUIRE(state.IsOccurrenceRetired(309));
-  REQUIRE_FALSE(state.IsOccurrenceRetired(310));
+  REQUIRE(state.IsOccurrenceRetired(308));
+  REQUIRE_FALSE(state.IsOccurrenceRetired(309));
   REQUIRE_FALSE(state.IsOccurrenceRetired(state.ingress.next));
   REQUIRE_FALSE(state.FindOccurrence(2));
   REQUIRE(state.FindOccurrence(310)->id == 311);
@@ -3647,7 +3672,7 @@ TEST_CASE("Schemas one through eight migrate untouched native ingress and "
     auto original = Waiting();
     const auto legacy = Legacy(original, version);
     const auto migrated = QuestJobState::Read(legacy);
-    REQUIRE(migrated.Save()["schemaVersion"] == 9);
+    REQUIRE(migrated.Save()["schemaVersion"] == 10);
     REQUIRE(migrated.ingress == QuestJobState::Ingress{});
     REQUIRE_FALSE(migrated.live.at(1).occurrence);
     auto changed = legacy;
@@ -3666,4 +3691,203 @@ TEST_CASE("Schemas one through eight migrate untouched native ingress and "
          ReferenceLoadHandler(QuestJobState::LoadPhase::Load, true) }) {
     REQUIRE(QuestJobState::Read(Legacy(state, 8)).Save() == state.Save());
   }
+}
+
+TEST_CASE("Twenty sleeping roots admit a complete trigger batch without "
+          "reserving result slots",
+          "[Quest][QuestJob][QuestIngress]")
+{
+  auto state = SleepingOccurrences(20);
+  const auto sleepers = state.live;
+  REQUIRE(state.RetireForAdmission().empty());
+  for (size_t index = 0; index < QuestJobState::MaxBatchOccurrences; ++index) {
+    auto job = NativeOccurrenceJob(state.nextJob++, state.ingress.next++);
+    job.interaction->name = "OnTrigger";
+    state.live.emplace(job.id, std::move(job));
+  }
+  REQUIRE(state.live.size() == 84);
+  REQUIRE(state.completed.empty());
+  REQUIRE_NOTHROW(state.ValidateHeap(AllLiveHeap(state)));
+  const auto saved = state.Save();
+  REQUIRE(QuestJobState::Read(saved).Save() == saved);
+  for (const auto& [id, job] : sleepers)
+    REQUIRE(state.live.at(id) == job);
+  auto future = state;
+  auto& wake = future.live.at(21);
+  wake.interactionDone = true;
+  HostStep(wake, 1);
+  REQUIRE(future.CompleteJob(21).empty());
+  REQUIRE(future.FindCompleted(21));
+  REQUIRE(future.live.size() == 83);
+  REQUIRE_NOTHROW(future.ValidateHeap(AllLiveHeap(future)));
+  for (const auto& [id, job] : sleepers)
+    REQUIRE(future.live.at(id) == job);
+}
+
+TEST_CASE(
+  "Schema ten separates live capacity from permanent and recent history",
+  "[Quest][QuestJob]")
+{
+  auto state =
+    History(QuestJobState::MaxCompleted, QuestJobState::MaxRecentCompleted);
+  for (size_t index = 0; index < QuestJobState::MaxLive; ++index) {
+    auto job = Numbered(*Single(InteractionBegin()), state.nextJob++);
+    state.live.emplace(job.id, job);
+  }
+  REQUIRE_NOTHROW(state.Save());
+  const auto before = state.Save();
+  REQUIRE(state.RetireForAdmission() == std::vector<uint64_t>{ 257 });
+  REQUIRE(state.Save()["live"] == before["live"]);
+  REQUIRE(state.completed.size() == 287);
+  auto extra = Numbered(*Single(InteractionBegin()), state.nextJob++);
+  state.live.emplace(extra.id, extra);
+  REQUIRE_THROWS(state.Save());
+  const auto invalid = state;
+  REQUIRE_THROWS(state.RetireForAdmission());
+  REQUIRE(state.live == invalid.live);
+  REQUIRE(state.completed == invalid.completed);
+  REQUIRE(state.retiredRanges == invalid.retiredRanges);
+  REQUIRE(state.retiredThrough == invalid.retiredThrough);
+}
+
+TEST_CASE(
+  "Historic schemas retain their original live and combined result limits",
+  "[Quest][QuestJob]")
+{
+  auto combined = History(0, QuestJobState::MaxRecentCompleted - 1);
+  AddPending(combined, true);
+  for (uint64_t version = 5; version <= 9; ++version) {
+    INFO("Schema " << version);
+    REQUIRE_NOTHROW(QuestJobState::Read(Legacy(combined, version)));
+  }
+  // The new shape is legal in ten, but its source schema cannot be relabeled
+  // to bypass the old admission invariant during migration.
+  combined.completed.push_back(CompletedRecord(combined.nextJob++, true));
+  // Pre-six active IDs followed history; retain that ordering in this fixture.
+  auto pending = combined.live.begin()->second;
+  combined.live.clear();
+  combined.completed.back() = CompletedRecord(pending.id, true);
+  pending.id = combined.nextJob - 1;
+  pending.command = "quest-request:1:" + std::to_string(pending.id);
+  combined.live.emplace(pending.id, pending);
+  REQUIRE_NOTHROW(combined.Save());
+  for (uint64_t version = 5; version <= 9; ++version) {
+    INFO("Schema " << version);
+    REQUIRE_THROWS(QuestJobState::Read(Legacy(combined, version)));
+  }
+  QuestJobState roots;
+  for (uint64_t id = 1; id <= 21; ++id) {
+    roots.live.emplace(id, Numbered(*Single(InteractionBegin()), id));
+    ++roots.nextJob;
+  }
+  REQUIRE_NOTHROW(roots.Save());
+  for (uint64_t version = 7; version <= 9; ++version) {
+    auto old = Legacy(roots, version);
+    REQUIRE_THROWS(QuestJobState::Read(old));
+    old["live"].erase(old["live"].end() - 1);
+    old["nextJob"] = 21;
+    REQUIRE_NOTHROW(QuestJobState::Read(old));
+  }
+  auto native = NativeOccurrences();
+  native.live.at(3).interaction->name = "OnTrigger";
+  REQUIRE_NOTHROW(native.Save());
+  REQUIRE_THROWS(QuestJobState::Read(Legacy(native, 9)));
+  native.live.at(3).interaction->name = "OnTriggerLeave";
+  const auto migrated = QuestJobState::Read(Legacy(native, 9));
+  REQUIRE(migrated.Save() == native.Save());
+}
+
+TEST_CASE(
+  "Completion retirement preserves the finishing result and permanent records",
+  "[Quest][QuestJob][QuestIngress]")
+{
+  QuestJobState state;
+  state.completed.push_back(CompletedRecord(1, false));
+  const auto legacy = state.completed.front();
+  state.nextJob = 2;
+  state.ingress.identity = std::string(32, 'a');
+  for (uint64_t index = 0; index < 65; ++index) {
+    auto job = NativeOccurrenceJob(state.nextJob++, state.ingress.next++);
+    state.live.emplace(job.id, job);
+  }
+  REQUIRE_NOTHROW(state.Save());
+  std::set<uint64_t> retired;
+  // Out-of-order execution must never discard the result being published,
+  // even when that result has a lower ID than every retained completion.
+  for (uint64_t id = 66; id >= 2; --id) {
+    auto& job = state.live.at(id);
+    job.interactionDone = true;
+    HostStep(job, 1);
+    const auto expected = job;
+    const auto delta = state.CompleteJob(id);
+    REQUIRE(*state.FindCompleted(id) == expected);
+    REQUIRE(state.FindOccurrence(id - 1));
+    REQUIRE(*state.FindCompleted(1) == legacy);
+    REQUIRE(state.completed.size() <= QuestJobState::MaxRecentCompleted + 1);
+    for (const auto removed : delta) {
+      REQUIRE(retired.insert(removed).second);
+      REQUIRE(state.IsRetired(removed));
+      REQUIRE(state.IsOccurrenceRetired(removed - 1));
+    }
+    REQUIRE(QuestJobState::Read(state.Save()).Save() == state.Save());
+  }
+  REQUIRE_FALSE(state.HasLive());
+  REQUIRE(retired.size() == 33);
+  REQUIRE(state.FindCompleted(2));
+  REQUIRE_FALSE(state.IsOccurrenceRetired(1));
+  REQUIRE_NOTHROW(state.ValidateHeap(Json::object()));
+}
+
+TEST_CASE("Completion validates discarded records and leaves rejected "
+          "candidates intact",
+          "[Quest][QuestJob]")
+{
+  auto state = History(0, QuestJobState::MaxRecentCompleted);
+  AddPending(state, true);
+  const auto valid = state.Save();
+  REQUIRE_THROWS(state.CompleteJob(0));
+  REQUIRE_THROWS(state.CompleteJob(33));
+  REQUIRE(state.Save() == valid);
+  state.live.at(33).cursor = "done";
+  state.completed.front().command = "malformed-before-retirement";
+  const auto before = state;
+  REQUIRE_THROWS(state.CompleteJob(33));
+  REQUIRE(state.live == before.live);
+  REQUIRE(state.completed == before.completed);
+  REQUIRE(state.retiredThrough == before.retiredThrough);
+  REQUIRE(state.retiredRanges == before.retiredRanges);
+  REQUIRE(state.ingress == before.ingress);
+  state.completed.front() = CompletedRecord(1, true);
+  state.live.at(33).contentHash = "malformed-finished-root";
+  const auto malformed = state;
+  REQUIRE_THROWS(state.CompleteJob(33));
+  REQUIRE(state.live == malformed.live);
+  REQUIRE(state.completed == malformed.completed);
+  state.live.at(33).contentHash = std::string(64, 'a');
+  REQUIRE(state.CompleteJob(33) == std::vector<uint64_t>{ 1 });
+  REQUIRE(state.FindCompleted(33));
+  REQUIRE(state.retiredThrough == 1);
+}
+
+TEST_CASE(
+  "Completion count is hard bounded while byte retirement occurs at admission",
+  "[Quest][QuestJob]")
+{
+  auto state = History(0, QuestJobState::MaxRecentCompleted);
+  auto large = LargeCompletion(state.nextJob++, true);
+  large.events.resize(2048, large.events.front());
+  large.eventHead = static_cast<uint32_t>(large.events.size());
+  state.live.emplace(large.id, large);
+  REQUIRE(state.CompleteJob(large.id) == std::vector<uint64_t>{ 1 });
+  REQUIRE(state.completed.size() == QuestJobState::MaxRecentCompleted);
+  REQUIRE(state.RetainedSequencedBytes() > QuestJobState::MaxRecentBytes);
+  REQUIRE_NOTHROW(state.Save());
+  const auto delta = state.RetireForAdmission();
+  REQUIRE(delta.size() == QuestJobState::MaxRecentCompleted);
+  REQUIRE(delta.front() == 2);
+  REQUIRE(delta.back() == large.id);
+  REQUIRE(state.completed.empty());
+  REQUIRE(state.RetainedSequencedBytes() <= QuestJobState::MaxRecentBytes);
+  REQUIRE(state.retiredThrough == large.id);
+  REQUIRE_NOTHROW(state.Save());
 }

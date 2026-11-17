@@ -151,8 +151,10 @@ struct QuestJobState
   std::map<uint64_t, Job> live;
   std::vector<RetiredRange> retiredRanges;
   std::vector<Job> completed;
-  static constexpr size_t MaxLive = 20;
+  // All nonterminal roots, independently of the scheduler's per-tick budget.
+  static constexpr size_t MaxLive = 128;
   static constexpr size_t MaxStageLive = 16;
+  static constexpr size_t MaxBatchOccurrences = 64;
   static constexpr size_t MaxCompleted = 256;
   static constexpr size_t MaxRecentCompleted = 32;
   static constexpr size_t MaxRecentBytes = 1024 * 1024;
@@ -174,8 +176,14 @@ struct QuestJobState
   // Canonical full-job JSON bytes, excluding permanent legacy completions.
   size_t RetainedSequencedBytes() const;
   // Called only at durable sequenced admission. Retire oldest sequenced work
-  // until count and byte limits both permit the next pristine root.
+  // until the completed tail has a free slot and is at most MaxRecentBytes.
+  // Live roots do not reserve completed-result slots.
   std::vector<uint64_t> RetireForAdmission();
+  // Move a finished live root to history, retaining its result and retiring
+  // the oldest other numbered results to enforce MaxRecentCompleted. A newly
+  // completed tail may exceed MaxRecentBytes until the next admission.
+  // Both retirement operations publish only fully validated candidates.
+  std::vector<uint64_t> CompleteJob(uint64_t id);
   Job* FindLive(uint64_t id);
   const Job* FindLive(uint64_t id) const;
   const Job* FindCompleted(uint64_t id) const;
@@ -186,4 +194,13 @@ struct QuestJobState
   // Validate canonical heap shape plus one-to-one active job/stack ownership.
   // No object resolution or script execution occurs in this validation.
   void ValidateHeap(const nlohmann::json& heap) const;
+
+private:
+  // CompleteJob alone may validate one finished root before moving it out of
+  // live. Storage and ordinary typed candidates never accept this shape.
+  static QuestJobState Read(const nlohmann::json& value,
+                            uint64_t completedLive);
+  nlohmann::json Save(uint64_t completedLive) const;
+  std::vector<uint64_t> RetireCompleted(size_t limit, bool boundBytes,
+                                        uint64_t protectedId = 0);
 };

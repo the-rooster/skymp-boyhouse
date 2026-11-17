@@ -148,7 +148,7 @@ another segment executes. Master files must not change while loaded. Changed con
 not migrated. The initial full script parse/hash is not yet a performance-tested
 startup path.
 
-Up to 20 roots (at most 16 stages) can remain live in one campaign, each with its own
+Up to 128 roots (at most 16 stages) can remain live in one campaign, each with its own
 continuation and timer. Exactly one transaction executes at a time, and every
 mutating admission or segment waits for the owner's latest save receipt.
 Ordinary quest mutation and private-reference allocation cannot overwrite live
@@ -790,15 +790,18 @@ the result is retained. The sequence is the campaign's global job ID, including
 IDs consumed by older string-keyed commands. Keep the typed ID across retries;
 its diagnostic command spelling is not an interchangeable legacy key.
 
-Schema8 migrates schemas1-7 without changing command identities, scopes or
-continuations. Completed string-keyed commands remain permanent; live plus
-completed legacy commands retain the 256-command cap. Numbered live roots reserve
-a recent-result slot: at most 32 numbered live roots and full completed records
-combined are retained. Before numbered admission, retire the oldest completed
-numbered records until that sum is below 32 and canonical completed numbered
-records occupy at most 1 MiB. Completion transfers its reserved slot into history;
-it can push completed bytes above 1 MiB until the next admission. Legacy data,
-live stacks and the overall 8 MiB journal/VM limits remain independent.
+Schema10 migrates schemas1-9 without changing command identities, scopes or
+continuations. Older schemas retain their original validation limits. Completed
+string-keyed commands remain permanent; live plus completed legacy commands keep
+the 256-command cap. Up to 128 nonterminal roots may coexist independently of the
+32 completed numbered results. The stage limit remains 16. Before numbered
+admission, the oldest completed numbered records retire until fewer than 32 remain
+and canonical completed numbered records occupy at most 1 MiB. Completion also
+compacts the history to 32 results, preserving the root that just finished even
+when its ID is older than all other results. Completion can push completed bytes
+above 1 MiB until the next admission. Live stacks and the overall 8 MiB journal/VM
+limit remain independent. Capacity is explicit backpressure, not a guarantee that
+arbitrarily many mutually dependent waiting handlers can make progress.
 
 Out-of-order completion uses sorted sparse retired intervals above a contiguous
 frontier. A sleeping low-numbered request remains live while later completions
@@ -806,7 +809,7 @@ are compacted. Retired intervals never include retained legacy identities and
 never cross live or recent numbered records. Validation sweeps bounded records
 and ranges rather than iterating all historical IDs.
 
-Retirement and the new job's first segment share one atomic save. Only the exact
+Retirement and the admission or completion that caused it share one atomic save. Only the exact
 newly retired IDs remain Pending until that receipt is Durable. Merging an older
 durable sparse interval into an advancing frontier does not hide those older
 retirements. Failed writes retry the same snapshot; failed execution leaves
@@ -841,7 +844,7 @@ overlapping another entered live stage remains refused.
 Per-root timer anchors and quarantine are separate from the campaign-wide write
 barrier. Inspect can report an older root's durable status while another save is
 Pending, but Advance/Resume cannot execute through that pending owner barrier.
-Round-robin scheduling considers up to 64 owners, scans at most 20 roots per
+Round-robin scheduling considers up to 64 owners, scans at most 128 roots per
 owner and attempts at most eight segments, one per owner per pass. These are
 work-count limits, not measured production latency guarantees.
 
@@ -872,8 +875,8 @@ inventory FIFO. Admission and every subsequent segment use the same exact-save
 receipt barrier as stage roots. Reusing a retained request for a different kind
 or payload is rejected. Schemas1-6 migrate to Stage roots unchanged.
 
-The 20-root total limit and 16-stage limit reserve four positions against stage
-saturation. They do not guarantee unlimited event throughput: interaction-only
+The 128-root total limit and 16-stage limit leave capacity for events when
+stages reach their own limit. They do not guarantee unlimited event throughput: interaction-only
 saturation still applies backpressure. All roots share the bounded environment,
 heap and campaign journal, and retain their own aggregate work budgets.
 
@@ -966,14 +969,14 @@ lifecycle and full multiplayer playthrough/performance validation remain open.
 ## Durable trusted trigger occurrences
 
 QuestJobRunner exposes NextOccurrence, CaptureOccurrence, AdmitOccurrence and
-InspectOccurrence for trusted OnTriggerEnter/OnTriggerLeave producers. The ID
+InspectOccurrence for trusted OnTriggerEnter/OnTriggerLeave/OnTrigger producers. The ID
 contains owner, existing persistent campaign binding identity, journal generation
 and an independent native sequence. NextOccurrence is prospective only. Capture
 pins initiating actor, instance, canonical/physical source and target, and templates
 without consuming a sequence or changing occupancy. Clients cannot submit these
 IDs or choose event names through a packet endpoint.
 
-Schema9 stores one bounded ingress stream per campaign and an optional immutable
+Schema10 stores one bounded ingress stream per campaign and an optional immutable
 occurrence sequence on each numbered Interaction job. Admission installs that job
 and advances the ingress cursor in the same AtomicJob transaction. A prior target
 initialization marker is required, pending coordinator receipts gate new admission,
@@ -996,7 +999,8 @@ without asserting old payload equivalence or handler success. Retired native
 sequences use bounded canonical sparse intervals, so a low sleeping occurrence can
 retain its job while later completed results compact. Both native and global job
 retirement summaries change atomically. Schemas1-8 migrate with empty ingress and
-no occurrence tags; the original schema5 byte guard is retained.
+no occurrence tags; schema9 preserves its ingress and original Enter/Leave-only
+validation. The original schema5 byte guard is retained.
 
 This API does not persist a movement sample, reserve a prospective ID, or supply a
 native load/reset policy. Production SetPos, Subscribe, inline OnTrigger and packet
@@ -1006,6 +1010,31 @@ boundary before this bridge can replace live ingress. Identical saved logical
 references can recover across restart; new durable incarnation/reset semantics are
 not inferred from transient native pointers or phase epochs. No complete quest is
 certified playable by these backend fixtures.
+
+## Atomic trusted occurrence batches
+
+AdmitOccurrences accepts at most 64 contiguous captures from one campaign stream.
+Every new job and its initial recipient snapshot share one transaction and one
+immutable save receipt. No event handler executes during this admission. A failure
+in any entry rolls back the complete batch, including job IDs, occurrence IDs,
+retirement and VM changes. Existing roots and their saved continuations remain
+unchanged. Recipient membership is captured at admission; attachment and handler
+state selection retain their later dispatch boundaries.
+
+All new jobs and occurrences stay Pending behind the same exact receipt. Duplicate
+batches containing only previously admitted occurrences are queries; mixed old/new
+batches are refused. Retired entries remain opaque consumed identities. An empty
+batch seals the owner state without creating a job or consuming an occurrence.
+Later writes do not revoke an older durable admission. Completion compaction uses
+the exact receipt of the completing segment for newly retired request results.
+
+The larger live-root capacity is separate from the existing per-tick execution
+budget. It permits later events to wake more than twenty independently waiting
+handlers; it does not provide unlimited throughput or prove multiplayer latency.
+OnTrigger occurrences are explicit individual samples: this API neither invents
+native cadence nor coalesces level events. The production movement path still
+needs atomic physical transform/occupancy/event acceptance and receipt-gated
+packet publication. These backend changes do not certify any complete quest.
 
 ## Production movement validation and publication
 
@@ -1268,3 +1297,24 @@ The existing one-shot teleport correction is preserved. These packet-path
 fixtures do not make physical movement or trigger delivery durable, establish
 native event ordering, or certify complete quests or 32-player performance.
 Skyrim was not launched; the installed client and staging were unchanged.
+
+The atomic-occurrence-batch changes passed the Linux build and full verification
+on 2026-11-17 UTC: 856 native cases / 511,044 assertions,
+368 JavaScript tests, 47 Python tests, addon and both protocol
+smokes, and SQLite recovery of 32 characters. The focused run passed
+106 cases / 8,023 assertions. Schema10 separates
+nonterminal-root capacity from bounded completed results. Trusted batches save
+every initial recipient snapshot behind one exact receipt, preserving old
+continuations and allowing later events to wake more than twenty waiting roots.
+These are generated runtime/storage fixtures. Production physical movement,
+occupancy and packet publication are not yet connected to this atomic batch,
+and no complete quest or multiplayer performance target is certified.
+Skyrim was not launched; the installed client and staging were unchanged.
+The first build caught malformed JSON initializer braces in a new Journal test;
+the fixture was corrected and the failed source/log retained as attempt-1.
+The first broad focused run passed 183 of 186 cases. Three fixture assumptions
+needed updating: completion cannot repair an already invalid duplicate load,
+live roots no longer consume completed-result slots, and OnTrigger is now an
+allowed native occurrence. Invalid transition checks remain, and a new level-event
+test checks distinct effects and duplicate retry safety. The failed focused snapshot
+is retained as attempt-2; the final full run includes every affected case.

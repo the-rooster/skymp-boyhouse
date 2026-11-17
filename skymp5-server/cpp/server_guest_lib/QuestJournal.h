@@ -43,12 +43,24 @@ public:
     MpActor& actor, const std::function<void()>& execute);
   static std::shared_ptr<const SaveReceipt> AtomicJob(
     MpActor& actor, uint64_t jobId, const std::function<void()>& execute);
+  // Admission-only leases for contiguous new native occurrences. Each
+  // initializer must install a pristine root and save only its first recipient
+  // snapshot. No handler, existing stack or gameplay effect may execute here.
+  // Empty batches seal an unchanged owner snapshot without inventing a job.
+  static std::shared_ptr<const SaveReceipt> AtomicJobAdmissions(
+    MpActor& actor, const std::vector<uint64_t>& jobIds,
+    const std::function<void()>& prepare,
+    const std::function<void(uint64_t)>& initializeOne);
   static QuestJobState JobState(MpActor& actor);
   static QuestJobState PersonalJobState(MpActor& owner);
   static void SetJobState(MpActor& actor, const QuestJobState& state);
   // A saved live root is not itself an execution lease. Runtime entry must
   // match the selected job of the current campaign transaction.
   static void RequireJobExecution(MpActor& actor, uint64_t jobId);
+  // Runtime entry checks the actual cursor, so an admission lease cannot be
+  // reused to execute a handler before its initial snapshot is durable.
+  static void RequireJobExecution(MpActor& actor,
+                                  const QuestJobState::Job& job);
   // Only quest/journal mutation is leased; ordinary physical gameplay is not.
   static void RequireJobAccess(MpActor& actor);
   // Personal allocation/recovery must not borrow the visited host's lease.
@@ -84,5 +96,6 @@ public:
 private:
   static std::shared_ptr<const SaveReceipt> AtomicImpl(
     MpActor& actor, const std::function<void()>& execute, bool durable,
-    std::optional<uint64_t> jobId = std::nullopt);
+    std::optional<uint64_t> jobId = std::nullopt,
+    const std::vector<uint64_t>* admissions = nullptr);
 };

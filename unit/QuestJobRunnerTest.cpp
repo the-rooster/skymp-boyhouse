@@ -3744,7 +3744,8 @@ TEST_CASE(
     REQUIRE(f.Gold() == 13 + index);
     const auto state = QuestJournal::JobState(f.Owner());
     REQUIRE(state.live.size() == 1);
-    REQUIRE(state.completed.size() + state.live.size() <= 32);
+    REQUIRE(state.completed.size() <= QuestJobState::MaxRecentCompleted);
+    REQUIRE(state.live.size() <= QuestJobState::MaxLive);
     REQUIRE(state.retiredThrough == 0);
     REQUIRE_FALSE(state.IsRetired(first.sequence));
     REQUIRE(state.retiredRanges.size() <= 1);
@@ -3758,10 +3759,10 @@ TEST_CASE(
     f.storage->submissions.clear();
   }
   const auto sparse = QuestJournal::JobState(f.Owner());
-  REQUIRE(sparse.completed.size() == 31);
+  REQUIRE(sparse.completed.size() == QuestJobState::MaxRecentCompleted);
   REQUIRE(sparse.retiredRanges.size() == 1);
   REQUIRE(sparse.retiredRanges[0].first == 2);
-  REQUIRE(sparse.retiredRanges[0].last == 271);
+  REQUIRE(sparse.retiredRanges[0].last == 270);
   RequireRetired(f.InspectRoot(earliestLater));
   const auto wake = f.Jobs().NextRequest(f.Owner());
   RequirePending(f.SubmitRoot(wake, kParentQuest, 20));
@@ -5541,8 +5542,8 @@ TEST_CASE(
             sleepingRequest.sequence);
     REQUIRE(state.ingress.retiredThrough == 0);
     REQUIRE(state.ingress.retiredRanges.size() <= 1);
-    REQUIRE(state.live.size() + state.completed.size() <=
-            QuestJobState::MaxRecentCompleted);
+    REQUIRE(state.completed.size() <= QuestJobState::MaxRecentCompleted);
+    REQUIRE(state.live.size() <= QuestJobState::MaxLive);
     REQUIRE(state.Save().dump().size() < 2 * 1024 * 1024);
     f.storage->submissions.clear();
   }
@@ -5615,7 +5616,7 @@ TEST_CASE("Occurrence envelopes reject mismatched identity and physical "
   ++unknown.sequence;
   REQUIRE_THROWS(f.Admission(unknown));
   REQUIRE_THROWS(f.Jobs().CaptureOccurrence(f.Owner(), captured.id, f.Target(),
-                                            "OnTrigger", f.Owner()));
+                                            "OnActivate", f.Owner()));
   const auto originalPhase = f.Target().GetWorldInstance();
   f.Target().SetWorldInstance("campaign:" + std::to_string(kOwner) +
                               ":elsewhere");

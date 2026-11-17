@@ -11,6 +11,11 @@
 namespace {
 using Json = nlohmann::json;
 constexpr uint64_t MaxIdentity = 9007199254740991ULL;
+constexpr size_t HistoricMaxLive = 20;
+constexpr size_t HistoricMaxRetiredRanges = HistoricMaxLive +
+  QuestJobState::MaxRecentCompleted + QuestJobState::MaxCompleted + 1;
+constexpr size_t HistoricMaxIngressRetiredRanges =
+  HistoricMaxLive + QuestJobState::MaxRecentCompleted + 1;
 
 void Fields(const Json& value, std::initializer_list<const char*> fields)
 {
@@ -542,7 +547,8 @@ QuestJobState::Job ReadJob(const Json& saved, uint64_t version)
   if (job.occurrence &&
       (!job.sequenced || !interaction ||
        (job.interaction->name != "OnTriggerEnter" &&
-        job.interaction->name != "OnTriggerLeave")))
+        job.interaction->name != "OnTriggerLeave" &&
+        (version < 10 || job.interaction->name != "OnTrigger"))))
     throw std::runtime_error("Invalid native quest occurrence job");
   job.contentMode = version >= 3 ? Text(value.at("contentMode"), 7) : "legacy";
   job.environmentHash =
@@ -943,7 +949,13 @@ std::string QuestJobState::Job::NextToken() const
 
 QuestJobState QuestJobState::Read(const nlohmann::json& value)
 {
-  const auto version = Number(value.at("schemaVersion"), 9, true);
+  return Read(value, 0);
+}
+
+QuestJobState QuestJobState::Read(const nlohmann::json& value,
+                                  uint64_t completedLive)
+{
+  const auto version = Number(value.at("schemaVersion"), 10, true);
   if (version >= 9)
     Fields(value,
            { "schemaVersion", "generation", "nextJob", "retiredThrough",
@@ -986,9 +998,9 @@ QuestJobState QuestJobState::Read(const nlohmann::json& value)
       coverage.push_back({ job.id, job.id });
     if (!job.sequenced && ++legacyCount > MaxCompleted)
       throw std::runtime_error("Legacy quest job history is full");
-    if (job.sequenced && ++sequencedCount > MaxRecentCompleted)
-      throw std::runtime_error(
-        "Sequenced live and recent quest capacity exceeded");
+    if (job.sequenced && (version < 10 || !isLive) &&
+        ++sequencedCount > MaxRecentCompleted)
+      throw std::runtime_error("Sequenced quest result capacity exceeded");
   };
   uint64_t previous = 0;
   for (const auto& saved : completed) {
@@ -1002,7 +1014,8 @@ QuestJobState QuestJobState::Read(const nlohmann::json& value)
   auto live = Json::array();
   if (version >= 6) {
     const auto& saved = value.at("live");
-    if (!saved.is_array() || saved.size() > MaxLive)
+    if (!saved.is_array() ||
+        saved.size() > (version < 10 ? HistoricMaxLive : MaxLive))
       throw std::runtime_error("Live quest job limit exceeded");
     live = saved;
   } else if (!value.at("active").is_null())
@@ -1012,7 +1025,7 @@ QuestJobState QuestJobState::Read(const nlohmann::json& value)
   std::set<std::string> loadTargets;
   for (const auto& saved : live) {
     auto job = ReadJob(saved, version);
-    if (job.IsComplete() || job.id <= previous ||
+    if ((job.IsComplete() && job.id != completedLive) || job.id <= previous ||
         (version < 6 && !result.completed.empty() &&
          job.id <= result.completed.back().id))
       throw std::runtime_error("Completed or unordered live quest job");
@@ -1035,7 +1048,9 @@ QuestJobState QuestJobState::Read(const nlohmann::json& value)
   }
   if (version >= 6) {
     const auto& ranges = value.at("retiredRanges");
-    if (!ranges.is_array() || ranges.size() > MaxRetiredRanges)
+    if (!ranges.is_array() ||
+        ranges.size() >
+          (version < 10 ? HistoricMaxRetiredRanges : MaxRetiredRanges))
       throw std::runtime_error("Quest retirement range limit exceeded");
     uint64_t last = result.retiredThrough;
     for (const auto& range : ranges) {
@@ -1072,7 +1087,9 @@ QuestJobState QuestJobState::Read(const nlohmann::json& value)
     ingress.next = Number(saved.at("next"), MaxIdentity, true);
     ingress.retiredThrough = Number(saved.at("retiredThrough"), MaxIdentity);
     const auto& ranges = saved.at("retiredRanges");
-    if (!ranges.is_array() || ranges.size() > MaxIngressRetiredRanges ||
+    if (!ranges.is_array() ||
+        ranges.size() > (version < 10 ? HistoricMaxIngressRetiredRanges
+                                      : MaxIngressRetiredRanges) ||
         ingress.retiredThrough >= ingress.next ||
         ingress.next > result.nextJob ||
         (ingress.identity.empty()
@@ -1179,12 +1196,51 @@ size_t QuestJobState::RetainedSequencedBytes() const
 std::vector<uint64_t> QuestJobState::RetireForAdmission()
 {
   Save();
+  auto candidate = *this;
+  auto retired = candidate.RetireCompleted(MaxRecentCompleted - 1, true);
+  candidate.Save();
+  completed.swap(candidate.completed);
+  retiredRanges.swap(candidate.retiredRanges);
+  retiredThrough = candidate.retiredThrough;
+  ingress.retiredRanges.swap(candidate.ingress.retiredRanges);
+  ingress.retiredThrough = candidate.ingress.retiredThrough;
+  return retired;
+}
+
+std::vector<uint64_t> QuestJobState::CompleteJob(uint64_t id)
+{
+  const auto* selected = FindLive(id);
+  if (!selected || !selected->IsComplete())
+    throw std::runtime_error("Only a finished live quest job can complete");
+  // Validate every input record before any could be removed by retirement.
+  Save(id);
+  auto candidate = *this;
+  auto current = candidate.live.find(id);
+  candidate.completed.insert(
+    std::lower_bound(
+      candidate.completed.begin(), candidate.completed.end(), id,
+      [](const Job& job, uint64_t wanted) { return job.id < wanted; }),
+    std::move(current->second));
+  candidate.live.erase(current);
+  auto retired = candidate.RetireCompleted(MaxRecentCompleted, false, id);
+  candidate.Save();
+  completed.swap(candidate.completed);
+  live.swap(candidate.live);
+  retiredRanges.swap(candidate.retiredRanges);
+  retiredThrough = candidate.retiredThrough;
+  ingress.retiredRanges.swap(candidate.ingress.retiredRanges);
+  ingress.retiredThrough = candidate.ingress.retiredThrough;
+  return retired;
+}
+
+std::vector<uint64_t> QuestJobState::RetireCompleted(size_t limit,
+                                                     bool boundBytes,
+                                                     uint64_t protectedId)
+{
   auto count = static_cast<size_t>(
     std::count_if(completed.begin(), completed.end(),
                   [](const Job& job) { return job.sequenced; }));
-  for (const auto& [id, job] : live)
-    count += job.sequenced ? 1 : 0;
-  auto bytes = RetainedSequencedBytes();
+  auto bytes = boundBytes ? RetainedSequencedBytes() : 0;
   // All allocating work is prepared off to the side. Legacy records and live
   // stacks remain unchanged even if validation or allocation fails.
   auto retained = completed;
@@ -1192,12 +1248,13 @@ std::vector<uint64_t> QuestJobState::RetireForAdmission()
   auto nativeRanges = ingress.retiredRanges;
   std::vector<uint64_t> retired;
   for (auto current = retained.begin(); current != retained.end() &&
-       (count >= MaxRecentCompleted || bytes > MaxRecentBytes);) {
-    if (!current->sequenced) {
+       (count > limit || bytes > MaxRecentBytes);) {
+    if (!current->sequenced || current->id == protectedId) {
       ++current;
       continue;
     }
-    bytes -= SaveJob(*current).dump().size();
+    if (boundBytes)
+      bytes -= SaveJob(*current).dump().size();
     --count;
     retired.push_back(current->id);
     ranges.push_back({ current->id, current->id });
@@ -1334,6 +1391,11 @@ bool QuestJobState::IsOccurrenceRetired(uint64_t occurrence) const
 
 nlohmann::json QuestJobState::Save() const
 {
+  return Save(0);
+}
+
+nlohmann::json QuestJobState::Save(uint64_t completedLive) const
+{
   if (completed.size() > MaxCompleted + MaxRecentCompleted ||
       live.size() > MaxLive || retiredRanges.size() > MaxRetiredRanges ||
       ingress.retiredRanges.size() > MaxIngressRetiredRanges)
@@ -1355,7 +1417,7 @@ nlohmann::json QuestJobState::Save() const
   for (const auto& range : ingress.retiredRanges)
     nativeRanges.push_back(
       { { "first", range.first }, { "last", range.last } });
-  Json result = { { "schemaVersion", 9 },
+  Json result = { { "schemaVersion", 10 },
                   { "generation", generation },
                   { "nextJob", nextJob },
                   { "retiredThrough", retiredThrough },
@@ -1367,8 +1429,7 @@ nlohmann::json QuestJobState::Save() const
                       { "retiredRanges", std::move(nativeRanges) } } },
                   { "live", std::move(current) },
                   { "completed", std::move(history) } };
-  Read(
-    result); // Typed candidates must satisfy the same invariants as storage.
+  Read(result, completedLive);
   return result;
 }
 

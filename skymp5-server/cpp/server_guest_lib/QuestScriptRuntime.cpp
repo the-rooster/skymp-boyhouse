@@ -643,7 +643,7 @@ void QuestScriptRuntime::ExecuteJobSegment(
 {
   if (timerAnchor)
     timerAnchor->reset();
-  QuestJournal::RequireJobExecution(actor, job.id);
+  QuestJournal::RequireJobExecution(actor, job);
   const auto jobs = QuestJournal::JobState(actor);
   const auto* selected = jobs.FindLive(job.id);
   if (!selected || selected->generation != job.generation)

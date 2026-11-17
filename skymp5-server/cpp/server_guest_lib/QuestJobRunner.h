@@ -73,6 +73,12 @@ public:
     std::optional<RequestId> request;
     std::string error;
   };
+  struct AdmissionBatchResult
+  {
+    AdmissionStatus status = AdmissionStatus::Pending;
+    std::shared_ptr<const SaveReceipt> receipt;
+    std::vector<AdmissionResult> results;
+  };
   enum class ResultKind
   {
     Stage,
@@ -105,6 +111,16 @@ public:
                                   const MetadataOverrides& overrides,
                                   const std::vector<PexScript::Lazy>& scripts,
                                   bool automatic = false);
+  // All new contiguous occurrences capture their initial recipient rosters in
+  // one transaction. Handler bodies execute only after its shared receipt.
+  // Entirely existing batches are queries; mixed existing/new batches fail.
+  // Empty batches seal an unchanged owner snapshot and consume no identities.
+  AdmissionBatchResult AdmitOccurrences(
+    MpActor& actor, const std::vector<CapturedOccurrence>& occurrences);
+  AdmissionBatchResult AdmitOccurrences(
+    MpActor& actor, const std::vector<CapturedOccurrence>& occurrences,
+    const MetadataOverrides& overrides,
+    const std::vector<PexScript::Lazy>& scripts, bool automatic = false);
   // Admission durability is independent of subsequent handler status. A
   // consumed occurrence whose details were retired has no request result.
   AdmissionResult InspectOccurrence(MpActor& actor, const OccurrenceId& id);
@@ -166,15 +182,16 @@ private:
   void OnActorLoaded(MpActor& actor) noexcept;
   struct Barrier
   {
-    uint64_t job = 0, generation = 0;
+    uint64_t job = 0, lastJob = 0, generation = 0;
     std::weak_ptr<MpForm> owner;
     std::shared_ptr<const SaveReceipt> receipt;
     bool busy = false;
     std::vector<uint64_t> retiredIds;
     uint64_t retirementGeneration = 0;
     std::shared_ptr<const SaveReceipt> retirementReceipt;
-    uint64_t occurrence = 0, occurrenceGeneration = 0;
-    uint64_t admittingOccurrence = 0, admittingGeneration = 0;
+    uint64_t occurrence = 0, lastOccurrence = 0, occurrenceGeneration = 0;
+    uint64_t admittingOccurrence = 0, admittingLastOccurrence = 0,
+             admittingGeneration = 0;
     std::shared_ptr<const SaveReceipt> admissionReceipt;
   };
   struct Scheduled
@@ -209,12 +226,12 @@ private:
                          const QuestJobState&) const;
   AdmissionResult InspectOccurrence(MpActor&, const OccurrenceId&,
                                     const QuestJobState&);
-  std::optional<AdmissionResult> PrepareOccurrence(MpActor&,
-                                                   const CapturedOccurrence&);
-  AdmissionResult AdmitOccurrenceWithContent(
-    MpActor&, const CapturedOccurrence&, const std::vector<PexScript::Lazy>&,
-    const MetadataOverrides&, const std::string&, bool fixtureAwait,
-    bool automatic);
+  std::optional<AdmissionBatchResult> PrepareOccurrences(
+    MpActor&, const std::vector<CapturedOccurrence>&);
+  AdmissionBatchResult AdmitOccurrencesWithContent(
+    MpActor&, const std::vector<CapturedOccurrence>&,
+    const std::vector<PexScript::Lazy>&, const MetadataOverrides&,
+    const std::string&, bool fixtureAwait, bool automatic);
   std::optional<Result> Retired(MpActor&, const Request&,
                                 const QuestJobState&);
   std::optional<Result> Retired(MpActor&, const Request&);

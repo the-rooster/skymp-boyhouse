@@ -113,6 +113,17 @@ struct IngressJournalFixture
       server.worldState.Tick();
     REQUIRE(receipt->GetState() == SaveReceipt::State::Durable);
   }
+  void InitializeSnapshot(uint64_t id)
+  {
+    auto next = Next(QuestJournal::JobState(*owner));
+    REQUIRE(next.nextJob - 1 == id);
+    QuestJournal::SetJobState(*owner, next);
+    auto& job = next.live.at(id);
+    job.dispatch = QuestJobState::Dispatch{};
+    job.dispatch->recipients = { kTarget };
+    job.segment = job.steps = job.instructions = 1;
+    QuestJournal::SetJobState(*owner, next);
+  }
 };
 }
 
@@ -205,5 +216,182 @@ TEST_CASE("Ordinary numbered admission compacts exact native history only",
     REQUIRE_NOTHROW(next.Save());
     REQUIRE_THROWS(f.Publish(next));
     REQUIRE(f.Saved() == original);
+  }
+}
+
+TEST_CASE(
+  "Batch journal leases require a complete initial snapshot for each ID",
+  "[Quest][QuestIngress][QuestOccurrenceBatch]")
+{
+  IngressJournalFixture f;
+  f.Publish(f.Next({}));
+  const auto oldRoot = QuestJournal::JobState(*f.owner).live.at(1);
+  const auto initial = f.Saved();
+  SECTION("Two fresh roots share one receipt and preserve the existing root")
+  {
+    const auto receipt = QuestJournal::AtomicJobAdmissions(
+      *f.owner, { 2, 3 }, [] {},
+      [&](uint64_t id) { f.InitializeSnapshot(id); });
+    REQUIRE(receipt);
+    REQUIRE(receipt->GetState() == SaveReceipt::State::Pending);
+    const auto jobs = QuestJournal::JobState(*f.owner);
+    REQUIRE(jobs.live.at(1) == oldRoot);
+    REQUIRE(jobs.nextJob == 4);
+    REQUIRE(jobs.ingress.next == 4);
+    for (const auto id : { 2, 3 }) {
+      REQUIRE(jobs.live.at(id).dispatch);
+      REQUIRE(jobs.live.at(id).segment == 1);
+      REQUIRE(jobs.live.at(id).instructions == 1);
+      REQUIRE_FALSE(jobs.live.at(id).handler);
+    }
+    for (unsigned i = 0;
+         i < 5 && receipt->GetState() == SaveReceipt::State::Pending; ++i)
+      f.server.worldState.Tick();
+    REQUIRE(receipt->GetState() == SaveReceipt::State::Durable);
+  }
+  SECTION("An uninitialized last root rolls the whole batch back")
+  {
+    REQUIRE_THROWS(QuestJournal::AtomicJobAdmissions(
+      *f.owner, { 2, 3 }, [] {},
+      [&](uint64_t id) {
+        if (id == 2)
+          f.InitializeSnapshot(id);
+        else
+          QuestJournal::SetJobState(*f.owner,
+                                    f.Next(QuestJournal::JobState(*f.owner)));
+      }));
+    REQUIRE(f.Saved() == initial);
+  }
+  SECTION("A later callback cannot edit an earlier admitted root")
+  {
+    REQUIRE_THROWS(QuestJournal::AtomicJobAdmissions(
+      *f.owner, { 2, 3 }, [] {},
+      [&](uint64_t id) {
+        f.InitializeSnapshot(id);
+        if (id == 3) {
+          auto state = QuestJournal::JobState(*f.owner);
+          state.live.at(2).automatic = true;
+          QuestJournal::SetJobState(*f.owner, state);
+        }
+      }));
+    REQUIRE(f.Saved() == initial);
+  }
+  SECTION("An old live root cannot be selected through the batch")
+  {
+    bool called = false;
+    REQUIRE_THROWS(QuestJournal::AtomicJobAdmissions(
+      *f.owner, { 1, 2 }, [&] { called = true; },
+      [&](uint64_t id) { f.InitializeSnapshot(id); }));
+    REQUIRE_FALSE(called);
+    REQUIRE(f.Saved() == initial);
+  }
+  SECTION("A skipped ID is refused before preparation")
+  {
+    bool called = false;
+    REQUIRE_THROWS(QuestJournal::AtomicJobAdmissions(
+      *f.owner, { 2, 4 }, [&] { called = true; },
+      [&](uint64_t id) { f.InitializeSnapshot(id); }));
+    REQUIRE_FALSE(called);
+    REQUIRE(f.Saved() == initial);
+  }
+  SECTION("Empty admission seals existing state without taking a root lease")
+  {
+    bool prepared = false, initialized = false;
+    const auto receipt = QuestJournal::AtomicJobAdmissions(
+      *f.owner, {}, [&] { prepared = true; },
+      [&](uint64_t) { initialized = true; });
+    REQUIRE(prepared);
+    REQUIRE_FALSE(initialized);
+    REQUIRE(receipt);
+    REQUIRE(receipt->GetState() == SaveReceipt::State::Pending);
+    REQUIRE(f.Saved() == initial);
+  }
+}
+
+TEST_CASE("Admission runtime entry cannot advance beyond its pristine capture",
+          "[Quest][QuestIngress][QuestOccurrenceBatch]")
+{
+  IngressJournalFixture f;
+  const auto receipt = QuestJournal::AtomicJobAdmissions(
+    *f.owner, { 1 }, [] {},
+    [&](uint64_t id) {
+      auto state = f.Next(QuestJournal::JobState(*f.owner));
+      QuestJournal::SetJobState(*f.owner, state);
+      auto& job = state.live.at(id);
+      auto advanced = job;
+      advanced.dispatch = QuestJobState::Dispatch{};
+      advanced.dispatch->recipients = { kTarget };
+      advanced.segment = advanced.steps = advanced.instructions = 1;
+      // A mutable cursor cannot borrow a pristine saved root's admission
+      // lease to enter later attachment/handler work.
+      REQUIRE_THROWS(QuestJournal::RequireJobExecution(*f.owner, advanced));
+      REQUIRE_NOTHROW(QuestJournal::RequireJobExecution(*f.owner, job));
+      REQUIRE_THROWS(QuestJournal::RequireJobExecution(*f.owner, job));
+      job = std::move(advanced);
+      QuestJournal::SetJobState(*f.owner, state);
+    });
+  REQUIRE(receipt);
+  REQUIRE(receipt->GetState() == SaveReceipt::State::Pending);
+  REQUIRE(QuestJournal::JobState(*f.owner).live.at(1).segment == 1);
+}
+
+TEST_CASE(
+  "Admission can add defaults without changing existing shared VM values",
+  "[Quest][QuestIngress][QuestOccurrenceBatch]")
+{
+  IngressJournalFixture f;
+  Json heap = {
+    { "schemaVersion", 6 },        { "scripts", Json::object() },
+    { "arrays", Json::object() },  { "globals", Json::object() },
+    { "aliases", Json::object() }, { "continuations", Json::object() }
+  };
+  heap["scripts"]["shared"] = {
+    { "schemaVersion", 1 },
+    { "values",
+      { { "counter", { { "type", 3 }, { "value", 7 } } },
+        { "array", { { "type", 13 }, { "array", "1" } } } } }
+  };
+  heap["arrays"]["1"] = {
+    { "type", 13 },
+    { "values", Json::array({ { { "type", 3 }, { "value", 9 } } }) }
+  };
+  auto ledger = Json::parse(f.Saved());
+  ledger["vm"] = heap;
+  f.owner->SetPropertyValueDump(QuestJournal::kProperty, ledger.dump(), false,
+                                false);
+  const auto initial = f.Saved();
+  auto changed = heap;
+  bool allowed = false;
+  SECTION("A newly discovered default is permitted")
+  {
+    changed["scripts"]["shared"]["values"]["newDefault"] = { { "type", 3 },
+                                                             { "value", 0 } };
+    allowed = true;
+  }
+  SECTION("An existing scalar cannot be used as a hidden handler effect")
+  {
+    changed["scripts"]["shared"]["values"]["counter"]["value"] = 8;
+  }
+  SECTION("An existing shared array node is immutable during admission")
+  {
+    changed["arrays"]["1"]["values"][0]["value"] = 10;
+  }
+  const auto admit = [&] {
+    return QuestJournal::AtomicJobAdmissions(
+      *f.owner, { 1 }, [] {},
+      [&](uint64_t id) {
+        f.InitializeSnapshot(id);
+        QuestJournal::SetScriptState(*f.owner, changed);
+      });
+  };
+  if (allowed) {
+    REQUIRE(admit()->GetState() == SaveReceipt::State::Pending);
+    REQUIRE(QuestJournal::ScriptState(*f.owner) == changed);
+    REQUIRE(QuestJournal::JobState(*f.owner).ingress.next == 2);
+  } else {
+    REQUIRE_THROWS(admit());
+    REQUIRE(f.Saved() == initial);
+    REQUIRE(QuestJournal::ScriptState(*f.owner) == heap);
+    REQUIRE(QuestJournal::JobState(*f.owner).ingress.next == 1);
   }
 }
