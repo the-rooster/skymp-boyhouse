@@ -1,12 +1,13 @@
 #include "QuestScriptRuntime.h"
 #include "CampaignCondition.h"
-#include "CampaignInventoryApi.h"
 #include "CampaignFactionApi.h"
+#include "CampaignInventoryApi.h"
 #include "CampaignReferenceBinding.h"
 #include "CampaignReferenceQueryApi.h"
 #include "CampaignReferenceScripts.h"
 #include "CampaignWorldStateApi.h"
 #include "MpActor.h"
+#include "QuestJobContent.h"
 #include "QuestJournal.h"
 #include "QuestVmState.h"
 #include "WorldState.h"
@@ -522,7 +523,9 @@ void QuestScriptRuntime::ExecuteJobSegment(
   MpActor& actor, QuestJobState::Job& job,
   const espm::QuestScriptData& metadata,
   const std::vector<PexScript::Lazy>& scripts, std::optional<bool> completion,
-  bool fixtureAwait)
+  bool fixtureAwait,
+  const std::map<uint32_t, espm::QuestScriptData>& overrides,
+  const std::string& contentManifest)
 {
   if (!QuestJournal::HasActiveTransaction())
     throw std::runtime_error("Quest job execution requires its transaction");
@@ -530,10 +533,11 @@ void QuestScriptRuntime::ExecuteJobSegment(
   if (!jobs.active || jobs.active->id != job.id ||
       jobs.active->generation != job.generation)
     throw std::runtime_error("Quest job does not own this execution segment");
+  const auto& current = job.Current();
   const auto id =
-    FormDesc::FromString(job.quest).ToFormId(actor.GetParent()->espmFiles);
-  Execute(actor, id, job.stage, metadata, scripts, 0, nullptr, 0, &job,
-          completion, fixtureAwait);
+    FormDesc::FromString(current.quest).ToFormId(actor.GetParent()->espmFiles);
+  Execute(actor, id, current.stage, metadata, scripts, 0, nullptr, 0, &job,
+          completion, fixtureAwait, overrides, contentManifest);
 }
 
 bool QuestScriptRuntime::Execute(
@@ -541,7 +545,9 @@ bool QuestScriptRuntime::Execute(
   const espm::QuestScriptData& metadata,
   const std::vector<PexScript::Lazy>& scripts, uint32_t loadedReference,
   const char* referenceEvent, uint32_t eventSource, QuestJobState::Job* job,
-  std::optional<bool> completion, bool fixtureAwait)
+  std::optional<bool> completion, bool fixtureAwait,
+  const std::map<uint32_t, espm::QuestScriptData>& overrides,
+  const std::string& contentManifest)
 {
   if (!actor.GetParent())
     throw std::runtime_error("Unregistered campaign actor");
@@ -549,6 +555,20 @@ bool QuestScriptRuntime::Execute(
   const auto record = world.GetEspm().GetBrowser().LookupById(questId);
   if (!loadedReference && (!record.rec || record.rec->GetType() != "QUST"))
     throw std::invalid_argument("Expected quest record");
+  // deque keeps this frame stable when a native queues its child. All frames
+  // share one VM heap and the root's budgets and pending inventory events.
+  auto* work = job ? &job->Current() : nullptr;
+  auto readMetadata = [&](uint32_t id) {
+    if (const auto found = overrides.find(id); found != overrides.end())
+      return found->second;
+    if (id == questId)
+      return metadata;
+    const auto target = world.GetEspm().GetBrowser().LookupById(id);
+    if (!target.rec || target.rec->IsDeleted() ||
+        target.rec->GetType() != "QUST")
+      throw std::invalid_argument("Expected a live quest record");
+    return espm::QuestScriptData::Read(target.rec, world.GetEspmCache());
+  };
   bool changed = false;
   const auto run = [&] {
     MpObjectReference* loaded = nullptr;
@@ -567,6 +587,7 @@ bool QuestScriptRuntime::Execute(
     }
     VirtualMachine vm(scripts);
     vm.SetStrictExecution(true);
+    bool managedFragment = false;
     if (job)
       vm.RestoreExecutionBudget(job->instructions);
     if (fixtureAwait) {
@@ -578,12 +599,13 @@ bool QuestScriptRuntime::Execute(
           if (args.size() != 1 || args[0].GetType() != VarValue::kType_String)
             throw std::invalid_argument("Fixture await requires a string key");
           const std::string key = static_cast<const char*>(args[0]);
-          if (key.empty() || key.size() > 128 ||
-              job->completions.size() >= QuestJobState::MaxOperations)
+          if (!managedFragment || key.empty() || key.size() > 128 ||
+              job->nextOperation > QuestJobState::MaxOperations)
             throw std::runtime_error("Quest await limit exceeded");
-          job->token = job->NextToken();
-          job->awaitKey = key;
-          vm.RequestSuspension(job->token, "Bool");
+          work->token = job->NextToken();
+          ++job->nextOperation;
+          work->awaitKey = key;
+          vm.RequestSuspension(work->token, "Bool");
         });
     }
     auto policy = std::make_shared<HeuristicPolicy>(&world);
@@ -707,9 +729,7 @@ bool QuestScriptRuntime::Execute(
       }
       auto object = std::make_shared<CampaignQuestObject>(rec, owner);
       objects[id] = object;
-      const auto data = id == questId
-        ? metadata
-        : espm::QuestScriptData::Read(rec.rec, world.GetEspmCache());
+      const auto data = readMetadata(id);
       std::vector<VirtualMachine::ScriptInfo> bindings;
       for (const auto& script : data.scripts) {
         if (script.status & 2)
@@ -770,9 +790,7 @@ bool QuestScriptRuntime::Execute(
         std::make_shared<CampaignAliasObject>(owner, id, *definition);
       aliases.emplace(key, object);
       const auto rec = world.GetEspm().GetBrowser().LookupById(id);
-      const auto data = id == questId
-        ? metadata
-        : espm::QuestScriptData::Read(rec.rec, world.GetEspmCache());
+      const auto data = readMetadata(id);
       std::vector<VirtualMachine::ScriptInfo> bindings;
       for (const auto& binding : data.aliases) {
         if (binding.object.alias != aliasId)
@@ -1169,10 +1187,7 @@ bool QuestScriptRuntime::Execute(
         std::dynamic_pointer_cast<CampaignQuestObject>(resolve(id));
       if (!object)
         throw std::runtime_error("Condition expected a campaign quest");
-      const auto data = id == questId
-        ? metadata
-        : espm::QuestScriptData::Read(object->record.rec,
-                                      world.GetEspmCache());
+      const auto data = readMetadata(id);
       std::shared_ptr<PexScript> conditionalScript;
       std::shared_ptr<Variables> holder;
       for (const auto& script : data.scripts) {
@@ -1258,9 +1273,52 @@ bool QuestScriptRuntime::Execute(
           const auto index = static_cast<int32_t>(args[0]);
           if (index < 0 || index > 65535)
             throw std::invalid_argument("Quest stage out of range");
+          const auto targetId =
+            object->record.ToGlobalId(object->record.rec->GetId());
+          if (managedFragment) {
+            // Stop at the native boundary. Entering the child here would put
+            // an unserializable C++ native frame below its Papyrus stack.
+            QuestJournal::RequireAdapter(actor, targetId);
+            if (job->children.size() + 1 >= QuestJobState::MaxDepth ||
+                job->nextOperation > QuestJobState::MaxOperations)
+              throw std::runtime_error("Quest child work limit exceeded");
+            const auto& life = lifecycle(targetId);
+            if (std::count_if(life.stages.begin(), life.stages.end(),
+                              [&](const auto& entry) {
+                                return entry.index == index;
+                              }) != 1)
+              throw std::runtime_error(
+                "Missing or ambiguous child quest stage");
+            const auto targetKey =
+              FormDesc::FromFormId(targetId, world.espmFiles).ToString();
+            const auto reentrant = [&](const QuestJobState::Stage& ancestor) {
+              return ancestor.quest == targetKey && ancestor.stage == index;
+            };
+            if ((life.flags & espm::QuestLifecycleData::AllowRepeatedStages) &&
+                (reentrant(*job) ||
+                 std::any_of(job->children.begin(), job->children.end(),
+                             reentrant)))
+              throw std::runtime_error(
+                "Reentrant repeated quest stage requires scheduling");
+            QuestJobState::Stage child;
+            child.node = job->nextOperation;
+            child.quest = targetKey;
+            child.stage = static_cast<uint16_t>(index);
+            const auto hashManifest = contentManifest.empty()
+              ? QuestJobContent::WithMetadataOverrides(
+                  world, QuestJobContent::ScriptManifest(scripts), overrides)
+              : contentManifest;
+            child.contentHash = QuestJobContent::Hash(
+              world, targetId, readMetadata(targetId), hashManifest);
+            work->token = job->NextToken();
+            ++job->nextOperation;
+            work->child = child.node;
+            work->awaitKey = "quest-stage";
+            job->children.push_back(std::move(child));
+            vm.RequestSuspension(work->token, "Bool");
+          }
           return VarValue(
-            execute(object->record.ToGlobalId(object->record.rec->GetId()),
-                    static_cast<uint16_t>(index), false));
+            execute(targetId, static_cast<uint16_t>(index), false));
         });
     }
     execute = [&](uint32_t targetId, uint16_t targetStage, bool managedEntry) {
@@ -1281,9 +1339,7 @@ bool QuestScriptRuntime::Execute(
       if (!target.rec || target.rec->IsDeleted() ||
           target.rec->GetType() != "QUST")
         throw std::invalid_argument("Expected nested quest record");
-      const auto data = targetId == questId
-        ? metadata
-        : espm::QuestScriptData::Read(target.rec, world.GetEspmCache());
+      const auto data = readMetadata(targetId);
       const auto& lifecycleData = lifecycle(targetId);
       const auto stageCount = std::count_if(
         lifecycleData.stages.begin(), lifecycleData.stages.end(),
@@ -1303,7 +1359,7 @@ bool QuestScriptRuntime::Execute(
             "Invalid or duplicate quest fragment log binding");
       }
       const auto identity = std::make_pair(targetId, targetStage);
-      if (!(managed && job->cursor == "waiting") &&
+      if (!(managed && work->cursor == "waiting") &&
           !QuestJournal::Apply(actor,
                                { { "quest", targetId },
                                  { "op", "setStage" },
@@ -1332,13 +1388,13 @@ bool QuestScriptRuntime::Execute(
       } activeStageGuard{ activeStages, identity };
       auto object =
         std::dynamic_pointer_cast<CampaignQuestObject>(resolve(targetId));
-      if (managed && job->cursor == "waiting" && job->log >= logs.size())
+      if (managed && work->cursor == "waiting" && work->log >= logs.size())
         throw std::runtime_error("Saved quest log is out of range");
-      for (size_t logIndex = managed ? job->log : 0; logIndex < logs.size();
+      for (size_t logIndex = managed ? work->log : 0; logIndex < logs.size();
            ++logIndex) {
         if (job && ++job->steps > QuestJobState::MaxSteps)
           throw std::runtime_error("Quest job work limit exceeded");
-        const bool resuming = managed && job->cursor == "waiting";
+        const bool resuming = managed && work->cursor == "waiting";
         if (!resuming) {
           const bool passes =
             CampaignCondition::Evaluate(logs[logIndex].conditions,
@@ -1346,7 +1402,7 @@ bool QuestScriptRuntime::Execute(
                                           readQuestVariable, conditionAlias });
           if (!passes) {
             if (managed)
-              job->log = static_cast<uint32_t>(logIndex + 1);
+              work->log = static_cast<uint32_t>(logIndex + 1);
             continue;
           }
         }
@@ -1370,34 +1426,44 @@ bool QuestScriptRuntime::Execute(
           VarValue result;
           try {
             if (managed) {
+              struct ManagedGuard
+              {
+                bool& active;
+                explicit ManagedGuard(bool& value)
+                  : active(value)
+                {
+                  active = true;
+                }
+                ~ManagedGuard() { active = false; }
+              } managedGuard(managedFragment);
               PapyrusExecutionResult execution;
               if (resuming) {
-                if (!completion || job->script != fragment.script ||
-                    job->function != fragment.function)
+                if (!completion || work->script != fragment.script ||
+                    work->function != fragment.function || work->child)
                   throw std::runtime_error("Saved quest fragment mismatch");
                 const auto saved =
-                  state.TakeContinuation(job->Scope(), job->token);
-                if (!job->completions.emplace(job->token, *completion).second)
+                  state.TakeContinuation(job->Scope(*work), work->token);
+                if (!job->completions.emplace(work->token, *completion).second)
                   throw std::runtime_error(
                     "Quest completion already consumed");
-                job->token.clear();
-                job->awaitKey.clear();
-                job->cursor = "begin";
+                work->token.clear();
+                work->awaitKey.clear();
+                work->cursor = "begin";
                 execution = script->ResumeFunction(
-                  job->Scope(), saved, VarValue(*completion), stack);
+                  job->Scope(*work), saved, VarValue(*completion), stack);
               } else {
-                job->script = fragment.script;
-                job->function = fragment.function;
+                work->script = fragment.script;
+                work->function = fragment.function;
                 execution = script->StartResumableFunction(
-                  job->Scope(), "", fragment.function, {}, stack);
+                  job->Scope(*work), "", fragment.function, {}, stack);
               }
               if (execution.continuation) {
-                if (job->token != execution.continuation->token ||
-                    job->awaitKey.empty())
+                if (work->token != execution.continuation->token ||
+                    work->awaitKey.empty())
                   throw std::runtime_error("Quest await has no saved intent");
                 state.PutContinuation(*execution.continuation);
-                job->cursor = "waiting";
-                job->log = static_cast<uint32_t>(logIndex);
+                work->cursor = "waiting";
+                work->log = static_cast<uint32_t>(logIndex);
                 return true;
               }
               result = execution.value;
@@ -1414,7 +1480,7 @@ bool QuestScriptRuntime::Execute(
         if (resuming && !foundFragment)
           throw std::runtime_error("Saved quest fragment binding disappeared");
         if (managed)
-          job->log = static_cast<uint32_t>(logIndex + 1);
+          work->log = static_cast<uint32_t>(logIndex + 1);
       }
       return true;
     };
@@ -1433,9 +1499,7 @@ bool QuestScriptRuntime::Execute(
         const auto id = FormDesc::FromString(key).ToFormId(world.espmFiles);
         QuestJournal::RequireAdapter(actor, id);
         const auto record = world.GetEspm().GetBrowser().LookupById(id);
-        const auto data = id == questId
-          ? metadata
-          : espm::QuestScriptData::Read(record.rec, world.GetEspmCache());
+        const auto data = readMetadata(id);
         std::set<uint32_t> seen;
         for (const auto& binding : data.aliases) {
           if (std::none_of(
@@ -1476,9 +1540,10 @@ bool QuestScriptRuntime::Execute(
       if (!changed && !job)
         return;
     }
-    const bool waiting = job && job->cursor == "waiting";
+    const bool waiting = work && work->cursor == "waiting";
+    const bool deferEvents = waiting || (work && work->node != 0);
     for (size_t eventIndex = 0;
-         !waiting && eventIndex < inventoryEvents.size(); ++eventIndex) {
+         !deferEvents && eventIndex < inventoryEvents.size(); ++eventIndex) {
       // Copy before dispatch: handlers may append more inventory events.
       const auto event = inventoryEvents[eventIndex];
       const auto* name = event.added ? "OnItemAdded" : "OnItemRemoved";
@@ -1499,9 +1564,9 @@ bool QuestScriptRuntime::Execute(
     QuestJournal::SetScriptState(actor, state.Save());
     if (job) {
       job->instructions = vm.GetExecutedInstructions();
-      job->accepted = changed;
+      work->accepted = changed;
       job->events.clear();
-      if (waiting) {
+      if (deferEvents) {
         for (const auto& event : inventoryEvents)
           job->events.push_back(
             { FormDesc::FromFormId(event.target, world.espmFiles).ToString(),
@@ -1511,14 +1576,15 @@ bool QuestScriptRuntime::Execute(
                     .ToString()
                 : std::string(),
               event.count, event.added });
-      } else {
-        job->cursor = "done";
-        job->log = 0;
-        job->script.clear();
-        job->function.clear();
-        job->token.clear();
-        job->awaitKey.clear();
-        job->failure.clear();
+      }
+      if (!waiting) {
+        work->cursor = "done";
+        work->log = 0;
+        work->script.clear();
+        work->function.clear();
+        work->token.clear();
+        work->awaitKey.clear();
+        work->failure.clear();
       }
     }
   };

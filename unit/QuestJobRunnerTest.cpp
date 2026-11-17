@@ -750,13 +750,14 @@ void AttachDatabase(PartOne& server, const SqliteFiles& files)
     "quest-job-restart", 1));
 }
 
-QuestJobRunner::Result WaitForDurable(PartOne& server, MpActor& owner)
+QuestJobRunner::Result WaitForDurable(PartOne& server, MpActor& owner,
+                                      const std::string& command = kCommand)
 {
   const auto deadline =
     std::chrono::steady_clock::now() + std::chrono::seconds(10);
   while (std::chrono::steady_clock::now() < deadline) {
     server.worldState.Tick();
-    auto result = server.worldState.GetQuestJobs().Inspect(owner, kCommand);
+    auto result = server.worldState.GetQuestJobs().Inspect(owner, command);
     if (result.status != Status::Pending)
       return result;
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -856,4 +857,686 @@ TEST_CASE(
     REQUIRE(owner.GetInventory().GetItemCount(0xf) == 37);
     REQUIRE(QuestJournal::Snapshot(owner) == before);
   }
+}
+
+namespace {
+constexpr uint32_t kParentQuest = 0x4e50d;
+constexpr auto kChildCommand = "queued-child-stage";
+
+struct ChildProgram
+{
+  Program program;
+  QuestJobRunner::MetadataOverrides metadata;
+  uint32_t childQuest;
+  uint16_t childStage;
+  ChildProgram(bool waits = true, bool twice = false, bool repeated = false,
+               bool failChild = false, bool failParent = false)
+    : childQuest(repeated ? 0x2aa57 : 0x2d512)
+    , childStage(repeated ? 10 : 5)
+  {
+    auto& object = program.script->objectTable[0];
+    object.variables = { { "shared", "Int[]", 0, VarValue::None() },
+                         { "runs", "Int", 0, VarValue(0) },
+                         { "firstResult", "Bool", 0, VarValue(false) },
+                         { "secondResult", "Bool", 0, VarValue(false) } };
+    Object::PropInfo property;
+    property.name = "Shared";
+    property.type = "Int[]";
+    property.flags = 7;
+    property.autoVarName = "shared";
+    object.properties = { property };
+    auto parent = Reward(2);
+    parent.locals.push_back({ "childQuest", "Quest" });
+    parent.locals.push_back({ "localShared", "Int[]" });
+    parent.locals.push_back({ "suffix", "Int" });
+    parent.code.instructions.pop_back();
+    const std::vector<FunctionCode::Instruction> prefix = {
+      { FunctionCode::kOp_IAdd, { Name("runs"), Name("runs"), VarValue(1) } },
+      { FunctionCode::kOp_ArrayCreate, { Name("shared"), VarValue(1) } },
+      { FunctionCode::kOp_ArraySetElement,
+        { Name("shared"), VarValue(0), VarValue(3) } },
+      { FunctionCode::kOp_Assign, { Name("localShared"), Name("shared") } },
+      { FunctionCode::kOp_CallStatic,
+        { VarValue("Game"), VarValue("GetForm"), Name("childQuest"),
+          VarValue(1), VarValue(static_cast<int32_t>(childQuest)) } },
+      { FunctionCode::kOp_PropSet,
+        { VarValue("Shared"), Name("childQuest"), Name("shared") } },
+      { FunctionCode::kOp_CallMethod,
+        { VarValue("SetStage"), Name("childQuest"), Name("firstResult"),
+          VarValue(1), VarValue(static_cast<int32_t>(childStage)) } }
+    };
+    parent.code.instructions.insert(parent.code.instructions.end(),
+                                    prefix.begin(), prefix.end());
+    if (twice)
+      parent.code.instructions.push_back(
+        { FunctionCode::kOp_CallMethod,
+          { VarValue("SetCurrentStageID"), Name("childQuest"),
+            Name("secondResult"), VarValue(1),
+            VarValue(static_cast<int32_t>(childStage)) } });
+    parent.code.instructions.push_back(
+      { FunctionCode::kOp_ArrayGetElement,
+        { Name("suffix"), Name("localShared"), VarValue(0) } });
+    parent.code.instructions.push_back(
+      { FunctionCode::kOp_CallMethod,
+        { VarValue("AddItem"), Name("target"), Name("temp"), VarValue(3),
+          Name("gold"), Name("suffix"), VarValue(true) } });
+    if (failParent)
+      parent.code.instructions.push_back(
+        { FunctionCode::kOp_CallMethod,
+          { VarValue("UnsupportedParentSuffix"), Name("self"), Name("temp"),
+            VarValue(0) } });
+    parent.code.instructions.push_back(
+      { FunctionCode::kOp_Return, { VarValue::None() } });
+
+    auto child = Reward(3);
+    child.locals.push_back({ "completed", "Bool" });
+    child.code.instructions.pop_back();
+    child.code.instructions.push_back(
+      { FunctionCode::kOp_IAdd, { Name("runs"), Name("runs"), VarValue(1) } });
+    if (waits) {
+      child.code.instructions.push_back(
+        { FunctionCode::kOp_ArraySetElement,
+          { Name("shared"), VarValue(0), VarValue(7) } });
+      child.code.instructions.push_back(
+        { FunctionCode::kOp_CallStatic,
+          { VarValue("FixtureAwait"), VarValue("AwaitBool"), Name("completed"),
+            VarValue(1), VarValue("child") } });
+      child.code.instructions.push_back(
+        { FunctionCode::kOp_CallMethod,
+          { VarValue("AddItem"), Name("target"), Name("temp"), VarValue(3),
+            Name("gold"), VarValue(4), VarValue(true) } });
+    }
+    child.code.instructions.push_back(
+      { FunctionCode::kOp_ArraySetElement,
+        { Name("shared"), VarValue(0), VarValue(9) } });
+    if (failChild) {
+      child.code.instructions.push_back(
+        { FunctionCode::kOp_JumpT, { Name("completed"), VarValue(2) } });
+      child.code.instructions.push_back(
+        { FunctionCode::kOp_CallMethod,
+          { VarValue("UnsupportedChildSuffix"), Name("self"), Name("temp"),
+            VarValue(0) } });
+    }
+    child.code.instructions.push_back(
+      { FunctionCode::kOp_Return, { VarValue::None() } });
+    object.states = { { "", { { "Parent", parent }, { "Child", child } } } };
+    program.metadata.fragments = { { 10, 0, 1, "JobFixture", "Parent" } };
+    metadata[kParentQuest] = program.metadata;
+    auto childMetadata = program.metadata;
+    childMetadata.fragments = { { childStage, 0, 1, "JobFixture", "Child" } };
+    metadata[childQuest] = childMetadata;
+  }
+  std::vector<PexScript::Lazy> Scripts() const { return program.Scripts(); }
+  void Enable(MpActor& actor) const
+  {
+    const auto enabled = Json::array(
+      { "4e50d:Skyrim.esm",
+        childQuest == 0x2aa57 ? "2aa57:Skyrim.esm" : "2d512:Skyrim.esm" });
+    actor.SetPropertyValueDump(QuestJournal::kEnabled, enabled.dump(), false,
+                               false);
+  }
+};
+
+Json ChildField(MpActor& actor, uint32_t quest, const std::string& field)
+{
+  const auto key =
+    FormDesc::FromFormId(quest, actor.GetParent()->espmFiles).ToString() +
+    "/jobfixture";
+  return QuestJournal::ScriptState(actor)
+    .at("scripts")
+    .at(key)
+    .at("values")
+    .at("jobfixture/" + field);
+}
+
+struct ChildFixture : Fixture
+{
+  ChildProgram content;
+  ChildFixture(bool waits = true, bool twice = false, bool repeated = false,
+               bool failChild = false, bool failParent = false)
+    : content(waits, twice, repeated, failChild, failParent)
+  {
+    content.Enable(Owner());
+  }
+  QuestJobRunner::Result SubmitChild()
+  {
+    return Jobs().Submit(Owner(), kChildCommand, kParentQuest, 10,
+                         content.metadata, content.Scripts());
+  }
+  QuestJobRunner::Result Advance()
+  {
+    return Jobs().Advance(Owner(), kChildCommand, content.metadata,
+                          content.Scripts());
+  }
+  QuestJobRunner::Result ResumeChild(const std::string& token,
+                                     bool value = true)
+  {
+    return Jobs().Resume(Owner(), kChildCommand, token, value,
+                         content.metadata, content.Scripts());
+  }
+  QuestJobRunner::Result InspectChild()
+  {
+    return Jobs().Inspect(Owner(), kChildCommand);
+  }
+  QuestJobRunner::Result AckChild(size_t index)
+  {
+    storage->Complete(index);
+    Tick();
+    return InspectChild();
+  }
+};
+
+void RequireReady(const QuestJobRunner::Result& result)
+{
+  REQUIRE(result.status == Status::Ready);
+  REQUIRE(result.token.empty());
+  REQUIRE(result.key.empty());
+}
+
+void ObserveInventoryOrder(ChildFixture& fixture)
+{
+  espm::QuestScriptData::Alias alias;
+  alias.object.type = 1;
+  alias.object.formId = kParentQuest;
+  alias.object.alias = 3;
+  alias.version = 5;
+  alias.objectFormat = 2;
+  alias.scripts.push_back({ "InventoryOrder", 0, {} });
+  fixture.content.metadata.at(kParentQuest).aliases.push_back(alias);
+  auto script = std::make_shared<PexScript>();
+  script->source = "InventoryOrder";
+  Object object;
+  object.NameIndex = script->source;
+  object.parentClassName = "ReferenceAlias";
+  object.variables = { { "order", "Int", 0, VarValue(0) } };
+  FunctionInfo event;
+  event.valid = true;
+  event.returnType = "None";
+  event.params = { { "item", "Form" },
+                   { "count", "Int" },
+                   { "reference", "ObjectReference" },
+                   { "source", "ObjectReference" } };
+  event.code.instructions = {
+    { FunctionCode::kOp_IMultiply,
+      { Name("order"), Name("order"), VarValue(10) } },
+    { FunctionCode::kOp_IAdd,
+      { Name("order"), Name("order"), Name("count") } },
+    { FunctionCode::kOp_Return, { VarValue::None() } }
+  };
+  object.states.push_back({ "", { { "OnItemAdded", event } } });
+  script->objectTable.push_back(std::move(object));
+  fixture.content.program.bases.push_back(script);
+  QuestJournal::Atomic(fixture.Owner(), [&] {
+    QuestVmState state(QuestJournal::ScriptState(fixture.Owner()), {}, {});
+    state.SetAliasBinding("4e50d:Skyrim.esm/alias:3", "14:Skyrim.esm");
+    QuestJournal::SetScriptState(fixture.Owner(), state.Save());
+  });
+}
+
+int InventoryOrder(MpActor& actor)
+{
+  const auto scripts = QuestJournal::ScriptState(actor).at("scripts");
+  const auto found = scripts.find("4e50d:Skyrim.esm/alias:3/inventoryorder");
+  if (found == scripts.end())
+    return 0;
+  return found->at("values").at("inventoryorder/order").at("value").get<int>();
+}
+}
+
+TEST_CASE("Child stages commit their intent and result before parent progress",
+          "[Quest][QuestJobs][ChildStages]")
+{
+  ChildFixture f;
+  ObserveInventoryOrder(f);
+  RequirePending(f.SubmitChild());
+  REQUIRE(f.Gold() == 12);
+  REQUIRE(InventoryOrder(f.Owner()) == 0);
+  REQUIRE(
+    QuestJournal::Get(f.Owner(), f.content.childQuest).at("stages").empty());
+  const auto parentToken = QuestJournal::JobState(f.Owner()).active->token;
+  REQUIRE_FALSE(parentToken.empty());
+  RequirePending(f.Advance());
+  REQUIRE_THROWS(f.ResumeChild(parentToken));
+  f.Tick();
+  REQUIRE(f.storage->submissions.size() == 1);
+  const auto intent = Serialized(f.storage->submissions[0].forms);
+  f.storage->Complete(0,
+                      std::make_exception_ptr(std::runtime_error("intent")));
+  f.Tick();
+  RequirePending(f.InspectChild());
+  REQUIRE(f.storage->submissions.size() == 2);
+  REQUIRE(Serialized(f.storage->submissions[1].forms) == intent);
+  f.storage->Complete(0);
+  f.Tick();
+  RequirePending(f.InspectChild());
+  RequireReady(f.AckChild(1));
+  REQUIRE_THROWS(f.ResumeChild(parentToken, true));
+  REQUIRE_THROWS(f.ResumeChild(parentToken, false));
+
+  RequirePending(f.Advance());
+  REQUIRE(f.Gold() == 15);
+  RequirePending(f.Advance());
+  REQUIRE(InventoryOrder(f.Owner()) == 0);
+  f.Tick();
+  const auto waiting = f.AckChild(2);
+  REQUIRE(waiting.status == Status::Waiting);
+  REQUIRE(waiting.key == "child");
+  REQUIRE(waiting.token != parentToken);
+  REQUIRE(f.Advance().status == Status::Waiting);
+  REQUIRE_THROWS(f.ResumeChild(parentToken));
+  REQUIRE(QuestJournal::ScriptState(f.Owner()).at("continuations").size() ==
+          2);
+  REQUIRE(ChildField(f.Owner(), kParentQuest, "shared") ==
+          ChildField(f.Owner(), f.content.childQuest, "shared"));
+  RequirePending(f.ResumeChild(waiting.token));
+  REQUIRE(f.Gold() == 19);
+  RequirePending(f.Advance());
+  REQUIRE(InventoryOrder(f.Owner()) == 0);
+  f.Tick();
+  const auto childDone = Serialized(f.storage->submissions[3].forms);
+  f.storage->Complete(
+    3, std::make_exception_ptr(std::runtime_error("child done")));
+  f.Tick();
+  RequirePending(f.InspectChild());
+  REQUIRE(Serialized(f.storage->submissions[4].forms) == childDone);
+  REQUIRE(f.Gold() == 19);
+  RequireReady(f.AckChild(4));
+  REQUIRE(InventoryOrder(f.Owner()) == 0);
+  RequireReady(f.ResumeChild(waiting.token));
+  REQUIRE_THROWS(f.ResumeChild(waiting.token, false));
+  RequirePending(f.Advance());
+  REQUIRE(f.Gold() == 28);
+  REQUIRE(InventoryOrder(f.Owner()) == 2349);
+  REQUIRE(ChildField(f.Owner(), kParentQuest, "runs").at("value") == 1);
+  REQUIRE(ChildField(f.Owner(), f.content.childQuest, "runs").at("value") ==
+          1);
+  REQUIRE(ChildField(f.Owner(), kParentQuest, "firstresult").at("value") ==
+          true);
+  f.Tick();
+  REQUIRE(f.AckChild(5).status == Status::Completed);
+  REQUIRE(f.SubmitChild().status == Status::Completed);
+  REQUIRE(f.ResumeChild(waiting.token).status == Status::Completed);
+  REQUIRE(f.Advance().status == Status::Completed);
+  REQUIRE_THROWS(f.ResumeChild(parentToken, false));
+  REQUIRE(f.Gold() == 28);
+  REQUIRE(QuestJournal::ScriptState(f.Owner()).at("continuations").empty());
+  REQUIRE(QuestJournal::JobState(f.Owner()).completed.back().children.empty());
+}
+
+TEST_CASE("Repeated and already-visited child stages return their actual Bool",
+          "[Quest][QuestJobs][ChildStages]")
+{
+  const bool repeated = GENERATE(false, true);
+  ChildFixture f(false, true, repeated);
+  RequirePending(f.SubmitChild());
+  f.Tick();
+  RequireReady(f.AckChild(0));
+  for (size_t segment = 1; segment <= 4; ++segment) {
+    RequirePending(f.Advance());
+    f.Tick();
+    const auto result = f.AckChild(segment);
+    if (segment == 4)
+      REQUIRE(result.status == Status::Completed);
+    else
+      RequireReady(result);
+  }
+  REQUIRE(f.Gold() == (repeated ? 27 : 24));
+  REQUIRE(ChildField(f.Owner(), kParentQuest, "firstresult").at("value") ==
+          true);
+  REQUIRE(ChildField(f.Owner(), kParentQuest, "secondresult").at("value") ==
+          repeated);
+  REQUIRE(ChildField(f.Owner(), f.content.childQuest, "runs").at("value") ==
+          (repeated ? 2 : 1));
+  REQUIRE(QuestJournal::Get(f.Owner(), f.content.childQuest).at("stages") ==
+          Json::array({ f.content.childStage }));
+  REQUIRE(f.SubmitChild().status == Status::Completed);
+  REQUIRE(f.Gold() == (repeated ? 27 : 24));
+}
+
+TEST_CASE(
+  "Failed child and parent segments preserve the last durable boundary",
+  "[Quest][QuestJobs][ChildStages][Rollback]")
+{
+  const bool parentFailure = GENERATE(false, true);
+  ChildFixture f(true, false, false, !parentFailure, parentFailure);
+  f.SubmitChild();
+  f.Tick();
+  RequireReady(f.AckChild(0));
+  f.Advance();
+  f.Tick();
+  const auto waiting = f.AckChild(1);
+  REQUIRE(waiting.status == Status::Waiting);
+  if (!parentFailure) {
+    const auto before = QuestJournal::Snapshot(f.Owner());
+    const auto heap = QuestJournal::ScriptState(f.Owner());
+    REQUIRE_THROWS(f.ResumeChild(waiting.token, false));
+    REQUIRE(f.Gold() == 15);
+    REQUIRE(QuestJournal::Snapshot(f.Owner()) == before);
+    REQUIRE(QuestJournal::ScriptState(f.Owner()) == heap);
+    REQUIRE(f.InspectChild().token == waiting.token);
+    f.Tick();
+    REQUIRE(f.storage->submissions.size() == 2);
+  }
+  f.ResumeChild(waiting.token, true);
+  f.Tick();
+  RequireReady(f.AckChild(2));
+  REQUIRE(f.Gold() == 19);
+  if (parentFailure) {
+    const auto before = QuestJournal::Snapshot(f.Owner());
+    const auto heap = QuestJournal::ScriptState(f.Owner());
+    REQUIRE_THROWS(f.Advance());
+    REQUIRE(f.Gold() == 19);
+    REQUIRE(QuestJournal::Snapshot(f.Owner()) == before);
+    REQUIRE(QuestJournal::ScriptState(f.Owner()) == heap);
+    RequireReady(f.InspectChild());
+    f.Tick();
+    REQUIRE(f.storage->submissions.size() == 3);
+  } else {
+    f.Advance();
+    f.Tick();
+    REQUIRE(f.AckChild(3).status == Status::Completed);
+    REQUIRE(f.Gold() == 28);
+  }
+}
+
+TEST_CASE(
+  "Queued child content and actor identity remain bound to one campaign",
+  "[Quest][QuestJobs][ChildStages]")
+{
+  ChildFixture f;
+  f.SubmitChild();
+  f.Tick();
+  RequireReady(f.AckChild(0));
+  const auto before = QuestJournal::Snapshot(f.Owner());
+  auto changed = f.content.metadata;
+  changed.at(f.content.childQuest).fragments[0].function = "DifferentChild";
+  REQUIRE_THROWS(
+    f.Jobs().Advance(f.Owner(), kChildCommand, changed, f.content.Scripts()));
+  REQUIRE(QuestJournal::Snapshot(f.Owner()) == before);
+  REQUIRE(f.Gold() == 12);
+  f.Advance();
+  f.Tick();
+  const auto waiting = f.AckChild(1);
+  REQUIRE(waiting.status == Status::Waiting);
+  REQUIRE(f.Gold() == 15);
+  REQUIRE_THROWS(f.Jobs().Resume(f.Owner(), kChildCommand, waiting.token, true,
+                                 changed, f.content.Scripts()));
+  const auto beforeMissingAdapter = QuestJournal::Snapshot(f.Owner());
+  f.Owner().SetPropertyValueDump(QuestJournal::kEnabled,
+                                 "[\"2d512:Skyrim.esm\"]", false, false);
+  REQUIRE_THROWS(f.ResumeChild(waiting.token));
+  REQUIRE(f.Gold() == 15);
+  REQUIRE(QuestJournal::Snapshot(f.Owner()) == beforeMissingAdapter);
+  f.content.Enable(f.Owner());
+  constexpr uint32_t guestId = kOwner + 1, otherId = kOwner + 2;
+  f.server.CreateActor(guestId, { 1, 2, 3 }, 0, 0x3c);
+  auto& guest = f.server.worldState.GetFormAt<MpActor>(guestId);
+  guest.SetWorldInstance(f.Owner().GetWorldInstance());
+  f.content.Enable(guest);
+  REQUIRE_THROWS(f.Jobs().Inspect(guest, kChildCommand));
+  REQUIRE_THROWS(f.Jobs().Resume(guest, kChildCommand, waiting.token, true,
+                                 f.content.metadata, f.content.Scripts()));
+  f.server.CreateActor(otherId, { 1, 2, 3 }, 0, 0x3c);
+  auto& other = f.server.worldState.GetFormAt<MpActor>(otherId);
+  other.SetWorldInstance("campaign:" + std::to_string(otherId) + ":jobs");
+  other.SetInventory(Inventory().AddItem(0xf, 100));
+  f.content.Enable(other);
+  RequirePending(f.Jobs().Submit(other, kChildCommand, kParentQuest, 10,
+                                 f.content.metadata, f.content.Scripts()));
+  REQUIRE(other.GetInventory().GetItemCount(0xf) == 102);
+  REQUIRE(f.Gold() == 15);
+  REQUIRE(f.InspectChild().status == Status::Waiting);
+  REQUIRE(f.InspectChild().token == waiting.token);
+  f.Tick();
+  REQUIRE(f.storage->submissions.size() == 3);
+  f.storage->Complete(2);
+  f.Tick();
+  RequireReady(f.Jobs().Inspect(other, kChildCommand));
+  REQUIRE(f.InspectChild().status == Status::Waiting);
+  REQUIRE(QuestJournal::Get(other, f.content.childQuest).at("stages").empty());
+  REQUIRE(QuestJournal::Get(f.Owner(), f.content.childQuest).at("stages") ==
+          Json::array({ f.content.childStage }));
+}
+
+TEST_CASE(
+  "A child can queue another stage in its parent's quest and unwind in order",
+  "[Quest][QuestJobs][ChildStages]")
+{
+  ChildFixture f(false);
+  auto& object = f.content.program.script->objectTable[0];
+  object.variables.push_back({ "grandRuns", "Int", 0, VarValue(0) });
+  auto& child = object.states[0].functions[1].function;
+  child.locals.push_back({ "parentQuest", "Quest" });
+  child.code.instructions.pop_back();
+  const std::vector<FunctionCode::Instruction> suffix = {
+    { FunctionCode::kOp_CallStatic,
+      { VarValue("Game"), VarValue("GetForm"), Name("parentQuest"),
+        VarValue(1), VarValue(static_cast<int32_t>(kParentQuest)) } },
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("SetStage"), Name("parentQuest"), Name("completed"),
+        VarValue(1), VarValue(20) } },
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("AddItem"), Name("target"), Name("temp"), VarValue(3),
+        Name("gold"), VarValue(1), VarValue(true) } },
+    { FunctionCode::kOp_Return, { VarValue::None() } }
+  };
+  child.code.instructions.insert(child.code.instructions.end(), suffix.begin(),
+                                 suffix.end());
+  auto grandchild = Reward(6);
+  grandchild.code.instructions.pop_back();
+  grandchild.code.instructions.push_back(
+    { FunctionCode::kOp_ArraySetElement,
+      { Name("shared"), VarValue(0), VarValue(8) } });
+  grandchild.code.instructions.push_back(
+    { FunctionCode::kOp_IAdd,
+      { Name("grandRuns"), Name("grandRuns"), VarValue(1) } });
+  grandchild.code.instructions.push_back(
+    { FunctionCode::kOp_Return, { VarValue::None() } });
+  object.states[0].functions.push_back({ "Grandchild", grandchild });
+  f.content.metadata.at(kParentQuest)
+    .fragments.push_back({ 20, 0, 1, "JobFixture", "Grandchild" });
+  RequirePending(f.SubmitChild());
+  f.Tick();
+  RequireReady(f.AckChild(0));
+  const std::vector<uint32_t> expectedGold{ 15, 21, 22, 30 };
+  const std::vector<size_t> expectedStacks{ 2, 2, 1, 0 };
+  for (size_t index = 0; index < expectedGold.size(); ++index) {
+    RequirePending(f.Advance());
+    REQUIRE(f.Gold() == expectedGold[index]);
+    REQUIRE(QuestJournal::ScriptState(f.Owner()).at("continuations").size() ==
+            expectedStacks[index]);
+    f.Tick();
+    const auto result = f.AckChild(index + 1);
+    if (index + 1 == expectedGold.size())
+      REQUIRE(result.status == Status::Completed);
+    else
+      RequireReady(result);
+  }
+  REQUIRE(QuestJournal::Get(f.Owner(), kParentQuest).at("stages") ==
+          Json::array({ 10, 20 }));
+  REQUIRE(ChildField(f.Owner(), kParentQuest, "runs").at("value") == 1);
+  REQUIRE(ChildField(f.Owner(), kParentQuest, "grandruns").at("value") == 1);
+  REQUIRE(ChildField(f.Owner(), f.content.childQuest, "runs").at("value") ==
+          1);
+  REQUIRE(f.SubmitChild().status == Status::Completed);
+  REQUIRE(f.Gold() == 30);
+}
+
+TEST_CASE(
+  "Queued stage children recover from SQLite before and after child work",
+  "[Quest][QuestJobs][ChildStages][SQLite]")
+{
+  SqliteFiles files;
+  ChildProgram content;
+  uint64_t jobId = 0;
+  std::string externalToken;
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    Initialize(server);
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    content.Enable(owner);
+    auto& jobs = server.worldState.GetQuestJobs();
+    RequirePending(jobs.Submit(owner, kChildCommand, kParentQuest, 10,
+                               content.metadata, content.Scripts()));
+    const auto ready = WaitForDurable(server, owner, kChildCommand);
+    RequireReady(ready);
+    jobId = ready.job;
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 12);
+    REQUIRE(QuestJournal::Get(owner, content.childQuest).at("stages").empty());
+  }
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    auto& jobs = server.worldState.GetQuestJobs();
+    RequireReady(jobs.Inspect(owner, kChildCommand));
+    REQUIRE(jobs.Inspect(owner, kChildCommand).job == jobId);
+    RequireReady(jobs.Submit(owner, kChildCommand, kParentQuest, 10,
+                             content.metadata, content.Scripts()));
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 12);
+    RequirePending(
+      jobs.Advance(owner, kChildCommand, content.metadata, content.Scripts()));
+    const auto waiting = WaitForDurable(server, owner, kChildCommand);
+    REQUIRE(waiting.status == Status::Waiting);
+    REQUIRE(waiting.key == "child");
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 15);
+    externalToken = waiting.token;
+  }
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    auto& jobs = server.worldState.GetQuestJobs();
+    const auto waiting = jobs.Inspect(owner, kChildCommand);
+    REQUIRE(waiting.status == Status::Waiting);
+    REQUIRE(waiting.token == externalToken);
+    REQUIRE(waiting.job == jobId);
+    RequirePending(jobs.Resume(owner, kChildCommand, externalToken, true,
+                               content.metadata, content.Scripts()));
+    RequireReady(WaitForDurable(server, owner, kChildCommand));
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 19);
+    REQUIRE(QuestJournal::JobState(owner).active->Current().cursor == "done");
+  }
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    auto& jobs = server.worldState.GetQuestJobs();
+    RequireReady(jobs.Inspect(owner, kChildCommand));
+    RequireReady(jobs.Resume(owner, kChildCommand, externalToken, true,
+                             content.metadata, content.Scripts()));
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 19);
+    RequirePending(
+      jobs.Advance(owner, kChildCommand, content.metadata, content.Scripts()));
+    REQUIRE(WaitForDurable(server, owner, kChildCommand).status ==
+            Status::Completed);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 28);
+    REQUIRE(ChildField(owner, kParentQuest, "runs").at("value") == 1);
+    REQUIRE(ChildField(owner, content.childQuest, "runs").at("value") == 1);
+    REQUIRE(ChildField(owner, kParentQuest, "shared") ==
+            ChildField(owner, content.childQuest, "shared"));
+    REQUIRE(QuestJournal::ScriptState(owner).at("continuations").empty());
+  }
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    auto& jobs = server.worldState.GetQuestJobs();
+    const auto before = QuestJournal::Snapshot(owner);
+    REQUIRE(jobs
+              .Submit(owner, kChildCommand, kParentQuest, 10, content.metadata,
+                      content.Scripts())
+              .status == Status::Completed);
+    REQUIRE(jobs
+              .Resume(owner, kChildCommand, externalToken, true,
+                      content.metadata, content.Scripts())
+              .status == Status::Completed);
+    REQUIRE(QuestJournal::Snapshot(owner) == before);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 28);
+  }
+}
+
+TEST_CASE("A repeated child cannot reenter its still-active ancestor stage",
+          "[Quest][QuestJobs][ChildStages][Rollback]")
+{
+  ChildFixture f(false, false, true);
+  auto& child =
+    f.content.program.script->objectTable[0].states[0].functions[1].function;
+  child.code.instructions.insert(
+    child.code.instructions.end() - 1,
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("SetStage"), Name("self"), Name("completed"), VarValue(1),
+        VarValue(10) } });
+  RequirePending(f.SubmitChild());
+  REQUIRE(f.Gold() == 12);
+  f.Tick();
+  RequireReady(f.AckChild(0));
+  const auto before = QuestJournal::Snapshot(f.Owner());
+  const auto heap = QuestJournal::ScriptState(f.Owner());
+  const auto jobs = QuestJournal::JobState(f.Owner()).Save();
+  REQUIRE_THROWS_WITH(f.Advance(),
+                      Catch::Matchers::ContainsSubstring(
+                        "Reentrant repeated quest stage requires scheduling"));
+  REQUIRE(f.Gold() == 12);
+  REQUIRE(QuestJournal::Snapshot(f.Owner()) == before);
+  REQUIRE(QuestJournal::ScriptState(f.Owner()) == heap);
+  REQUIRE(QuestJournal::JobState(f.Owner()).Save() == jobs);
+  REQUIRE(
+    QuestJournal::Get(f.Owner(), f.content.childQuest).at("stages").empty());
+  REQUIRE(ChildField(f.Owner(), kParentQuest, "runs").at("value") == 1);
+  RequireReady(f.InspectChild());
+  RequireReady(f.SubmitChild());
+  f.Tick();
+  REQUIRE(f.storage->submissions.size() == 1);
+}
+
+TEST_CASE("Child stage VMs share the parent's cumulative instruction budget",
+          "[Quest][QuestJobs][ChildStages][Quota]")
+{
+  ChildFixture f(false);
+  auto& functions =
+    f.content.program.script->objectTable[0].states[0].functions;
+  // Four authored instructions execute about sixty thousand VM steps. Each
+  // function fits by itself, but the child's fresh VM must retain the
+  // parent's expenditure instead of starting another 100,000-step budget.
+  for (size_t index = 0; index < 2; ++index) {
+    auto& function = functions[index].function;
+    function.locals.push_back({ "budgetCounter", "Int" });
+    function.locals.push_back({ "budgetAgain", "Bool" });
+    const std::vector<FunctionCode::Instruction> loop = {
+      { FunctionCode::kOp_Assign, { Name("budgetCounter"), VarValue(0) } },
+      { FunctionCode::kOp_IAdd,
+        { Name("budgetCounter"), Name("budgetCounter"), VarValue(1) } },
+      { FunctionCode::kOp_CompareLT,
+        { Name("budgetAgain"), Name("budgetCounter"), VarValue(20000) } },
+      { FunctionCode::kOp_JumpT, { Name("budgetAgain"), VarValue(-2) } }
+    };
+    function.code.instructions.insert(function.code.instructions.begin(),
+                                      loop.begin(), loop.end());
+  }
+  RequirePending(f.SubmitChild());
+  REQUIRE(f.Gold() == 12);
+  f.Tick();
+  RequireReady(f.AckChild(0));
+  const auto active = QuestJournal::JobState(f.Owner()).active;
+  REQUIRE(active);
+  REQUIRE(active->instructions >= 60000);
+  REQUIRE(active->instructions < 65000);
+  const auto before = QuestJournal::Snapshot(f.Owner());
+  const auto heap = QuestJournal::ScriptState(f.Owner());
+  const auto jobs = QuestJournal::JobState(f.Owner()).Save();
+  REQUIRE_THROWS_WITH(
+    f.Advance(),
+    Catch::Matchers::ContainsSubstring("instruction quota exceeded"));
+  REQUIRE(f.Gold() == 12);
+  REQUIRE(QuestJournal::Snapshot(f.Owner()) == before);
+  REQUIRE(QuestJournal::ScriptState(f.Owner()) == heap);
+  REQUIRE(QuestJournal::JobState(f.Owner()).Save() == jobs);
+  REQUIRE(
+    QuestJournal::Get(f.Owner(), f.content.childQuest).at("stages").empty());
+  RequireReady(f.InspectChild());
+  RequireReady(f.SubmitChild());
+  f.Tick();
+  REQUIRE(f.storage->submissions.size() == 1);
 }

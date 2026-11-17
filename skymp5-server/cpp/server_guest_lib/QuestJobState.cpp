@@ -1,6 +1,7 @@
 #include "QuestJobState.h"
 #include "FormDesc.h"
 #include "QuestVmState.h"
+#include <charconv>
 #include <initializer_list>
 #include <limits>
 #include <set>
@@ -75,41 +76,122 @@ std::string Identity(const Json& value, bool dynamic, bool empty = false)
   return text;
 }
 
-QuestJobState::Job ReadJob(const Json& value)
+void Bounded(const std::string& text, size_t limit)
 {
-  Fields(value,
-         { "id",     "generation", "segment",  "command",      "actor",
-           "owner",  "quest",      "instance", "contentHash",  "stage",
-           "cursor", "accepted",   "log",      "instructions", "steps",
-           "script", "function",   "token",    "awaitKey",     "failure",
-           "events", "completions" });
+  if (text.size() > limit || text.find('\0') != std::string::npos)
+    throw std::runtime_error("Quest job string out of bounds");
+}
+
+QuestJobState::Stage ReadStage(const Json& value, bool child)
+{
+  if (child)
+    Fields(value,
+           { "node", "child", "quest", "contentHash", "stage", "cursor",
+             "accepted", "log", "script", "function", "token", "awaitKey",
+             "failure" });
+  QuestJobState::Stage stage;
+  stage.node = Number(value.at("node"), QuestJobState::MaxOperations, child);
+  stage.child = Number(value.at("child"), QuestJobState::MaxOperations);
+  stage.quest = Identity(value.at("quest"), false);
+  stage.contentHash = Text(value.at("contentHash"), 64);
+  if (stage.contentHash.size() != 64 ||
+      stage.contentHash.find_first_not_of("0123456789abcdef") !=
+        std::string::npos)
+    throw std::runtime_error("Invalid quest job content hash");
+  stage.stage = static_cast<uint16_t>(Number(value.at("stage"), 65535));
+  stage.cursor = Text(value.at("cursor"), 7);
+  stage.accepted = Boolean(value.at("accepted"));
+  stage.log = static_cast<uint32_t>(Number(value.at("log"), 100000));
+  stage.script = Text(value.at("script"), 1024, true);
+  stage.function = Text(value.at("function"), 1024, true);
+  stage.token = Text(value.at("token"), 256, true);
+  stage.awaitKey = Text(value.at("awaitKey"), 128, true);
+  stage.failure = Text(value.at("failure"), 1024, true);
+  const bool pending = stage.child || stage.log || !stage.script.empty() ||
+    !stage.function.empty() || !stage.token.empty() ||
+    !stage.awaitKey.empty() || !stage.failure.empty();
+  if (stage.cursor == "begin") {
+    if (pending || stage.accepted)
+      throw std::runtime_error("Quest stage begin cursor is not pristine");
+  } else if (stage.cursor == "waiting") {
+    if (!stage.accepted || stage.script.empty() || stage.function.empty() ||
+        stage.token.empty() || stage.awaitKey.empty())
+      throw std::runtime_error("Invalid waiting quest stage cursor");
+  } else if (stage.cursor == "done") {
+    if (pending)
+      throw std::runtime_error("Completed quest stage retains pending work");
+  } else
+    throw std::runtime_error("Unsupported quest stage cursor");
+  return stage;
+}
+
+uint64_t Operation(const QuestJobState::Job& job, const std::string& token)
+{
+  Bounded(token, 256);
+  const auto prefix = job.Scope() + ":";
+  if (!token.starts_with(prefix))
+    throw std::runtime_error("Quest operation belongs to another job");
+  uint64_t result = 0;
+  const auto begin = token.data() + prefix.size();
+  const auto end = token.data() + token.size();
+  const auto parsed = std::from_chars(begin, end, result);
+  if (parsed.ec != std::errc() || parsed.ptr != end || !result ||
+      result >= job.nextOperation || token != prefix + std::to_string(result))
+    throw std::runtime_error("Invalid quest operation identity");
+  return result;
+}
+
+QuestJobState::Job ReadJob(const Json& saved, uint64_t version)
+{
+  auto value = saved;
+  if (version == 1) {
+    Fields(value,
+           { "id",     "generation", "segment",  "command",      "actor",
+             "owner",  "quest",      "instance", "contentHash",  "stage",
+             "cursor", "accepted",   "log",      "instructions", "steps",
+             "script", "function",   "token",    "awaitKey",     "failure",
+             "events", "completions" });
+    if (!value.at("completions").is_object() ||
+        value.at("completions").size() > QuestJobState::MaxOperations)
+      throw std::runtime_error("Invalid legacy quest completions");
+    value["node"] = 0;
+    value["child"] = 0;
+    value["children"] = Json::array();
+    value["nextOperation"] = value.at("completions").size() + 1 +
+      (value.at("cursor") == "waiting" ? 1 : 0);
+  } else
+    Fields(
+      value,
+      { "id",      "generation",  "segment",  "command",      "actor",
+        "owner",   "quest",       "instance", "contentHash",  "stage",
+        "cursor",  "accepted",    "log",      "instructions", "steps",
+        "script",  "function",    "token",    "awaitKey",     "failure",
+        "events",  "completions", "node",     "child",        "nextOperation",
+        "children" });
   QuestJobState::Job job;
+  static_cast<QuestJobState::Stage&>(job) = ReadStage(value, false);
+  if (job.node)
+    throw std::runtime_error("Root quest stage has a child identity");
   job.id = Number(value.at("id"), MaxIdentity, true);
   job.generation = Number(value.at("generation"), MaxIdentity, true);
-  job.segment = Number(value.at("segment"), QuestJobState::MaxOperations + 1);
+  job.segment =
+    Number(value.at("segment"),
+           (version == 1 ? 1 : 2) * QuestJobState::MaxOperations + 1);
+  job.nextOperation =
+    Number(value.at("nextOperation"), QuestJobState::MaxOperations + 1, true);
   job.command = Text(value.at("command"), 128);
   job.actor = Identity(value.at("actor"), true);
   job.owner = Identity(value.at("owner"), true);
-  job.quest = Identity(value.at("quest"), false);
   job.instance = Text(value.at("instance"), 300, true);
-  job.contentHash = Text(value.at("contentHash"), 64);
-  if (job.contentHash.size() != 64 ||
-      job.contentHash.find_first_not_of("0123456789abcdef") !=
-        std::string::npos)
-    throw std::runtime_error("Invalid quest job content hash");
-  job.stage = static_cast<uint16_t>(Number(value.at("stage"), 65535));
-  job.cursor = Text(value.at("cursor"), 7);
-  job.accepted = Boolean(value.at("accepted"));
-  job.log = static_cast<uint32_t>(Number(value.at("log"), 100000));
   job.instructions =
     static_cast<uint32_t>(Number(value.at("instructions"), 100000));
   job.steps =
     static_cast<uint32_t>(Number(value.at("steps"), QuestJobState::MaxSteps));
-  job.script = Text(value.at("script"), 1024, true);
-  job.function = Text(value.at("function"), 1024, true);
-  job.token = Text(value.at("token"), 256, true);
-  job.awaitKey = Text(value.at("awaitKey"), 128, true);
-  job.failure = Text(value.at("failure"), 1024, true);
+  const auto& children = value.at("children");
+  if (!children.is_array() || children.size() >= QuestJobState::MaxDepth)
+    throw std::runtime_error("Quest child stack depth exceeded");
+  for (const auto& child : children)
+    job.children.push_back(ReadStage(child, true));
   const auto& events = value.at("events");
   if (!events.is_array() || events.size() > QuestJobState::MaxEvents)
     throw std::runtime_error("Quest job event limit exceeded");
@@ -125,57 +207,84 @@ QuestJobState::Job ReadJob(const Json& value)
   if (!completions.is_object() ||
       completions.size() > QuestJobState::MaxOperations)
     throw std::runtime_error("Quest job operation limit exceeded");
-  for (size_t index = 1; index <= completions.size(); ++index) {
-    const auto token = job.Scope() + ":" + std::to_string(index);
-    if (!completions.contains(token))
-      throw std::runtime_error("Invalid quest job completion sequence");
-    job.completions.emplace(token, Boolean(completions.at(token)));
+  std::set<uint64_t> operations;
+  for (const auto& [token, result] : completions.items()) {
+    if (!operations.insert(Operation(job, token)).second)
+      throw std::runtime_error("Duplicate quest completion");
+    job.completions.emplace(token, Boolean(result));
   }
-  if (job.cursor == "begin") {
-    if (job.segment || job.accepted || job.log || job.instructions ||
-        job.steps || !job.script.empty() || !job.function.empty() ||
-        !job.token.empty() || !job.awaitKey.empty() || !job.failure.empty() ||
-        !job.events.empty() || !job.completions.empty())
-      throw std::runtime_error("Quest job begin cursor is not pristine");
-  } else if (job.cursor == "waiting") {
-    if (!job.accepted || !job.segment || !job.instructions ||
-        job.script.empty() || job.function.empty() || job.awaitKey.empty() ||
-        job.token != job.NextToken() ||
-        job.completions.size() >= QuestJobState::MaxOperations)
-      throw std::runtime_error("Invalid waiting quest job cursor");
-  } else if (job.cursor == "done") {
-    if (job.log || !job.script.empty() || !job.function.empty() ||
-        !job.token.empty() || !job.awaitKey.empty() || !job.failure.empty() ||
-        !job.events.empty())
-      throw std::runtime_error("Completed quest job retains pending work");
-  } else
-    throw std::runtime_error("Unsupported quest job cursor");
+  if (version == 1 && job.cursor == "waiting" &&
+      job.token !=
+        job.Scope() + ":" + std::to_string(job.completions.size() + 1))
+    throw std::runtime_error("Invalid legacy pending quest operation");
+  std::vector<const QuestJobState::Stage*> stages{ &job };
+  for (const auto& child : job.children)
+    stages.push_back(&child);
+  for (size_t index = 0; index < stages.size(); ++index) {
+    const auto& stage = *stages[index];
+    if (stage.cursor == "waiting") {
+      if (!job.segment || !job.instructions ||
+          !operations.insert(Operation(job, stage.token)).second)
+        throw std::runtime_error(
+          "Invalid or duplicate pending quest operation");
+    }
+    if (index + 1 < stages.size()) {
+      const auto& child = *stages[index + 1];
+      if (stage.cursor != "waiting" || stage.awaitKey != "quest-stage" ||
+          stage.child != child.node || child.node <= stage.node ||
+          Operation(job, stage.token) != child.node)
+        throw std::runtime_error(
+          "Quest stage stack has inconsistent parent links");
+    } else if (stage.child)
+      throw std::runtime_error("Quest stage has a missing child");
+  }
+  // Each allocated number is either an outstanding operation or one retained
+  // completion, including parent waits whose children are still on the stack.
+  if (operations.size() != job.nextOperation - 1)
+    throw std::runtime_error("Quest operation history has missing identities");
+  if (job.cursor == "begin" &&
+      (job.segment || job.instructions || job.steps ||
+       job.nextOperation != 1 || !job.events.empty() ||
+       !job.completions.empty() || !job.children.empty()))
+    throw std::runtime_error("Quest job begin cursor is not pristine");
+  if (job.cursor == "done" && (!job.children.empty() || !job.events.empty()))
+    throw std::runtime_error("Completed quest job retains pending work");
   return job;
+}
+
+Json SaveStage(const QuestJobState::Stage& stage)
+{
+  Bounded(stage.quest, 300);
+  Bounded(stage.contentHash, 64);
+  Bounded(stage.cursor, 7);
+  for (const auto* text : { &stage.script, &stage.function, &stage.failure })
+    Bounded(*text, 1024);
+  Bounded(stage.token, 256);
+  Bounded(stage.awaitKey, 128);
+  return {
+    { "node", stage.node },         { "child", stage.child },
+    { "quest", stage.quest },       { "contentHash", stage.contentHash },
+    { "stage", stage.stage },       { "cursor", stage.cursor },
+    { "accepted", stage.accepted }, { "log", stage.log },
+    { "script", stage.script },     { "function", stage.function },
+    { "token", stage.token },       { "awaitKey", stage.awaitKey },
+    { "failure", stage.failure }
+  };
 }
 
 Json SaveJob(const QuestJobState::Job& job)
 {
-  const auto bounded = [](const std::string& text, size_t limit) {
-    if (text.size() > limit || text.find('\0') != std::string::npos)
-      throw std::runtime_error("Quest job string out of bounds");
-  };
-  bounded(job.command, 128);
-  for (const auto* text :
-       { &job.actor, &job.owner, &job.quest, &job.instance })
-    bounded(*text, 300);
-  bounded(job.contentHash, 64);
-  bounded(job.cursor, 7);
-  for (const auto* text : { &job.script, &job.function, &job.failure })
-    bounded(*text, 1024);
-  bounded(job.token, 256);
-  bounded(job.awaitKey, 128);
-  auto events = Json::array();
+  Bounded(job.command, 128);
+  for (const auto* text : { &job.actor, &job.owner, &job.instance })
+    Bounded(*text, 300);
   if (job.events.size() > QuestJobState::MaxEvents ||
-      job.completions.size() > QuestJobState::MaxOperations)
+      job.completions.size() > QuestJobState::MaxOperations ||
+      job.children.size() >= QuestJobState::MaxDepth)
     throw std::runtime_error("Quest job collection limit exceeded");
+  auto events = Json::array();
   for (const auto& event : job.events) {
     for (const auto* text : { &event.target, &event.item, &event.container })
-      bounded(*text, 300);
+      Bounded(*text, 300);
     events.push_back({ { "target", event.target },
                        { "item", event.item },
                        { "container", event.container },
@@ -183,29 +292,25 @@ Json SaveJob(const QuestJobState::Job& job)
                        { "added", event.added } });
   }
   for (const auto& [token, result] : job.completions)
-    bounded(token, 256);
-  return { { "id", job.id },
-           { "generation", job.generation },
-           { "segment", job.segment },
-           { "command", job.command },
-           { "actor", job.actor },
-           { "owner", job.owner },
-           { "quest", job.quest },
-           { "instance", job.instance },
-           { "contentHash", job.contentHash },
-           { "stage", job.stage },
-           { "cursor", job.cursor },
-           { "accepted", job.accepted },
-           { "log", job.log },
-           { "instructions", job.instructions },
-           { "steps", job.steps },
-           { "script", job.script },
-           { "function", job.function },
-           { "token", job.token },
-           { "awaitKey", job.awaitKey },
-           { "failure", job.failure },
-           { "events", std::move(events) },
-           { "completions", job.completions } };
+    Bounded(token, 256);
+  auto children = Json::array();
+  for (const auto& child : job.children)
+    children.push_back(SaveStage(child));
+  auto result = SaveStage(job);
+  result.update({ { "id", job.id },
+                  { "generation", job.generation },
+                  { "segment", job.segment },
+                  { "nextOperation", job.nextOperation },
+                  { "command", job.command },
+                  { "actor", job.actor },
+                  { "owner", job.owner },
+                  { "instance", job.instance },
+                  { "instructions", job.instructions },
+                  { "steps", job.steps },
+                  { "events", std::move(events) },
+                  { "completions", job.completions },
+                  { "children", std::move(children) } });
+  return result;
 }
 }
 
@@ -214,17 +319,32 @@ std::string QuestJobState::Job::Scope() const
   return "quest-job:" + std::to_string(generation) + ":" + std::to_string(id);
 }
 
+std::string QuestJobState::Job::Scope(const Stage& stage) const
+{
+  return stage.node ? Scope() + ":node:" + std::to_string(stage.node)
+                    : Scope();
+}
+
+QuestJobState::Stage& QuestJobState::Job::Current()
+{
+  return children.empty() ? static_cast<Stage&>(*this) : children.back();
+}
+
+const QuestJobState::Stage& QuestJobState::Job::Current() const
+{
+  return children.empty() ? static_cast<const Stage&>(*this) : children.back();
+}
+
 std::string QuestJobState::Job::NextToken() const
 {
-  return Scope() + ":" + std::to_string(completions.size() + 1);
+  return Scope() + ":" + std::to_string(nextOperation);
 }
 
 QuestJobState QuestJobState::Read(const nlohmann::json& value)
 {
   Fields(value,
          { "schemaVersion", "generation", "nextJob", "active", "completed" });
-  if (Number(value.at("schemaVersion"), 1, true) != 1)
-    throw std::runtime_error("Unsupported quest job schema");
+  const auto version = Number(value.at("schemaVersion"), 2, true);
   QuestJobState result;
   result.generation = Number(value.at("generation"), MaxIdentity, true);
   result.nextJob = Number(value.at("nextJob"), MaxIdentity, true);
@@ -240,7 +360,7 @@ QuestJobState QuestJobState::Read(const nlohmann::json& value)
     previous = job.id;
   };
   for (const auto& value : completed) {
-    auto job = ReadJob(value);
+    auto job = ReadJob(value, version);
     if (job.cursor != "done")
       throw std::runtime_error("Incomplete quest job in history");
     identity(job);
@@ -249,7 +369,7 @@ QuestJobState QuestJobState::Read(const nlohmann::json& value)
   if (!value.at("active").is_null()) {
     if (result.completed.size() == MaxCompleted)
       throw std::runtime_error("Quest job completion history is full");
-    result.active = ReadJob(value.at("active"));
+    result.active = ReadJob(value.at("active"), version);
     if (result.active->cursor == "done")
       throw std::runtime_error("Completed quest job is still active");
     identity(*result.active);
@@ -266,7 +386,7 @@ nlohmann::json QuestJobState::Save() const
   auto history = Json::array();
   for (const auto& job : completed)
     history.push_back(SaveJob(job));
-  Json result = { { "schemaVersion", 1 },
+  Json result = { { "schemaVersion", 2 },
                   { "generation", generation },
                   { "nextJob", nextJob },
                   { "active", active ? SaveJob(*active) : Json(nullptr) },
@@ -293,25 +413,35 @@ void QuestJobState::ValidateHeap(const nlohmann::json& heap) const
   // standalone VM fixtures. Once used, the runner owns every saved stack.
   if (generation == 1 && nextJob == 1 && !active && completed.empty())
     return;
-  if (!active || active->cursor != "waiting") {
-    if (!continuations.empty())
-      throw std::runtime_error("Orphan quest job continuation");
-    return;
+  std::vector<const Stage*> waiting;
+  if (active) {
+    if (active->cursor == "waiting")
+      waiting.push_back(&*active);
+    for (const auto& child : active->children)
+      if (child.cursor == "waiting")
+        waiting.push_back(&child);
   }
-  const auto& job = *active;
-  if (continuations.size() != 1 || !continuations.contains(job.token))
+  if (continuations.size() != waiting.size())
     throw std::runtime_error("Missing or orphan quest job continuation");
-  const auto& continuation = continuations.at(job.token);
-  const auto& callers = continuation.at("callers");
-  const auto& outer = callers.empty() ? continuation : callers.back();
-  if (continuation.at("scope") != job.Scope() ||
-      continuation.at("executedInstructions") != job.instructions ||
-      outer.at("kind") != "method" || outer.at("state") != "" ||
-      !SameScriptName(outer.at("rootScript"), job.script) ||
-      !SameScriptName(outer.at("script"), job.script) ||
-      !SameScriptName(outer.at("function"), job.function) ||
-      outer.at("receiver").at("type") != VarValue::kType_Object ||
-      outer.at("receiver").at("value") != job.quest)
-    throw std::runtime_error(
-      "Quest job continuation does not match its cursor");
+  for (const auto* stage : waiting) {
+    if (!continuations.contains(stage->token))
+      throw std::runtime_error("Missing quest stage continuation");
+    const auto& continuation = continuations.at(stage->token);
+    const auto& callers = continuation.at("callers");
+    const auto& outer = callers.empty() ? continuation : callers.back();
+    const auto instructions =
+      continuation.at("executedInstructions").get<uint64_t>();
+    if (continuation.at("scope") != active->Scope(*stage) || !instructions ||
+        instructions > active->instructions ||
+        (stage == &active->Current() &&
+         instructions != active->instructions) ||
+        outer.at("kind") != "method" || outer.at("state") != "" ||
+        !SameScriptName(outer.at("rootScript"), stage->script) ||
+        !SameScriptName(outer.at("script"), stage->script) ||
+        !SameScriptName(outer.at("function"), stage->function) ||
+        outer.at("receiver").at("type") != VarValue::kType_Object ||
+        outer.at("receiver").at("value") != stage->quest)
+      throw std::runtime_error(
+        "Quest stage continuation does not match its cursor");
+  }
 }

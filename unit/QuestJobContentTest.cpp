@@ -361,3 +361,80 @@ TEST_CASE("Content pinning rejects incomplete ambiguous or unbounded inputs",
                                          fixture.metadata, scripts));
   }
 }
+
+TEST_CASE(
+  "Quest override manifests pin every child independently of visit order",
+  "[Quest][QuestJobContent]")
+{
+  ContentFixture fixture(Plugin() + Record("QUST", 0x300, QuestFields()));
+  const auto manifest = QuestJobContent::ScriptManifest(fixture.Scripts());
+  REQUIRE(QuestJobContent::WithMetadataOverrides(fixture.server.worldState,
+                                                 manifest, {}) == manifest);
+  using Overrides = std::map<uint32_t, espm::QuestScriptData>;
+  Overrides overrides{ { 0x100, fixture.metadata },
+                       { 0x300, fixture.metadata } };
+  const auto pinned = QuestJobContent::WithMetadataOverrides(
+    fixture.server.worldState, manifest, overrides);
+  REQUIRE(pinned != manifest);
+  Overrides reversed;
+  reversed.emplace(0x300, fixture.metadata);
+  reversed.emplace(0x100, fixture.metadata);
+  REQUIRE(QuestJobContent::WithMetadataOverrides(
+            fixture.server.worldState, manifest, reversed) == pinned);
+  const auto rootHash = QuestJobContent::Hash(fixture.server.worldState, 0x100,
+                                              fixture.metadata, pinned);
+  // A retired child's fixture-only VMAD edit still changes the root's pin.
+  ++overrides.at(0x300).scripts[0].properties[0].value.integer;
+  const auto changed = QuestJobContent::WithMetadataOverrides(
+    fixture.server.worldState, manifest, overrides);
+  REQUIRE(changed != pinned);
+  REQUIRE(QuestJobContent::Hash(fixture.server.worldState, 0x100,
+                                fixture.metadata, changed) != rootHash);
+  overrides.erase(0x300);
+  REQUIRE(QuestJobContent::WithMetadataOverrides(
+            fixture.server.worldState, manifest, overrides) != pinned);
+}
+
+TEST_CASE("Quest override manifests reject invalid maps and source digests",
+          "[Quest][QuestJobContent]")
+{
+  ContentFixture fixture;
+  const auto manifest = QuestJobContent::ScriptManifest(fixture.Scripts());
+  std::map<uint32_t, espm::QuestScriptData> overrides;
+  SECTION("invalid empty-map source")
+  {
+    REQUIRE_THROWS(QuestJobContent::WithMetadataOverrides(
+      fixture.server.worldState, std::string(64, 'g'), overrides));
+  }
+  SECTION("invalid populated-map source")
+  {
+    overrides.emplace(0x100, fixture.metadata);
+    REQUIRE_THROWS(QuestJobContent::WithMetadataOverrides(
+      fixture.server.worldState, "short", overrides));
+  }
+  SECTION("nonquest record")
+  {
+    overrides.emplace(0x200, fixture.metadata);
+    REQUIRE_THROWS(QuestJobContent::WithMetadataOverrides(
+      fixture.server.worldState, manifest, overrides));
+  }
+  SECTION("zero identity")
+  {
+    overrides.emplace(0, fixture.metadata);
+    REQUIRE_THROWS(QuestJobContent::WithMetadataOverrides(
+      fixture.server.worldState, manifest, overrides));
+  }
+  SECTION("missing quest")
+  {
+    overrides.emplace(0x300, fixture.metadata);
+    REQUIRE_THROWS(QuestJobContent::WithMetadataOverrides(
+      fixture.server.worldState, manifest, overrides));
+  }
+  SECTION("oversized map")
+  {
+    for (uint32_t id = 0; id < 4097; ++id)
+      overrides.emplace(id, espm::QuestScriptData{});
+    REQUIRE_THROWS(QuestJobContent::WithMetadataOverrides(
+      fixture.server.worldState, manifest, overrides));
+  }
+}

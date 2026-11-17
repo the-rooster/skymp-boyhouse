@@ -39,6 +39,7 @@ QuestJobState Waiting()
   job.function = "Fragment_0";
   job.awaitKey = "operation";
   job.token = job.NextToken();
+  ++job.nextOperation;
   job.events.push_back({ "14:Skyrim.esm", "f:Skyrim.esm", "", 2, true });
   return state;
 }
@@ -46,6 +47,8 @@ QuestJobState Waiting()
 QuestJobState Done(QuestJobState state)
 {
   auto job = *state.active;
+  if (!job.token.empty())
+    job.completions[job.token] = true;
   job.cursor = "done";
   job.log = 0;
   job.script.clear();
@@ -59,22 +62,27 @@ QuestJobState Done(QuestJobState state)
   return state;
 }
 
-Json Heap(const QuestJobState::Job& job)
+Json Heap(const QuestJobState::Job& job,
+          const QuestJobState::Stage* selected = nullptr,
+          uint32_t instructions = 0)
 {
+  const auto& stage =
+    selected ? *selected : static_cast<const QuestJobState::Stage&>(job);
   Json frame = { { "schemaVersion", 2 },
-                 { "scope", job.Scope() },
-                 { "receiver", { { "type", 0 }, { "value", job.quest } } },
+                 { "scope", job.Scope(stage) },
+                 { "receiver", { { "type", 0 }, { "value", stage.quest } } },
                  { "kind", "method" },
-                 { "rootScript", job.script },
-                 { "script", job.script },
+                 { "rootScript", stage.script },
+                 { "script", stage.script },
                  { "state", "" },
-                 { "function", job.function },
+                 { "function", stage.function },
                  { "contentHashes",
-                   Json::array({ { { "script", job.script },
-                                   { "hash", job.contentHash } } }) },
+                   Json::array({ { { "script", stage.script },
+                                   { "hash", stage.contentHash } } }) },
                  { "resultType", "None" },
                  { "instruction", 1 },
-                 { "executedInstructions", job.instructions },
+                 { "executedInstructions",
+                   instructions ? instructions : job.instructions },
                  { "locals", Json::array() },
                  { "callers", Json::array() } };
   return { { "schemaVersion", 6 },
@@ -82,7 +90,81 @@ Json Heap(const QuestJobState::Job& job)
            { "arrays", Json::object() },
            { "globals", Json::object() },
            { "aliases", Json::object() },
-           { "continuations", { { job.token, frame } } } };
+           { "continuations", { { stage.token, frame } } } };
+}
+
+QuestJobState Nested(bool waitingChild = false)
+{
+  auto state = Waiting();
+  auto& job = *state.active;
+  job.child = 1;
+  job.awaitKey = "quest-stage";
+  QuestJobState::Stage child;
+  child.node = 1;
+  child.quest = "2aa57:Skyrim.esm";
+  child.contentHash = std::string(64, 'b');
+  child.stage = 20;
+  if (waitingChild) {
+    child.cursor = "waiting";
+    child.accepted = true;
+    child.script = "QF_Child";
+    child.function = "Fragment_1";
+    child.awaitKey = "external";
+    child.token = job.NextToken();
+    ++job.nextOperation;
+    job.segment = 2;
+    job.instructions = 7;
+    job.steps = 4;
+  }
+  job.children.push_back(child);
+  return state;
+}
+
+Json NestedHeap(const QuestJobState::Job& job)
+{
+  auto heap = Heap(job, &job, 3);
+  for (const auto& child : job.children) {
+    if (child.cursor == "waiting") {
+      const auto childHeap = Heap(job, &child);
+      heap["continuations"].update(childHeap["continuations"]);
+    }
+  }
+  return heap;
+}
+
+void FinishChild(QuestJobState::Job& job)
+{
+  auto& child = job.children.back();
+  if (!child.token.empty())
+    job.completions[child.token] = true;
+  const auto node = child.node;
+  const auto quest = child.quest;
+  const auto hash = child.contentHash;
+  const auto stage = child.stage;
+  child = QuestJobState::Stage{};
+  child.node = node;
+  child.quest = quest;
+  child.contentHash = hash;
+  child.stage = stage;
+  child.cursor = "done";
+  child.accepted = true;
+  ++job.segment;
+  ++job.instructions;
+}
+
+Json Legacy(const QuestJobState& state)
+{
+  auto saved = state.Save();
+  saved["schemaVersion"] = 1;
+  auto strip = [](Json& job) {
+    for (const char* field : { "node", "child", "children", "nextOperation" })
+      job.erase(field);
+  };
+  if (!saved["active"].is_null())
+    strip(saved["active"]);
+  for (auto& job : saved["completed"])
+    strip(job);
+  return saved;
 }
 
 struct JobStorage
@@ -156,9 +238,10 @@ TEST_CASE("Quest job codec round trips begin waiting and completed work",
     REQUIRE(QuestJobState::Read(state.Save()).Save() == state.Save());
   auto state = Waiting();
   REQUIRE(state.active->Scope() == "quest-job:1:1");
-  REQUIRE(state.active->NextToken() == "quest-job:1:1:1");
+  REQUIRE(state.active->NextToken() == "quest-job:1:1:2");
   state.active->completions[state.active->token] = false;
   state.active->token = state.active->NextToken();
+  ++state.active->nextOperation;
   state.active->segment = 2;
   REQUIRE(state.active->token == "quest-job:1:1:2");
   REQUIRE_NOTHROW(state.Save());
@@ -171,7 +254,7 @@ TEST_CASE("Quest jobs reject corrupt exact fields identities and cursor state",
   std::vector<std::function<void(Json&)>> corrupt = {
     [](Json& v) { v["unknown"] = 1; },
     [](Json& v) { v.erase("active"); },
-    [](Json& v) { v["schemaVersion"] = 2; },
+    [](Json& v) { v["schemaVersion"] = 3; },
     [](Json& v) { v["generation"] = 0; },
     [](Json& v) { v["nextJob"] = 1; },
     [](Json& v) { v["nextJob"] = UINT64_MAX; },
@@ -241,7 +324,7 @@ TEST_CASE("Typed quest job saves enforce history uniqueness and limits",
     auto old = Done(Begin()).completed.front();
     state.completed.push_back(old);
     state.active->id = 2;
-    state.active->token = state.active->NextToken();
+    state.active->token = state.active->Scope() + ":1";
     state.nextJob = 3;
   }
   SECTION("completed work cannot retain a failure")
@@ -479,4 +562,348 @@ TEST_CASE("Personal job ownership remains locked while visiting another host",
   REQUIRE_NOTHROW(QuestJournal::RequireJobAccess(*f.actor));
   REQUIRE_NOTHROW(QuestJournal::RequirePersonalJobAccess(host));
   REQUIRE_THROWS(QuestJournal::RequirePersonalJobAccess(*f.actor));
+}
+
+TEST_CASE(
+  "Legacy quest jobs migrate operation identities without losing history",
+  "[Quest][QuestJob]")
+{
+  for (const auto& state : { Begin(), Waiting(), Done(Waiting()) }) {
+    const auto legacy = Legacy(state);
+    const auto migrated = QuestJobState::Read(legacy);
+    REQUIRE(migrated.Save() == state.Save());
+    REQUIRE(migrated.Save()["schemaVersion"] == 2);
+  }
+  auto external = Waiting();
+  external.active->awaitKey = "quest-stage";
+  REQUIRE(QuestJobState::Read(Legacy(external)).Save() == external.Save());
+  auto legacy = Legacy(Waiting());
+  SECTION("extra new field is not accepted in legacy schema")
+  {
+    legacy["active"]["nextOperation"] = 2;
+  }
+  SECTION("legacy pending token must follow completions")
+  {
+    legacy["active"]["token"] = "quest-job:1:1:2";
+  }
+  SECTION("legacy completion sequence cannot have a gap")
+  {
+    legacy["active"]["completions"]["quest-job:1:1:3"] = true;
+    legacy["active"]["token"] = "quest-job:1:1:2";
+  }
+  REQUIRE_THROWS(QuestJobState::Read(legacy));
+}
+
+TEST_CASE("Nested quest stages retain separate scopes and one global "
+          "operation sequence",
+          "[Quest][QuestJob]")
+{
+  for (auto state : { Nested(), Nested(true) }) {
+    const auto& job = *state.active;
+    REQUIRE(&job.Current() == &job.children.back());
+    REQUIRE(job.Scope(job) == "quest-job:1:1");
+    REQUIRE(job.Scope(job.Current()) == "quest-job:1:1:node:1");
+    REQUIRE(QuestJobState::Read(state.Save()).Save() == state.Save());
+    REQUIRE_NOTHROW(state.ValidateHeap(NestedHeap(job)));
+  }
+  auto state = Nested(true);
+  FinishChild(*state.active);
+  REQUIRE_NOTHROW(state.Save());
+  REQUIRE_NOTHROW(state.ValidateHeap(NestedHeap(*state.active)));
+  REQUIRE_FALSE(state.active->events.empty());
+  REQUIRE(state.active->completions.at("quest-job:1:1:2"));
+  REQUIRE(state.active->NextToken() == "quest-job:1:1:3");
+}
+
+TEST_CASE("Nested stage codecs reject broken links reused tokens and "
+          "incomplete histories",
+          "[Quest][QuestJob]")
+{
+  const auto original = Nested(true).Save();
+  const std::vector<std::function<void(Json&)>> corrupt = {
+    [](Json& v) { v["active"]["node"] = 1; },
+    [](Json& v) { v["active"]["child"] = 2; },
+    [](Json& v) { v["active"]["awaitKey"] = "external"; },
+    [](Json& v) { v["active"]["children"][0]["node"] = 0; },
+    [](Json& v) { v["active"]["children"][0]["node"] = 2; },
+    [](Json& v) { v["active"]["children"][0]["child"] = 2; },
+    [](Json& v) { v["active"]["children"][0]["extra"] = 1; },
+    [](Json& v) { v["active"]["children"][0]["token"] = "quest-job:1:1:1"; },
+    [](Json& v) {
+      v["active"]["children"][0]["token"] = "quest-job:1:1:node:1:2";
+    },
+    [](Json& v) { v["active"]["children"][0]["token"] = "quest-job:1:1:02"; },
+    [](Json& v) { v["active"]["children"].clear(); },
+    [](Json& v) { v["active"]["nextOperation"] = 4; },
+    [](Json& v) { v["active"]["nextOperation"] = 258; },
+    [](Json& v) { v["active"]["completions"]["quest-job:1:1:2"] = true; },
+    [](Json& v) { v["active"]["children"][0]["cursor"] = "begin"; },
+    [](Json& v) { v["active"]["children"][0]["cursor"] = "done"; },
+    [](Json& v) { v["active"]["children"][0]["quest"] = "3000"; }
+  };
+  for (size_t index = 0; index < corrupt.size(); ++index) {
+    INFO("Nested corruption " << index);
+    auto value = original;
+    corrupt[index](value);
+    REQUIRE_THROWS(QuestJobState::Read(value));
+  }
+}
+
+TEST_CASE("Nested heap validation requires every waiting node and exact "
+          "current budget",
+          "[Quest][QuestJob]")
+{
+  const auto state = Nested(true);
+  const auto& job = *state.active;
+  const auto childToken = job.children.back().token;
+  auto heap = NestedHeap(job);
+  REQUIRE(heap["continuations"][job.token]["executedInstructions"] == 3);
+  REQUIRE(heap["continuations"][childToken]["executedInstructions"] == 7);
+  REQUIRE_NOTHROW(state.ValidateHeap(heap));
+  SECTION("missing child")
+  {
+    heap["continuations"].erase(childToken);
+  }
+  SECTION("missing parent")
+  {
+    heap["continuations"].erase(job.token);
+  }
+  SECTION("child using parent scope")
+  {
+    heap["continuations"][childToken]["scope"] = job.Scope();
+  }
+  SECTION("child using parent receiver")
+  {
+    heap["continuations"][childToken]["receiver"]["value"] = job.quest;
+  }
+  SECTION("parent budget exceeds aggregate")
+  {
+    heap["continuations"][job.token]["executedInstructions"] = 8;
+  }
+  SECTION("current child budget differs from aggregate")
+  {
+    heap["continuations"][childToken]["executedInstructions"] = 6;
+  }
+  REQUIRE_THROWS(state.ValidateHeap(heap));
+}
+
+TEST_CASE("Quest stage depth and operation bounds include pending ancestors",
+          "[Quest][QuestJob]")
+{
+  auto state = Waiting();
+  auto& job = *state.active;
+  for (uint64_t node = 1; node < QuestJobState::MaxDepth; ++node) {
+    auto& parent = job.Current();
+    parent.child = node;
+    parent.awaitKey = "quest-stage";
+    QuestJobState::Stage child = parent;
+    child.node = node;
+    child.child = 0;
+    child.awaitKey = "external";
+    child.token = job.NextToken();
+    ++job.nextOperation;
+    job.children.push_back(child);
+  }
+  REQUIRE(job.children.size() == 127);
+  REQUIRE_NOTHROW(state.Save());
+  auto& parent = job.Current();
+  parent.child = 128;
+  parent.awaitKey = "quest-stage";
+  auto child = parent;
+  child.node = 128;
+  child.child = 0;
+  child.awaitKey = "external";
+  child.token = job.NextToken();
+  ++job.nextOperation;
+  job.children.push_back(child);
+  REQUIRE_THROWS(state.Save());
+}
+
+TEST_CASE(
+  "Journal advances one durable child boundary and permits a new sibling",
+  "[Quest][QuestJob]")
+{
+  Fixture f;
+  f.Start();
+  const auto publish = [&](const QuestJobState& state) {
+    QuestJournal::AtomicJob(*f.actor, 1, [&] {
+      QuestJournal::SetScriptState(*f.actor, NestedHeap(*state.active));
+      QuestJournal::SetJobState(*f.actor, state);
+    });
+  };
+  auto state = Nested();
+  REQUIRE_NOTHROW(publish(state));
+  state = Nested(true);
+  REQUIRE_NOTHROW(publish(state));
+  FinishChild(*state.active);
+  REQUIRE_NOTHROW(publish(state));
+  auto& job = *state.active;
+  job.completions[job.token] = job.children.back().accepted;
+  job.children.pop_back();
+  job.child = job.nextOperation;
+  job.token = job.NextToken();
+  ++job.nextOperation;
+  ++job.segment;
+  ++job.instructions;
+  QuestJobState::Stage sibling;
+  sibling.node = job.child;
+  sibling.quest = "2aa58:Skyrim.esm";
+  sibling.contentHash = std::string(64, 'c');
+  sibling.stage = 30;
+  job.children.push_back(sibling);
+  REQUIRE_NOTHROW(publish(state));
+  REQUIRE(QuestJournal::JobState(*f.actor).Save() == state.Save());
+  REQUIRE(job.completions.size() == 2);
+  REQUIRE(job.children.back().node == 3);
+}
+
+TEST_CASE("Journal refuses rewriting live children ancestors or unrequested "
+          "completions",
+          "[Quest][QuestJob]")
+{
+  Fixture f;
+  f.Start();
+  auto state = Nested(true);
+  // New children must first commit their begin cursor.
+  const auto begin = Nested();
+  QuestJournal::AtomicJob(*f.actor, 1, [&] {
+    QuestJournal::SetScriptState(*f.actor, NestedHeap(*begin.active));
+    QuestJournal::SetJobState(*f.actor, begin);
+  });
+  QuestJournal::AtomicJob(*f.actor, 1, [&] {
+    QuestJournal::SetScriptState(*f.actor, NestedHeap(*state.active));
+    QuestJournal::SetJobState(*f.actor, state);
+  });
+  const auto before = f.Saved();
+  auto& job = *state.active;
+  SECTION("live child identity")
+  {
+    job.children.back().quest = "2aa58:Skyrim.esm";
+  }
+  SECTION("ancestor cursor metadata")
+  {
+    job.log = 1;
+  }
+  SECTION("drop unfinished child")
+  {
+    job.completions[job.token] = true;
+    job.completions[job.children.back().token] = true;
+    job.children.clear();
+    job.child = 0;
+    job.token = job.NextToken();
+    ++job.nextOperation;
+    job.awaitKey = "external";
+  }
+  SECTION("invent completed operation while keeping current wait")
+  {
+    job.completions[job.NextToken()] = true;
+    ++job.nextOperation;
+  }
+  SECTION("allocate multiple operations in one segment")
+  {
+    job.completions[job.children.back().token] = true;
+    job.completions[job.NextToken()] = true;
+    ++job.nextOperation;
+    job.children.back().token = job.NextToken();
+    ++job.nextOperation;
+  }
+  REQUIRE_NOTHROW(state.Save());
+  REQUIRE_THROWS(QuestJournal::AtomicJob(*f.actor, 1, [&] {
+    QuestJournal::SetScriptState(*f.actor, NestedHeap(job));
+    QuestJournal::SetJobState(*f.actor, state);
+  }));
+  REQUIRE(f.Saved() == before);
+}
+
+TEST_CASE("A job transaction cannot cross two durable child boundaries",
+          "[Quest][QuestJob]")
+{
+  Fixture f;
+  const auto begin = Begin();
+  const auto nested = Nested();
+  // Submit may expose its pristine root before publishing the first segment.
+  REQUIRE_NOTHROW(QuestJournal::AtomicJob(*f.actor, 1, [&] {
+    QuestJournal::SetJobState(*f.actor, begin);
+    QuestJournal::SetJobState(*f.actor, begin);
+    QuestJournal::SetScriptState(*f.actor, NestedHeap(*nested.active));
+    QuestJournal::SetJobState(*f.actor, nested);
+    QuestJournal::SetJobState(*f.actor, nested);
+  }));
+  const auto before = f.Saved();
+  auto doneChild = nested;
+  FinishChild(*doneChild.active);
+  auto sibling = doneChild;
+  auto& job = *sibling.active;
+  job.completions[job.token] = true;
+  job.children.pop_back();
+  job.child = job.nextOperation;
+  job.token = job.NextToken();
+  ++job.nextOperation;
+  auto child = nested.active->children.front();
+  child.node = job.child;
+  job.children.push_back(child);
+  REQUIRE_NOTHROW(doneChild.Save());
+  REQUIRE_NOTHROW(sibling.Save());
+  REQUIRE_THROWS(QuestJournal::AtomicJob(*f.actor, 1, [&] {
+    QuestJournal::SetJobState(*f.actor, doneChild);
+    QuestJournal::SetJobState(*f.actor, sibling);
+    QuestJournal::SetScriptState(*f.actor, NestedHeap(job));
+  }));
+  REQUIRE(f.Saved() == before);
+}
+
+TEST_CASE(
+  "Consuming a wait cannot rewind stage log effects or change its fragment",
+  "[Quest][QuestJob]")
+{
+  Fixture f;
+  f.Start();
+  auto state = Waiting();
+  state.active->log = 10;
+  QuestJournal::AtomicJob(*f.actor, 1, [&] {
+    QuestJournal::SetScriptState(*f.actor, Heap(*state.active));
+    QuestJournal::SetJobState(*f.actor, state);
+  });
+  const auto before = f.Saved();
+  auto& job = *state.active;
+  job.completions[job.token] = true;
+  job.token = job.NextToken();
+  ++job.nextOperation;
+  SECTION("earlier log")
+  {
+    job.log = 9;
+  }
+  SECTION("same log different script")
+  {
+    job.script = "Different";
+  }
+  SECTION("same log different function")
+  {
+    job.function = "Fragment_1";
+  }
+  REQUIRE_NOTHROW(state.Save());
+  REQUIRE_THROWS(QuestJournal::AtomicJob(*f.actor, 1, [&] {
+    QuestJournal::SetScriptState(*f.actor, Heap(job));
+    QuestJournal::SetJobState(*f.actor, state);
+  }));
+  REQUIRE(f.Saved() == before);
+}
+
+TEST_CASE(
+  "Completed and pending operations together respect the bounded capacity",
+  "[Quest][QuestJob]")
+{
+  auto state = Waiting();
+  auto& job = *state.active;
+  for (uint64_t operation = 1; operation < QuestJobState::MaxOperations;
+       ++operation)
+    job.completions[job.Scope() + ":" + std::to_string(operation)] = true;
+  job.token = job.Scope() + ":256";
+  job.nextOperation = 257;
+  job.segment = 513;
+  REQUIRE_NOTHROW(state.Save());
+  job.completions[job.token] = true;
+  job.token = job.NextToken();
+  ++job.nextOperation;
+  REQUIRE_THROWS(state.Save());
 }

@@ -234,3 +234,20 @@ std::string QuestJobContent::Hash(WorldState& world, uint32_t questId,
 {
   return Hash(world, questId, metadata, ScriptManifest(scripts));
 }
+
+std::string QuestJobContent::WithMetadataOverrides(
+  WorldState& world, const std::string& scriptManifest,
+  const std::map<uint32_t, espm::QuestScriptData>& overrides)
+{
+  const auto source = Digest(scriptManifest);
+  if (overrides.empty())
+    return scriptManifest;
+  Hasher hash("skymp.quest.metadata-overrides.v1");
+  hash.Text(source);
+  hash.Count(overrides.size(), 4096);
+  for (const auto& [quest, metadata] : overrides) {
+    hash.Number(quest, 4);
+    hash.Text(Hash(world, quest, metadata, source));
+  }
+  return hash.Finish();
+}

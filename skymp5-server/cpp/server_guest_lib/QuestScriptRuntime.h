@@ -15,11 +15,13 @@ public:
   // Called within the coordinator's AtomicJob segment. The caller persists
   // the updated job alongside the heap; this function never dispatches an
   // awaited operation. Fixture awaits are explicitly opt-in test injection.
-  static void ExecuteJobSegment(MpActor& actor, QuestJobState::Job& job,
-                                const espm::QuestScriptData& metadata,
-                                const std::vector<PexScript::Lazy>& scripts,
-                                std::optional<bool> completion = {},
-                                bool fixtureAwait = false);
+  static void ExecuteJobSegment(
+    MpActor& actor, QuestJobState::Job& job,
+    const espm::QuestScriptData& metadata,
+    const std::vector<PexScript::Lazy>& scripts,
+    std::optional<bool> completion = {}, bool fixtureAwait = false,
+    const std::map<uint32_t, espm::QuestScriptData>& overrides = {},
+    const std::string& contentManifest = {});
   // Trusted experimental stage execution. The quest adapter remains
   // responsible for startup, alias filling and external effects. Unsupported
   // natives throw and roll back journal/VM state. No client packet invokes
@@ -51,13 +53,13 @@ public:
     const std::vector<PexScript::Lazy>& scripts);
 
 private:
-  static bool Execute(MpActor& actor, uint32_t questId, uint16_t stage,
-                      const espm::QuestScriptData& metadata,
-                      const std::vector<PexScript::Lazy>& scripts,
-                      uint32_t loadedReference = 0,
-                      const char* referenceEvent = nullptr,
-                      uint32_t eventSource = 0,
-                      QuestJobState::Job* job = nullptr,
-                      std::optional<bool> completion = {},
-                      bool fixtureAwait = false);
+  static bool Execute(
+    MpActor& actor, uint32_t questId, uint16_t stage,
+    const espm::QuestScriptData& metadata,
+    const std::vector<PexScript::Lazy>& scripts, uint32_t loadedReference = 0,
+    const char* referenceEvent = nullptr, uint32_t eventSource = 0,
+    QuestJobState::Job* job = nullptr, std::optional<bool> completion = {},
+    bool fixtureAwait = false,
+    const std::map<uint32_t, espm::QuestScriptData>& overrides = {},
+    const std::string& contentManifest = {});
 };

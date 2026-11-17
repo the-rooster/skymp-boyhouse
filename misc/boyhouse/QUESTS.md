@@ -87,31 +87,47 @@ operation delivery remain unfinished. See [STORAGE.md](STORAGE.md).
 
 `world.GetQuestJobs()` exposes a trusted C++ `QuestJobRunner`. `Submit` accepts a
 campaign actor, unique command string, quest and stage; `Inspect` reports that
-command's status. `Resume` accepts its pending token and completion. These APIs
+command's status. `Resume` accepts a pending external token and completion;
+`Advance` executes one ready internal segment. These APIs
 are not client packets or addon bindings. The explicit metadata/script overloads
 are fixtures: only they register `FixtureAwait.AwaitBool`, with a bounded string
-key and Boolean result. The ordinary overload pins owned content and registers
-no replacement for a missing Skyrim native.
+key and Boolean result. The ordinary overload pins owned content and supports
+queued `Quest.SetStage`/`SetCurrentStageID` calls from resumable fragments.
 
 Every segment creates a fresh isolated VM inside `AtomicJob`, saves script
 fields, shared arrays, complete caller stacks, the selected log/fragment and
 pending inventory events, then seals an exact durable save receipt. A resumed
 log does not repeat its condition, QSDT completion or earlier fragment effects.
 The next operation token and cumulative instruction/work budgets survive reload.
-Inventory handlers remain synchronous and drain after the stage finishes; a
-latent handler or nested native-to-script wait still fails explicitly.
+Inventory handlers remain synchronous and drain in original FIFO order only
+after the root stage finishes, including events created by its descendants.
+A latent handler or another nested native-to-script wait still fails explicitly.
 
-Private journal schema 2 adds validated job state; ordinary untouched journals
+An authored child-stage call checkpoints its parent before entering the child.
+After that receipt is durable, `Advance` runs the child in a fresh segment. A
+completed child is saved separately; only after its own receipt is durable can
+another `Advance` consume its Boolean result and resume the parent. Child stages
+share the campaign heap, arrays, event queue and aggregate execution limits.
+Each invocation has its own saved cursor, scope and parent link. The work stack
+is bounded to 128 stages and the root to 256 total awaited operations. Reentry
+into an unfinished repeatable ancestor is rejected; distinct stages and
+sequential repeats are supported. Ordinary synchronous `ExecuteStage` and
+inventory-handler stage calls retain their existing behavior.
+
+Private journal schema 2 adds validated job state; its nested work codec is now
+schema 2 and reads the previous single-stage schema 1. Ordinary untouched journals
 remain schema 1. Public snapshots explicitly project the existing schema-1
 progress/context fields, excluding jobs, operation tokens and the VM. Job and
 stack ownership, outer fragment binding, content signatures and budgets are
 validated together at commit. Failed resumed execution keeps the last saved
 checkpoint and effects intact. There is no automatic retry of script execution.
 
-`Pending` exposes no operation token or final result. `Waiting` and `Completed`
+`Pending` exposes no operation token or final result. `Ready`, `Waiting` and `Completed`
 are visible only after the matching receipt becomes durable. After a fresh
 server loads persisted jobs, their saved state replaces process-local receipts.
-Duplicate commands/completions report existing work; conflicting values fail.
+`Ready` exposes no child completion token; the host calls `Advance`. A pending
+internal child result cannot be supplied through `Resume`. Duplicate commands
+and consumed completions report existing work; conflicting values fail.
 Operation tokens are campaign-scoped; a future external dispatcher must include
 the owning campaign in its delivery/deduplication identity.
 Clearing a world stops its coordinator: recovery requires a fresh server after
@@ -120,7 +136,9 @@ the previous writer has shut down, rather than reusing abandoned write state.
 The signature covers ordered complete-master SHA256 values, plugin mapping,
 raw quest fields, supplied VMAD metadata and executable script hashes. Production
 scripts are pinned once per coordinator; master hashes are cached per immutable
-loader. Master files must not change while loaded. Changed content is refused,
+loader. Fixture signatures also pin the entire metadata override map, including
+completed child quests. Every live ancestor's adapter must remain enabled before
+another segment executes. Master files must not change while loaded. Changed content is refused,
 not migrated. The initial full script parse/hash is not yet a performance-tested
 startup path.
 
@@ -130,7 +148,7 @@ history while visiting another host. This does not provide a global gameplay
 lease over every physical action between segments. Completed history currently
 has a hard 256-command limit with no eviction; new work is refused at capacity
 to avoid replaying old rewards. Scalable deduplication retention, real external
-operation delivery, child-stage scheduling, latent event cursors, lifecycle
+operation delivery, automatic host scheduling, latent event cursors, lifecycle
 semantics and real-client playthroughs remain required for full quest support.
 
 ### Repeatable stages and lifecycle metadata
@@ -343,7 +361,7 @@ parents, container UI and other spatial effects are outside this transaction;
 they still need campaign-specific integration. Movement is also outside the
 script transaction. Automatic alias fills, remaining natives and latent handlers
 remain restricted. Controlled script tests do not certify any vanilla quest or
-establish throughput for 16Ã¢â‚¬â€œ32 players.
+establish throughput for 16ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“32 players.
 
 ### Creating private reference copies
 
@@ -397,7 +415,7 @@ location playable. Automatic entry, engine-side transition application, cross-ar
 enable-parent change propagation, scale/ownership/lock overlays, NPC auto-calculated
 stats, respawns and durable lifecycle delivery remain unfinished. The factory
 currently copies the relevant world indexes during a batch; this needs measurement
-and optimization before a 16Ã¢â‚¬â€œ32 player rollout. Requests are bounded to 4,096
+and optimization before a 16ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“32 player rollout. Requests are bounded to 4,096
 references, a radius of 65,536 units, and a 100,000-entry/8 MiB owner ledger;
 streaming and ledger partitioning are required for a full world.
 
@@ -753,3 +771,17 @@ playthroughs. The owned scan remains at 2,274 quests, 14,026 PEX objects, 642
 capabilities, 1,146 quests with runtime dispatch, no parse failures and zero
 certified playable quests. The registry guards 145 sources. No Skyrim launch,
 client installation change or staging deployment was performed.
+
+The queued-child-stage batch passed the Linux server build and full verification
+on 2026-11-17 UTC: 697 native cases / 453,517 assertions, 368 JavaScript
+tests, 47 Python tests, addon and both protocol smokes, and SQLite recovery
+of 32 characters. Its 48 focused cases (899 assertions)
+include parent/child/grandchild execution, shared arrays across suspended quests,
+FIFO inventory delivery at root completion, exact failed-save retries, child-result
+receipt gating, repeated and already-visited stage results, context/content/adapter
+checks, failed child/parent resumption rollback, strict saved work transitions,
+legacy migration, and fresh-server SQLite recovery before and after child work.
+These use owned quest metadata with generated fragments, not quest playthroughs.
+No quest is certified playable. Skyrim, the installed client and staging deployment
+were untouched. Automatic host scheduling, real native timing and latent events,
+lifecycle semantics and broader gameplay integration remain unfinished.

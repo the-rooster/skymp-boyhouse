@@ -11,6 +11,7 @@
 #include <charconv>
 #include <cstring>
 #include <set>
+#include <tuple>
 
 namespace {
 using Json = nlohmann::json;
@@ -40,6 +41,7 @@ struct Transaction
   std::map<uint32_t, InventoryEdit> inventories;
   std::map<uint32_t, ReferenceEdit> references;
   std::optional<uint64_t> jobId;
+  bool jobTransitionApplied = false;
 };
 thread_local Transaction* transaction = nullptr;
 
@@ -733,6 +735,9 @@ void QuestJournal::SetJobState(MpActor& actor, const QuestJobState& state)
   const auto old = previous.Save();
   if (transaction->ledger.contains("jobs") && old == saved)
     return;
+  if (transaction->jobTransitionApplied)
+    throw std::runtime_error(
+      "Job transaction already advanced its durable cursor");
   const auto id = *transaction->jobId;
   const QuestJobState::Job* candidate = state.active ? &*state.active
     : state.completed.empty()                        ? nullptr
@@ -756,6 +761,8 @@ void QuestJournal::SetJobState(MpActor& actor, const QuestJobState& state)
         candidate->contentHash != prior.contentHash ||
         candidate->stage != prior.stage ||
         candidate->segment < prior.segment ||
+        candidate->nextOperation < prior.nextOperation ||
+        candidate->nextOperation > prior.nextOperation + 1 ||
         candidate->instructions < prior.instructions ||
         candidate->steps < prior.steps ||
         (prior.accepted && !candidate->accepted))
@@ -764,6 +771,87 @@ void QuestJournal::SetJobState(MpActor& actor, const QuestJobState& state)
       if (!candidate->completions.contains(token) ||
           candidate->completions.at(token) != result)
         throw std::runtime_error("Job transaction rewrote a completion");
+    using Stage = QuestJobState::Stage;
+    const auto sameStage = [](const Stage& a, const Stage& b) {
+      return std::tie(a.node, a.child, a.quest, a.contentHash, a.stage,
+                      a.cursor, a.accepted, a.log, a.script, a.function,
+                      a.token, a.awaitKey, a.failure) ==
+        std::tie(b.node, b.child, b.quest, b.contentHash, b.stage, b.cursor,
+                 b.accepted, b.log, b.script, b.function, b.token, b.awaitKey,
+                 b.failure);
+    };
+    std::vector<const Stage*> before{ &prior }, after{ candidate };
+    for (const auto& child : prior.children)
+      before.push_back(&child);
+    for (const auto& child : candidate->children)
+      after.push_back(&child);
+    size_t shared = 0;
+    while (shared < before.size() && shared < after.size() &&
+           before[shared]->node == after[shared]->node)
+      ++shared;
+    if (!shared || before.size() - shared > 1 || after.size() - shared > 1)
+      throw std::runtime_error(
+        "Job transaction skipped a durable child boundary");
+    if (before.size() != shared) {
+      const auto& child = *before.back();
+      const auto& parent = *before[before.size() - 2];
+      const auto completion = candidate->completions.find(parent.token);
+      if (child.cursor != "done" ||
+          completion == candidate->completions.end() ||
+          completion->second != child.accepted)
+        throw std::runtime_error(
+          "Job transaction dropped unfinished child work");
+    }
+    std::string consumed;
+    if (before.size() != shared)
+      consumed = before[before.size() - 2]->token;
+    else if (prior.Current().cursor == "waiting" &&
+             prior.Current().token != after[shared - 1]->token)
+      consumed = prior.Current().token;
+    for (const auto& [token, result] : candidate->completions)
+      if (!prior.completions.contains(token) && token != consumed)
+        throw std::runtime_error(
+          "Job transaction completed an unrequested operation");
+    for (size_t index = 0; index < shared; ++index) {
+      const auto& oldStage = *before[index];
+      const auto& nextStage = *after[index];
+      if (oldStage.quest != nextStage.quest ||
+          oldStage.contentHash != nextStage.contentHash ||
+          oldStage.stage != nextStage.stage ||
+          (oldStage.accepted && !nextStage.accepted))
+        throw std::runtime_error(
+          "Job transaction rewrote a live stage identity");
+      if ((index + 1 < shared || oldStage.cursor == "done") &&
+          !sameStage(oldStage, nextStage))
+        throw std::runtime_error(
+          "Job transaction rewrote a suspended ancestor");
+      if (oldStage.cursor == "waiting") {
+        if (oldStage.token != nextStage.token) {
+          if (nextStage.cursor == "waiting" &&
+              (nextStage.log < oldStage.log ||
+               (nextStage.log == oldStage.log &&
+                (nextStage.script != oldStage.script ||
+                 nextStage.function != oldStage.function))))
+            throw std::runtime_error(
+              "Job transaction rewound a stage fragment cursor");
+          if (!candidate->completions.contains(oldStage.token))
+            throw std::runtime_error(
+              "Job transaction lost a pending operation");
+        } else if (oldStage.child != nextStage.child ||
+                   oldStage.log != nextStage.log ||
+                   oldStage.script != nextStage.script ||
+                   oldStage.function != nextStage.function ||
+                   oldStage.awaitKey != nextStage.awaitKey ||
+                   nextStage.cursor != "waiting")
+          throw std::runtime_error(
+            "Job transaction rewrote a pending operation");
+      }
+    }
+    if (after.size() != shared &&
+        (after.back()->node != prior.nextOperation ||
+         after.back()->cursor != "begin"))
+      throw std::runtime_error(
+        "Job transaction reused or bypassed a new child");
   }
   auto history = old.at("completed");
   auto nextHistory = saved.at("completed");
@@ -783,6 +871,11 @@ void QuestJournal::SetJobState(MpActor& actor, const QuestJobState& state)
   ledger["revision"] = revision + 1;
   Validate(ledger, false);
   transaction->ledger = std::move(ledger);
+  // A pristine initial install exposes the new job to script/native guards.
+  // Every other transition must receive its own durable receipt before the
+  // next cursor can advance; repeated identical calls above remain harmless.
+  if (previous.active || !state.active || state.active->cursor != "begin")
+    transaction->jobTransitionApplied = true;
 }
 
 void QuestJournal::SetScriptState(MpActor& actor, const nlohmann::json& state)

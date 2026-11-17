@@ -19,10 +19,12 @@ public:
   enum class Status
   {
     Pending,
+    Ready,
     Waiting,
     Completed,
     Failed
   };
+  using MetadataOverrides = std::map<uint32_t, espm::QuestScriptData>;
   struct Result
   {
     Status status = Status::Pending;
@@ -35,12 +37,26 @@ public:
   Result Submit(MpActor& actor, const std::string& command, uint32_t quest,
                 uint16_t stage, const espm::QuestScriptData& metadata,
                 const std::vector<PexScript::Lazy>& scripts);
+  Result Submit(MpActor& actor, const std::string& command, uint32_t quest,
+                uint16_t stage, const MetadataOverrides& overrides,
+                const std::vector<PexScript::Lazy>& scripts);
   Result Resume(MpActor& actor, const std::string& command,
                 const std::string& token, bool completion);
   Result Resume(MpActor& actor, const std::string& command,
                 const std::string& token, bool completion,
                 const espm::QuestScriptData& metadata,
                 const std::vector<PexScript::Lazy>& scripts);
+  Result Resume(MpActor& actor, const std::string& command,
+                const std::string& token, bool completion,
+                const MetadataOverrides& overrides,
+                const std::vector<PexScript::Lazy>& scripts);
+  // Advance one internally scheduled segment after its predecessor is durable.
+  // Resume cannot complete pending internal work. Matching already-consumed
+  // tokens are harmless queries, regardless of their original source.
+  Result Advance(MpActor& actor, const std::string& command);
+  Result Advance(MpActor& actor, const std::string& command,
+                 const MetadataOverrides& overrides,
+                 const std::vector<PexScript::Lazy>& scripts);
   Result Inspect(MpActor& actor, const std::string& command);
 
 private:
@@ -58,13 +74,24 @@ private:
   void RequireReady(MpActor& actor);
   const std::vector<PexScript::Lazy>& Scripts();
   Result SubmitWithContent(MpActor&, const std::string&, uint32_t, uint16_t,
-                           const espm::QuestScriptData&,
                            const std::vector<PexScript::Lazy>&,
-                           const std::string&, bool fixtureAwait);
+                           const MetadataOverrides&, const std::string&,
+                           bool fixtureAwait);
   Result ResumeWithContent(MpActor&, const std::string&, const std::string&,
-                           bool, const espm::QuestScriptData&,
-                           const std::vector<PexScript::Lazy>&,
-                           const std::string&, bool fixtureAwait);
+                           bool, const std::vector<PexScript::Lazy>&,
+                           const MetadataOverrides&, const std::string&,
+                           bool fixtureAwait);
+  Result AdvanceWithContent(MpActor&, const std::string&,
+                            const std::vector<PexScript::Lazy>&,
+                            const MetadataOverrides&, const std::string&,
+                            bool fixtureAwait);
+  void ValidateContent(const QuestJobState::Job&, const MetadataOverrides&,
+                       const std::string&) const;
+  Result RunSegment(MpActor&, QuestJobState,
+                    const std::vector<PexScript::Lazy>&,
+                    const MetadataOverrides&, const std::string&,
+                    std::optional<bool>, bool fixtureAwait, bool submit,
+                    bool consumeChild = false);
   WorldState& world;
   bool stopped = false;
   std::map<uint32_t, Barrier> barriers;
