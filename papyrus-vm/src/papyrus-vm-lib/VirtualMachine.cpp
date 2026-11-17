@@ -23,6 +23,18 @@ void VirtualMachine::CheckExecutionBudget()
     throw std::runtime_error("Papyrus transaction instruction quota exceeded");
 }
 
+uint32_t VirtualMachine::GetExecutedInstructions() const noexcept
+{
+  return static_cast<uint32_t>(executedInstructions);
+}
+
+void VirtualMachine::RestoreExecutionBudget(uint32_t executed)
+{
+  if (!strictExecution || executed > 100000)
+    throw std::runtime_error("Invalid restored Papyrus execution budget");
+  executedInstructions = std::max(executedInstructions, size_t(executed));
+}
+
 void VirtualMachine::RequestSuspension(const std::string& token,
                                        const std::string& resultType)
 {

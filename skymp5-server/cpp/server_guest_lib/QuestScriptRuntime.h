@@ -1,14 +1,25 @@
 #pragma once
+#include "QuestJobState.h"
 #include "libespm/QuestScriptData.h"
 #include "papyrus-vm/PexScript.h"
 #include <nlohmann/json.hpp>
 
 class MpActor;
 class MpObjectReference;
+class WorldState;
 
 class QuestScriptRuntime
 {
 public:
+  static std::vector<PexScript::Lazy> LoadScripts(WorldState& world);
+  // Called within the coordinator's AtomicJob segment. The caller persists
+  // the updated job alongside the heap; this function never dispatches an
+  // awaited operation. Fixture awaits are explicitly opt-in test injection.
+  static void ExecuteJobSegment(MpActor& actor, QuestJobState::Job& job,
+                                const espm::QuestScriptData& metadata,
+                                const std::vector<PexScript::Lazy>& scripts,
+                                std::optional<bool> completion = {},
+                                bool fixtureAwait = false);
   // Trusted experimental stage execution. The quest adapter remains
   // responsible for startup, alias filling and external effects. Unsupported
   // natives throw and roll back journal/VM state. No client packet invokes
@@ -45,5 +56,8 @@ private:
                       const std::vector<PexScript::Lazy>& scripts,
                       uint32_t loadedReference = 0,
                       const char* referenceEvent = nullptr,
-                      uint32_t eventSource = 0);
+                      uint32_t eventSource = 0,
+                      QuestJobState::Job* job = nullptr,
+                      std::optional<bool> completion = {},
+                      bool fixtureAwait = false);
 };

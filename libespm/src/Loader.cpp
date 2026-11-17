@@ -3,6 +3,9 @@
 #include "AllocatedBuffer.h"
 #include "MappedBuffer.h"
 #include "libespm/Utils.h"
+#include <algorithm>
+#include <array>
+#include <sodium.h>
 
 namespace espm {
 
@@ -75,6 +78,42 @@ std::map<std::string, Loader::FileInfo> Loader::GetFilesInfo() const
   }
 
   return res;
+}
+
+const std::vector<Loader::FileContentHash>& Loader::GetContentHashes() const
+{
+  std::call_once(contentHashesOnce, [&] {
+    std::vector<FileContentHash> result;
+    result.reserve(entries.size());
+    for (const auto& entry : entries) {
+      crypto_hash_sha256_state hash{};
+      if (crypto_hash_sha256_init(&hash) != 0)
+        throw std::runtime_error("Cannot initialize master content hash");
+      const auto size = entry.buffer->GetLength();
+      const auto* data = reinterpret_cast<const unsigned char*>(
+        entry.buffer->GetData());
+      for (size_t offset = 0; offset < size;) {
+        const auto count = std::min<size_t>(size - offset, 1024 * 1024);
+        if (crypto_hash_sha256_update(&hash, data + offset, count) != 0)
+          throw std::runtime_error("Cannot update master content hash");
+        offset += count;
+      }
+      std::array<unsigned char, crypto_hash_sha256_BYTES> digest{};
+      if (crypto_hash_sha256_final(&hash, digest.data()) != 0)
+        throw std::runtime_error("Cannot finish master content hash");
+      constexpr char hex[] = "0123456789abcdef";
+      std::string encoded;
+      encoded.reserve(digest.size() * 2);
+      for (const auto byte : digest) {
+        encoded.push_back(hex[byte >> 4]);
+        encoded.push_back(hex[byte & 15]);
+      }
+      result.push_back({ entry.fileName.string(), uint64_t(size),
+                         std::move(encoded) });
+    }
+    contentHashes.swap(result);
+  });
+  return contentHashes;
 }
 
 std::vector<fs::path> Loader::MakeFilePaths(

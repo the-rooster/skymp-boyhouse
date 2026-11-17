@@ -7,6 +7,7 @@
 #include "MpActor.h"
 #include "MpChangeForms.h"
 #include "MpObjectReference.h"
+#include "QuestJobRunner.h"
 #include "QuestJournal.h"
 #include "libespm/GroupUtils.h"
 #include "libespm/RecordHeaderAccess.h"
@@ -44,6 +45,7 @@ struct RelootTimeForTypesEntry
 
 struct WorldState::Impl
 {
+  std::unique_ptr<QuestJobRunner> questJobs;
   struct SaveBatch
   {
     std::vector<std::optional<MpChangeForm>> forms;
@@ -109,6 +111,8 @@ void WorldState::Clear()
     if (batch->receipt && batch->receipt->state == SaveReceipt::State::Pending)
       batch->receipt->state = SaveReceipt::State::Abandoned;
   }
+  if (pImpl->questJobs)
+    pImpl->questJobs->Stop();
   // A submitted write may still commit. Retain it only as a draining barrier
   // if this WorldState is reused; never replay abandoned work or acknowledge
   // it as durable to its old caller. Unsubmitted work can be discarded.
@@ -283,6 +287,13 @@ void WorldState::Tick()
   const auto now = std::chrono::system_clock::now();
   TickSaveStorage(now);
   TickTimers(now);
+}
+
+QuestJobRunner& WorldState::GetQuestJobs()
+{
+  if (!pImpl->questJobs)
+    pImpl->questJobs.reset(new QuestJobRunner(*this));
+  return *pImpl->questJobs;
 }
 
 void WorldState::LoadChangeForm(const MpChangeForm& changeForm,
@@ -816,6 +827,7 @@ void WorldState::CommitCampaignReferences(
   MpActor& owner, MpChangeForm ownerState,
   const std::vector<MpChangeForm>& copies)
 {
+  QuestJournal::RequirePersonalJobAccess(owner);
   if (pImpl->formLoadingInProgress || QuestJournal::HasActiveTransaction() ||
       owner.GetParent() != this ||
       LookupFormByIdNoLoad(owner.GetFormId()).get() != &owner ||

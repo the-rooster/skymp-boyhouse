@@ -138,6 +138,7 @@ void CampaignReferenceBinding::Bind(MpActor& owner, uint32_t original,
     throw std::runtime_error(
       "Campaign copy requires a static non-player original");
   Validate(owner, original, copy);
+  QuestJournal::RequireJobAccess(owner);
   Identity(owner, true);
   const auto key = Key(owner, original);
   const auto& previous = copy.GetDynamicFields().GetValueDump(kProperty);

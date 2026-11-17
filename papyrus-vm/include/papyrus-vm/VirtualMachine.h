@@ -82,6 +82,10 @@ public:
   }
   bool IsStrictExecution() const { return strictExecution; }
   void CheckExecutionBudget();
+  uint32_t GetExecutedInstructions() const noexcept;
+  // Restore cumulative work when a host job reconstructs a fresh VM. This
+  // never lowers the current counter or makes an exhausted VM runnable again.
+  void RestoreExecutionBudget(uint32_t executed);
 
   // Only an explicitly registered host native may request a checkpoint, and
   // only inside StartResumableFunction/ResumeFunction. Ordinary promises keep

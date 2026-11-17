@@ -39,6 +39,7 @@ struct Transaction
   Json ledger;
   std::map<uint32_t, InventoryEdit> inventories;
   std::map<uint32_t, ReferenceEdit> references;
+  std::optional<uint64_t> jobId;
 };
 thread_local Transaction* transaction = nullptr;
 
@@ -58,6 +59,7 @@ Transaction::ReferenceEdit& ReferenceTarget(MpActor& actor,
   if (!actor.GetParent())
     throw std::runtime_error("Unregistered quest transaction participant");
   auto& owner = QuestJournal::Owner(actor);
+  QuestJournal::RequireJobAccess(actor);
   if (!transaction || transaction->owner != &owner)
     throw std::runtime_error(
       "Reference reads require an owning quest transaction");
@@ -97,6 +99,7 @@ Transaction::InventoryEdit& InventoryTarget(MpActor& actor,
   if (!actor.GetParent())
     throw std::runtime_error("Unregistered quest transaction participant");
   auto& owner = QuestJournal::Owner(actor);
+  QuestJournal::RequireJobAccess(actor);
   if (!transaction || transaction->owner != &owner)
     throw std::runtime_error("Inventory requires an owning quest transaction");
   auto& world = *owner.GetParent();
@@ -153,14 +156,26 @@ Json EmptyQuest()
            { "objectives", Json::object() } };
 }
 
-void Validate(const Json& ledger)
+void Validate(const Json& ledger, bool validateHeap = true)
 {
-  if (!ledger.is_object() || ledger.at("schemaVersion") != 1 ||
+  if (!ledger.is_object() || !ledger.at("schemaVersion").is_number_integer() ||
+      (ledger.at("schemaVersion") != 1 && ledger.at("schemaVersion") != 2) ||
       !ledger.at("revision").is_number_unsigned() ||
       ledger.at("revision").get<uint64_t>() > kMaxRevision ||
       !ledger.at("quests").is_object() || ledger.at("quests").size() > 10000) {
     throw std::runtime_error("Invalid or unsupported campaign journal");
   }
+  if (ledger.at("schemaVersion") == 2) {
+    for (const auto& [field, value] : ledger.items())
+      if (field != "schemaVersion" && field != "revision" &&
+          field != "quests" && field != "jobs" && field != "vm" &&
+          field != "referenceInit")
+        throw std::runtime_error("Unknown private campaign journal field");
+    const auto jobs = QuestJobState::Read(ledger.at("jobs"));
+    if (validateHeap)
+      jobs.ValidateHeap(ledger.value("vm", Json::object()));
+  } else if (ledger.contains("jobs"))
+    throw std::runtime_error("Quest jobs require private journal schema two");
   if (ledger.contains("referenceInit")) {
     const auto& initialized = ledger.at("referenceInit");
     if (!initialized.is_object() || initialized.size() > 100000)
@@ -298,9 +313,11 @@ MpActor& QuestJournal::Owner(MpActor& actor)
 nlohmann::json QuestJournal::Snapshot(MpActor& actor)
 {
   auto& owner = Owner(actor);
-  auto result = Read(owner);
-  result.erase("vm"); // Script variables are private server state.
-  result.erase("referenceInit");
+  const auto ledger = Read(owner);
+  // Public schema remains stable even when the private journal is migrated.
+  Json result = { { "schemaVersion", 1 },
+                  { "revision", ledger.at("revision") },
+                  { "quests", ledger.at("quests") } };
   result["campaignOwner"] = owner.GetFormId();
   result["instance"] = actor.GetWorldInstance();
   result["actor"] = actor.GetFormId();
@@ -319,6 +336,7 @@ nlohmann::json QuestJournal::Get(MpActor& actor, uint32_t questId)
 
 bool QuestJournal::Apply(MpActor& actor, const nlohmann::json& command)
 {
+  RequireJobAccess(actor);
   if (!command.is_object())
     throw std::invalid_argument("Expected quest command object");
   auto& owner = Owner(actor);
@@ -411,7 +429,7 @@ bool QuestJournal::Apply(MpActor& actor, const nlohmann::json& command)
   if (revision == kMaxRevision)
     throw std::overflow_error("Quest revision exhausted");
   ledger["revision"] = revision + 1;
-  Validate(ledger);
+  Validate(ledger, !transaction);
   const auto dump = ledger.dump();
   if (dump.size() > 8 * 1024 * 1024) {
     throw std::runtime_error("Campaign journal too large");
@@ -431,6 +449,7 @@ void QuestJournal::RecordRepeatedStage(MpActor& actor, uint32_t questId,
   if (!actor.GetParent())
     throw std::runtime_error("Unregistered quest transaction participant");
   auto& owner = Owner(actor);
+  RequireJobAccess(actor);
   if (!transaction || transaction->owner != &owner)
     throw std::runtime_error(
       "Repeated stage execution requires an owning quest transaction");
@@ -446,10 +465,9 @@ void QuestJournal::RecordRepeatedStage(MpActor& actor, uint32_t questId,
     throw std::runtime_error("Quest does not allow repeated stages");
   if (!def.stages.count(stage))
     throw std::invalid_argument("Stage does not exist in this quest");
-  if (std::count_if(metadata.stages.begin(), metadata.stages.end(),
-                    [stage](const auto& entry) {
-                      return entry.index == stage;
-                    }) != 1)
+  if (std::count_if(
+        metadata.stages.begin(), metadata.stages.end(),
+        [stage](const auto& entry) { return entry.index == stage; }) != 1)
     throw std::runtime_error("Repeated stage definition is ambiguous");
   auto ledger = Read(owner);
   const auto found = ledger.at("quests").find(def.key);
@@ -462,7 +480,7 @@ void QuestJournal::RecordRepeatedStage(MpActor& actor, uint32_t questId,
   if (revision == kMaxRevision)
     throw std::overflow_error("Quest revision exhausted");
   ledger["revision"] = revision + 1;
-  Validate(ledger);
+  Validate(ledger, !transaction);
   if (ledger.dump().size() > 8 * 1024 * 1024)
     throw std::runtime_error("Campaign journal too large");
   transaction->ledger = std::move(ledger);
@@ -479,8 +497,15 @@ std::shared_ptr<const SaveReceipt> QuestJournal::AtomicDurable(
   return AtomicImpl(actor, execute, true);
 }
 
+std::shared_ptr<const SaveReceipt> QuestJournal::AtomicJob(
+  MpActor& actor, uint64_t jobId, const std::function<void()>& execute)
+{
+  return AtomicImpl(actor, execute, true, jobId);
+}
+
 std::shared_ptr<const SaveReceipt> QuestJournal::AtomicImpl(
-  MpActor& actor, const std::function<void()>& execute, bool durable)
+  MpActor& actor, const std::function<void()>& execute, bool durable,
+  std::optional<uint64_t> jobId)
 {
   if (transaction)
     throw std::runtime_error("Nested quest transaction");
@@ -500,8 +525,19 @@ std::shared_ptr<const SaveReceipt> QuestJournal::AtomicImpl(
   const auto actorEpoch = actor.GetWorldInstanceEpoch();
   const auto ownerEpoch = owner.GetWorldInstanceEpoch();
   const auto initial = Read(owner);
+  const auto jobs = initial.contains("jobs")
+    ? QuestJobState::Read(initial.at("jobs"))
+    : QuestJobState{};
+  if (jobId) {
+    if (!*jobId || (jobs.active ? jobs.active->id : jobs.nextJob) != *jobId)
+      throw std::runtime_error("Quest transaction does not own this job");
+    if (!jobs.active && jobs.completed.size() >= QuestJobState::MaxCompleted)
+      throw std::runtime_error("Quest job completion history is full");
+  } else if (jobs.active)
+    throw std::runtime_error("Campaign has an active quest job");
   const auto initialJournal = owner.GetDynamicFields().GetValueDump(kProperty);
   Transaction local{ &owner, initial, {}, {} };
+  local.jobId = jobId;
   transaction = &local;
   try {
     execute();
@@ -538,6 +574,13 @@ std::shared_ptr<const SaveReceipt> QuestJournal::AtomicImpl(
       }
     };
     validateReads();
+    if (jobId) {
+      const auto candidate = QuestJobState::Read(local.ledger.at("jobs"));
+      if ((!candidate.active || candidate.active->id != *jobId) &&
+          (candidate.completed.empty() ||
+           candidate.completed.back().id != *jobId))
+        throw std::runtime_error("Quest transaction did not retain its job");
+    }
     Validate(local.ledger);
     const auto dump = local.ledger.dump();
     if (dump.size() > 8 * 1024 * 1024)
@@ -656,8 +699,95 @@ nlohmann::json QuestJournal::PersonalScriptState(MpActor& actor)
   return value;
 }
 
+QuestJobState QuestJournal::JobState(MpActor& actor)
+{
+  const auto ledger = Read(Owner(actor));
+  return ledger.contains("jobs") ? QuestJobState::Read(ledger.at("jobs"))
+                                 : QuestJobState{};
+}
+
+void QuestJournal::RequireJobAccess(MpActor& actor)
+{
+  RequirePersonalJobAccess(Owner(actor));
+}
+
+void QuestJournal::RequirePersonalJobAccess(MpActor& owner)
+{
+  const auto ledger = Read(owner);
+  if (!ledger.contains("jobs"))
+    return;
+  const auto jobs = QuestJobState::Read(ledger.at("jobs"));
+  if (jobs.active &&
+      (!transaction || transaction->owner != &owner ||
+       transaction->jobId != jobs.active->id))
+    throw std::runtime_error("Campaign has an active quest job");
+}
+
+void QuestJournal::SetJobState(MpActor& actor, const QuestJobState& state)
+{
+  auto& owner = Owner(actor);
+  if (!transaction || transaction->owner != &owner || !transaction->jobId)
+    throw std::runtime_error("Job state requires an owning job transaction");
+  const auto saved = state.Save();
+  const auto previous = JobState(actor);
+  const auto old = previous.Save();
+  if (transaction->ledger.contains("jobs") && old == saved)
+    return;
+  const auto id = *transaction->jobId;
+  const QuestJobState::Job* candidate = state.active ? &*state.active
+    : state.completed.empty()                        ? nullptr
+                                                     : &state.completed.back();
+  if (!candidate || candidate->id != id ||
+      state.generation != previous.generation ||
+      state.nextJob !=
+        (previous.active ? previous.nextJob : previous.nextJob + 1) ||
+      candidate->owner != owner.GetChangeForm().formDesc.ToString() ||
+      candidate->actor != actor.GetChangeForm().formDesc.ToString() ||
+      candidate->instance != actor.GetWorldInstance())
+    throw std::runtime_error("Job transaction changed another job identity");
+  if (previous.active) {
+    const auto& prior = *previous.active;
+    if (candidate->id != prior.id ||
+        candidate->generation != prior.generation ||
+        candidate->command != prior.command ||
+        candidate->actor != prior.actor || candidate->owner != prior.owner ||
+        candidate->quest != prior.quest ||
+        candidate->instance != prior.instance ||
+        candidate->contentHash != prior.contentHash ||
+        candidate->stage != prior.stage ||
+        candidate->segment < prior.segment ||
+        candidate->instructions < prior.instructions ||
+        candidate->steps < prior.steps ||
+        (prior.accepted && !candidate->accepted))
+      throw std::runtime_error("Job transaction rewrote immutable work");
+    for (const auto& [token, result] : prior.completions)
+      if (!candidate->completions.contains(token) ||
+          candidate->completions.at(token) != result)
+        throw std::runtime_error("Job transaction rewrote a completion");
+  }
+  auto history = old.at("completed");
+  auto nextHistory = saved.at("completed");
+  if (!state.active) {
+    nextHistory.erase(nextHistory.end() - 1);
+  }
+  if (history != nextHistory)
+    throw std::runtime_error("Job transaction rewrote another job's history");
+  const auto revision = transaction->ledger.at("revision").get<uint64_t>();
+  if (revision == kMaxRevision)
+    throw std::overflow_error("Quest revision exhausted");
+  // Job and heap updates may temporarily disagree inside this transaction;
+  // AtomicImpl validates their complete cross-links before publication.
+  auto ledger = transaction->ledger;
+  ledger["schemaVersion"] = 2;
+  ledger["jobs"] = saved;
+  ledger["revision"] = revision + 1;
+  Validate(ledger, false);
+  transaction->ledger = std::move(ledger);
+}
+
 void QuestJournal::SetScriptState(MpActor& actor, const nlohmann::json& state)
 {
+  RequireJobAccess(actor);
   auto& owner = Owner(actor);
   if (!transaction || transaction->owner != &owner || !state.is_object())
     throw std::runtime_error(
@@ -695,6 +825,7 @@ bool QuestJournal::ReferenceInitialized(MpActor& actor, uint32_t original)
 
 void QuestJournal::MarkReferenceInitialized(MpActor& actor, uint32_t original)
 {
+  RequireJobAccess(actor);
   const auto key = ReferenceKey(actor, original);
   auto& owner = Owner(actor);
   if (!transaction || transaction->owner != &owner)

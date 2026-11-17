@@ -432,6 +432,7 @@ std::vector<uint32_t> CampaignReferenceFactory::EnsureForInstance(
       owner.GetFormId() < 0xff000000 || owner.IsDeleted() || !encounterLevel ||
       encounterLevel > 65535 || originals.size() > 4096)
     throw std::runtime_error("Invalid campaign allocation request");
+  QuestJournal::RequirePersonalJobAccess(owner);
   if (originals.empty())
     return {};
   Allocation allocation(owner, instance, encounterLevel);

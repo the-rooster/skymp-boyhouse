@@ -39,6 +39,7 @@ class ISaveStorage;
 }
 class IScriptStorage;
 class GameModeEvent;
+class QuestJobRunner;
 
 class WorldState
 {
@@ -84,6 +85,7 @@ public:
                       const FormCallbacks& callbacks);
 
   void Tick();
+  QuestJobRunner& GetQuestJobs();
 
   void RequestReloot(MpObjectReference& ref,
                      std::chrono::system_clock::duration time);

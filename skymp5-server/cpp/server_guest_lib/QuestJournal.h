@@ -1,5 +1,6 @@
 #pragma once
 #include "Faction.h"
+#include "QuestJobState.h"
 #include "SaveReceipt.h"
 #include <cstdint>
 #include <functional>
@@ -40,6 +41,14 @@ public:
   // deduplication.
   static std::shared_ptr<const SaveReceipt> AtomicDurable(
     MpActor& actor, const std::function<void()>& execute);
+  static std::shared_ptr<const SaveReceipt> AtomicJob(
+    MpActor& actor, uint64_t jobId, const std::function<void()>& execute);
+  static QuestJobState JobState(MpActor& actor);
+  static void SetJobState(MpActor& actor, const QuestJobState& state);
+  // Only quest/journal mutation is leased; ordinary physical gameplay is not.
+  static void RequireJobAccess(MpActor& actor);
+  // Personal allocation/recovery must not borrow the visited host's lease.
+  static void RequirePersonalJobAccess(MpActor& owner);
   static bool HasActiveTransaction() noexcept;
   static const Inventory& ReadInventory(MpActor& actor,
                                         MpObjectReference& target);
@@ -70,5 +79,6 @@ public:
 
 private:
   static std::shared_ptr<const SaveReceipt> AtomicImpl(
-    MpActor& actor, const std::function<void()>& execute, bool durable);
+    MpActor& actor, const std::function<void()>& execute, bool durable,
+    std::optional<uint64_t> jobId = std::nullopt);
 };

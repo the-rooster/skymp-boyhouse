@@ -5,6 +5,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <sstream>
 
 namespace espm {
@@ -50,6 +51,18 @@ public:
 
   std::map<std::string, FileInfo> GetFilesInfo() const;
 
+  struct FileContentHash
+  {
+    std::string fileName;
+    uint64_t size = 0;
+    std::string sha256;
+  };
+  // Ordered complete-master hashes, computed once from the loaded buffers.
+  // Source content must remain immutable for this Loader's lifetime. The
+  // returned storage lives with the Loader and concurrent initialization is
+  // synchronized; failed initialization may safely be retried.
+  const std::vector<FileContentHash>& GetContentHashes() const;
+
 private:
   std::vector<fs::path> MakeFilePaths(const fs::path& dataDir,
                                       const std::vector<fs::path>& fileNames);
@@ -72,6 +85,8 @@ private:
   std::unique_ptr<CombineBrowser> combineBrowser;
   std::vector<fs::path> filePaths;
   BufferType bufferType;
+  mutable std::once_flag contentHashesOnce;
+  mutable std::vector<FileContentHash> contentHashes;
 };
 
 template <class EspmProvider>

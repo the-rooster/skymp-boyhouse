@@ -11,3 +11,5 @@ apply_default_settings(TARGETS espm)
 add_library(libespm ALIAS espm)
 
 target_link_libraries(espm PUBLIC viet)
+find_package(unofficial-sodium CONFIG REQUIRED)
+target_link_libraries(espm PRIVATE unofficial-sodium::sodium)

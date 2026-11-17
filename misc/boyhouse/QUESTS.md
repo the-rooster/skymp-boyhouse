@@ -78,12 +78,60 @@ Ordinary strict-mode promises remain rejected. The host is responsible for
 rebinding stack policy and committing token consumption, resumed effects and any
 replacement frame in one campaign transaction.
 
-The production quest runner does not yet use these entry points. No Utility.Wait,
-Start/Stop/Reset, latent fragment or event is enabled by this change. Persistent
-stage/log completion cursors, event delivery, lifecycle ordering and integration
-with durable storage receipts are still required. Destroying and rebuilding a VM
-from saved JSON proves frame recovery; it does not prove crash-durable quest
-execution or exactly-once external delivery. See [STORAGE.md](STORAGE.md).
+The existing `ExecuteStage` API remains synchronous. The experimental durable
+coordinator below uses these entry points, but no production Utility.Wait,
+Start/Stop/Reset or latent event is enabled. Lifecycle ordering and real native
+operation delivery remain unfinished. See [STORAGE.md](STORAGE.md).
+
+### Durable stage work
+
+`world.GetQuestJobs()` exposes a trusted C++ `QuestJobRunner`. `Submit` accepts a
+campaign actor, unique command string, quest and stage; `Inspect` reports that
+command's status. `Resume` accepts its pending token and completion. These APIs
+are not client packets or addon bindings. The explicit metadata/script overloads
+are fixtures: only they register `FixtureAwait.AwaitBool`, with a bounded string
+key and Boolean result. The ordinary overload pins owned content and registers
+no replacement for a missing Skyrim native.
+
+Every segment creates a fresh isolated VM inside `AtomicJob`, saves script
+fields, shared arrays, complete caller stacks, the selected log/fragment and
+pending inventory events, then seals an exact durable save receipt. A resumed
+log does not repeat its condition, QSDT completion or earlier fragment effects.
+The next operation token and cumulative instruction/work budgets survive reload.
+Inventory handlers remain synchronous and drain after the stage finishes; a
+latent handler or nested native-to-script wait still fails explicitly.
+
+Private journal schema 2 adds validated job state; ordinary untouched journals
+remain schema 1. Public snapshots explicitly project the existing schema-1
+progress/context fields, excluding jobs, operation tokens and the VM. Job and
+stack ownership, outer fragment binding, content signatures and budgets are
+validated together at commit. Failed resumed execution keeps the last saved
+checkpoint and effects intact. There is no automatic retry of script execution.
+
+`Pending` exposes no operation token or final result. `Waiting` and `Completed`
+are visible only after the matching receipt becomes durable. After a fresh
+server loads persisted jobs, their saved state replaces process-local receipts.
+Duplicate commands/completions report existing work; conflicting values fail.
+Operation tokens are campaign-scoped; a future external dispatcher must include
+the owning campaign in its delivery/deduplication identity.
+Clearing a world stops its coordinator: recovery requires a fresh server after
+the previous writer has shut down, rather than reusing abandoned write state.
+
+The signature covers ordered complete-master SHA256 values, plugin mapping,
+raw quest fields, supplied VMAD metadata and executable script hashes. Production
+scripts are pinned once per coordinator; master hashes are cached per immutable
+loader. Master files must not change while loaded. Changed content is refused,
+not migrated. The initial full script parse/hash is not yet a performance-tested
+startup path.
+
+One job owns a campaign at a time. Ordinary quest mutation and private-reference
+allocation cannot overwrite active work, including a character's personal
+history while visiting another host. This does not provide a global gameplay
+lease over every physical action between segments. Completed history currently
+has a hard 256-command limit with no eviction; new work is refused at capacity
+to avoid replaying old rewards. Scalable deduplication retention, real external
+operation delivery, child-stage scheduling, latent event cursors, lifecycle
+semantics and real-client playthroughs remain required for full quest support.
 
 ### Repeatable stages and lifecycle metadata
 
@@ -295,7 +343,7 @@ parents, container UI and other spatial effects are outside this transaction;
 they still need campaign-specific integration. Movement is also outside the
 script transaction. Automatic alias fills, remaining natives and latent handlers
 remain restricted. Controlled script tests do not certify any vanilla quest or
-establish throughput for 16â€“32 players.
+establish throughput for 16Ã¢â‚¬â€œ32 players.
 
 ### Creating private reference copies
 
@@ -349,7 +397,7 @@ location playable. Automatic entry, engine-side transition application, cross-ar
 enable-parent change propagation, scale/ownership/lock overlays, NPC auto-calculated
 stats, respawns and durable lifecycle delivery remain unfinished. The factory
 currently copies the relevant world indexes during a batch; this needs measurement
-and optimization before a 16â€“32 player rollout. Requests are bounded to 4,096
+and optimization before a 16Ã¢â‚¬â€œ32 player rollout. Requests are bounded to 4,096
 references, a radius of 65,536 units, and a 100,000-entry/8 MiB owner ledger;
 streaming and ledger partitioning are required for a full world.
 
@@ -691,3 +739,17 @@ No Skyrim launch, client installation change or staging deployment was performed
 An initial JavaScript run terminated one test process with SIGSEGV; its 36 cases
 passed in isolation and the full JavaScript suite passed on rerun without a
 source change. That process crash was not reproduced or diagnosed.
+
+The durable-stage-job batch passed the Linux server build and full verification
+on 2026-11-17 UTC: 677 native cases / 452,979 assertions, 368 JavaScript
+tests, 47 Python tests, addon and both protocol smokes, and SQLite recovery of
+32 characters. The 28 focused cases (420 assertions) cover strict job/heap
+validation, content changes, cumulative budgets, two nested waits with shared
+arrays, saved log decisions, exact failed-save retries, duplicate commands and
+completions, failed-resume rollback, synchronous inventory-event stage calls,
+and fresh-server recovery at each wait and completion. MQ101/MQ102/DA04 metadata
+with generated fragments exercises the shared runner; these are not quest
+playthroughs. The owned scan remains at 2,274 quests, 14,026 PEX objects, 642
+capabilities, 1,146 quests with runtime dispatch, no parse failures and zero
+certified playable quests. The registry guards 145 sources. No Skyrim launch,
+client installation change or staging deployment was performed.

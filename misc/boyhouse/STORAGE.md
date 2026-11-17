@@ -83,8 +83,9 @@ settings explicitly choose SQLite. Initialization never replaces existing settin
   effects and the next checkpoint together, and wait for storage acknowledgement
   before acknowledging durable delivery. JSON/fresh-VM recovery tests do not
   establish that crash boundary. Production stage/event execution remains
-  synchronous until its work cursors, lifecycle jobs and receipt-gated delivery
-  are also persistent.
+  synchronous through its existing API. The experimental `QuestJobRunner`
+  persists stage/log work and gates its wait/result observations on receipts;
+  real latent natives, event cursors and lifecycle jobs remain unfinished.
 - Change forms now store maximum attributes and regeneration values as well as
   percentages. Legacy saves without the optional `actorValues` object retain
   the previous default attributes; missing members in a present object are an
