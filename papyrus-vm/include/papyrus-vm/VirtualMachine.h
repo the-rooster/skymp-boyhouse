@@ -109,6 +109,21 @@ public:
   void SendEvent(ActivePexInstance* instance, const char* eventName,
                  const std::vector<VarValue>& arguments);
 
+  struct EventHandlerSelection
+  {
+    std::shared_ptr<ActivePexInstance> root, implementation;
+    // The selected implementation's state, empty when using its fallback.
+    // The attached root remains distinct from an inherited implementation.
+    std::string state, function;
+    FunctionInfo body;
+  };
+  std::vector<std::shared_ptr<ActivePexInstance>> GetEventAttachments(
+    const std::shared_ptr<IGameObject>& self) const;
+  // Strict selection only; does not invoke the handler. Select each attachment
+  // when its turn begins, then retain this identity across any suspension.
+  std::optional<EventHandlerSelection> SelectEventHandler(
+    const std::shared_ptr<ActivePexInstance>& root, const char* eventName);
+
   // Campaign transactions share one stack context/budget and must complete
   // every handler synchronously before publishing any external effect.
   void SendEventSynchronous(std::shared_ptr<IGameObject> self,

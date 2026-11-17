@@ -61,7 +61,7 @@ QuestJobState Done(QuestJobState state)
   job.awaitKind.clear();
   job.timer.reset();
   job.failure.clear();
-  job.events.clear();
+  job.eventHead = static_cast<uint32_t>(job.events.size());
   state.active.reset();
   state.completed.push_back(job);
   return state;
@@ -73,14 +73,18 @@ Json Heap(const QuestJobState::Job& job,
 {
   const auto& stage =
     selected ? *selected : static_cast<const QuestJobState::Stage&>(job);
+  const auto* identity =
+    stage.handlerIdentity ? &*stage.handlerIdentity : nullptr;
   Json frame = {
     { "schemaVersion", 2 },
     { "scope", job.Scope(stage) },
-    { "receiver", { { "type", 0 }, { "value", stage.quest } } },
+    { "receiver",
+      { { "type", 0 },
+        { "value", identity ? identity->receiver : Json(stage.quest) } } },
     { "kind", "method" },
-    { "rootScript", stage.script },
+    { "rootScript", identity ? identity->rootScript : stage.script },
     { "script", stage.script },
-    { "state", "" },
+    { "state", identity ? identity->state : "" },
     { "function", stage.function },
     { "contentHashes",
       Json::array(
@@ -165,16 +169,25 @@ Json Legacy(const QuestJobState& state, uint64_t version = 1)
   auto saved = state.Save();
   saved["schemaVersion"] = version;
   auto strip = [version](Json& job) {
-    job.erase("automatic");
-    job.erase("contentMode");
-    job.erase("awaitKind");
-    job.erase("timer");
-    for (auto& child : job["children"]) {
-      child.erase("awaitKind");
-      child.erase("timer");
+    for (const char* field : { "handlerIdentity", "eventHead", "nextHandler",
+                               "dispatch", "handler" })
+      job.erase(field);
+    for (auto& child : job["children"])
+      child.erase("handlerIdentity");
+    if (job["cursor"] == "done")
+      job["events"] = Json::array();
+    if (version < 3) {
+      job.erase("automatic");
+      job.erase("contentMode");
+      job.erase("awaitKind");
+      job.erase("timer");
+      for (auto& child : job["children"]) {
+        child.erase("awaitKind");
+        child.erase("timer");
+      }
+      for (auto& completion : job["completions"])
+        completion = completion.at("value").get<bool>();
     }
-    for (auto& completion : job["completions"])
-      completion = completion.at("value").get<bool>();
     if (version == 1)
       for (const char* field :
            { "node", "child", "children", "nextOperation" })
@@ -187,12 +200,16 @@ Json Legacy(const QuestJobState& state, uint64_t version = 1)
   return saved;
 }
 
-QuestJobState MigratedLegacy(QuestJobState state)
+QuestJobState MigratedLegacy(QuestJobState state, uint64_t version = 1)
 {
-  if (state.active)
+  if (state.active && version < 3)
     state.active->contentMode = "legacy";
-  for (auto& job : state.completed)
-    job.contentMode = "legacy";
+  for (auto& job : state.completed) {
+    if (version < 3)
+      job.contentMode = "legacy";
+    job.events.clear();
+    job.eventHead = 0;
+  }
   return state;
 }
 
@@ -204,6 +221,100 @@ QuestJobState TimerWaiting()
   state.active->timer =
     QuestJobState::Timer{ 1700000000000, 1700000000100, 100 };
   return state;
+}
+
+QuestJobState BodyDone()
+{
+  auto state = Begin();
+  auto& job = *state.active;
+  job.cursor = "done";
+  job.accepted = true;
+  job.segment = job.steps = job.instructions = 1;
+  job.events.push_back({ "14:Skyrim.esm", "f:Skyrim.esm", "", 2, true });
+  return state;
+}
+
+void HostStep(QuestJobState::Job& job, uint32_t instructions = 0)
+{
+  ++job.segment;
+  ++job.steps;
+  job.instructions += instructions;
+}
+
+QuestJobState Dispatching(bool captured = false)
+{
+  auto state = BodyDone();
+  auto& job = *state.active;
+  job.dispatch = QuestJobState::Dispatch{};
+  job.dispatch->recipients = { job.events.front().target };
+  HostStep(job, 1);
+  if (captured) {
+    job.dispatch->captured = true;
+    job.dispatch->roots = { "ChildScript" };
+    job.dispatch->templates = { "7:Skyrim.esm" };
+    job.dispatch->reference = "3000";
+    HostStep(job);
+  }
+  return state;
+}
+
+QuestJobState SelectedHandler(bool waiting = false, bool alias = false)
+{
+  auto state = Dispatching(true);
+  auto& job = *state.active;
+  auto& dispatch = *job.dispatch;
+  if (alias) {
+    dispatch.recipients.push_back(Json{
+      { "kind", "alias" }, { "quest", job.quest }, { "id", 2147483647 } });
+    dispatch.recipient = 1;
+    dispatch.templates.clear();
+    dispatch.reference.clear();
+  }
+  QuestJobState::Stage handler;
+  handler.quest = job.quest;
+  handler.contentHash = job.contentHash;
+  handler.stage = job.stage;
+  handler.handlerIdentity =
+    QuestJobState::HandlerIdentity{ dispatch.recipients[dispatch.recipient],
+                                    "ChildScript",
+                                    "ParentScript",
+                                    "busy",
+                                    "OnItemAdded",
+                                    job.nextHandler++ };
+  job.handler = handler;
+  HostStep(job, 1);
+  if (waiting) {
+    auto& work = *job.handler;
+    work.cursor = "waiting";
+    work.accepted = true;
+    work.script = "ParentScript";
+    work.function = "OnItemAdded";
+    work.token = job.NextToken();
+    ++job.nextOperation;
+    work.awaitKind = "bool";
+    work.awaitKey = "fixture";
+    HostStep(job, 2);
+  }
+  return state;
+}
+
+Json DispatchHeap(const QuestJobState::Job& job)
+{
+  auto heap = Heap(*Waiting().active);
+  heap["continuations"].clear();
+  const auto add = [&](const QuestJobState::Stage& stage) {
+    if (stage.cursor != "waiting")
+      return;
+    const auto saved =
+      Heap(job, &stage, &stage == &job.Current() ? job.instructions : 1);
+    heap["continuations"].update(saved["continuations"]);
+  };
+  add(job);
+  if (job.handler)
+    add(*job.handler);
+  for (const auto& child : job.children)
+    add(child);
+  return heap;
 }
 
 struct JobStorage
@@ -293,7 +404,7 @@ TEST_CASE("Quest jobs reject corrupt exact fields identities and cursor state",
   std::vector<std::function<void(Json&)>> corrupt = {
     [](Json& v) { v["unknown"] = 1; },
     [](Json& v) { v.erase("active"); },
-    [](Json& v) { v["schemaVersion"] = 4; },
+    [](Json& v) { v["schemaVersion"] = 5; },
     [](Json& v) { v["generation"] = 0; },
     [](Json& v) { v["nextJob"] = 1; },
     [](Json& v) { v["nextJob"] = UINT64_MAX; },
@@ -517,7 +628,8 @@ TEST_CASE("Owning jobs permit intermediate cursor heap changes but commit "
 {
   Fixture f;
   f.Start();
-  const auto waiting = Waiting();
+  auto waiting = Waiting();
+  waiting.active->events.clear();
   const auto before = f.Saved();
   REQUIRE_THROWS(QuestJournal::AtomicJob(
     *f.actor, 1, [&] { QuestJournal::SetJobState(*f.actor, waiting); }));
@@ -614,7 +726,7 @@ TEST_CASE(
     const auto legacy = Legacy(state);
     const auto migrated = QuestJobState::Read(legacy);
     REQUIRE(migrated.Save() == MigratedLegacy(state).Save());
-    REQUIRE(migrated.Save()["schemaVersion"] == 3);
+    REQUIRE(migrated.Save()["schemaVersion"] == 4);
   }
   auto external = Waiting();
   external.active->awaitKey = "quest-stage";
@@ -988,7 +1100,7 @@ TEST_CASE("Timer jobs round trip UTC deadlines and typed None completions",
   for (const auto& value : { state, Done(state) })
     REQUIRE(QuestJobState::Read(value.Save()).Save() == value.Save());
   const auto saved = state.Save();
-  REQUIRE(saved["schemaVersion"] == 3);
+  REQUIRE(saved["schemaVersion"] == 4);
   REQUIRE(saved["active"]["timer"]["policy"] == "utc-deadline-v1");
   const auto done = Done(state);
   const auto& job = done.completed.front();
@@ -1100,7 +1212,8 @@ TEST_CASE("Journal consumes timer waits only with typed None results",
 {
   Fixture f;
   f.Start();
-  const auto waiting = TimerWaiting();
+  auto waiting = TimerWaiting();
+  waiting.active->events.clear();
   QuestJournal::AtomicJob(*f.actor, 1, [&] {
     QuestJournal::SetScriptState(*f.actor, Heap(*waiting.active));
     QuestJournal::SetJobState(*f.actor, waiting);
@@ -1175,6 +1288,7 @@ TEST_CASE("Journal rejects None for Boolean waits and child-stage results",
   SECTION("external Boolean")
   {
     waiting = Waiting();
+    waiting.active->events.clear();
     QuestJournal::AtomicJob(*f.actor, 1, [&] {
       QuestJournal::SetScriptState(*f.actor, Heap(*waiting.active));
       QuestJournal::SetJobState(*f.actor, waiting);
@@ -1183,6 +1297,7 @@ TEST_CASE("Journal rejects None for Boolean waits and child-stage results",
   SECTION("child stage")
   {
     waiting = Nested();
+    waiting.active->events.clear();
     QuestJournal::AtomicJob(*f.actor, 1, [&] {
       QuestJournal::SetScriptState(*f.actor, NestedHeap(*waiting.active));
       QuestJournal::SetJobState(*f.actor, waiting);
@@ -1228,4 +1343,341 @@ TEST_CASE(
     state.active->contentMode = invalid;
     REQUIRE_THROWS(state.Save());
   }
+}
+
+TEST_CASE("Saved event dispatch keeps the completed quest body active",
+          "[Quest][QuestJob]")
+{
+  for (const auto& state :
+       { BodyDone(), Dispatching(), Dispatching(true), SelectedHandler(),
+         SelectedHandler(true), SelectedHandler(true, true) }) {
+    const auto& job = *state.active;
+    REQUIRE(job.cursor == "done");
+    REQUIRE_FALSE(job.IsComplete());
+    REQUIRE(QuestJobState::Read(state.Save()).Save() == state.Save());
+    REQUIRE_NOTHROW(state.ValidateHeap(DispatchHeap(job)));
+  }
+  const auto state = SelectedHandler();
+  REQUIRE(&state.active->Current() == &*state.active->handler);
+  REQUIRE(state.active->Scope(*state.active->handler) ==
+          "quest-job:1:1:handler:1");
+  REQUIRE(state.active->NextToken() == "quest-job:1:1:1");
+}
+
+TEST_CASE(
+  "Schema three jobs migrate without changing pending native identities",
+  "[Quest][QuestJob]")
+{
+  for (const auto& state :
+       { Begin(), Waiting(), TimerWaiting(), Nested(true), Done(Waiting()) }) {
+    const auto migrated = QuestJobState::Read(Legacy(state, 3));
+    REQUIRE(migrated.Save() == MigratedLegacy(state, 3).Save());
+    const auto& job =
+      migrated.active ? *migrated.active : migrated.completed.back();
+    REQUIRE_FALSE(job.handler);
+    REQUIRE_FALSE(job.dispatch);
+    REQUIRE(job.eventHead == 0);
+    REQUIRE(job.nextHandler == 1);
+  }
+  auto legacy = Legacy(Waiting(), 3);
+  legacy["active"]["handlerIdentity"] = nullptr;
+  REQUIRE_THROWS(QuestJobState::Read(legacy));
+}
+
+TEST_CASE(
+  "Dispatch codecs reject forged membership bindings and handler identities",
+  "[Quest][QuestJob]")
+{
+  const auto original = SelectedHandler(true).Save();
+  const std::vector<std::function<void(Json&)>> corrupt = {
+    [](Json& v) { v["active"]["dispatch"]["recipients"] = Json::array(); },
+    [](Json& v) {
+      v["active"]["dispatch"]["recipients"][0] = "15:Skyrim.esm";
+    },
+    [](Json& v) {
+      v["active"]["dispatch"]["recipients"].push_back("15:Skyrim.esm");
+    },
+    [](Json& v) {
+      v["active"]["dispatch"]["recipients"].push_back("14:Skyrim.esm");
+    },
+    [](Json& v) { v["active"]["dispatch"]["recipient"] = 1; },
+    [](Json& v) { v["active"]["dispatch"]["attachment"] = 1; },
+    [](Json& v) { v["active"]["dispatch"]["captured"] = false; },
+    [](Json& v) { v["active"]["dispatch"]["reference"] = "14:Skyrim.esm"; },
+    [](Json& v) { v["active"]["dispatch"]["reference"] = ""; },
+    [](Json& v) { v["active"]["dispatch"]["templates"][0] = "3000"; },
+    [](Json& v) { v["active"]["dispatch"]["roots"].push_back("childscript"); },
+    [](Json& v) { v["active"]["dispatch"]["unknown"] = true; },
+    [](Json& v) { v["active"]["eventHead"] = 1; },
+    [](Json& v) { v["active"]["nextHandler"] = 1; },
+    [](Json& v) { v["active"]["nextHandler"] = 4098; },
+    [](Json& v) { v["active"]["handler"]["node"] = 1; },
+    [](Json& v) { v["active"]["handler"]["quest"] = "2aa57:Skyrim.esm"; },
+    [](Json& v) { v["active"]["handler"]["handlerIdentity"] = nullptr; },
+    [](Json& v) {
+      v["active"]["handler"]["handlerIdentity"]["rootScript"] = "Other";
+    },
+    [](Json& v) { v["active"]["handler"]["handlerIdentity"]["sequence"] = 2; },
+    [](Json& v) {
+      v["active"]["handler"]["handlerIdentity"]["receiver"] = "3000";
+    },
+    [](Json& v) {
+      v["active"]["handler"]["handlerIdentity"]["function"] = "OnItemRemoved";
+    },
+    [](Json& v) { v["active"]["handler"]["script"] = "Other"; },
+    [](Json& v) {
+      v["active"]["handlerIdentity"] =
+        v["active"]["handler"]["handlerIdentity"];
+    }
+  };
+  for (size_t index = 0; index < corrupt.size(); ++index) {
+    INFO("Dispatch corruption " << index);
+    auto value = original;
+    corrupt[index](value);
+    REQUIRE_THROWS(QuestJobState::Read(value));
+  }
+  auto alias = SelectedHandler(true, true).Save();
+  alias["active"]["dispatch"]["reference"] = "3000";
+  REQUIRE_THROWS(QuestJobState::Read(alias));
+  alias = SelectedHandler(true, true).Save();
+  alias["active"]["dispatch"]["recipients"][1]["id"] = 2147483648ULL;
+  REQUIRE_THROWS(QuestJobState::Read(alias));
+}
+
+TEST_CASE(
+  "Handler continuations pin inherited implementation state and receiver",
+  "[Quest][QuestJob]")
+{
+  const auto state = SelectedHandler(true, true);
+  const auto& job = *state.active;
+  auto heap = DispatchHeap(job);
+  REQUIRE_NOTHROW(state.ValidateHeap(heap));
+  auto& frame = heap["continuations"][job.handler->token];
+  SECTION("wrong scope")
+  {
+    frame["scope"] = job.Scope();
+  }
+  SECTION("wrong attachment")
+  {
+    frame["rootScript"] = "ParentScript";
+  }
+  SECTION("wrong implementation")
+  {
+    frame["script"] = "ChildScript";
+  }
+  SECTION("wrong state")
+  {
+    frame["state"] = "";
+  }
+  SECTION("wrong event")
+  {
+    frame["function"] = "OnItemRemoved";
+  }
+  SECTION("wrong receiver")
+  {
+    frame["receiver"]["value"] = "14:Skyrim.esm";
+  }
+  REQUIRE_THROWS(state.ValidateHeap(heap));
+}
+
+TEST_CASE(
+  "Handlers parent native child stages without sharing host scope identities",
+  "[Quest][QuestJob]")
+{
+  auto state = SelectedHandler(true);
+  auto& job = *state.active;
+  job.handler->child = 1;
+  job.handler->awaitKind = "stage";
+  job.handler->awaitKey = "quest-stage";
+  auto child = Nested().active->children.front();
+  job.children.push_back(child);
+  REQUIRE_NOTHROW(state.Save());
+  REQUIRE_NOTHROW(state.ValidateHeap(DispatchHeap(job)));
+  REQUIRE(&job.Current() == &job.children.back());
+  REQUIRE(job.Scope(*job.handler) == "quest-job:1:1:handler:1");
+  REQUIRE(job.Scope(job.Current()) == "quest-job:1:1:node:1");
+  auto invalid = state;
+  invalid.active->children.back().handlerIdentity =
+    job.handler->handlerIdentity;
+  REQUIRE_THROWS(invalid.Save());
+  invalid = state;
+  invalid.active->handler.reset();
+  REQUIRE_THROWS(invalid.Save());
+}
+
+TEST_CASE(
+  "Journal saves each event delivery boundary and retains its payload audit",
+  "[Quest][QuestJob]")
+{
+  Fixture f;
+  f.Start();
+  const auto publish = [&](const QuestJobState& state) {
+    QuestJournal::AtomicJob(*f.actor, 1, [&] {
+      QuestJournal::SetJobState(*f.actor, state);
+      QuestJournal::SetScriptState(
+        *f.actor, state.active ? DispatchHeap(*state.active) : Json::object());
+    });
+  };
+  auto state = BodyDone();
+  REQUIRE_NOTHROW(publish(state));
+  state = Dispatching();
+  REQUIRE_NOTHROW(publish(state));
+  state = Dispatching(true);
+  REQUIRE_NOTHROW(publish(state));
+  SECTION("selected handler executes and suspends")
+  {
+    state = SelectedHandler();
+    REQUIRE_NOTHROW(publish(state));
+    state = SelectedHandler(true);
+    REQUIRE_NOTHROW(publish(state));
+    auto& job = *state.active;
+    job.completions[job.handler->token] = true;
+    auto complete = *SelectedHandler().active->handler;
+    complete.cursor = "done";
+    complete.accepted = true;
+    job.handler = complete;
+    HostStep(job, 1);
+    REQUIRE_NOTHROW(publish(state));
+    job.handler.reset();
+    ++job.dispatch->attachment;
+    HostStep(job);
+    REQUIRE_NOTHROW(publish(state));
+  }
+  SECTION("absent handler advances exactly one attachment")
+  {
+    ++state.active->dispatch->attachment;
+    HostStep(*state.active, 1);
+    REQUIRE_NOTHROW(publish(state));
+  }
+  auto& job = *state.active;
+  ++job.dispatch->recipient;
+  job.dispatch->attachment = 0;
+  job.dispatch->captured = false;
+  job.dispatch->roots.clear();
+  job.dispatch->templates.clear();
+  job.dispatch->reference.clear();
+  HostStep(job);
+  REQUIRE_NOTHROW(publish(state));
+  job.dispatch.reset();
+  ++job.eventHead;
+  HostStep(job);
+  REQUIRE(job.IsComplete());
+  state.completed.push_back(job);
+  state.active.reset();
+  REQUIRE_NOTHROW(publish(state));
+  const auto saved = QuestJournal::JobState(*f.actor);
+  REQUIRE(saved.completed.front().events.size() == 1);
+  REQUIRE(saved.completed.front().eventHead == 1);
+  REQUIRE(saved.Save() == state.Save());
+}
+
+TEST_CASE(
+  "Journal refuses event payload roster binding and selected-handler rewrites",
+  "[Quest][QuestJob]")
+{
+  Fixture f;
+  f.Start();
+  const auto publish = [&](const QuestJobState& state) {
+    QuestJournal::AtomicJob(*f.actor, 1, [&] {
+      QuestJournal::SetJobState(*f.actor, state);
+      QuestJournal::SetScriptState(*f.actor, DispatchHeap(*state.active));
+    });
+  };
+  for (const auto& state : { BodyDone(), Dispatching(), Dispatching(true),
+                             SelectedHandler(), SelectedHandler(true) })
+    publish(state);
+  const auto before = f.Saved();
+  auto state = SelectedHandler(true);
+  auto& job = *state.active;
+  SECTION("payload count")
+  {
+    ++job.events.front().count;
+  }
+  SECTION("physical reference")
+  {
+    job.dispatch->reference = "3001";
+  }
+  SECTION("template chain")
+  {
+    job.dispatch->templates.push_back("8:Skyrim.esm");
+  }
+  SECTION("recipient membership")
+  {
+    job.dispatch->recipients.push_back(
+      Json{ { "kind", "alias" }, { "quest", job.quest }, { "id", 1 } });
+  }
+  SECTION("selected state")
+  {
+    job.handler->handlerIdentity->state = "other";
+  }
+  SECTION("implementation")
+  {
+    job.handler->handlerIdentity->implementation = "Other";
+    job.handler->script = "Other";
+  }
+  SECTION("root context")
+  {
+    ++job.stage;
+    ++job.handler->stage;
+  }
+  REQUIRE_NOTHROW(state.Save());
+  REQUIRE_THROWS(publish(state));
+  REQUIRE(f.Saved() == before);
+}
+
+TEST_CASE("Journal disallows skipping event host saves or installing advanced "
+          "new work",
+          "[Quest][QuestJob]")
+{
+  Fixture f;
+  REQUIRE_THROWS(QuestJournal::AtomicJob(
+    *f.actor, 1, [&] { QuestJournal::SetJobState(*f.actor, BodyDone()); }));
+  f.Start();
+  QuestJournal::AtomicJob(
+    *f.actor, 1, [&] { QuestJournal::SetJobState(*f.actor, BodyDone()); });
+  const auto before = f.Saved();
+  SECTION("snapshot and capture combined")
+  {
+    REQUIRE_THROWS(QuestJournal::AtomicJob(*f.actor, 1, [&] {
+      QuestJournal::SetJobState(*f.actor, Dispatching(true));
+    }));
+  }
+  SECTION("two host transitions in one transaction")
+  {
+    REQUIRE_THROWS(QuestJournal::AtomicJob(*f.actor, 1, [&] {
+      QuestJournal::SetJobState(*f.actor, Dispatching());
+      QuestJournal::SetJobState(*f.actor, Dispatching(true));
+    }));
+  }
+  SECTION("snapshot omitted shared instruction accounting")
+  {
+    auto state = Dispatching();
+    --state.active->instructions;
+    REQUIRE_THROWS(QuestJournal::AtomicJob(
+      *f.actor, 1, [&] { QuestJournal::SetJobState(*f.actor, state); }));
+  }
+  REQUIRE(f.Saved() == before);
+}
+
+TEST_CASE(
+  "Consumed event history remains bounded and cannot become pending again",
+  "[Quest][QuestJob]")
+{
+  auto state = Done(Waiting());
+  auto& job = state.completed.front();
+  REQUIRE(job.IsComplete());
+  REQUIRE(job.events.size() == job.eventHead);
+  job.events.resize(QuestJobState::MaxEvents + 1);
+  job.eventHead = static_cast<uint32_t>(job.events.size());
+  REQUIRE_THROWS(state.Save());
+  state = Done(Waiting());
+  --state.completed.front().eventHead;
+  REQUIRE_THROWS(state.Save());
+  auto active = SelectedHandler();
+  active.active->dispatch->roots.resize(QuestJobState::MaxAttachments + 1,
+                                        "Root");
+  REQUIRE_THROWS(active.Save());
+  active = SelectedHandler();
+  active.active->segment = QuestJobState::MaxSegments + 1;
+  REQUIRE_THROWS(active.Save());
 }

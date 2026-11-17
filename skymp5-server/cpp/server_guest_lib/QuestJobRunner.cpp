@@ -418,7 +418,7 @@ QuestJobRunner::Result QuestJobRunner::Inspect(MpActor& actor,
                : scheduledJob->second.error };
   if (!current.failure.empty())
     return { Status::Failed, job->id, false, {}, {}, current.failure };
-  if (job->cursor == "done")
+  if (job->IsComplete())
     return { Status::Completed, job->id, job->accepted };
   if (current.cursor == "waiting" && current.awaitKind == "timer")
     return { TimerReady(actor, *job) ? Status::Ready : Status::Sleeping,
@@ -642,7 +642,9 @@ QuestJobRunner::Result QuestJobRunner::AdvanceWithContent(
   const bool consumeChild = current.node && current.cursor == "done";
   const bool timer =
     current.cursor == "waiting" && current.awaitKind == "timer";
-  if (current.cursor != "begin" && !consumeChild && !timer)
+  const bool hostWork = jobs.active->cursor == "done" &&
+    jobs.active->children.empty() && current.cursor == "done";
+  if (current.cursor != "begin" && !consumeChild && !timer && !hostWork)
     throw std::runtime_error("Quest job has no internal work ready");
   return RunSegment(actor, std::move(jobs), sources, overrides, hashManifest,
                     timer ? std::optional(QuestJobState::Completion::None())
@@ -700,7 +702,7 @@ QuestJobRunner::Result QuestJobRunner::RunSegment(
         fixtureAwait, overrides, hashManifest, [this] { return Now(); },
         &timerAnchor);
       ++job.segment;
-      if (job.cursor == "done") {
+      if (job.IsComplete()) {
         jobs.completed.push_back(job);
         jobs.active.reset();
       }

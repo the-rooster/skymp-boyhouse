@@ -45,6 +45,110 @@ struct Transaction
 };
 thread_local Transaction* transaction = nullptr;
 
+// Host dispatch advances one saved boundary without executing script work.
+// The native child-stack rules below govern root/handler body execution.
+bool ValidateDispatchTransition(const QuestJobState::Job& prior,
+                                const QuestJobState::Job& next)
+{
+  using Stage = QuestJobState::Stage;
+  if (next.events.size() < prior.events.size() ||
+      !std::equal(prior.events.begin(), prior.events.end(),
+                  next.events.begin()))
+    throw std::runtime_error(
+      "Job transaction rewrote inventory event history");
+  const bool host = prior.cursor == "done" &&
+    (!prior.handler || prior.handler->cursor == "done");
+  if (!host) {
+    if (next.eventHead != prior.eventHead ||
+        next.nextHandler != prior.nextHandler ||
+        next.dispatch != prior.dispatch ||
+        next.handler.has_value() != prior.handler.has_value() ||
+        (prior.handler &&
+         (static_cast<const Stage&>(prior) !=
+            static_cast<const Stage&>(next) ||
+          next.handler->handlerIdentity != prior.handler->handlerIdentity)))
+      throw std::runtime_error("Job body rewrote event dispatch state");
+    return false;
+  }
+  if (static_cast<const Stage&>(prior) != static_cast<const Stage&>(next) ||
+      next.events != prior.events || !prior.children.empty() ||
+      !next.children.empty() || next.nextOperation != prior.nextOperation ||
+      next.completions != prior.completions ||
+      next.instructions < prior.instructions ||
+      next.steps != prior.steps + 1 || next.segment != prior.segment + 1)
+    throw std::runtime_error(
+      "Event dispatch crossed a script execution boundary");
+  const auto instructions = next.instructions - prior.instructions;
+  if (prior.handler) {
+    auto expected = *prior.dispatch;
+    ++expected.attachment;
+    if (instructions || next.handler || next.dispatch != expected ||
+        next.eventHead != prior.eventHead ||
+        next.nextHandler != prior.nextHandler)
+      throw std::runtime_error(
+        "Job transaction did not retire exactly one completed handler");
+    return true;
+  }
+  if (!prior.dispatch) {
+    if (instructions != 1 || !next.dispatch || next.dispatch->captured ||
+        next.dispatch->recipient || next.handler ||
+        next.eventHead != prior.eventHead ||
+        next.nextHandler != prior.nextHandler)
+      throw std::runtime_error(
+        "Job transaction skipped event recipient snapshot");
+    return true;
+  }
+  const auto& dispatch = *prior.dispatch;
+  if (!dispatch.captured && dispatch.recipient == dispatch.recipients.size()) {
+    if (instructions || next.dispatch || next.handler ||
+        next.eventHead != prior.eventHead + 1 ||
+        next.nextHandler != prior.nextHandler)
+      throw std::runtime_error(
+        "Job transaction did not retire exactly one inventory event");
+    return true;
+  }
+  if (!next.dispatch || next.eventHead != prior.eventHead ||
+      next.dispatch->recipients != dispatch.recipients)
+    throw std::runtime_error(
+      "Job transaction rewrote event recipient membership");
+  if (!dispatch.captured) {
+    if (instructions || !next.dispatch->captured ||
+        next.dispatch->recipient != dispatch.recipient ||
+        next.dispatch->attachment || next.handler ||
+        next.nextHandler != prior.nextHandler)
+      throw std::runtime_error(
+        "Job transaction skipped recipient attachment capture");
+    return true;
+  }
+  auto expected = dispatch;
+  if (dispatch.attachment == dispatch.roots.size()) {
+    ++expected.recipient;
+    expected.attachment = 0;
+    expected.captured = false;
+    expected.roots.clear();
+    expected.templates.clear();
+    expected.reference.clear();
+    if (instructions || next.handler || next.dispatch != expected ||
+        next.nextHandler != prior.nextHandler)
+      throw std::runtime_error(
+        "Job transaction did not retire exactly one recipient");
+  } else if (next.handler) {
+    if (!instructions || instructions > 128 || next.dispatch != dispatch ||
+        next.nextHandler != prior.nextHandler + 1 ||
+        next.handler->cursor != "begin" ||
+        next.handler->handlerIdentity->sequence != prior.nextHandler)
+      throw std::runtime_error(
+        "Job transaction skipped handler selection boundary");
+  } else {
+    ++expected.attachment;
+    if (!instructions || instructions > 128 || next.dispatch != expected ||
+        next.nextHandler != prior.nextHandler)
+      throw std::runtime_error(
+        "Job transaction did not skip exactly one absent handler");
+  }
+  return true;
+}
+
 bool EqualFactions(const std::vector<Faction>& lhs,
                    const std::vector<Faction>& rhs)
 {
@@ -755,6 +859,9 @@ void QuestJournal::SetJobState(MpActor& actor, const QuestJobState& state)
       candidate->actor != actor.GetChangeForm().formDesc.ToString() ||
       candidate->instance != actor.GetWorldInstance())
     throw std::runtime_error("Job transaction changed another job identity");
+  if (!previous.active && (!state.active || state.active->cursor != "begin"))
+    throw std::runtime_error(
+      "New quest job must first install its pristine root");
   if (previous.active) {
     const auto& prior = *previous.active;
     if (candidate->id != prior.id ||
@@ -778,94 +885,93 @@ void QuestJournal::SetJobState(MpActor& actor, const QuestJobState& state)
       if (!candidate->completions.contains(token) ||
           candidate->completions.at(token) != result)
         throw std::runtime_error("Job transaction rewrote a completion");
-    using Stage = QuestJobState::Stage;
-    const auto sameStage = [](const Stage& a, const Stage& b) {
-      return std::tie(a.node, a.child, a.quest, a.contentHash, a.stage,
-                      a.cursor, a.accepted, a.log, a.script, a.function,
-                      a.token, a.awaitKey, a.awaitKind, a.timer, a.failure) ==
-        std::tie(b.node, b.child, b.quest, b.contentHash, b.stage, b.cursor,
-                 b.accepted, b.log, b.script, b.function, b.token, b.awaitKey,
-                 b.awaitKind, b.timer, b.failure);
-    };
-    std::vector<const Stage*> before{ &prior }, after{ candidate };
-    for (const auto& child : prior.children)
-      before.push_back(&child);
-    for (const auto& child : candidate->children)
-      after.push_back(&child);
-    size_t shared = 0;
-    while (shared < before.size() && shared < after.size() &&
-           before[shared]->node == after[shared]->node)
-      ++shared;
-    if (!shared || before.size() - shared > 1 || after.size() - shared > 1)
-      throw std::runtime_error(
-        "Job transaction skipped a durable child boundary");
-    if (before.size() != shared) {
-      const auto& child = *before.back();
-      const auto& parent = *before[before.size() - 2];
-      const auto completion = candidate->completions.find(parent.token);
-      if (child.cursor != "done" ||
-          completion == candidate->completions.end() ||
-          completion->second != QuestJobState::Completion(child.accepted))
+    if (!ValidateDispatchTransition(prior, *candidate)) {
+      using Stage = QuestJobState::Stage;
+      const auto sameStage = [](const Stage& a, const Stage& b) {
+        return a == b;
+      };
+      std::vector<const Stage*> before{ prior.handler ? &*prior.handler
+                                                      : &prior },
+        after{ candidate->handler ? &*candidate->handler : candidate };
+      for (const auto& child : prior.children)
+        before.push_back(&child);
+      for (const auto& child : candidate->children)
+        after.push_back(&child);
+      size_t shared = 0;
+      while (shared < before.size() && shared < after.size() &&
+             before[shared]->node == after[shared]->node)
+        ++shared;
+      if (!shared || before.size() - shared > 1 || after.size() - shared > 1)
         throw std::runtime_error(
-          "Job transaction dropped unfinished child work");
-    }
-    const Stage* consumed = nullptr;
-    if (before.size() != shared)
-      consumed = before[before.size() - 2];
-    else if (prior.Current().cursor == "waiting" &&
-             prior.Current().token != after[shared - 1]->token)
-      consumed = &prior.Current();
-    for (const auto& [token, result] : candidate->completions)
-      if (!prior.completions.contains(token) &&
-          (!consumed || token != consumed->token ||
-           result.kind !=
-             (consumed->awaitKind == "timer"
-                ? QuestJobState::Completion::Kind::None
-                : QuestJobState::Completion::Kind::Boolean)))
-        throw std::runtime_error(
-          "Job transaction completed an unrequested or mistyped operation");
-    for (size_t index = 0; index < shared; ++index) {
-      const auto& oldStage = *before[index];
-      const auto& nextStage = *after[index];
-      if (oldStage.quest != nextStage.quest ||
-          oldStage.contentHash != nextStage.contentHash ||
-          oldStage.stage != nextStage.stage ||
-          (oldStage.accepted && !nextStage.accepted))
-        throw std::runtime_error(
-          "Job transaction rewrote a live stage identity");
-      if ((index + 1 < shared || oldStage.cursor == "done") &&
-          !sameStage(oldStage, nextStage))
-        throw std::runtime_error(
-          "Job transaction rewrote a suspended ancestor");
-      if (oldStage.cursor == "waiting") {
-        if (oldStage.token != nextStage.token) {
-          if (nextStage.cursor == "waiting" &&
-              (nextStage.log < oldStage.log ||
-               (nextStage.log == oldStage.log &&
-                (nextStage.script != oldStage.script ||
-                 nextStage.function != oldStage.function))))
-            throw std::runtime_error(
-              "Job transaction rewound a stage fragment cursor");
-          if (!candidate->completions.contains(oldStage.token))
-            throw std::runtime_error(
-              "Job transaction lost a pending operation");
-        } else if (oldStage.child != nextStage.child ||
-                   oldStage.log != nextStage.log ||
-                   oldStage.script != nextStage.script ||
-                   oldStage.function != nextStage.function ||
-                   oldStage.awaitKey != nextStage.awaitKey ||
-                   oldStage.awaitKind != nextStage.awaitKind ||
-                   oldStage.timer != nextStage.timer ||
-                   nextStage.cursor != "waiting")
+          "Job transaction skipped a durable child boundary");
+      if (before.size() != shared) {
+        const auto& child = *before.back();
+        const auto& parent = *before[before.size() - 2];
+        const auto completion = candidate->completions.find(parent.token);
+        if (child.cursor != "done" ||
+            completion == candidate->completions.end() ||
+            completion->second != QuestJobState::Completion(child.accepted))
           throw std::runtime_error(
-            "Job transaction rewrote a pending operation");
+            "Job transaction dropped unfinished child work");
       }
+      const Stage* consumed = nullptr;
+      if (before.size() != shared)
+        consumed = before[before.size() - 2];
+      else if (prior.Current().cursor == "waiting" &&
+               prior.Current().token != after[shared - 1]->token)
+        consumed = &prior.Current();
+      for (const auto& [token, result] : candidate->completions)
+        if (!prior.completions.contains(token) &&
+            (!consumed || token != consumed->token ||
+             result.kind !=
+               (consumed->awaitKind == "timer"
+                  ? QuestJobState::Completion::Kind::None
+                  : QuestJobState::Completion::Kind::Boolean)))
+          throw std::runtime_error(
+            "Job transaction completed an unrequested or mistyped operation");
+      for (size_t index = 0; index < shared; ++index) {
+        const auto& oldStage = *before[index];
+        const auto& nextStage = *after[index];
+        if (oldStage.quest != nextStage.quest ||
+            oldStage.contentHash != nextStage.contentHash ||
+            oldStage.stage != nextStage.stage ||
+            (oldStage.accepted && !nextStage.accepted))
+          throw std::runtime_error(
+            "Job transaction rewrote a live stage identity");
+        if ((index + 1 < shared || oldStage.cursor == "done") &&
+            !sameStage(oldStage, nextStage))
+          throw std::runtime_error(
+            "Job transaction rewrote a suspended ancestor");
+        if (oldStage.cursor == "waiting") {
+          if (oldStage.token != nextStage.token) {
+            if (nextStage.cursor == "waiting" &&
+                (nextStage.log < oldStage.log ||
+                 (nextStage.log == oldStage.log &&
+                  (nextStage.script != oldStage.script ||
+                   nextStage.function != oldStage.function))))
+              throw std::runtime_error(
+                "Job transaction rewound a stage fragment cursor");
+            if (!candidate->completions.contains(oldStage.token))
+              throw std::runtime_error(
+                "Job transaction lost a pending operation");
+          } else if (oldStage.child != nextStage.child ||
+                     oldStage.log != nextStage.log ||
+                     oldStage.script != nextStage.script ||
+                     oldStage.function != nextStage.function ||
+                     oldStage.awaitKey != nextStage.awaitKey ||
+                     oldStage.awaitKind != nextStage.awaitKind ||
+                     oldStage.timer != nextStage.timer ||
+                     nextStage.cursor != "waiting")
+            throw std::runtime_error(
+              "Job transaction rewrote a pending operation");
+        }
+      }
+      if (after.size() != shared &&
+          (after.back()->node != prior.nextOperation ||
+           after.back()->cursor != "begin"))
+        throw std::runtime_error(
+          "Job transaction reused or bypassed a new child");
     }
-    if (after.size() != shared &&
-        (after.back()->node != prior.nextOperation ||
-         after.back()->cursor != "begin"))
-      throw std::runtime_error(
-        "Job transaction reused or bypassed a new child");
   }
   auto history = old.at("completed");
   auto nextHistory = saved.at("completed");

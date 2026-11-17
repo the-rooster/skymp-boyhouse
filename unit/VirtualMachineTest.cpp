@@ -246,3 +246,226 @@ TEST_CASE("Test nested latent calls", "[VirtualMachine]")
 
   REQUIRE(result == VarValue(6));
 }
+
+namespace {
+class EventVariables : public IVariablesHolder
+{
+public:
+  VarValue state = VarValue("Ready");
+
+  VarValue* GetVariableByName(const char* name, const PexScript&) override
+  {
+    return std::string(name) == "::State" ? &state : nullptr;
+  }
+};
+
+VarValue EventName(const char* name)
+{
+  return VarValue(VarValue::kType_Identifier, name);
+}
+
+FunctionInfo EventBody(int marker)
+{
+  FunctionInfo function;
+  function.valid = true;
+  function.returnType = "None";
+  function.locals = { { "temp", "None" } };
+  function.code.instructions = {
+    { FunctionCode::kOp_CallStatic,
+      { VarValue("EventFixture"), VarValue("Record"), EventName("temp"),
+        VarValue(1), VarValue(marker) } },
+    { FunctionCode::kOp_Return, { VarValue::None() } }
+  };
+  return function;
+}
+
+std::shared_ptr<PexScript> EventScript(
+  const std::string& name, const std::string& parent,
+  const std::vector<Object::StateInfo>& states)
+{
+  auto script = std::make_shared<PexScript>();
+  script->source = name;
+  Object object;
+  object.NameIndex = name;
+  object.parentClassName = parent;
+  object.states = states;
+  script->objectTable.push_back(std::move(object));
+  return script;
+}
+
+std::shared_ptr<StackData> EventStack(VirtualMachine& vm)
+{
+  return std::shared_ptr<StackData>(new StackData{ StackIdHolder(vm) });
+}
+}
+
+TEST_CASE(
+  "Strict event selection preserves attachment and per-level state fallback",
+  "[VirtualMachine][EventSelection]")
+{
+  auto parent = EventScript(
+    "EventParent", "",
+    { { "Ready",
+        { { "OnInherited", EventBody(1) }, { "OnShadow", EventBody(2) } } },
+      { "", { { "OnFallback", EventBody(3) } } } });
+  auto child = EventScript("EventChild", "EventParent",
+                           { { "Ready", { { "OnCurrent", EventBody(4) } } },
+                             { "", { { "OnShadow", EventBody(5) } } } });
+  VirtualMachine vm(std::vector<std::shared_ptr<PexScript>>{ child, parent });
+  vm.SetStrictExecution(true);
+  auto object = std::make_shared<TestObject>();
+  auto variables = std::make_shared<EventVariables>();
+  vm.AddObject(object, { { "EventChild", variables } });
+  const auto root = object->scripts.at(0);
+
+  const auto inherited = vm.SelectEventHandler(root, "OnInherited");
+  REQUIRE(inherited);
+  REQUIRE(inherited->root == root);
+  REQUIRE(inherited->implementation == root->GetParentInstance());
+  REQUIRE(inherited->state == "Ready");
+  REQUIRE(inherited->function == "OnInherited");
+  REQUIRE(inherited->body.valid);
+
+  const auto fallback = vm.SelectEventHandler(root, "OnFallback");
+  REQUIRE(fallback);
+  REQUIRE(fallback->root == root);
+  REQUIRE(fallback->implementation == root->GetParentInstance());
+  REQUIRE(fallback->state.empty());
+
+  // A child's empty-state handler wins over the parent's active-state body.
+  const auto shadow = vm.SelectEventHandler(root, "OnShadow");
+  REQUIRE(shadow);
+  REQUIRE(shadow->implementation == root);
+  REQUIRE(shadow->state.empty());
+  const auto current = vm.SelectEventHandler(root, "OnCurrent");
+  REQUIRE(current);
+  REQUIRE(current->implementation == root);
+  REQUIRE(current->state == "Ready");
+  REQUIRE_FALSE(vm.SelectEventHandler(root, "OnAbsent"));
+}
+
+TEST_CASE(
+  "An inherited event selection resumes its chosen state after a state change",
+  "[VirtualMachine][EventSelection][PapyrusContinuation]")
+{
+  auto body = EventBody(7);
+  body.code.instructions.insert(
+    body.code.instructions.begin(),
+    { FunctionCode::kOp_CallStatic,
+      { VarValue("EventFixture"), VarValue("Await"), EventName("temp"),
+        VarValue(0) } });
+  auto parent = EventScript("WaitingEventParent", "",
+                            { { "Ready", { { "OnSignal", body } } } });
+  auto child = EventScript("WaitingEventChild", "WaitingEventParent", {});
+  VirtualMachine vm(std::vector<std::shared_ptr<PexScript>>{ child, parent });
+  vm.SetStrictExecution(true);
+  auto object = std::make_shared<TestObject>();
+  auto variables = std::make_shared<EventVariables>();
+  vm.AddObject(object, { { "WaitingEventChild", variables } });
+  std::vector<int> effects;
+  vm.RegisterFunction("EventFixture", "Record", FunctionType::GlobalFunction,
+                      [&](VarValue, std::vector<VarValue> args) {
+                        effects.push_back(static_cast<int32_t>(args.at(0)));
+                        return VarValue::None();
+                      });
+  vm.RegisterFunction("EventFixture", "Await", FunctionType::GlobalFunction,
+                      [&](VarValue, std::vector<VarValue>) -> VarValue {
+                        vm.RequestSuspension("event-operation", "None");
+                      });
+  const auto selected =
+    vm.SelectEventHandler(object->scripts.at(0), "OnSignal");
+  REQUIRE(selected);
+  const auto stack = EventStack(vm);
+  const auto started = selected->implementation->StartResumableFunction(
+    "event-scope", selected->state, selected->function, {}, stack);
+  REQUIRE(started.continuation);
+  REQUIRE(started.continuation->rootScript == "WaitingEventChild");
+  REQUIRE(started.continuation->script == "WaitingEventParent");
+  REQUIRE(started.continuation->state == "Ready");
+  REQUIRE(effects.empty());
+
+  variables->state = VarValue("Changed");
+  REQUIRE_FALSE(vm.SelectEventHandler(object->scripts.at(0), "OnSignal"));
+  const auto resumed = selected->implementation->ResumeFunction(
+    "event-scope", *started.continuation, VarValue::None(), stack);
+  REQUIRE_FALSE(resumed.continuation);
+  REQUIRE(resumed.value == VarValue::None());
+  REQUIRE(effects == std::vector<int>{ 7 });
+}
+
+TEST_CASE(
+  "Synchronous events snapshot roots and select each state at delivery time",
+  "[VirtualMachine][EventSelection]")
+{
+  auto first = EventScript("FirstEvent", "",
+                           { { "", { { "OnSignal", EventBody(10) } } } });
+  auto second =
+    EventScript("SecondEvent", "",
+                { { "Ready", { { "OnSignal", EventBody(20) } } },
+                  { "Changed", { { "OnSignal", EventBody(30) } } } });
+  auto late = EventScript("LateEvent", "",
+                          { { "", { { "OnSignal", EventBody(40) } } } });
+  VirtualMachine vm(
+    std::vector<std::shared_ptr<PexScript>>{ first, second, late });
+  vm.SetStrictExecution(true);
+  auto object = std::make_shared<TestObject>();
+  auto firstVariables = std::make_shared<EventVariables>();
+  auto secondVariables = std::make_shared<EventVariables>();
+  auto lateVariables = std::make_shared<EventVariables>();
+  vm.AddObject(
+    object,
+    { { "FirstEvent", firstVariables }, { "SecondEvent", secondVariables } });
+  const auto before = vm.SelectEventHandler(object->scripts.at(1), "OnSignal");
+  REQUIRE(before);
+  REQUIRE(before->state == "Ready");
+  std::vector<int> effects;
+  vm.RegisterFunction("EventFixture", "Record", FunctionType::GlobalFunction,
+                      [&](VarValue, std::vector<VarValue> args) {
+                        const auto marker = static_cast<int32_t>(args.at(0));
+                        effects.push_back(marker);
+                        if (marker == 10) {
+                          secondVariables->state = VarValue("Changed");
+                          vm.AddObject(object,
+                                       { { "LateEvent", lateVariables } });
+                        }
+                        return VarValue::None();
+                      });
+  vm.SendEventSynchronous(object, "OnSignal", {}, EventStack(vm));
+  REQUIRE(object->scripts.size() == 3);
+  REQUIRE(effects == std::vector<int>{ 10, 30 });
+  REQUIRE(before->state == "Ready");
+}
+
+TEST_CASE("Strict event selection rejects invalid entries and consumes the "
+          "shared budget",
+          "[VirtualMachine][EventSelection]")
+{
+  const auto flags = GENERATE(uint8_t(1), uint8_t(2));
+  auto invalid = EventBody(1);
+  invalid.flags = flags;
+  auto parent = EventScript("InvalidEventParent", "", {});
+  auto script = EventScript(
+    "InvalidEvent", "InvalidEventParent",
+    { { "Ready", { { "OnInvalid", invalid }, { "OnSignal", EventBody(2) } } },
+      { "", { { "OnInvalid", EventBody(3) } } } });
+  VirtualMachine vm(std::vector<std::shared_ptr<PexScript>>{ script, parent });
+  auto object = std::make_shared<TestObject>();
+  auto variables = std::make_shared<EventVariables>();
+  vm.AddObject(object, { { "InvalidEvent", variables } });
+  const auto root = object->scripts.at(0);
+  REQUIRE_THROWS(vm.SelectEventHandler(root, "OnSignal"));
+  vm.SetStrictExecution(true);
+  REQUIRE_THROWS(vm.SelectEventHandler({}, "OnSignal"));
+  REQUIRE_THROWS(vm.SelectEventHandler(root, nullptr));
+  REQUIRE_THROWS(vm.SelectEventHandler(root, ""));
+  REQUIRE_THROWS(vm.SelectEventHandler(root->GetParentInstance(), "OnSignal"));
+  VirtualMachine foreign(std::vector<PexScript::Lazy>{});
+  foreign.SetStrictExecution(true);
+  REQUIRE_THROWS(foreign.SelectEventHandler(root, "OnSignal"));
+  REQUIRE_THROWS(vm.SelectEventHandler(root, "OnInvalid"));
+  REQUIRE(vm.GetExecutedInstructions() == 1);
+  REQUIRE(vm.SelectEventHandler(root, "OnSignal"));
+  REQUIRE(vm.GetExecutedInstructions() == 2);
+  vm.RestoreExecutionBudget(100000);
+  REQUIRE_THROWS(vm.SelectEventHandler(root, "OnSignal"));
+}

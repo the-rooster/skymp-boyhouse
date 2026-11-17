@@ -328,6 +328,38 @@ void RequirePending(const QuestJobRunner::Result& result)
   REQUIRE(result.token.empty());
   REQUIRE(result.key.empty());
 }
+
+// Every host transition has its own receipt. This helper deliberately stops
+// at an external wait or timer; it never invents a completion for a script.
+QuestJobRunner::Result Drain(Fixture& f, const std::string& command,
+                             const QuestJobRunner::MetadataOverrides& metadata,
+                             const std::vector<PexScript::Lazy>& scripts)
+{
+  for (size_t boundary = 0; boundary < 1024; ++boundary) {
+    const auto result = f.Jobs().Inspect(f.Owner(), command);
+    if (result.status == Status::Pending) {
+      f.Tick();
+      REQUIRE_FALSE(f.storage->submissions.empty());
+      f.storage->Complete(f.storage->submissions.size() - 1);
+      f.Tick();
+    } else if (result.status == Status::Ready) {
+      RequirePending(f.Jobs().Advance(f.Owner(), command, metadata, scripts));
+    } else {
+      return result;
+    }
+  }
+  throw std::runtime_error("Quest dispatch failed to reach a stable boundary");
+}
+
+QuestJobRunner::Result Finish(Fixture& f,
+                              const std::string& command = kCommand,
+                              uint32_t quest = kQuest)
+{
+  const auto result =
+    Drain(f, command, { { quest, f.program.metadata } }, f.program.Scripts());
+  REQUIRE(result.status == Status::Completed);
+  return result;
+}
 }
 
 TEST_CASE("Quest jobs expose waits and results only after exact durable saves",
@@ -407,7 +439,9 @@ TEST_CASE("Quest jobs expose waits and results only after exact durable saves",
   REQUIRE(Serialized(f.storage->submissions[4].forms) == finalBytes);
   RequirePending(f.Inspect());
   REQUIRE(f.Gold() == 37);
-  const auto complete = f.Ack(4);
+  REQUIRE(f.Ack(4).status == Status::Ready);
+  const auto complete = Finish(f);
+  const auto saved = f.storage->submissions.size();
   REQUIRE(complete.status == Status::Completed);
   REQUIRE(complete.job == first.job);
   REQUIRE(complete.accepted);
@@ -419,7 +453,7 @@ TEST_CASE("Quest jobs expose waits and results only after exact durable saves",
   REQUIRE_THROWS(f.Resume(second.token, false));
   REQUIRE(f.Gold() == 37);
   f.Tick();
-  REQUIRE(f.storage->submissions.size() == 5);
+  REQUIRE(f.storage->submissions.size() == saved);
 }
 
 TEST_CASE(
@@ -488,7 +522,8 @@ TEST_CASE("A failed resumed segment preserves its durable stack and rewards",
   REQUIRE(f.Gold() == 37);
   f.Tick();
   REQUIRE(f.storage->submissions.size() == 3);
-  REQUIRE(f.Ack(2).status == Status::Completed);
+  REQUIRE(f.Ack(2).status == Status::Ready);
+  Finish(f);
   REQUIRE(f.Gold() == 37);
 }
 
@@ -510,8 +545,8 @@ TEST_CASE("A quest job without awaits durably completes once",
   const auto submitted = submit();
   RequirePending(submitted);
   REQUIRE(f.Gold() == 14);
-  REQUIRE_FALSE(QuestJournal::JobState(f.Owner()).active);
-  REQUIRE(QuestJournal::JobState(f.Owner()).completed.size() == 1);
+  REQUIRE(QuestJournal::JobState(f.Owner()).active->cursor == "done");
+  REQUIRE(QuestJournal::JobState(f.Owner()).completed.empty());
   REQUIRE(QuestJournal::ScriptState(f.Owner()).at("continuations").empty());
   REQUIRE(submit().job == submitted.job);
   RequirePending(f.Jobs().Inspect(f.Owner(), command));
@@ -521,7 +556,9 @@ TEST_CASE("A quest job without awaits durably completes once",
   f.storage->Complete(0);
   RequirePending(f.Jobs().Inspect(f.Owner(), command));
   f.Tick();
-  const auto completed = f.Jobs().Inspect(f.Owner(), command);
+  REQUIRE(f.Jobs().Inspect(f.Owner(), command).status == Status::Ready);
+  const auto completed = Finish(f, command, quest);
+  const auto saved = f.storage->submissions.size();
   REQUIRE(completed.status == Status::Completed);
   REQUIRE(completed.accepted);
   REQUIRE(completed.job == submitted.job);
@@ -532,7 +569,7 @@ TEST_CASE("A quest job without awaits durably completes once",
   REQUIRE(f.Gold() == 14);
   REQUIRE(QuestJournal::Snapshot(f.Owner()) == before);
   f.Tick();
-  REQUIRE(f.storage->submissions.size() == 1);
+  REQUIRE(f.storage->submissions.size() == saved);
 
   // A newer job's pending receipt must not hide a previously durable result.
   const auto later = f.Jobs().Submit(f.Owner(), "da04-stage5-again", quest, 5,
@@ -543,9 +580,9 @@ TEST_CASE("A quest job without awaits durably completes once",
   REQUIRE(f.Jobs().Inspect(f.Owner(), command).status == Status::Completed);
   REQUIRE(submit().status == Status::Completed);
   f.Tick();
-  REQUIRE(f.storage->submissions.size() == 2);
+  REQUIRE(f.storage->submissions.size() == saved + 1);
   REQUIRE(f.Jobs().Inspect(f.Owner(), command).status == Status::Completed);
-  f.storage->Complete(1);
+  f.storage->Complete(saved);
   f.Tick();
   const auto laterCompleted = f.Jobs().Inspect(f.Owner(), "da04-stage5-again");
   REQUIRE(laterCompleted.status == Status::Completed);
@@ -623,7 +660,11 @@ TEST_CASE("Inventory event stage calls do not reuse the outer job log cursor",
                            f.program.Scripts());
   };
   RequirePending(submit());
+  REQUIRE(f.Gold() == 15);
+  REQUIRE(QuestJournal::JobState(f.Owner()).active->cursor == "done");
+  Finish(f, command, quest);
   REQUIRE(f.Gold() == 19);
+  const auto saved = f.storage->submissions.size();
   const auto heap = QuestJournal::ScriptState(f.Owner());
   REQUIRE(heap.at("scripts")
             .at("4e50d:Skyrim.esm/jobfixture")
@@ -644,19 +685,18 @@ TEST_CASE("Inventory event stage calls do not reuse the outer job log cursor",
   REQUIRE(jobs.completed[0].stage == 10);
   REQUIRE(jobs.completed[0].log == 0);
   REQUIRE(jobs.completed[0].cursor == "done");
-  REQUIRE(jobs.completed[0].events.empty());
-  REQUIRE(jobs.completed[0].completions.empty());
+  REQUIRE(jobs.completed[0].eventHead == jobs.completed[0].events.size());
+  REQUIRE(jobs.completed[0].events.size() == 2);
+  REQUIRE(jobs.completed[0].completions.size() == 1);
   f.Tick();
-  REQUIRE(f.storage->submissions.size() == 1);
-  f.storage->Complete(0);
-  f.Tick();
+  REQUIRE(f.storage->submissions.size() == saved);
   REQUIRE(f.Jobs().Inspect(f.Owner(), command).status == Status::Completed);
   const auto before = QuestJournal::Snapshot(f.Owner());
   REQUIRE(submit().status == Status::Completed);
   REQUIRE(f.Gold() == 19);
   REQUIRE(QuestJournal::Snapshot(f.Owner()) == before);
   f.Tick();
-  REQUIRE(f.storage->submissions.size() == 1);
+  REQUIRE(f.storage->submissions.size() == saved);
 }
 
 TEST_CASE("A zero-log quest job saves visitation with a false accepted result",
@@ -767,6 +807,21 @@ QuestJobRunner::Result WaitForDurable(PartOne& server, MpActor& owner,
   }
   throw std::runtime_error("Timed out waiting for durable quest job");
 }
+
+QuestJobRunner::Result DrainStored(
+  PartOne& server, MpActor& owner, const std::string& command,
+  const QuestJobRunner::MetadataOverrides& metadata,
+  const std::vector<PexScript::Lazy>& scripts)
+{
+  for (size_t boundary = 0; boundary < 1024; ++boundary) {
+    const auto result = WaitForDurable(server, owner, command);
+    if (result.status != Status::Ready)
+      return result;
+    RequirePending(server.worldState.GetQuestJobs().Advance(
+      owner, command, metadata, scripts));
+  }
+  throw std::runtime_error("SQLite quest dispatch did not settle");
+}
 }
 
 TEST_CASE(
@@ -832,7 +887,9 @@ TEST_CASE(
                                program.metadata, program.Scripts()));
     RequirePending(jobs.Resume(owner, kCommand, secondToken, true,
                                program.metadata, program.Scripts()));
-    const auto complete = WaitForDurable(server, owner);
+    const auto complete =
+      DrainStored(server, owner, kCommand, { { kQuest, program.metadata } },
+                  program.Scripts());
     REQUIRE(complete.status == Status::Completed);
     REQUIRE(complete.job == jobId);
     REQUIRE(complete.accepted);
@@ -1029,6 +1086,14 @@ struct ChildFixture : Fixture
   }
 };
 
+QuestJobRunner::Result FinishChild(ChildFixture& f)
+{
+  const auto result =
+    Drain(f, kChildCommand, f.content.metadata, f.content.Scripts());
+  REQUIRE(result.status == Status::Completed);
+  return result;
+}
+
 void RequireReady(const QuestJobRunner::Result& result)
 {
   REQUIRE(result.status == Status::Ready);
@@ -1149,14 +1214,16 @@ TEST_CASE("Child stages commit their intent and result before parent progress",
   REQUIRE_THROWS(f.ResumeChild(waiting.token, false));
   RequirePending(f.Advance());
   REQUIRE(f.Gold() == 28);
-  REQUIRE(InventoryOrder(f.Owner()) == 2349);
+  REQUIRE(InventoryOrder(f.Owner()) == 0);
   REQUIRE(ChildField(f.Owner(), kParentQuest, "runs").at("value") == 1);
   REQUIRE(ChildField(f.Owner(), f.content.childQuest, "runs").at("value") ==
           1);
   REQUIRE(ChildField(f.Owner(), kParentQuest, "firstresult").at("value") ==
           true);
   f.Tick();
-  REQUIRE(f.AckChild(5).status == Status::Completed);
+  RequireReady(f.AckChild(5));
+  FinishChild(f);
+  REQUIRE(InventoryOrder(f.Owner()) == 2349);
   REQUIRE(f.SubmitChild().status == Status::Completed);
   REQUIRE(f.ResumeChild(waiting.token).status == Status::Completed);
   REQUIRE(f.Advance().status == Status::Completed);
@@ -1178,10 +1245,9 @@ TEST_CASE("Repeated and already-visited child stages return their actual Bool",
     RequirePending(f.Advance());
     f.Tick();
     const auto result = f.AckChild(segment);
+    RequireReady(result);
     if (segment == 4)
-      REQUIRE(result.status == Status::Completed);
-    else
-      RequireReady(result);
+      FinishChild(f);
   }
   REQUIRE(f.Gold() == (repeated ? 27 : 24));
   REQUIRE(ChildField(f.Owner(), kParentQuest, "firstresult").at("value") ==
@@ -1237,7 +1303,8 @@ TEST_CASE(
   } else {
     f.Advance();
     f.Tick();
-    REQUIRE(f.AckChild(3).status == Status::Completed);
+    RequireReady(f.AckChild(3));
+    FinishChild(f);
     REQUIRE(f.Gold() == 28);
   }
 }
@@ -1350,10 +1417,9 @@ TEST_CASE(
             expectedStacks[index]);
     f.Tick();
     const auto result = f.AckChild(index + 1);
+    RequireReady(result);
     if (index + 1 == expectedGold.size())
-      REQUIRE(result.status == Status::Completed);
-    else
-      RequireReady(result);
+      FinishChild(f);
   }
   REQUIRE(QuestJournal::Get(f.Owner(), kParentQuest).at("stages") ==
           Json::array({ 10, 20 }));
@@ -1432,8 +1498,9 @@ TEST_CASE(
     REQUIRE(owner.GetInventory().GetItemCount(0xf) == 19);
     RequirePending(
       jobs.Advance(owner, kChildCommand, content.metadata, content.Scripts()));
-    REQUIRE(WaitForDurable(server, owner, kChildCommand).status ==
-            Status::Completed);
+    REQUIRE(DrainStored(server, owner, kChildCommand, content.metadata,
+                        content.Scripts())
+              .status == Status::Completed);
     REQUIRE(owner.GetInventory().GetItemCount(0xf) == 28);
     REQUIRE(ChildField(owner, kParentQuest, "runs").at("value") == 1);
     REQUIRE(ChildField(owner, content.childQuest, "runs").at("value") == 1);
@@ -1625,6 +1692,14 @@ struct TimerFixture : Fixture
   }
 };
 
+QuestJobRunner::Result FinishTimer(TimerFixture& f)
+{
+  const auto result =
+    Drain(f, kTimerCommand, f.content.metadata, f.content.Scripts());
+  REQUIRE(result.status == Status::Completed);
+  return result;
+}
+
 void RequireSleeping(const QuestJobRunner::Result& result)
 {
   REQUIRE(result.status == Status::Sleeping);
@@ -1663,11 +1738,13 @@ TEST_CASE("Managed Utility waits preserve native millisecond conversion and "
       REQUIRE(clockReads == 0);
       REQUIRE(f.Gold() == 15);
       const auto jobs = QuestJournal::JobState(f.Owner());
-      REQUIRE_FALSE(jobs.active);
-      REQUIRE(jobs.completed.back().completions.empty());
-      REQUIRE(jobs.completed.back().nextOperation == 1);
+      REQUIRE(jobs.active);
+      REQUIRE(jobs.active->cursor == "done");
+      REQUIRE(jobs.active->completions.empty());
+      REQUIRE(jobs.active->nextOperation == 1);
       f.Tick();
-      REQUIRE(f.AckTimer(0).status == Status::Completed);
+      RequireReady(f.AckTimer(0));
+      FinishTimer(f);
       continue;
     }
     REQUIRE(f.Gold() == 12);
@@ -1693,7 +1770,8 @@ TEST_CASE("Managed Utility waits preserve native millisecond conversion and "
     RequirePending(f.AdvanceTimer());
     REQUIRE(f.Gold() == 15);
     f.Tick();
-    REQUIRE(f.AckTimer(1).status == Status::Completed);
+    RequireReady(f.AckTimer(1));
+    FinishTimer(f);
     const auto completed = QuestJournal::JobState(f.Owner()).completed.back();
     REQUIRE(completed.completions.at(token).kind ==
             QuestJobState::Completion::Kind::None);
@@ -1747,7 +1825,8 @@ TEST_CASE("Elapsed timers remain hidden behind failed saves without "
   RequirePending(f.AdvanceTimer());
   REQUIRE(f.Gold() == 15);
   f.Tick();
-  REQUIRE(f.AckTimer(2).status == Status::Completed);
+  RequireReady(f.AckTimer(2));
+  FinishTimer(f);
 }
 
 TEST_CASE(
@@ -1783,7 +1862,8 @@ TEST_CASE(
   f.AdvanceTimer();
   REQUIRE(f.Gold() == 20);
   f.Tick();
-  REQUIRE(f.AckTimer(2).status == Status::Completed);
+  RequireReady(f.AckTimer(2));
+  FinishTimer(f);
 }
 
 TEST_CASE(
@@ -1839,7 +1919,8 @@ TEST_CASE(
   REQUIRE(f.Gold() == 19);
   f.Advance();
   f.Tick();
-  REQUIRE(f.AckChild(4).status == Status::Completed);
+  RequireReady(f.AckChild(4));
+  FinishChild(f);
   REQUIRE(f.Gold() == 28);
   const auto completions =
     QuestJournal::JobState(f.Owner()).completed.back().completions;
@@ -1902,8 +1983,9 @@ TEST_CASE(
     RequireReady(jobs.Inspect(owner, kTimerCommand));
     RequirePending(
       jobs.Advance(owner, kTimerCommand, content.metadata, content.Scripts()));
-    REQUIRE(WaitForDurable(server, owner, kTimerCommand).status ==
-            Status::Completed);
+    REQUIRE(DrainStored(server, owner, kTimerCommand, content.metadata,
+                        content.Scripts())
+              .status == Status::Completed);
     REQUIRE(owner.GetInventory().GetItemCount(0xf) == 15);
   }
   {
@@ -2026,7 +2108,7 @@ TEST_CASE(
   REQUIRE(advanced == 32);
   time->steadyMs += 1000;
   size_t completed = 0;
-  for (size_t pass = 0; pass < 160 && completed < actors.size(); ++pass) {
+  for (size_t pass = 0; pass < 2048 && completed < actors.size(); ++pass) {
     server.worldState.Tick();
     completed = static_cast<size_t>(
       std::count_if(actors.begin(), actors.end(), [&](auto* actor) {
@@ -2086,7 +2168,7 @@ TEST_CASE("One failing automatic quest is quarantined without starving other "
   const auto checkpoint = QuestJournal::Snapshot(bad);
   const auto heap = QuestJournal::ScriptState(bad);
   time->steadyMs += 1000;
-  for (size_t index = 0; index < 12; ++index)
+  for (size_t index = 0; index < 64; ++index)
     server.worldState.Tick();
   const auto failed = jobs.Inspect(bad, kTimerCommand);
   REQUIRE(failed.status == Status::Failed);
@@ -2136,7 +2218,7 @@ TEST_CASE(
   REQUIRE(submitted.job == nextJob);
   REQUIRE(f.Gold() == 12);
   f.time->steadyMs += 1000;
-  for (size_t index = 0; index < 5; ++index)
+  for (size_t index = 0; index < 64; ++index)
     f.Tick();
   REQUIRE(f.Jobs().Inspect(f.Owner(), command).status == Status::Completed);
   if (!changedInstance)
@@ -2208,7 +2290,8 @@ TEST_CASE(
   f.time->steadyMs += 1000;
   f.AdvanceTimer();
   f.Tick();
-  REQUIRE(f.AckTimer(1).status == Status::Completed);
+  RequireReady(f.AckTimer(1));
+  FinishTimer(f);
   REQUIRE(f.Gold() == 15);
   REQUIRE_NOTHROW(f.server.worldState.AttachSaveStorage(replacement));
   REQUIRE_NOTHROW(f.server.worldState.AttachSaveStorage(nullptr));
@@ -2264,4 +2347,524 @@ TEST_CASE("Automatic submissions and recovered timer continuations retain "
     REQUIRE(QuestJournal::Snapshot(actor) == before);
     REQUIRE(storage->submissions.empty());
   }
+}
+namespace {
+constexpr auto kEventCommand = "durable-inventory-handler";
+
+FunctionInfo EventFunction()
+{
+  FunctionInfo function;
+  function.valid = true;
+  function.returnType = "None";
+  function.params = { { "item", "Form" },
+                      { "count", "Int" },
+                      { "reference", "ObjectReference" },
+                      { "source", "ObjectReference" } };
+  return function;
+}
+
+struct EventProgram
+{
+  Program program;
+  QuestJobRunner::MetadataOverrides metadata;
+  std::shared_ptr<PexScript> base, observer;
+  explicit EventProgram(bool child = false, const char* wait = "Wait",
+                        bool remove = false)
+  {
+    auto& quest = program.script->objectTable[0];
+    quest.states[0].functions = { { "Root", Reward(5) } };
+    if (remove) {
+      auto& code = quest.states[0].functions[0].function.code.instructions;
+      code.insert(
+        code.end() - 1,
+        { FunctionCode::kOp_CallMethod,
+          { VarValue("RemoveItem"), Name("target"), Name("temp"), VarValue(4),
+            Name("gold"), VarValue(1), VarValue(true), VarValue::None() } });
+    }
+    program.metadata.fragments = { { 10, 0, 1, "JobFixture", "Root" } };
+    espm::QuestScriptData::Alias alias;
+    alias.object.type = 1;
+    alias.object.formId = kParentQuest;
+    alias.object.alias = 3;
+    alias.version = 5;
+    alias.objectFormat = 2;
+    alias.scripts = { { "EventDerived", 0, {} }, { "EventObserver", 0, {} } };
+    program.metadata.aliases = { alias };
+    metadata[kParentQuest] = program.metadata;
+
+    base = std::make_shared<PexScript>();
+    base->source = "EventBase";
+    Object object;
+    object.NameIndex = base->source;
+    object.parentClassName = "ReferenceAlias";
+    object.variables = { { "prefixes", "Int", 0, VarValue(0) },
+                         { "suffixes", "Int", 0, VarValue(0) } };
+    auto handler = EventFunction();
+    handler.locals = { { "matches", "Bool" }, { "target", "ObjectReference" },
+                       { "temp", "None" },    { "other", "EventObserver" },
+                       { "quest", "Quest" },  { "accepted", "Bool" } };
+    handler.code.instructions = {
+      { FunctionCode::kOp_CompareEQ,
+        { Name("matches"), Name("count"), VarValue(5) } },
+      { FunctionCode::kOp_JumpT, { Name("matches"), VarValue(2) } },
+      { FunctionCode::kOp_Return, { VarValue::None() } },
+      { FunctionCode::kOp_IAdd,
+        { Name("prefixes"), Name("prefixes"), VarValue(1) } },
+      { FunctionCode::kOp_CallMethod,
+        { VarValue("GetReference"), Name("self"), Name("target"),
+          VarValue(0) } },
+      { FunctionCode::kOp_CallMethod,
+        { VarValue("AddItem"), Name("target"), Name("temp"), VarValue(3),
+          Name("item"), VarValue(2), VarValue(true) } },
+      { FunctionCode::kOp_Cast, { Name("other"), Name("self") } },
+      { FunctionCode::kOp_CallMethod,
+        { VarValue("SetBusy"), Name("other"), Name("temp"), VarValue(0) } },
+      { FunctionCode::kOp_Assign, { Name("::State"), VarValue("idle") } }
+    };
+    if (child) {
+      handler.code.instructions.push_back(
+        { FunctionCode::kOp_CallStatic,
+          { VarValue("Game"), VarValue("GetForm"), Name("quest"), VarValue(1),
+            VarValue(static_cast<int32_t>(kTimerQuest)) } });
+      handler.code.instructions.push_back(
+        { FunctionCode::kOp_CallMethod,
+          { VarValue("SetStage"), Name("quest"), Name("accepted"), VarValue(1),
+            VarValue(5) } });
+      auto childFunction = Reward(4);
+      childFunction.code.instructions.pop_back();
+      childFunction.code.instructions.push_back(
+        { FunctionCode::kOp_CallStatic,
+          { VarValue("Utility"), VarValue(wait), Name("temp"), VarValue(1),
+            VarValue(1.0f) } });
+      childFunction.code.instructions.push_back(
+        { FunctionCode::kOp_CallMethod,
+          { VarValue("AddItem"), Name("target"), Name("temp"), VarValue(3),
+            Name("gold"), VarValue(6), VarValue(true) } });
+      childFunction.code.instructions.push_back(
+        { FunctionCode::kOp_Return, { VarValue::None() } });
+      quest.states[0].functions.push_back({ "Child", childFunction });
+      auto childMetadata = program.metadata;
+      childMetadata.aliases.clear();
+      childMetadata.fragments = { { 5, 0, 1, "JobFixture", "Child" } };
+      metadata[kTimerQuest] = childMetadata;
+    } else {
+      handler.code.instructions.push_back(
+        { FunctionCode::kOp_CallStatic,
+          { VarValue("Utility"), VarValue(wait), Name("temp"), VarValue(1),
+            VarValue(1.0f) } });
+    }
+    handler.code.instructions.push_back(
+      { FunctionCode::kOp_IAdd,
+        { Name("suffixes"), Name("suffixes"), VarValue(1) } });
+    handler.code.instructions.push_back(
+      { FunctionCode::kOp_CallMethod,
+        { VarValue("AddItem"), Name("target"), Name("temp"), VarValue(3),
+          Name("item"), VarValue(3), VarValue(true) } });
+    handler.code.instructions.push_back(
+      { FunctionCode::kOp_Return, { VarValue::None() } });
+    auto empty = EventFunction();
+    empty.code.instructions = { { FunctionCode::kOp_Return,
+                                  { VarValue::None() } } };
+    object.states = { { "busy", { { "OnItemAdded", handler } } },
+                      { "idle", { { "OnItemAdded", empty } } } };
+    base->objectTable.push_back(object);
+    auto derived = std::make_shared<PexScript>();
+    derived->source = "EventDerived";
+    Object attached;
+    attached.NameIndex = derived->source;
+    attached.parentClassName = base->source;
+    attached.autoStateName = "busy";
+    derived->objectTable.push_back(attached);
+
+    observer = std::make_shared<PexScript>();
+    observer->source = "EventObserver";
+    Object observed;
+    observed.NameIndex = observer->source;
+    observed.parentClassName = "ReferenceAlias";
+    observed.variables = { { "order", "Int", 0, VarValue(0) },
+                           { "selected", "Int", 0, VarValue(0) },
+                           { "removed", "Int", 0, VarValue(0) } };
+    auto observedEvent = EventFunction();
+    observedEvent.code.instructions = {
+      { FunctionCode::kOp_IMultiply,
+        { Name("order"), Name("order"), VarValue(10) } },
+      { FunctionCode::kOp_IAdd,
+        { Name("order"), Name("order"), Name("count") } },
+      { FunctionCode::kOp_Assign, { Name("selected"), VarValue(1) } },
+      { FunctionCode::kOp_Return, { VarValue::None() } }
+    };
+    auto busy = observedEvent;
+    busy.code.instructions[2].args[1] = VarValue(7);
+    auto removed = busy;
+    removed.code.instructions.insert(
+      removed.code.instructions.end() - 1,
+      { FunctionCode::kOp_IAdd,
+        { Name("removed"), Name("removed"), Name("count") } });
+    FunctionInfo setBusy;
+    setBusy.valid = true;
+    setBusy.returnType = "None";
+    setBusy.code.instructions = {
+      { FunctionCode::kOp_Assign, { Name("::State"), VarValue("busy") } },
+      { FunctionCode::kOp_Return, { VarValue::None() } }
+    };
+    observed.states = {
+      { "", { { "OnItemAdded", observedEvent }, { "SetBusy", setBusy } } },
+      { "busy", { { "OnItemAdded", busy }, { "OnItemRemoved", removed } } }
+    };
+    observer->objectTable.push_back(observed);
+    program.bases.push_back(base);
+    program.bases.push_back(derived);
+    program.bases.push_back(observer);
+  }
+  auto Scripts() const { return program.Scripts(); }
+  void Enable(MpActor& actor) const
+  {
+    actor.SetPropertyValueDump(QuestJournal::kEnabled,
+                               "[\"4e50d:Skyrim.esm\",\"2d512:Skyrim.esm\"]",
+                               false, false);
+    QuestJournal::Atomic(actor, [&] {
+      QuestVmState state(QuestJournal::ScriptState(actor), {}, {});
+      state.SetAliasBinding("4e50d:Skyrim.esm/alias:3", "14:Skyrim.esm");
+      QuestJournal::SetScriptState(actor, state.Save());
+    });
+  }
+};
+
+int EventField(MpActor& actor, const char* attachment, const char* field)
+{
+  const auto heap = QuestJournal::ScriptState(actor);
+  const std::string root =
+    std::string("4e50d:Skyrim.esm/alias:3/") + attachment;
+  if (!heap.contains("scripts") || !heap.at("scripts").contains(root))
+    return 0;
+  const auto& values = heap.at("scripts").at(root).at("values");
+  return values.contains(field) ? values.at(field).at("value").get<int>() : 0;
+}
+
+struct EventFixture : Fixture
+{
+  EventProgram content;
+  std::shared_ptr<QuestJobTime> time =
+    std::make_shared<QuestJobTime>(QuestJobTime{ 1000000, 5000 });
+  EventFixture(bool child = false, const char* wait = "Wait",
+               bool remove = false)
+    : content(child, wait, remove)
+  {
+    content.Enable(Owner());
+    Jobs().SetClock([time = time] { return *time; });
+  }
+  QuestJobRunner::Result SubmitEvent()
+  {
+    return Jobs().Submit(Owner(), kEventCommand, kParentQuest, 10,
+                         content.metadata, content.Scripts());
+  }
+  QuestJobRunner::Result AdvanceEvent()
+  {
+    return Jobs().Advance(Owner(), kEventCommand, content.metadata,
+                          content.Scripts());
+  }
+  QuestJobRunner::Result InspectEvent()
+  {
+    return Jobs().Inspect(Owner(), kEventCommand);
+  }
+  void AckLatest()
+  {
+    Tick();
+    REQUIRE_FALSE(storage->submissions.empty());
+    storage->Complete(storage->submissions.size() - 1);
+    Tick();
+  }
+  void SelectFirstHandler()
+  {
+    for (size_t boundary = 0; boundary < 32; ++boundary) {
+      if (InspectEvent().status == Status::Pending)
+        AckLatest();
+      const auto job = QuestJournal::JobState(Owner()).active;
+      REQUIRE(job);
+      if (job->handler)
+        return;
+      RequireReady(InspectEvent());
+      RequirePending(AdvanceEvent());
+    }
+    FAIL("Inventory event never selected its first handler");
+  }
+  QuestJobRunner::Result DrainEvent()
+  {
+    return Drain(*this, kEventCommand, content.metadata, content.Scripts());
+  }
+};
+}
+
+TEST_CASE(
+  "Inventory handler prefixes and selected states cross exact receipts",
+  "[Quest][QuestJobs][InventoryHandlers][SaveReceipt]")
+{
+  const auto wait = GENERATE("Wait", "WaitMenuMode");
+  EventFixture f(false, wait, true);
+  RequirePending(f.SubmitEvent());
+  REQUIRE(f.Gold() == 14);
+  REQUIRE(EventField(f.Owner(), "eventderived", "eventbase/prefixes") == 0);
+  f.SelectFirstHandler();
+  auto selected = QuestJournal::JobState(f.Owner()).active;
+  REQUIRE(selected->eventHead == 0);
+  REQUIRE(selected->handler->cursor == "begin");
+  REQUIRE(selected->handler->handlerIdentity->rootScript == "EventDerived");
+  REQUIRE(selected->handler->handlerIdentity->implementation == "EventBase");
+  REQUIRE(selected->handler->handlerIdentity->state == "busy");
+  RequirePending(f.AdvanceEvent());
+  REQUIRE(f.Gold() == 16);
+  REQUIRE(EventField(f.Owner(), "eventderived", "eventbase/prefixes") == 1);
+  REQUIRE(EventField(f.Owner(), "eventobserver", "eventobserver/order") == 0);
+  const auto waiting = QuestJournal::JobState(f.Owner()).active;
+  REQUIRE(waiting->handler->cursor == "waiting");
+  REQUIRE(waiting->handler->timer);
+  const auto token = waiting->handler->token;
+  REQUIRE_THROWS(f.Jobs().Resume(f.Owner(), kEventCommand, token, true,
+                                 f.content.metadata, f.content.Scripts()));
+  f.Tick();
+  const auto failed = f.storage->submissions.size() - 1;
+  const auto bytes = Serialized(f.storage->submissions[failed].forms);
+  f.time->steadyMs += 1000;
+  f.storage->Complete(
+    failed, std::make_exception_ptr(std::runtime_error("handler save")));
+  f.Tick();
+  REQUIRE(Serialized(f.storage->submissions.back().forms) == bytes);
+  RequirePending(f.AdvanceEvent());
+  REQUIRE(f.Gold() == 16);
+  f.storage->Complete(failed);
+  f.Tick();
+  RequirePending(f.InspectEvent());
+  f.AckLatest();
+  RequireReady(f.InspectEvent());
+  RequirePending(f.AdvanceEvent());
+  REQUIRE(f.Gold() == 19);
+  REQUIRE(EventField(f.Owner(), "eventderived", "eventbase/suffixes") == 1);
+  REQUIRE(EventField(f.Owner(), "eventobserver", "eventobserver/order") == 0);
+  REQUIRE(QuestJournal::JobState(f.Owner()).active->handler->cursor == "done");
+  REQUIRE(f.DrainEvent().status == Status::Completed);
+  REQUIRE(f.Gold() == 19);
+  REQUIRE(EventField(f.Owner(), "eventderived", "eventbase/prefixes") == 1);
+  REQUIRE(EventField(f.Owner(), "eventderived", "eventbase/suffixes") == 1);
+  REQUIRE(EventField(f.Owner(), "eventobserver", "eventobserver/order") ==
+          5123);
+  REQUIRE(EventField(f.Owner(), "eventobserver", "eventobserver/removed") ==
+          1);
+  REQUIRE(EventField(f.Owner(), "eventobserver", "eventobserver/selected") ==
+          7);
+  const auto complete = QuestJournal::JobState(f.Owner()).completed.back();
+  REQUIRE(complete.eventHead == complete.events.size());
+  REQUIRE(complete.events.size() == 4);
+  REQUIRE(complete.completions.at(token).kind ==
+          QuestJobState::Completion::Kind::None);
+  const auto before = QuestJournal::Snapshot(f.Owner());
+  REQUIRE(f.SubmitEvent().status == Status::Completed);
+  REQUIRE(QuestJournal::Snapshot(f.Owner()) == before);
+}
+
+TEST_CASE(
+  "An inventory handler's child timer preserves FIFO and durable unwind",
+  "[Quest][QuestJobs][InventoryHandlers][ChildStages]")
+{
+  EventFixture f(true, "WaitMenuMode");
+  f.SubmitEvent();
+  f.SelectFirstHandler();
+  RequirePending(f.AdvanceEvent());
+  REQUIRE(f.Gold() == 17);
+  auto job = QuestJournal::JobState(f.Owner()).active;
+  REQUIRE(job->handler->cursor == "waiting");
+  REQUIRE(job->handler->awaitKind == "stage");
+  REQUIRE(job->children.size() == 1);
+  REQUIRE(job->children.back().cursor == "begin");
+  const auto childToken = job->handler->token;
+  REQUIRE(EventField(f.Owner(), "eventobserver", "eventobserver/order") == 0);
+  f.AckLatest();
+  RequireReady(f.InspectEvent());
+  REQUIRE_THROWS(f.Jobs().Resume(f.Owner(), kEventCommand, childToken, true,
+                                 f.content.metadata, f.content.Scripts()));
+  // An already selected alias remains authorized throughout its child work.
+  const auto checkpoint = QuestJournal::Snapshot(f.Owner());
+  f.Owner().SetPropertyValueDump(QuestJournal::kEnabled,
+                                 "[\"2d512:Skyrim.esm\"]", false, false);
+  REQUIRE_THROWS(f.AdvanceEvent());
+  REQUIRE(f.Gold() == 17);
+  REQUIRE(QuestJournal::Snapshot(f.Owner()) == checkpoint);
+  f.Owner().SetPropertyValueDump(QuestJournal::kEnabled,
+                                 "[\"4e50d:Skyrim.esm\",\"2d512:Skyrim.esm\"]",
+                                 false, false);
+  RequirePending(f.AdvanceEvent());
+  REQUIRE(f.Gold() == 21);
+  f.AckLatest();
+  RequireSleeping(f.InspectEvent());
+  REQUIRE(QuestJournal::ScriptState(f.Owner()).at("continuations").size() ==
+          2);
+  REQUIRE(EventField(f.Owner(), "eventobserver", "eventobserver/order") == 0);
+  f.time->steadyMs += 1000;
+  RequirePending(f.AdvanceEvent());
+  REQUIRE(f.Gold() == 27);
+  REQUIRE(EventField(f.Owner(), "eventderived", "eventbase/suffixes") == 0);
+  job = QuestJournal::JobState(f.Owner()).active;
+  REQUIRE(job->children.back().cursor == "done");
+  f.Tick();
+  const auto failed = f.storage->submissions.size() - 1;
+  const auto bytes = Serialized(f.storage->submissions[failed].forms);
+  f.storage->Complete(
+    failed, std::make_exception_ptr(std::runtime_error("child receipt")));
+  f.Tick();
+  REQUIRE(Serialized(f.storage->submissions.back().forms) == bytes);
+  RequirePending(f.AdvanceEvent());
+  REQUIRE(f.Gold() == 27);
+  f.AckLatest();
+  RequirePending(f.AdvanceEvent());
+  REQUIRE(f.Gold() == 30);
+  REQUIRE(EventField(f.Owner(), "eventderived", "eventbase/suffixes") == 1);
+  REQUIRE(EventField(f.Owner(), "eventobserver", "eventobserver/order") == 0);
+  job = QuestJournal::JobState(f.Owner()).active;
+  REQUIRE(job->children.empty());
+  REQUIRE(job->handler->cursor == "done");
+  REQUIRE(job->completions.at(childToken).value);
+  REQUIRE(f.DrainEvent().status == Status::Completed);
+  REQUIRE(f.Gold() == 30);
+  REQUIRE(EventField(f.Owner(), "eventderived", "eventbase/prefixes") == 1);
+  REQUIRE(EventField(f.Owner(), "eventobserver", "eventobserver/order") ==
+          52463);
+  const auto done = QuestJournal::Snapshot(f.Owner());
+  REQUIRE(f.Jobs()
+            .Resume(f.Owner(), kEventCommand, childToken, true,
+                    f.content.metadata, f.content.Scripts())
+            .status == Status::Completed);
+  REQUIRE_THROWS(f.Jobs().Resume(f.Owner(), kEventCommand, childToken, false,
+                                 f.content.metadata, f.content.Scripts()));
+  REQUIRE(QuestJournal::Snapshot(f.Owner()) == done);
+}
+
+TEST_CASE("Inherited inventory handlers recover from SQLite before retirement",
+          "[Quest][QuestJobs][InventoryHandlers][SQLite]")
+{
+  SqliteFiles files;
+  EventProgram content;
+  std::string token;
+  Json selected;
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    Initialize(server);
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    content.Enable(owner);
+    auto& jobs = server.worldState.GetQuestJobs();
+    jobs.SetClock([] { return QuestJobTime{ 1000000, 5000 }; });
+    RequirePending(jobs.Submit(owner, kEventCommand, kParentQuest, 10,
+                               content.metadata, content.Scripts()));
+    RequireSleeping(DrainStored(server, owner, kEventCommand, content.metadata,
+                                content.Scripts()));
+    const auto job = QuestJournal::JobState(owner).active;
+    REQUIRE(job->handler);
+    REQUIRE(job->handler->handlerIdentity->rootScript == "EventDerived");
+    REQUIRE(job->handler->handlerIdentity->implementation == "EventBase");
+    REQUIRE(job->handler->handlerIdentity->state == "busy");
+    token = job->handler->token;
+    selected = QuestJournal::ScriptState(owner).at("continuations").at(token);
+    REQUIRE(selected.at("rootScript") == "EventDerived");
+    REQUIRE(selected.at("script") == "EventBase");
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 17);
+    REQUIRE(EventField(owner, "eventderived", "eventbase/prefixes") == 1);
+    REQUIRE(EventField(owner, "eventobserver", "eventobserver/order") == 0);
+  }
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    auto& jobs = server.worldState.GetQuestJobs();
+    jobs.SetClock([] { return QuestJobTime{ 1002000, 100 }; });
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    RequireReady(jobs.Inspect(owner, kEventCommand));
+    REQUIRE(QuestJournal::ScriptState(owner).at("continuations").at(token) ==
+            selected);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 17);
+    REQUIRE(EventField(owner, "eventderived", "eventbase/prefixes") == 1);
+    const auto before = QuestJournal::Snapshot(owner);
+    EventProgram changed;
+    changed.base->objectTable[0]
+      .states[0]
+      .functions[0]
+      .function.code.instructions[3]
+      .args[2] = VarValue(2);
+    REQUIRE_THROWS(
+      jobs.Advance(owner, kEventCommand, changed.metadata, changed.Scripts()));
+    REQUIRE(QuestJournal::Snapshot(owner) == before);
+    REQUIRE_THROWS(jobs.Resume(owner, kEventCommand, token, false,
+                               content.metadata, content.Scripts()));
+    RequirePending(
+      jobs.Advance(owner, kEventCommand, content.metadata, content.Scripts()));
+    RequireReady(WaitForDurable(server, owner, kEventCommand));
+    REQUIRE(QuestJournal::JobState(owner).active->handler->cursor == "done");
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 20);
+    REQUIRE(EventField(owner, "eventderived", "eventbase/prefixes") == 1);
+    REQUIRE(EventField(owner, "eventderived", "eventbase/suffixes") == 1);
+    REQUIRE(EventField(owner, "eventobserver", "eventobserver/order") == 0);
+  }
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    REQUIRE(QuestJournal::JobState(owner).active->handler->cursor == "done");
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 20);
+    REQUIRE(DrainStored(server, owner, kEventCommand, content.metadata,
+                        content.Scripts())
+              .status == Status::Completed);
+    REQUIRE(EventField(owner, "eventderived", "eventbase/prefixes") == 1);
+    REQUIRE(EventField(owner, "eventderived", "eventbase/suffixes") == 1);
+    REQUIRE(EventField(owner, "eventobserver", "eventobserver/order") == 523);
+    REQUIRE(EventField(owner, "eventobserver", "eventobserver/selected") == 7);
+    REQUIRE(QuestJournal::ScriptState(owner).at("continuations").empty());
+  }
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    const auto before = QuestJournal::Snapshot(owner);
+    REQUIRE(server.worldState.GetQuestJobs()
+              .Submit(owner, kEventCommand, kParentQuest, 10, content.metadata,
+                      content.Scripts())
+              .status == Status::Completed);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 20);
+    REQUIRE(QuestJournal::Snapshot(owner) == before);
+  }
+}
+
+TEST_CASE("Inventory handlers share the stage instruction budget",
+          "[Quest][QuestJobs][InventoryHandlers][Rollback]")
+{
+  EventFixture f;
+  const auto addLoop = [](FunctionInfo& function) {
+    function.locals.push_back({ "loop", "Int" });
+    function.locals.push_back({ "again", "Bool" });
+    const std::vector<FunctionCode::Instruction> loop{
+      { FunctionCode::kOp_Assign, { Name("loop"), VarValue(0) } },
+      { FunctionCode::kOp_IAdd, { Name("loop"), Name("loop"), VarValue(1) } },
+      { FunctionCode::kOp_CompareLT,
+        { Name("again"), Name("loop"), VarValue(20000) } },
+      { FunctionCode::kOp_JumpT, { Name("again"), VarValue(-2) } }
+    };
+    function.code.instructions.insert(function.code.instructions.begin(),
+                                      loop.begin(), loop.end());
+  };
+  addLoop(
+    f.content.program.script->objectTable[0].states[0].functions[0].function);
+  addLoop(f.content.base->objectTable[0].states[0].functions[0].function);
+  f.SubmitEvent();
+  f.SelectFirstHandler();
+  REQUIRE(f.Gold() == 15);
+  const auto job = QuestJournal::JobState(f.Owner()).active;
+  REQUIRE(job->instructions > 60000);
+  REQUIRE(job->instructions < 65000);
+  const auto before = QuestJournal::Snapshot(f.Owner());
+  const auto heap = QuestJournal::ScriptState(f.Owner());
+  const auto saves = f.storage->submissions.size();
+  REQUIRE_THROWS(f.AdvanceEvent());
+  REQUIRE(f.Gold() == 15);
+  REQUIRE(QuestJournal::Snapshot(f.Owner()) == before);
+  REQUIRE(QuestJournal::ScriptState(f.Owner()) == heap);
+  REQUIRE(EventField(f.Owner(), "eventderived", "eventbase/prefixes") == 0);
+  f.Tick();
+  REQUIRE(f.storage->submissions.size() == saves);
+  RequireReady(f.InspectEvent());
 }

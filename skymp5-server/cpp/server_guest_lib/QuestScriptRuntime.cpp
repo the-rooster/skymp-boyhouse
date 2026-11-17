@@ -691,57 +691,57 @@ bool QuestScriptRuntime::Execute(
     std::map<std::pair<uint32_t, uint32_t>,
              std::shared_ptr<CampaignAliasObject>>
       aliases;
-    QuestVmState state(
-      QuestJournal::ScriptState(actor),
-      [&](IGameObject* value) -> Json {
-        if (auto* alias = dynamic_cast<CampaignAliasObject*>(value)) {
-          if (alias->OwnerId() != owner)
-            throw std::runtime_error("Alias belongs to another campaign");
-          return { { "kind", "alias" },
-                   { "quest",
-                     FormDesc::FromFormId(alias->QuestId(), world.espmFiles)
-                       .ToString() },
-                   { "id", alias->Definition().id } };
-        }
-        if (auto* reference = dynamic_cast<CampaignFormObject*>(value)) {
-          if (reference->OwnerId() != owner)
-            throw std::runtime_error("Form belongs to another campaign");
-          return FormDesc::FromFormId(reference->FormId(), world.espmFiles)
-            .ToString();
-        }
-        const EspmGameObject* form = nullptr;
-        if (auto* quest = dynamic_cast<CampaignQuestObject*>(value)) {
-          if (quest->OwnerId() == owner)
-            form = quest;
-        } else if (auto* global = dynamic_cast<CampaignGlobalObject*>(value)) {
-          if (global->OwnerId() == owner)
-            form = global;
-        }
-        if (!form)
-          throw std::runtime_error("Unsupported saved campaign object");
-        return FormDesc::FromFormId(
-                 form->record.ToGlobalId(form->record.rec->GetId()),
-                 world.espmFiles)
+    const auto encodeObject = [&](IGameObject* value) -> Json {
+      if (auto* alias = dynamic_cast<CampaignAliasObject*>(value)) {
+        if (alias->OwnerId() != owner)
+          throw std::runtime_error("Alias belongs to another campaign");
+        return { { "kind", "alias" },
+                 { "quest",
+                   FormDesc::FromFormId(alias->QuestId(), world.espmFiles)
+                     .ToString() },
+                 { "id", alias->Definition().id } };
+      }
+      if (auto* reference = dynamic_cast<CampaignFormObject*>(value)) {
+        if (reference->OwnerId() != owner)
+          throw std::runtime_error("Form belongs to another campaign");
+        return FormDesc::FromFormId(reference->FormId(), world.espmFiles)
           .ToString();
-      },
-      [&](const Json& value) -> VarValue {
-        if (value.is_object()) {
-          if (value.size() != 3 || value.at("kind") != "alias" ||
-              !value.at("quest").is_string() ||
-              !value.at("id").is_number_integer() ||
-              value.at("id").get<int64_t>() < 0 ||
-              value.at("id").get<uint64_t>() > INT32_MAX)
-            throw std::runtime_error("Invalid saved campaign alias identity");
-          return VarValue(resolveAlias(FormDesc::FromString(
-                                         value.at("quest").get<std::string>())
-                                         .ToFormId(world.espmFiles),
-                                       value.at("id").get<uint32_t>())
-                            .get());
-        }
-        return VarValue(resolve(FormDesc::FromString(value.get<std::string>())
-                                  .ToFormId(world.espmFiles))
+      }
+      const EspmGameObject* form = nullptr;
+      if (auto* quest = dynamic_cast<CampaignQuestObject*>(value)) {
+        if (quest->OwnerId() == owner)
+          form = quest;
+      } else if (auto* global = dynamic_cast<CampaignGlobalObject*>(value)) {
+        if (global->OwnerId() == owner)
+          form = global;
+      }
+      if (!form)
+        throw std::runtime_error("Unsupported saved campaign object");
+      return FormDesc::FromFormId(
+               form->record.ToGlobalId(form->record.rec->GetId()),
+               world.espmFiles)
+        .ToString();
+    };
+    const auto decodeObject = [&](const Json& value) -> VarValue {
+      if (value.is_object()) {
+        if (value.size() != 3 || value.at("kind") != "alias" ||
+            !value.at("quest").is_string() ||
+            !value.at("id").is_number_integer() ||
+            value.at("id").get<int64_t>() < 0 ||
+            value.at("id").get<uint64_t>() > INT32_MAX)
+          throw std::runtime_error("Invalid saved campaign alias identity");
+        return VarValue(resolveAlias(FormDesc::FromString(
+                                       value.at("quest").get<std::string>())
+                                       .ToFormId(world.espmFiles),
+                                     value.at("id").get<uint32_t>())
                           .get());
-      });
+      }
+      return VarValue(resolve(FormDesc::FromString(value.get<std::string>())
+                                .ToFormId(world.espmFiles))
+                        .get());
+    };
+    QuestVmState state(QuestJournal::ScriptState(actor), encodeObject,
+                       decodeObject);
 
     resolve = [&](uint32_t id) -> std::shared_ptr<IGameObject> {
       if (objects.count(id))
@@ -1350,7 +1350,8 @@ bool QuestScriptRuntime::Execute(
             const auto targetKey =
               FormDesc::FromFormId(targetId, world.espmFiles).ToString();
             const auto reentrant = [&](const QuestJobState::Stage& ancestor) {
-              return ancestor.quest == targetKey && ancestor.stage == index;
+              return ancestor.cursor != "done" &&
+                ancestor.quest == targetKey && ancestor.stage == index;
             };
             if ((life.flags & espm::QuestLifecycleData::AllowRepeatedStages) &&
                 (reentrant(*job) ||
@@ -1380,6 +1381,66 @@ bool QuestScriptRuntime::Execute(
             execute(targetId, static_cast<uint16_t>(index), false));
         });
     }
+    // Stage fragments and event handlers share this clean host checkpoint.
+    // The native boundary only records intent; it never enters a child VM.
+    auto managedCall = [&](const std::shared_ptr<ActivePexInstance>& script,
+                           const std::string& selectedState,
+                           const std::string& function,
+                           const std::vector<VarValue>& args) {
+      struct ManagedGuard
+      {
+        bool& active;
+        explicit ManagedGuard(bool& value)
+          : active(value)
+        {
+          active = true;
+        }
+        ~ManagedGuard() { active = false; }
+      } managedGuard(managedFragment);
+      PapyrusExecutionResult execution;
+      if (work->cursor == "waiting") {
+        if (!completion ||
+            Lower(work->script) != Lower(script->GetSourcePexName()) ||
+            work->function != function || work->child)
+          throw std::runtime_error("Saved quest entry mismatch");
+        const bool timer = work->awaitKind == "timer";
+        if ((!timer && work->awaitKind != "bool" &&
+             work->awaitKind != "stage") ||
+            completion->kind !=
+              (timer ? QuestJobState::Completion::Kind::None
+                     : QuestJobState::Completion::Kind::Boolean) ||
+            (timer && (completion->value || !work->timer)) ||
+            (!timer && work->timer))
+          throw std::runtime_error("Quest completion type mismatch");
+        const auto saved =
+          state.TakeContinuation(job->Scope(*work), work->token);
+        if (Lower(saved.resultType) != (timer ? "none" : "bool"))
+          throw std::runtime_error("Quest continuation result type mismatch");
+        if (!job->completions.emplace(work->token, *completion).second)
+          throw std::runtime_error("Quest completion already consumed");
+        work->token.clear();
+        work->awaitKey.clear();
+        work->awaitKind.clear();
+        work->timer.reset();
+        work->cursor = "begin";
+        execution = script->ResumeFunction(
+          job->Scope(*work), saved,
+          timer ? VarValue::None() : VarValue(completion->value), stack);
+      } else {
+        work->script = script->GetSourcePexName();
+        work->function = function;
+        execution = script->StartResumableFunction(
+          job->Scope(*work), selectedState, function, args, stack);
+      }
+      if (execution.continuation) {
+        if (work->token != execution.continuation->token ||
+            work->awaitKey.empty())
+          throw std::runtime_error("Quest await has no saved intent");
+        state.PutContinuation(*execution.continuation);
+        work->cursor = "waiting";
+      }
+      return execution;
+    };
     execute = [&](uint32_t targetId, uint16_t targetStage, bool managedEntry) {
       if (++depth > 128) {
         --depth;
@@ -1485,59 +1546,13 @@ bool QuestScriptRuntime::Execute(
           VarValue result;
           try {
             if (managed) {
-              struct ManagedGuard
-              {
-                bool& active;
-                explicit ManagedGuard(bool& value)
-                  : active(value)
-                {
-                  active = true;
-                }
-                ~ManagedGuard() { active = false; }
-              } managedGuard(managedFragment);
-              PapyrusExecutionResult execution;
-              if (resuming) {
-                if (!completion || work->script != fragment.script ||
-                    work->function != fragment.function || work->child)
-                  throw std::runtime_error("Saved quest fragment mismatch");
-                const bool timer = work->awaitKind == "timer";
-                if ((!timer && work->awaitKind != "bool" &&
-                     work->awaitKind != "stage") ||
-                    completion->kind !=
-                      (timer ? QuestJobState::Completion::Kind::None
-                             : QuestJobState::Completion::Kind::Boolean) ||
-                    (timer && (completion->value || !work->timer)) ||
-                    (!timer && work->timer))
-                  throw std::runtime_error("Quest completion type mismatch");
-                const auto saved =
-                  state.TakeContinuation(job->Scope(*work), work->token);
-                if (Lower(saved.resultType) != (timer ? "none" : "bool"))
-                  throw std::runtime_error(
-                    "Quest continuation result type mismatch");
-                if (!job->completions.emplace(work->token, *completion).second)
-                  throw std::runtime_error(
-                    "Quest completion already consumed");
-                work->token.clear();
-                work->awaitKey.clear();
-                work->awaitKind.clear();
-                work->timer.reset();
-                work->cursor = "begin";
-                execution = script->ResumeFunction(
-                  job->Scope(*work), saved,
-                  timer ? VarValue::None() : VarValue(completion->value),
-                  stack);
-              } else {
-                work->script = fragment.script;
-                work->function = fragment.function;
-                execution = script->StartResumableFunction(
-                  job->Scope(*work), "", fragment.function, {}, stack);
-              }
+              if (resuming &&
+                  (Lower(work->script) != Lower(fragment.script) ||
+                   work->function != fragment.function))
+                throw std::runtime_error("Saved quest fragment mismatch");
+              const auto execution =
+                managedCall(script, "", fragment.function, {});
               if (execution.continuation) {
-                if (work->token != execution.continuation->token ||
-                    work->awaitKey.empty())
-                  throw std::runtime_error("Quest await has no saved intent");
-                state.PutContinuation(*execution.continuation);
-                work->cursor = "waiting";
                 work->log = static_cast<uint32_t>(logIndex);
                 return true;
               }
@@ -1559,9 +1574,7 @@ bool QuestScriptRuntime::Execute(
       }
       return true;
     };
-    auto dispatchReferenceEvent = [&](uint32_t targetId, const char* name,
-                                      const std::vector<VarValue>& args,
-                                      bool includeAliases) {
+    auto eventRecipients = [&](uint32_t targetId, bool includeAliases) {
       vm.CheckExecutionBudget();
       std::vector<std::shared_ptr<IGameObject>> recipients{ resolve(
         targetId) };
@@ -1590,14 +1603,172 @@ bool QuestScriptRuntime::Execute(
           auto alias = std::dynamic_pointer_cast<CampaignAliasObject>(
             resolveAlias(id, binding.object.alias));
           const auto target = aliasTarget(*alias);
-          if (static_cast<IGameObject*>(target) && formId(target) == targetId)
+          if (static_cast<IGameObject*>(target) &&
+              formId(target) == targetId) {
+            if (recipients.size() >= QuestJobState::MaxRecipients)
+              throw std::runtime_error("Quest event recipient limit exceeded");
             recipients.push_back(alias);
+          }
         }
       }
-      for (const auto& recipient : recipients)
+      if (recipients.size() > QuestJobState::MaxRecipients)
+        throw std::runtime_error("Quest event recipient limit exceeded");
+      return recipients;
+    };
+    auto dispatchReferenceEvent = [&](uint32_t targetId, const char* name,
+                                      const std::vector<VarValue>& args,
+                                      bool includeAliases) {
+      for (const auto& recipient : eventRecipients(targetId, includeAliases))
         vm.SendEventSynchronous(recipient, name, args, stack);
     };
-    if (referenceEvent) {
+    auto eventArguments = [&](const CampaignInventoryApi::Event& event) {
+      return std::vector<VarValue>{
+        VarValue(resolve(event.item).get()),
+        VarValue(static_cast<int32_t>(event.count)), VarValue::None(),
+        event.container ? VarValue(resolve(event.container).get())
+                        : VarValue::None()
+      };
+    };
+    // Resolve canonical receivers through this transaction's fresh object set.
+    // Membership was selected once; an alias may legitimately change its
+    // target while an earlier handler is running.
+    auto dispatchObject = [&](const Json& receiver) {
+      if (receiver.is_object()) {
+        const auto id =
+          FormDesc::FromString(receiver.at("quest").get<std::string>())
+            .ToFormId(world.espmFiles);
+        QuestJournal::RequireAdapter(actor, id);
+        return resolveAlias(id, receiver.at("id").get<uint32_t>());
+      }
+      return resolve(FormDesc::FromString(receiver.get<std::string>())
+                       .ToFormId(world.espmFiles));
+    };
+    auto roster = [&](QuestJobState::Dispatch& dispatch, bool capture) {
+      const auto& identity = dispatch.recipients.at(dispatch.recipient);
+      const auto recipient = dispatchObject(identity);
+      const auto roots = vm.GetEventAttachments(recipient);
+      if (roots.size() > QuestJobState::MaxAttachments)
+        throw std::runtime_error("Quest event attachment limit exceeded");
+      std::vector<std::string> names, templates;
+      std::string reference;
+      for (const auto& root : roots) {
+        if (!root || !root->IsValid())
+          throw std::runtime_error("Invalid quest event attachment");
+        names.push_back(root->GetSourcePexName());
+      }
+      if (identity.is_string()) {
+        const auto original = FormDesc::FromString(identity.get<std::string>())
+                                .ToFormId(world.espmFiles);
+        auto& copy = CampaignReferenceBinding::Resolve(actor, original);
+        QuestJournal::ReadInventory(actor, copy);
+        reference = copy.GetChangeForm().formDesc.ToString();
+        for (const auto& selected : copy.GetChangeForm().templateChain)
+          templates.push_back(selected.ToString());
+      }
+      if (capture) {
+        dispatch.roots = std::move(names);
+        dispatch.templates = std::move(templates);
+        dispatch.reference = std::move(reference);
+        dispatch.captured = true;
+      } else if (dispatch.roots != names || dispatch.templates != templates ||
+                 dispatch.reference != reference)
+        throw std::runtime_error("Quest event recipient binding changed");
+      return roots;
+    };
+    // A child stage is still executing on behalf of the saved handler. Its
+    // effects cannot commit against a removed alias adapter or a replaced
+    // physical receiver while the parent is suspended.
+    if (job && job->handler && !job->children.empty())
+      roster(*job->dispatch, false);
+    bool executedWork = false;
+    if (job && job->cursor == "done" && job->children.empty()) {
+      if (++job->steps > QuestJobState::MaxSteps)
+        throw std::runtime_error("Quest job work limit exceeded");
+      if (job->handler) {
+        auto& dispatch = *job->dispatch;
+        const auto roots = roster(dispatch, false);
+        if (job->handler->cursor == "done") {
+          // Retiring an already durable handler is a host step, never a
+          // fabricated Papyrus completion. Do not rerun its prefix or suffix.
+          job->handler.reset();
+          ++dispatch.attachment;
+          work = job;
+        } else {
+          const auto& identity = *job->handler->handlerIdentity;
+          auto implementation = roots.at(dispatch.attachment);
+          size_t depth = 0;
+          while (implementation && implementation->IsValid() &&
+                 Lower(implementation->GetSourcePexName()) !=
+                   Lower(identity.implementation)) {
+            if (++depth > 128)
+              throw std::runtime_error(
+                "Quest event inheritance limit exceeded");
+            implementation = implementation->GetParentInstance();
+          }
+          if (!implementation || !implementation->IsValid())
+            throw std::runtime_error(
+              "Saved quest handler implementation is missing");
+          const auto& event = inventoryEvents.at(job->eventHead);
+          const auto result =
+            managedCall(implementation, identity.state, identity.function,
+                        eventArguments(event));
+          if (result.value.promise)
+            throw std::runtime_error(
+              "Quest handler returned an unmanaged promise");
+          changed = true;
+          executedWork = true;
+        }
+      } else if (!job->dispatch) {
+        const auto& event = inventoryEvents.at(job->eventHead);
+        QuestJobState::Dispatch dispatch;
+        for (const auto& recipient : eventRecipients(event.target, true))
+          dispatch.recipients.push_back(encodeObject(recipient.get()));
+        job->dispatch = std::move(dispatch);
+      } else {
+        auto& dispatch = *job->dispatch;
+        if (dispatch.recipient == dispatch.recipients.size()) {
+          job->dispatch.reset();
+          ++job->eventHead;
+        } else if (!dispatch.captured) {
+          roster(dispatch, true);
+        } else {
+          const auto roots = roster(dispatch, false);
+          if (dispatch.attachment == roots.size()) {
+            ++dispatch.recipient;
+            dispatch.attachment = 0;
+            dispatch.captured = false;
+            dispatch.roots.clear();
+            dispatch.templates.clear();
+            dispatch.reference.clear();
+          } else {
+            const auto& event = inventoryEvents.at(job->eventHead);
+            const auto selected = vm.SelectEventHandler(
+              roots.at(dispatch.attachment),
+              event.added ? "OnItemAdded" : "OnItemRemoved");
+            if (!selected) {
+              ++dispatch.attachment;
+            } else {
+              if (job->nextHandler > QuestJobState::MaxHandlers)
+                throw std::runtime_error("Quest event handler limit exceeded");
+              QuestJobState::Stage handler;
+              handler.quest = job->quest;
+              handler.contentHash = job->contentHash;
+              handler.stage = job->stage;
+              QuestJobState::HandlerIdentity identity;
+              identity.receiver = dispatch.recipients.at(dispatch.recipient);
+              identity.rootScript = selected->root->GetSourcePexName();
+              identity.implementation =
+                selected->implementation->GetSourcePexName();
+              identity.state = selected->state;
+              identity.function = selected->function;
+              identity.sequence = job->nextHandler++;
+              handler.handlerIdentity = std::move(identity);
+              job->handler = std::move(handler);
+            }
+          }
+        }
+      }
+    } else if (referenceEvent) {
       dispatchReferenceEvent(loadedReference, referenceEvent,
                              { VarValue(resolve(eventSource).get()) }, true);
       changed = true;
@@ -1612,23 +1783,19 @@ bool QuestScriptRuntime::Execute(
       changed = true;
     } else {
       changed = execute(questId, stage, job != nullptr);
+      executedWork = job != nullptr;
       if (!changed && !job)
         return;
     }
     const bool waiting = work && work->cursor == "waiting";
-    const bool deferEvents = waiting || (work && work->node != 0);
-    for (size_t eventIndex = 0;
-         !deferEvents && eventIndex < inventoryEvents.size(); ++eventIndex) {
+    // Durable jobs drain the root FIFO in later receipt-gated host steps.
+    // Ordinary synchronous entry points retain their atomic delivery policy.
+    for (size_t eventIndex = 0; !job && eventIndex < inventoryEvents.size();
+         ++eventIndex) {
       // Copy before dispatch: handlers may append more inventory events.
       const auto event = inventoryEvents[eventIndex];
       const auto* name = event.added ? "OnItemAdded" : "OnItemRemoved";
-      const std::vector<VarValue> args{
-        VarValue(resolve(event.item).get()),
-        VarValue(static_cast<int32_t>(event.count)), VarValue::None(),
-        event.container ? VarValue(resolve(event.container).get())
-                        : VarValue::None()
-      };
-      dispatchReferenceEvent(event.target, name, args, true);
+      dispatchReferenceEvent(event.target, name, eventArguments(event), true);
     }
     if (loadedReference &&
         &CampaignReferenceBinding::Resolve(actor, loadedReference) != loaded)
@@ -1639,20 +1806,21 @@ bool QuestScriptRuntime::Execute(
     QuestJournal::SetScriptState(actor, state.Save());
     if (job) {
       job->instructions = vm.GetExecutedInstructions();
-      work->accepted = changed;
-      job->events.clear();
-      if (deferEvents) {
-        for (const auto& event : inventoryEvents)
-          job->events.push_back(
-            { FormDesc::FromFormId(event.target, world.espmFiles).ToString(),
-              FormDesc::FromFormId(event.item, world.espmFiles).ToString(),
-              event.container
-                ? FormDesc::FromFormId(event.container, world.espmFiles)
-                    .ToString()
-                : std::string(),
-              event.count, event.added });
+      if (executedWork)
+        work->accepted = changed;
+      for (size_t index = job->events.size(); index < inventoryEvents.size();
+           ++index) {
+        const auto& event = inventoryEvents[index];
+        job->events.push_back(
+          { FormDesc::FromFormId(event.target, world.espmFiles).ToString(),
+            FormDesc::FromFormId(event.item, world.espmFiles).ToString(),
+            event.container
+              ? FormDesc::FromFormId(event.container, world.espmFiles)
+                  .ToString()
+              : std::string(),
+            event.count, event.added });
       }
-      if (!waiting) {
+      if (executedWork && !waiting) {
         work->cursor = "done";
         work->log = 0;
         work->script.clear();

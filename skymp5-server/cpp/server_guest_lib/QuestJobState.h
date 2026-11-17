@@ -16,6 +16,7 @@ struct QuestJobState
     std::string target, item, container;
     uint32_t count = 0;
     bool added = false;
+    bool operator==(const Event&) const = default;
   };
   struct Timer
   {
@@ -44,6 +45,22 @@ struct QuestJobState
     }
     bool operator==(const Completion&) const = default;
   };
+  struct HandlerIdentity
+  {
+    nlohmann::json receiver;
+    std::string rootScript, implementation, state, function;
+    uint64_t sequence = 0;
+    bool operator==(const HandlerIdentity&) const = default;
+  };
+  struct Dispatch
+  {
+    std::vector<nlohmann::json> recipients;
+    uint32_t recipient = 0, attachment = 0;
+    bool captured = false;
+    std::vector<std::string> roots, templates;
+    std::string reference;
+    bool operator==(const Dispatch&) const = default;
+  };
   struct Stage
   {
     uint64_t node = 0, child = 0;
@@ -56,6 +73,8 @@ struct QuestJobState
     uint32_t log = 0;
     std::string script, function, token, awaitKey, awaitKind, failure;
     std::optional<Timer> timer;
+    std::optional<HandlerIdentity> handlerIdentity;
+    bool operator==(const Stage&) const = default;
   };
   struct Job : Stage
   {
@@ -65,6 +84,10 @@ struct QuestJobState
     bool automatic = false;
     uint32_t instructions = 0, steps = 0;
     std::vector<Event> events;
+    uint32_t eventHead = 0;
+    uint64_t nextHandler = 1;
+    std::optional<Dispatch> dispatch;
+    std::optional<Stage> handler;
     std::map<std::string, Completion> completions;
     std::deque<Stage> children;
     std::string Scope() const;
@@ -72,6 +95,7 @@ struct QuestJobState
     std::string NextToken() const;
     Stage& Current();
     const Stage& Current() const;
+    bool IsComplete() const;
   };
   uint64_t generation = 1, nextJob = 1;
   std::optional<Job> active;
@@ -81,6 +105,10 @@ struct QuestJobState
   static constexpr size_t MaxEvents = 4096;
   static constexpr size_t MaxDepth = 128;
   static constexpr uint32_t MaxSteps = 100000;
+  static constexpr size_t MaxRecipients = 1024;
+  static constexpr size_t MaxAttachments = 1024;
+  static constexpr size_t MaxHandlers = 4096;
+  static constexpr uint64_t MaxSegments = MaxSteps;
 
   static QuestJobState Read(const nlohmann::json& value);
   nlohmann::json Save() const;
