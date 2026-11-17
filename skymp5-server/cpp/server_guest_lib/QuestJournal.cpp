@@ -470,12 +470,26 @@ void QuestJournal::RecordRepeatedStage(MpActor& actor, uint32_t questId,
 
 void QuestJournal::Atomic(MpActor& actor, const std::function<void()>& execute)
 {
+  AtomicImpl(actor, execute, false);
+}
+
+std::shared_ptr<const SaveReceipt> QuestJournal::AtomicDurable(
+  MpActor& actor, const std::function<void()>& execute)
+{
+  return AtomicImpl(actor, execute, true);
+}
+
+std::shared_ptr<const SaveReceipt> QuestJournal::AtomicImpl(
+  MpActor& actor, const std::function<void()>& execute, bool durable)
+{
   if (transaction)
     throw std::runtime_error("Nested quest transaction");
   if (!actor.GetParent())
     throw std::runtime_error("Unregistered quest transaction participant");
   auto& owner = Owner(actor);
   auto& world = *actor.GetParent();
+  if (durable)
+    world.RequireDurableSaveStorage();
   const auto actorId = actor.GetFormId(), ownerId = owner.GetFormId();
   // Keep both objects alive and require the same registered identities at
   // commit.
@@ -545,11 +559,13 @@ void QuestJournal::Atomic(MpActor& actor, const std::function<void()>& execute)
         factions.push_back(
           { edit.reference->AsActor(), *edit.current.factions });
     transaction = nullptr;
-    if (!changes.empty() || !visibility.empty() || !factions.empty())
-      world.CommitCampaignInventory(owner, dump, changes, visibility, factions,
-                                    validateReads);
+    if (durable || !changes.empty() || !visibility.empty() ||
+        !factions.empty())
+      return world.CommitCampaignInventory(owner, dump, changes, visibility,
+                                           factions, validateReads, durable);
     else if (local.ledger != initial)
       owner.SetPropertyValueDump(kProperty, dump, false, false);
+    return {};
   } catch (...) {
     transaction = nullptr;
     throw;

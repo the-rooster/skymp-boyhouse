@@ -22,6 +22,7 @@ struct TimerEntry
 struct Timer::Impl
 {
   std::deque<TimerEntry> timers;
+  uint64_t generation = 0;
   const std::unique_ptr<MakeID> idGenerator =
     std::make_unique<MakeID>(std::numeric_limits<uint32_t>::max());
 
@@ -46,9 +47,20 @@ void Timer::TickTimers()
   while (!timers.empty() && now >= timers.front().finish) {
     auto front = std::move(timers.front());
     timers.pop_front();
+    const auto generation = pImpl->generation;
     front.promise.Resolve(Void());
-    pImpl->DestroyID(front);
+    // Clear may have reset IDs and scheduled a new timer with front.id while
+    // resolving this callback. That ID now belongs to the new generation.
+    if (pImpl->generation == generation)
+      pImpl->DestroyID(front);
   }
+}
+
+void Timer::Clear() noexcept
+{
+  pImpl->timers.clear();
+  pImpl->idGenerator->Reset(std::numeric_limits<uint32_t>::max());
+  ++pImpl->generation;
 }
 
 bool Timer::RemoveTimer(const uint32_t timerId)

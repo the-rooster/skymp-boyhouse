@@ -24,6 +24,7 @@
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 #include <iterator>
+#include <limits>
 #include <optional>
 #include <save_storages/AsyncSaveStorage.h> // UpsertFailedException
 #include <save_storages/ISaveStorage.h>
@@ -43,14 +44,29 @@ struct RelootTimeForTypesEntry
 
 struct WorldState::Impl
 {
+  struct SaveBatch
+  {
+    std::vector<std::optional<MpChangeForm>> forms;
+    std::shared_ptr<SaveReceipt> receipt;
+    size_t receiptBytes = 0;
+    uint64_t attempt = 0;
+    bool submitted = false, tracked = false, resultReady = false;
+    bool abandoned = false;
+    std::exception_ptr result;
+  };
   std::vector<std::optional<MpChangeForm>> changesByIdx;
   bool changesByIdxEmpty = true;
+  std::list<std::shared_ptr<SaveBatch>> sealedSaves;
+  size_t queuedReceiptBytes = 0;
+  uint64_t nextSaveSequence = 0;
+  bool saveTickActive = false, clearing = false;
+  static constexpr size_t maxSaveBatches = 256;
+  static constexpr size_t maxReceiptBytes = 128 * 1024 * 1024;
 
   std::shared_ptr<
     Viet::ISaveStorage<MpChangeForm, FormDesc, std::vector<FormDesc>>>
     saveStorage;
   std::shared_ptr<IScriptStorage> scriptStorage;
-  bool saveStorageBusy = false;
   std::shared_ptr<VirtualMachine> vm;
   uint32_t nextId = 0xff000000;
   std::shared_ptr<IPapyrusCompatibilityPolicy> policy;
@@ -78,11 +94,55 @@ WorldState::WorldState()
   pImpl->policy = PapyrusCompatibilityPolicyFactory::Create(this);
 }
 
+WorldState::~WorldState()
+{
+  Clear();
+}
+
 void WorldState::Clear()
 {
+  if (pImpl->clearing)
+    return;
+  pImpl->clearing = true;
+  for (const auto& batch : pImpl->sealedSaves) {
+    batch->abandoned = true;
+    if (batch->receipt && batch->receipt->state == SaveReceipt::State::Pending)
+      batch->receipt->state = SaveReceipt::State::Abandoned;
+  }
+  // A submitted write may still commit. Retain it only as a draining barrier
+  // if this WorldState is reused; never replay abandoned work or acknowledge
+  // it as durable to its old caller. Unsubmitted work can be discarded.
+  if (!pImpl->sealedSaves.empty() && pImpl->sealedSaves.front()->submitted) {
+    auto keep = pImpl->sealedSaves.begin();
+    pImpl->queuedReceiptBytes = (*keep)->receiptBytes;
+    pImpl->sealedSaves.erase(++keep, pImpl->sealedSaves.end());
+  } else {
+    pImpl->sealedSaves.clear();
+    pImpl->queuedReceiptBytes = 0;
+  }
   forms.clear();
   grids.clear();
   formIdxManager.reset();
+  refrByIdxUnreliable.clear();
+  actorIdByProfileId.clear();
+  actorIdByPrivateIndexedProperty.clear();
+  hosters.clear();
+  activationChildsByActivationParent.clear();
+  lastMovUpdateByIdx.clear();
+  pImpl->changeFormsForDeferredLoad.clear();
+  pImpl->attachEspmRecordFailures.clear();
+  for (auto& cache : pImpl->allFormsByModIndexCache)
+    cache.reset();
+  timerEffects.Clear();
+  timerRegular.Clear();
+  for (auto& entry : pImpl->relootTimeForTypes)
+    entry.timer.Clear();
+  pImpl->vm.reset();
+  pImpl->classes.clear();
+  pImpl->policy.reset();
+  pImpl->changesByIdx.clear();
+  pImpl->changesByIdxEmpty = true;
+  pImpl->clearing = false;
 }
 
 const std::chrono::steady_clock::time_point& WorldState::GetStartPoint() const
@@ -105,6 +165,15 @@ void WorldState::AttachSaveStorage(
     Viet::ISaveStorage<MpChangeForm, FormDesc, std::vector<FormDesc>>>
     saveStorage)
 {
+  if (saveStorage == pImpl->saveStorage)
+    return;
+  if (QuestJournal::HasActiveTransaction() ||
+      pImpl->campaignVisibilityCommitting ||
+      (pImpl->saveStorage &&
+       (!pImpl->sealedSaves.empty() || !pImpl->changesByIdxEmpty ||
+        pImpl->saveTickActive)))
+    throw std::runtime_error(
+      "Cannot replace save storage with outstanding writes");
   spdlog::info("AttachSaveStorage - db fixes installed");
 
   pImpl->saveStorage = saveStorage;
@@ -353,7 +422,7 @@ void WorldState::RequestReloot(MpObjectReference& ref,
 
 void WorldState::RequestSave(MpObjectReference& ref)
 {
-  if (pImpl->formLoadingInProgress) {
+  if (pImpl->formLoadingInProgress || pImpl->clearing) {
     return;
   }
 
@@ -435,13 +504,28 @@ void WorldState::ValidateCampaignFactions(const std::vector<Faction>& factions)
   }
 }
 
-void WorldState::CommitCampaignInventory(
+void WorldState::RequireDurableSaveStorage() const
+{
+  if (pImpl->clearing || pImpl->formLoadingInProgress || !pImpl->saveStorage ||
+      !pImpl->saveStorage->SupportsAtomicBatches() ||
+      !pImpl->saveStorage->SupportsUpsertResults())
+    throw std::runtime_error(
+      "Durable campaign commit requires atomic save storage with results");
+  if (pImpl->sealedSaves.size() >= Impl::maxSaveBatches ||
+      pImpl->queuedReceiptBytes >= Impl::maxReceiptBytes ||
+      pImpl->nextSaveSequence == std::numeric_limits<uint64_t>::max())
+    throw std::runtime_error("Durable campaign save queue limit exceeded");
+}
+
+std::shared_ptr<const SaveReceipt> WorldState::CommitCampaignInventory(
   MpActor& owner, const std::string& journal,
   const std::vector<CampaignInventoryChange>& changes,
   const std::vector<CampaignVisibilityChange>& visibility,
   const std::vector<CampaignFactionChange>& factions,
-  const std::function<void()>& validateReads)
+  const std::function<void()>& validateReads, bool durable)
 {
+  if (durable)
+    RequireDurableSaveStorage();
   if (pImpl->formLoadingInProgress)
     throw std::runtime_error("Campaign commit during world loading");
   if (pImpl->saveStorage && !pImpl->saveStorage->SupportsAtomicBatches())
@@ -603,6 +687,43 @@ void WorldState::CommitCampaignInventory(
   saveBatch.resize(size);
   for (const auto& [id, entry] : prepared)
     saveBatch[entry.reference->GetIdx()] = entry.live;
+  std::shared_ptr<SaveReceipt> receipt;
+  std::list<std::shared_ptr<Impl::SaveBatch>> sealed;
+  std::vector<std::optional<MpChangeForm>> nextPending;
+  size_t receiptBytes = 0;
+  if (durable) {
+    // The barrier may have performed unrelated work or replaced storage.
+    RequireDurableSaveStorage();
+    // Indexed save buffers can be very sparse. Charge their slots as well as
+    // serialized values so many owner-only receipts cannot retain unbounded
+    // empty change-form allocations.
+    if (saveBatch.capacity() >
+        Impl::maxReceiptBytes / sizeof(std::optional<MpChangeForm>))
+      throw std::runtime_error("Durable campaign save batch is too large");
+    receiptBytes = saveBatch.capacity() * sizeof(std::optional<MpChangeForm>);
+    for (const auto& form : saveBatch) {
+      if (!form)
+        continue;
+      const auto bytes = MpChangeForm::ToJson(*form).dump().size();
+      if (bytes > Impl::maxReceiptBytes - receiptBytes)
+        throw std::runtime_error("Durable campaign save batch is too large");
+      receiptBytes += bytes;
+    }
+    if (receiptBytes > Impl::maxReceiptBytes - pImpl->queuedReceiptBytes)
+      throw std::runtime_error(
+        "Durable campaign save queue byte limit exceeded");
+    receipt = std::make_shared<SaveReceipt>();
+    receipt->sequence = pImpl->nextSaveSequence + 1;
+    receipt->campaign = ownerChange.live.formDesc;
+    receipt->journalRevision =
+      nlohmann::json::parse(journal).at("revision").get<uint64_t>();
+    auto batch = std::make_shared<Impl::SaveBatch>();
+    batch->forms.swap(saveBatch);
+    batch->receipt = receipt;
+    batch->receiptBytes = receiptBytes;
+    sealed.push_back(std::move(batch));
+    nextPending.resize(size);
+  }
   static_assert(noexcept(pImpl->changesByIdx.swap(saveBatch)));
   static_assert(noexcept(grids.swap(*nextGrids)));
   static_assert(noexcept(hosters.swap(*nextHosters)));
@@ -615,8 +736,16 @@ void WorldState::CommitCampaignInventory(
     grids.swap(*nextGrids);
     hosters.swap(*nextHosters);
   }
-  pImpl->changesByIdx.swap(saveBatch);
-  pImpl->changesByIdxEmpty = false;
+  if (durable) {
+    pImpl->changesByIdx.swap(nextPending);
+    pImpl->changesByIdxEmpty = true;
+    pImpl->sealedSaves.splice(pImpl->sealedSaves.end(), sealed);
+    pImpl->queuedReceiptBytes += receiptBytes;
+    pImpl->nextSaveSequence = receipt->sequence;
+  } else {
+    pImpl->changesByIdx.swap(saveBatch);
+    pImpl->changesByIdxEmpty = false;
+  }
   // Publication has succeeded. A notification failure must not pretend the
   // committed quest was rolled back, or allow its rewards to be run twice.
   bool synchronized = true;
@@ -680,6 +809,7 @@ void WorldState::CommitCampaignInventory(
       }
     }
   }
+  return receipt;
 }
 
 void WorldState::CommitCampaignReferences(
@@ -1175,93 +1305,156 @@ bool WorldState::LoadForm(uint32_t formId, std::stringstream* optionalOutTrace)
 
 void WorldState::TickSaveStorage(const std::chrono::system_clock::time_point&)
 {
-  if (!pImpl->saveStorage) {
+  if (!pImpl->saveStorage || pImpl->clearing || pImpl->saveTickActive)
     return;
-  }
-
+  pImpl->saveTickActive = true;
+  Viet::ScopedTask<bool> tickGuard([](bool& active) { active = false; },
+                                   pImpl->saveTickActive);
+  const auto storage = pImpl->saveStorage;
   try {
-    pImpl->saveStorage->Tick();
+    storage->Tick();
   } catch (
-    Viet::AsyncSaveStorage<MpChangeForm, FormDesc,
-                           std::vector<FormDesc>>::UpsertFailedException& e) {
-    spdlog::error(
-      "TickSaveStorage - received UpsertFailedException {}, re-saving",
-      e.what());
-
-    // No SetTimer here because timers may also break in theory. we faced such
-    // problems earlier
-    pImpl->saveStorageBusy = false;
-
-    auto& forms = e.GetAffectedForms();
-    size_t numRequested = 0;
-
-    for (size_t i = 0; i < forms.size(); ++i) {
-      auto& changeForm = forms[i];
-      if (changeForm == std::nullopt) {
-        continue;
+    const Viet::AsyncSaveStorage<
+      MpChangeForm, FormDesc, std::vector<FormDesc>>::UpsertFailedException&) {
+    // Compatibility with old custom storages. Durable receipts require the
+    // correlated result API, so an anonymous error can never fail their batch.
+    if (!pImpl->sealedSaves.empty()) {
+      auto& batch = *pImpl->sealedSaves.front();
+      if (batch.submitted && !batch.tracked && !batch.resultReady) {
+        batch.result = std::current_exception();
+        batch.resultReady = true;
       }
-
-      MpForm* form = LookupFormByIdx(static_cast<int>(i));
-      MpObjectReference* refr = form ? form->AsObjectReference() : nullptr;
-      if (!refr) {
-        continue;
-      }
-
-      auto formId = changeForm->formDesc.ToFormId(espmFiles);
-
-      if (refr->GetFormId() != formId) {
-        spdlog::error("TickSaveStorage - formIds not matching {:x} <=> {:x}",
-                      refr->GetFormId(), formId);
-        continue;
-      }
-
-      RequestSave(*refr);
-      numRequested++;
     }
-
-    spdlog::info("TickSaveStorage - requested re-save for {} forms in buffer "
-                 "with size {}",
-                 numRequested, forms.size());
-
-  } catch (std::exception& e) {
-    spdlog::error(
-      "TickSaveStorage - received std::exception {}, can't request re-save",
-      e.what());
-    pImpl->saveStorageBusy = false;
+  } catch (const std::exception& error) {
+    // Iterate/callback/recycling failures are not evidence about the current
+    // write. In particular they cannot release its ordering barrier.
+    spdlog::error("TickSaveStorage - unrelated storage error: {}",
+                  error.what());
+  } catch (...) {
+    spdlog::error("TickSaveStorage - unrelated unknown storage error");
   }
 
-  if (pImpl->saveStorageBusy) {
-    return;
-  }
+  auto finish = [&] {
+    if (pImpl->sealedSaves.empty())
+      return;
+    auto batch = pImpl->sealedSaves.front();
+    if (!batch->resultReady)
+      return;
+    batch->submitted = false;
+    batch->resultReady = false;
+    if (batch->result && !batch->abandoned) {
+      if (batch->receipt)
+        batch->receipt->lastError = batch->result;
+      // Retain the exact old snapshot, including unloaded/destroyed objects.
+      // New live edits remain behind it and never participate in this retry.
+      try {
+        std::rethrow_exception(batch->result);
+      } catch (const std::exception& error) {
+        spdlog::error("TickSaveStorage - retained batch failed: {}",
+                      error.what());
+      } catch (...) {
+        spdlog::error(
+          "TickSaveStorage - retained batch failed with unknown error");
+      }
+      batch->result = {};
+      return;
+    }
+    if (batch->receipt && !batch->abandoned) {
+      batch->receipt->state = SaveReceipt::State::Durable;
+      batch->receipt->lastError = {};
+    }
+    pImpl->queuedReceiptBytes -= batch->receiptBytes;
+    pImpl->sealedSaves.pop_front();
+  };
+  finish();
 
-  if (pImpl->changesByIdxEmpty) {
-    return;
-  }
-
-  pImpl->saveStorageBusy = true;
-
-  auto pImpl_ = pImpl;
-
-  auto previousSize = pImpl->changesByIdx.size();
-
+  // Async storage recycles one indexed vector per successful write. Consume
+  // those buffers even though we retain our own immutable retry snapshots;
+  // otherwise its recycle queue would grow on every ordinary save.
   try {
-    pImpl->saveStorage->Upsert(std::move(pImpl->changesByIdx),
-                               [pImpl_] { pImpl_->saveStorageBusy = false; });
-    pImpl->changesByIdxEmpty = true;
-  } catch (std::exception& e) {
-    pImpl->saveStorageBusy = false;
-    spdlog::error("TickSaveStorage - Upsert failed with {}", e.what());
+    std::vector<std::optional<MpChangeForm>> recycled;
+    for (size_t i = 0;
+         i < 64 && storage->GetRecycledChangeFormsBuffer(recycled); ++i) {
+      recycled.clear();
+      if (pImpl->changesByIdxEmpty &&
+          recycled.capacity() > pImpl->changesByIdx.capacity()) {
+        const auto size = pImpl->changesByIdx.size();
+        pImpl->changesByIdx.swap(recycled);
+        pImpl->changesByIdx.resize(size);
+      }
+    }
+  } catch (const std::exception& error) {
+    spdlog::error("TickSaveStorage - optional buffer recycling failed: {}",
+                  error.what());
+  } catch (...) {
+    spdlog::error("TickSaveStorage - optional buffer recycling failed");
   }
 
-  pImpl->changesByIdx.clear();
-
-  bool recycleSuccess =
-    pImpl->saveStorage->GetRecycledChangeFormsBuffer(pImpl->changesByIdx);
-
-  if (!recycleSuccess) {
-    // Just resize to previous size, at least not to resize every RequestSave
-    pImpl->changesByIdx.resize(previousSize);
+  // Coalesce ordinary updates only until submission. Existing sealed batches
+  // always drain first; campaign allocation and ordinary journal updates use
+  // this same pending buffer and cannot overtake an earlier receipt.
+  if (pImpl->sealedSaves.empty() && !pImpl->changesByIdxEmpty) {
+    try {
+      auto batch = std::make_shared<Impl::SaveBatch>();
+      std::vector<std::optional<MpChangeForm>> nextPending(
+        pImpl->changesByIdx.size());
+      pImpl->sealedSaves.push_back(batch);
+      batch->forms.swap(pImpl->changesByIdx);
+      pImpl->changesByIdx.swap(nextPending);
+      pImpl->changesByIdxEmpty = true;
+    } catch (const std::exception& error) {
+      spdlog::error("TickSaveStorage - could not prepare save batch: {}",
+                    error.what());
+      return;
+    }
   }
+  if (pImpl->sealedSaves.empty())
+    return;
+  const auto batch = pImpl->sealedSaves.front();
+  if (batch->submitted)
+    return;
+  try {
+    if (batch->receipt &&
+        (!storage->SupportsAtomicBatches() ||
+         !storage->SupportsUpsertResults()))
+      throw std::runtime_error(
+        "Queued durable save requires atomic storage with results");
+    // The storage interface takes ownership of its argument even on a throw.
+    // Keep our own immutable copy until a matching success is observed.
+    auto payload = batch->forms;
+    if (batch->attempt == std::numeric_limits<uint64_t>::max())
+      throw std::overflow_error("Save batch attempt counter exhausted");
+    const auto attempt = ++batch->attempt;
+    batch->submitted = true;
+    batch->tracked = storage->SupportsUpsertResults();
+    if (batch->receipt)
+      batch->receipt->attempts = attempt;
+    std::weak_ptr<Impl> weak = pImpl;
+    std::weak_ptr<Impl::SaveBatch> weakBatch = batch;
+    const auto complete = [weak, weakBatch,
+                           attempt](std::exception_ptr error) {
+      const auto state = weak.lock();
+      const auto pending = weakBatch.lock();
+      if (!state || !pending || state->sealedSaves.empty() ||
+          state->sealedSaves.front() != pending || !pending->submitted ||
+          pending->attempt != attempt || pending->resultReady)
+        return;
+      pending->result = error;
+      pending->resultReady = true;
+    };
+    if (batch->tracked)
+      storage->UpsertWithResult(std::move(payload), complete);
+    else
+      storage->Upsert(std::move(payload), [complete] { complete({}); });
+  } catch (...) {
+    // An inline result is authoritative even if a buggy backend throws after
+    // delivering it. Otherwise a synchronous submission failure is retryable.
+    if (!batch->resultReady) {
+      batch->result = std::current_exception();
+      batch->resultReady = true;
+    }
+  }
+  finish();
 }
 
 void WorldState::TickTimers(const std::chrono::system_clock::time_point&)
@@ -1482,6 +1675,8 @@ PexScript::Lazy CreatePexScriptLazy(
 
 VirtualMachine& WorldState::GetPapyrusVm()
 {
+  if (!pImpl->policy)
+    pImpl->policy = PapyrusCompatibilityPolicyFactory::Create(this);
   if (!pImpl->vm) {
     std::vector<PexScript::Lazy> pexStructures;
     std::vector<std::string> scriptNames;

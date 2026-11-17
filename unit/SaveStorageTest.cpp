@@ -5,7 +5,143 @@
 #include "database_drivers/FileDatabase.h"
 #include "database_drivers/ZipDatabase.h"
 #include "save_storages/AsyncSaveStorage.h"
+#include <condition_variable>
 #include <filesystem>
+#include <mutex>
+
+namespace {
+using ResultStorage = Viet::AsyncSaveStorage<int, int, int>;
+using ResultStorageInterface = Viet::ISaveStorage<int, int, int>;
+
+struct UnknownUpsertFailure
+{
+  int operation;
+};
+
+class GatedResultDatabase : public Viet::IDatabase<int, int, int>
+{
+public:
+  bool SupportsAtomicBatches() const noexcept override { return true; }
+
+  void Release()
+  {
+    std::lock_guard lock(mutex);
+    released = true;
+    condition.notify_all();
+  }
+
+  bool WaitForEntered(size_t count)
+  {
+    std::unique_lock lock(mutex);
+    return condition.wait_for(lock, std::chrono::seconds(2),
+                              [&] { return workers.size() >= count; });
+  }
+
+  bool WaitForFinished(size_t count)
+  {
+    std::unique_lock lock(mutex);
+    return condition.wait_for(lock, std::chrono::seconds(2),
+                              [&] { return finished >= count; });
+  }
+
+  std::vector<std::thread::id> Workers()
+  {
+    std::lock_guard lock(mutex);
+    return workers;
+  }
+
+  std::vector<int> Rows()
+  {
+    std::lock_guard lock(mutex);
+    return rows;
+  }
+
+  void Iterate(const IterateCallback& callback, std::optional<int>) override
+  {
+    for (const auto row : Rows())
+      callback(row);
+  }
+
+protected:
+  std::vector<std::optional<int>>&& UpsertImpl(
+    std::vector<std::optional<int>>&& forms, size_t& count) override
+  {
+    const auto operation = forms.at(0).value();
+    std::unique_lock lock(mutex);
+    workers.push_back(std::this_thread::get_id());
+    condition.notify_all();
+    condition.wait(lock, [&] { return released; });
+    if (operation >= 0)
+      rows.push_back(operation);
+    ++finished;
+    condition.notify_all();
+    if (operation == -2)
+      throw UnknownUpsertFailure{ operation };
+    if (operation < 0)
+      throw std::runtime_error("database operation " +
+                               std::to_string(operation));
+    count = forms.size();
+    return std::move(forms);
+  }
+
+private:
+  std::mutex mutex;
+  std::condition_variable condition;
+  bool released = false;
+  size_t finished = 0;
+  std::vector<int> rows;
+  std::vector<std::thread::id> workers;
+};
+
+struct ResultStorageFixture
+{
+  std::shared_ptr<GatedResultDatabase> database =
+    std::make_shared<GatedResultDatabase>();
+  ResultStorage storage{ database, nullptr, "gated-results", 1 };
+
+  // Also unblock the worker when a REQUIRE fails before the explicit release.
+  ~ResultStorageFixture() { database->Release(); }
+};
+
+class LegacyResultStorage : public ResultStorageInterface
+{
+public:
+  size_t submissions = 0;
+  void IterateSync(const IterateSyncCallback&) override {}
+  void Upsert(std::vector<std::optional<int>>&&,
+              const UpsertCallback&) override
+  {
+    ++submissions;
+  }
+  void Iterate(const IterateCallback&, const std::optional<int>&) override {}
+  uint32_t GetNumFinishedUpserts() const override { return 0; }
+  uint32_t GetNumFinishedIterates() const override { return 0; }
+  void Tick() override {}
+  bool GetRecycledChangeFormsBuffer(std::vector<std::optional<int>>&) override
+  {
+    return false;
+  }
+  const std::string& GetName() const override { return name; }
+
+private:
+  const std::string name = "legacy";
+};
+
+template <class Tick, class Finished>
+void PollStorageResults(Tick tick, Finished finished)
+{
+  const auto deadline =
+    std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!finished()) {
+    tick();
+    if (finished())
+      return;
+    if (std::chrono::steady_clock::now() >= deadline)
+      throw std::runtime_error("Timed out waiting for storage results");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+}
+}
 
 std::shared_ptr<
   Viet::ISaveStorage<MpChangeForm, FormDesc, std::vector<FormDesc>>>
@@ -241,4 +377,165 @@ TEST_CASE("Changes are transferred to SaveStorage", "[save]")
       REQUIRE(Viet::ISaveStorageUtils::CountSync(*st) == 1);
     }
   }
+}
+
+TEST_CASE("Tracked upserts require explicit support and a callback",
+          "[save][UpsertResults]")
+{
+  LegacyResultStorage legacy;
+  REQUIRE_FALSE(legacy.SupportsUpsertResults());
+  std::vector<std::optional<int>> untouched{ 1 };
+  REQUIRE_THROWS(
+    legacy.UpsertWithResult(std::move(untouched), [](std::exception_ptr) {}));
+  REQUIRE(untouched == std::vector<std::optional<int>>{ 1 });
+  REQUIRE(legacy.submissions == 0);
+
+  ResultStorageFixture fixture;
+  REQUIRE(fixture.storage.SupportsUpsertResults());
+  std::vector<std::optional<int>> rejected{ 2 };
+  REQUIRE_THROWS_AS(fixture.storage.UpsertWithResult(std::move(rejected), {}),
+                    std::invalid_argument);
+  REQUIRE(rejected == std::vector<std::optional<int>>{ 2 });
+  REQUIRE(fixture.database->Workers().empty());
+  REQUIRE(fixture.storage.GetNumFinishedUpserts() == 0);
+}
+
+TEST_CASE("Tracked upsert successes and failures remain correlated on Tick",
+          "[save][UpsertResults]")
+{
+  ResultStorageFixture fixture;
+  const auto callerThread = std::this_thread::get_id();
+  std::vector<std::pair<int, std::exception_ptr>> results;
+  std::vector<std::thread::id> callbackThreads;
+  for (const auto operation : { -1, 2, -2, 4 }) {
+    fixture.storage.UpsertWithResult(
+      { operation }, [&, operation](std::exception_ptr error) {
+        results.emplace_back(operation, error);
+        callbackThreads.push_back(std::this_thread::get_id());
+      });
+  }
+  REQUIRE(fixture.database->WaitForEntered(1));
+  REQUIRE(results.empty());
+  REQUIRE(fixture.storage.GetNumFinishedUpserts() == 0);
+  REQUIRE(fixture.database->Workers().front() != callerThread);
+  // The worker is blocked inside the database, while submission and Tick
+  // remain available on the caller thread.
+  REQUIRE_NOTHROW(fixture.storage.Tick());
+  REQUIRE(results.empty());
+  fixture.database->Release();
+  REQUIRE(fixture.database->WaitForFinished(4));
+  REQUIRE(results.empty()); // Database completion alone invokes no callbacks.
+  PollStorageResults([&] { fixture.storage.Tick(); },
+                     [&] { return results.size() == 4; });
+  const std::vector<int> expected{ -1, 2, -2, 4 };
+  for (size_t i = 0; i < results.size(); ++i) {
+    REQUIRE(results[i].first == expected[i]);
+    REQUIRE(callbackThreads[i] == callerThread);
+  }
+  REQUIRE(results[0].second);
+  REQUIRE_THROWS_WITH(std::rethrow_exception(results[0].second),
+                      "database operation -1");
+  REQUIRE_FALSE(results[1].second);
+  REQUIRE(results[2].second);
+  try {
+    std::rethrow_exception(results[2].second);
+  } catch (const UnknownUpsertFailure& error) {
+    REQUIRE(error.operation == -2);
+  }
+  REQUIRE_FALSE(results[3].second);
+  REQUIRE(fixture.database->Rows() == std::vector<int>{ 2, 4 });
+  std::vector<std::optional<int>> recycled;
+  size_t recycledBatches = 0;
+  while (fixture.storage.GetRecycledChangeFormsBuffer(recycled)) {
+    REQUIRE(recycled.size() == 1);
+    REQUIRE_FALSE(recycled.front().has_value());
+    ++recycledBatches;
+  }
+  REQUIRE(recycledBatches == 2);
+  for (const auto worker : fixture.database->Workers())
+    REQUIRE(worker != callerThread);
+  REQUIRE(fixture.storage.GetNumFinishedUpserts() == 4);
+  for (size_t i = 0; i < 3; ++i)
+    REQUIRE_NOTHROW(fixture.storage.Tick());
+  REQUIRE(results.size() == 4);
+  REQUIRE(fixture.storage.GetNumFinishedUpserts() == 4);
+}
+
+TEST_CASE("Untracked upsert errors keep the legacy exception path",
+          "[save][UpsertResults]")
+{
+  ResultStorageFixture fixture;
+  size_t failedCallback = 0, successCallback = 0, trackedCallback = 0;
+  std::exception_ptr trackedResult;
+  fixture.storage.Upsert({ -1 }, [&] { ++failedCallback; });
+  fixture.storage.UpsertWithResult({ 2 }, [&](std::exception_ptr error) {
+    ++trackedCallback;
+    trackedResult = error;
+  });
+  fixture.storage.Upsert({ 3 }, [&] { ++successCallback; });
+  fixture.database->Release();
+  size_t globalFailures = 0;
+  PollStorageResults(
+    [&] {
+      try {
+        fixture.storage.Tick();
+      } catch (const std::runtime_error& error) {
+        REQUIRE(std::string(error.what()) == "database operation -1");
+        ++globalFailures;
+      }
+    },
+    [&] {
+      return globalFailures == 1 && trackedCallback == 1 &&
+        successCallback == 1;
+    });
+  REQUIRE(failedCallback == 0);
+  REQUIRE_FALSE(trackedResult);
+  REQUIRE(fixture.storage.GetNumFinishedUpserts() == 2);
+  REQUIRE_NOTHROW(fixture.storage.Tick());
+  REQUIRE(globalFailures == 1);
+  REQUIRE(trackedCallback == 1);
+  REQUIRE(successCallback == 1);
+}
+
+TEST_CASE("Throwing tracked result callbacks are consumed without starving "
+          "later callbacks",
+          "[save][UpsertResults]")
+{
+  ResultStorageFixture fixture;
+  size_t throwingCalls = 0, laterCalls = 0;
+  std::exception_ptr originalFailure, laterResult;
+  fixture.storage.UpsertWithResult({ -2 }, [&](std::exception_ptr error) {
+    originalFailure = error;
+    ++throwingCalls;
+    throw std::runtime_error("result callback threw");
+  });
+  fixture.storage.UpsertWithResult({ 4 }, [&](std::exception_ptr error) {
+    laterResult = error;
+    ++laterCalls;
+  });
+  fixture.database->Release();
+  bool caught = false;
+  PollStorageResults(
+    [&] {
+      try {
+        fixture.storage.Tick();
+      } catch (const std::runtime_error& error) {
+        REQUIRE(std::string(error.what()) == "result callback threw");
+        caught = true;
+      }
+    },
+    [&] { return caught; });
+  REQUIRE(throwingCalls == 1);
+  REQUIRE(laterCalls == 0);
+  REQUIRE(originalFailure);
+  REQUIRE_THROWS_AS(std::rethrow_exception(originalFailure),
+                    UnknownUpsertFailure);
+  REQUIRE(fixture.storage.GetNumFinishedUpserts() == 0);
+  PollStorageResults([&] { fixture.storage.Tick(); },
+                     [&] { return laterCalls == 1; });
+  REQUIRE_FALSE(laterResult);
+  REQUIRE(fixture.storage.GetNumFinishedUpserts() == 1);
+  REQUIRE_NOTHROW(fixture.storage.Tick());
+  REQUIRE(throwingCalls == 1);
+  REQUIRE(laterCalls == 1);
 }

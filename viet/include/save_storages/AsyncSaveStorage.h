@@ -19,6 +19,8 @@ public:
     typename ISaveStorage<T, FormDescType, FilterType>::IterateSyncCallback;
   using UpsertCallback =
     typename ISaveStorage<T, FormDescType, FilterType>::UpsertCallback;
+  using UpsertResultCallback =
+    typename ISaveStorage<T, FormDescType, FilterType>::UpsertResultCallback;
   using IterateCallback =
     typename ISaveStorage<T, FormDescType, FilterType>::IterateCallback;
 
@@ -95,7 +97,18 @@ public:
               const UpsertCallback& cb) override
   {
     std::lock_guard l(pImpl->share3.m);
-    pImpl->share3.upsertTasks.push_back({ std::move(changeForms), cb });
+    pImpl->share3.upsertTasks.push_back({ std::move(changeForms), cb, {} });
+  }
+
+  bool SupportsUpsertResults() const noexcept override { return true; }
+
+  void UpsertWithResult(std::vector<std::optional<T>>&& changeForms,
+                        const UpsertResultCallback& cb) override
+  {
+    if (!cb)
+      throw std::invalid_argument("Tracked upsert requires a result callback");
+    std::lock_guard l(pImpl->share3.m);
+    pImpl->share3.upsertTasks.push_back({ std::move(changeForms), {}, cb });
   }
 
   void Iterate(const IterateCallback& cb,
@@ -107,6 +120,9 @@ public:
 
   uint32_t GetNumFinishedUpserts() const override
   {
+    // Preserve the legacy counter: callbacks that returned normally on Tick.
+    // Tracked failures also have callbacks; this is not a successful commit
+    // count, and a throwing callback is consumed without incrementing it.
     return pImpl->tickStore.numFinishedUpserts;
   }
 
@@ -236,6 +252,7 @@ private:
     {
       std::vector<std::optional<T>> changeForms;
       std::function<void()> callback;
+      UpsertResultCallback resultCallback;
     };
 
     struct IterateTask
@@ -330,18 +347,33 @@ private:
       for (size_t i = 0; i < tasks.size(); ++i) {
         auto& t = tasks[i];
         auto& a = taskArtifacts[i];
+        bool committed = false;
         try {
           numChangeForms +=
             pImpl->share.dbImpl->Upsert(std::move(t.changeForms));
+          committed = true;
           t.changeForms.clear();
           a.optionalCallbackToFire = std::move(t.callback);
-
-          std::vector<std::optional<T>> tmp;
-          if (pImpl->share.dbImpl->GetRecycledChangeFormsBuffer(tmp)) {
-            a.optionalRecycledChangeFormsBuffer = std::move(tmp);
-          }
         } catch (...) {
           a.optionalExceptionToFire = std::current_exception();
+        }
+        if (committed) {
+          try {
+            std::vector<std::optional<T>> tmp;
+            if (pImpl->share.dbImpl->GetRecycledChangeFormsBuffer(tmp))
+              a.optionalRecycledChangeFormsBuffer = std::move(tmp);
+          } catch (...) {
+            // Recycling is optional and cannot turn a committed tracked
+            // batch into a failed write. Preserve the old untracked path.
+            if (!t.resultCallback)
+              a.optionalExceptionToFire = std::current_exception();
+          }
+        }
+        if (t.resultCallback) {
+          const auto error = a.optionalExceptionToFire;
+          a.optionalExceptionToFire = nullptr;
+          a.optionalCallbackToFire = [cb = std::move(t.resultCallback),
+                                      error] { cb(error); };
         }
       }
 

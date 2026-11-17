@@ -1,6 +1,7 @@
 #include "database_drivers/SqliteDatabase.h"
 #include "CampaignReferenceBinding.h"
 #include "QuestJournal.h"
+#include "SaveReceipt.h"
 #include "TestUtils.hpp"
 #include "database_drivers/DatabaseFactory.h"
 #include "save_storages/AsyncSaveStorage.h"
@@ -437,6 +438,99 @@ TEST_CASE("Campaign reward transactions reload journals and bound inventories "
   REQUIRE(npc.GetInventory().GetItemCount(0xf) == 14);
   REQUIRE(QuestJournal::Get(owner, 0x4e50d).at("stage") == 10);
   REQUIRE(QuestJournal::ScriptState(owner).at("fixture") == 42);
+  REQUIRE(&CampaignReferenceBinding::Resolve(owner, 0x1a677) == &npc);
+}
+
+TEST_CASE(
+  "A durable campaign receipt certifies complete SQLite rows and restart",
+  "[SQLite][Quest][CampaignInventory][SaveReceipt]")
+{
+  SqliteFiles files;
+  constexpr uint32_t ownerId = 0xff004001, npcId = 0xff004010;
+  nlohmann::json journal;
+  std::shared_ptr<const SaveReceipt> receipt;
+  {
+    auto storage =
+      std::make_shared<Storage>(std::make_shared<SqliteDatabase>(files.File()),
+                                spdlog::default_logger(), "sqlite-receipt", 1);
+    REQUIRE(storage->SupportsAtomicBatches());
+    REQUIRE(storage->SupportsUpsertResults());
+    PartOne server;
+    server.AttachEspm(&GetEspmLoader());
+    server.AttachSaveStorage(storage);
+    server.CreateActor(ownerId, { 1, 2, 3 }, 0, 0x3c);
+    auto& owner = server.worldState.GetFormAt<MpActor>(ownerId);
+    owner.SetPropertyValueDump(QuestJournal::kEnabled,
+                               "[\"4e50d:Skyrim.esm\"]", false, false);
+    owner.SetWorldInstance("campaign:" + std::to_string(ownerId) + ":receipt");
+    owner.SetInventory(Inventory().AddItem(0xf, 10));
+    server.worldState.AddForm(
+      std::make_unique<MpActor>(
+        LocationalData{ { 1, 2, 3 }, { 0, 0, 0 }, FormDesc::Tamriel() },
+        FormCallbacks::DoNothing(), 0x13bbd),
+      npcId);
+    auto& npc = server.worldState.GetFormAt<MpActor>(npcId);
+    npc.SetWorldInstance(owner.GetWorldInstance());
+    npc.SetInventory(Inventory().AddItem(0xf, 20));
+    CampaignReferenceBinding::Bind(owner, 0x1a677, npc);
+    receipt = QuestJournal::AtomicDurable(owner, [&] {
+      QuestJournal::Apply(
+        owner,
+        { { "quest", 0x4e50d }, { "op", "setStage" }, { "index", 10 } });
+      QuestJournal::SetScriptState(owner,
+                                   { { "committedToken", "reward-once" } });
+      QuestJournal::EditInventory(
+        owner, owner, [](Inventory& inventory) { inventory.AddItem(0xf, 6); });
+      QuestJournal::EditInventory(owner, npc, [](Inventory& inventory) {
+        inventory.RemoveItems({ { 0xf, 6 } });
+      });
+    });
+    journal = QuestJournal::Snapshot(owner);
+    const auto committedOwner = MpChangeForm::ToJson(owner.GetChangeForm());
+    const auto committedNpc = MpChangeForm::ToJson(npc.GetChangeForm());
+    REQUIRE(receipt->GetState() == SaveReceipt::State::Pending);
+    REQUIRE(receipt->GetCampaign() == owner.GetChangeForm().formDesc);
+    REQUIRE(receipt->GetJournalRevision() ==
+            journal.at("revision").get<uint64_t>());
+    const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (receipt->GetState() == SaveReceipt::State::Pending &&
+           std::chrono::steady_clock::now() < deadline) {
+      server.worldState.Tick();
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(receipt->GetState() == SaveReceipt::State::Durable);
+    REQUIRE(receipt->GetAttempts() == 1);
+    REQUIRE_FALSE(receipt->GetLastError());
+    // A separate connection must observe the whole journal/reward commit as
+    // soon as the receipt says Durable, before the writer is closed.
+    SqliteDatabase independent(files.File());
+    const auto rows = Read(independent);
+    const auto ownerKey = owner.GetChangeForm().formDesc.ToString();
+    const auto npcKey = npc.GetChangeForm().formDesc.ToString();
+    REQUIRE(rows.at(ownerKey) == committedOwner);
+    REQUIRE(rows.at(npcKey) == committedNpc);
+  }
+  REQUIRE(receipt->GetState() == SaveReceipt::State::Durable);
+  auto storage =
+    std::make_shared<Storage>(std::make_shared<SqliteDatabase>(files.File()),
+                              spdlog::default_logger(), "sqlite-restarted", 1);
+  PartOne restarted;
+  restarted.AttachEspm(&GetEspmLoader());
+  restarted.AttachSaveStorage(storage);
+  auto& owner = restarted.worldState.GetFormAt<MpActor>(ownerId);
+  auto& npc = restarted.worldState.GetFormAt<MpActor>(npcId);
+  REQUIRE(owner.GetInventory().GetItemCount(0xf) == 16);
+  REQUIRE(npc.GetInventory().GetItemCount(0xf) == 14);
+  auto restoredJournal = QuestJournal::Snapshot(owner);
+  // Context epochs describe live instance lifetimes, not saved campaign
+  // progress. A fresh server rebinds that context while restoring history.
+  REQUIRE(restoredJournal.at("contextEpoch") != journal.at("contextEpoch"));
+  restoredJournal.erase("contextEpoch");
+  journal.erase("contextEpoch");
+  REQUIRE(restoredJournal == journal);
+  REQUIRE(QuestJournal::ScriptState(owner).at("committedToken") ==
+          "reward-once");
   REQUIRE(&CampaignReferenceBinding::Resolve(owner, 0x1a677) == &npc);
 }
 

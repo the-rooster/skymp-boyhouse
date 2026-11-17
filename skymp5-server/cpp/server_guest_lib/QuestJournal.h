@@ -1,7 +1,9 @@
 #pragma once
 #include "Faction.h"
+#include "SaveReceipt.h"
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <nlohmann/json.hpp>
 #include <vector>
 
@@ -31,6 +33,13 @@ public:
   // Synchronous journal/VM, inventory, actor factions and reference-visibility
   // transaction. Other world effects still require transactional adapters.
   static void Atomic(MpActor& actor, const std::function<void()>& execute);
+  // Publishes the same transaction and seals its exact save batch. The receipt
+  // stays pending until that batch commits; errors retry the retained
+  // snapshot. Requires atomic storage with per-submission results. Even a
+  // no-op seals the owner's state. A receipt is process-local, not durable job
+  // deduplication.
+  static std::shared_ptr<const SaveReceipt> AtomicDurable(
+    MpActor& actor, const std::function<void()>& execute);
   static bool HasActiveTransaction() noexcept;
   static const Inventory& ReadInventory(MpActor& actor,
                                         MpObjectReference& target);
@@ -58,4 +67,8 @@ public:
   static void SetScriptState(MpActor& actor, const nlohmann::json& state);
   static bool ReferenceInitialized(MpActor& actor, uint32_t original);
   static void MarkReferenceInitialized(MpActor& actor, uint32_t original);
+
+private:
+  static std::shared_ptr<const SaveReceipt> AtomicImpl(
+    MpActor& actor, const std::function<void()>& execute, bool durable);
 };

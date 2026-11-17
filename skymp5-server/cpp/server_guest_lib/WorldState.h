@@ -8,6 +8,7 @@
 #include "MpObjectReference.h"
 #include "NiPoint3.h"
 #include "PartOneListener.h"
+#include "SaveReceipt.h"
 #include "condition_functions/ConditionFunctionMap.h"
 #include "libespm/Loader.h"
 #include "papyrus-vm/VirtualMachine.h"
@@ -56,9 +57,13 @@ public:
 
 public:
   WorldState();
+  ~WorldState();
   WorldState(const WorldState&) = delete;
   WorldState& operator=(const WorldState&) = delete;
 
+  // Quiescent reset/teardown, outside active Papyrus or game-event execution.
+  // Cancels timers and clears world-derived identities; submitted saves drain
+  // independently and their old receipts become Abandoned.
   void Clear();
 
   const std::chrono::steady_clock::time_point& GetStartPoint() const;
@@ -120,12 +125,13 @@ private:
                                 const std::vector<MpChangeForm>& copies);
   // Internal campaign commit: prepare every live/save copy before publishing
   // any of them. Visibility and faction changes require a projection barrier.
-  void CommitCampaignInventory(
+  std::shared_ptr<const SaveReceipt> CommitCampaignInventory(
     MpActor& owner, const std::string& journal,
     const std::vector<CampaignInventoryChange>& changes,
     const std::vector<CampaignVisibilityChange>& visibility,
     const std::vector<CampaignFactionChange>& factions,
-    const std::function<void()>& validateReads);
+    const std::function<void()>& validateReads, bool durable = false);
+  void RequireDurableSaveStorage() const;
 
 public:
   bool HasEspmFile(std::string_view filename) const noexcept;

@@ -80,8 +80,8 @@ replacement frame in one campaign transaction.
 
 The production quest runner does not yet use these entry points. No Utility.Wait,
 Start/Stop/Reset, latent fragment or event is enabled by this change. Persistent
-stage/log completion cursors, event delivery, lifecycle ordering and
-disk-commit acknowledgements are still required. Destroying and rebuilding a VM
+stage/log completion cursors, event delivery, lifecycle ordering and integration
+with durable storage receipts are still required. Destroying and rebuilding a VM
 from saved JSON proves frame recovery; it does not prove crash-durable quest
 execution or exactly-once external delivery. See [STORAGE.md](STORAGE.md).
 
@@ -295,7 +295,7 @@ parents, container UI and other spatial effects are outside this transaction;
 they still need campaign-specific integration. Movement is also outside the
 script transaction. Automatic alias fills, remaining natives and latent handlers
 remain restricted. Controlled script tests do not certify any vanilla quest or
-establish throughput for 16–32 players.
+establish throughput for 16â€“32 players.
 
 ### Creating private reference copies
 
@@ -349,7 +349,7 @@ location playable. Automatic entry, engine-side transition application, cross-ar
 enable-parent change propagation, scale/ownership/lock overlays, NPC auto-calculated
 stats, respawns and durable lifecycle delivery remain unfinished. The factory
 currently copies the relevant world indexes during a batch; this needs measurement
-and optimization before a 16–32 player rollout. Requests are bounded to 4,096
+and optimization before a 16â€“32 player rollout. Requests are bounded to 4,096
 references, a radius of 65,536 units, and a 100,000-entry/8 MiB owner ledger;
 streaming and ledger partitioning are required for a full world.
 
@@ -675,3 +675,19 @@ clean retry. The owned scan remains at 2,274 quests, 14,026 PEX objects, 642
 capabilities, 1,146 quests with runtime dispatch, no parse failures, and zero
 certified playable quests. The registry still guards 131 source files. No
 Skyrim launch, client installation change or staging deployment was performed.
+
+The exact-save-receipt batch passed the Linux server build and full verification
+on 2026-11-17 UTC: 649 native cases / 453,724 assertions, 368 JavaScript
+tests, 47 Python tests, addon and both protocol smokes, and SQLite recovery of
+32 characters. Receipt cases cover immutable FIFO retries, stale/duplicate
+results, submission failures, admission bounds, backend replacement and abandoned
+in-flight writes. A separate SQLite connection observes all receipt participants
+before fresh-server recovery. World-reset tests prevent stale object indexes and
+timers from affecting reused identities. The source registry guards
+136 files; catalog counts and zero certified playable quests remain unchanged.
+These are storage/runtime checks, not a quest playthrough. Production quests
+still need persistent work cursors, outbox handling and lifecycle integration.
+No Skyrim launch, client installation change or staging deployment was performed.
+An initial JavaScript run terminated one test process with SIGSEGV; its 36 cases
+passed in isolation and the full JavaScript suite passed on rerun without a
+source change. That process crash was not reproduced or diagnosed.

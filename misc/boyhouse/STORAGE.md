@@ -2,9 +2,10 @@
 
 The `sqlite` database driver persists a whole `IDatabase::Upsert` batch in one
 transaction. A failed row, duplicate form identity, serialization error or commit
-failure rolls back the batch and preserves its change forms in the existing
-`UpsertFailedException` retry path. Empty slots in the world save buffer are
-ignored. A successful return reports only committed rows.
+failure rolls back the batch. The world retains an immutable snapshot for retry
+and receives a result tied to that submission; legacy callers can still use the
+`UpsertFailedException` path. Empty slots in the world save buffer are ignored.
+A successful return reports only committed rows.
 
 Configure the server with:
 
@@ -46,18 +47,43 @@ settings explicitly choose SQLite. Initialization never replaces existing settin
   reconciliation, inventory notifications and replacement projections follow
   the in-memory commit; failed delivery quarantines observers without retrying
   the committed rewards as though the transaction had rolled back.
-- A world save tick still submits the batch asynchronously. Client notifications
+- `QuestJournal::AtomicDurable` seals an immutable owner/effect batch and returns
+  a server-thread `SaveReceipt`. It requires atomic storage with per-submission
+  results; journal-only and no-op calls also save the owner. `Pending` becomes
+  `Durable` only when a matching successful result is processed by a world tick.
+  A sequence, campaign identity and journal revision identify the receipt within
+  this world lifetime. `GetNumFinishedUpserts` is a callback counter, not this
+  durability signal.
+- Sealed batches drain in FIFO order. Failed attempts retry the retained forms,
+  including removed or replaced actors, before any later save; they never rebuild
+  the failed snapshot from current live state. Ordinary updates continue to
+  coalesce behind sealed batches. Stale/duplicate results and unrelated read or
+  recycling errors cannot release the write barrier. Queue admission allows at
+  most 256 sealed batches and 128 MiB of receipt payload accounting (serialized
+  forms plus sparse-vector slots); refusal precedes transaction publication.
+- Backend replacement is refused while writes are pending or a transaction is
+  active. `Clear`/destruction marks pending receipts `Abandoned`: an already
+  submitted write may still commit. A reused world drains that attempt before
+  writing newer state, without retrying the abandoned batch. Receipts are
+  process-local observations; persistent job markers and an outbox are still
+  required to recover a commit whose acknowledgment was lost.
+- Quiescent world clearing also resets object/profile/private indexes, hosting
+  leases, deferred form caches and the shared VM/policy, and cancels regular,
+  effect and reloot timers. Old timer callbacks and indexed pointers must not
+  target newly created actors when identifiers are reused.
+- A world save tick still submits batches asynchronously. Client notifications
   do **not** wait for disk commit, so a crash can lose a recently acknowledged
   change. Persistent execution of external events, complete world-effect staging
-  and durable acknowledgements remain required. Switching drivers alone does not
-  make arbitrary world-effect natives safe to enable.
+  and integration of job dispatch with durable receipts remain required.
+  Switching drivers alone does not make arbitrary world-effect natives safe to
+  enable.
 - VM schema 6 can store a nested script checkpoint and preserve arrays held only
   by any saved caller's locals. Its codec consumes a pending completion token once within the
   candidate heap. The caller still has to commit token consumption, resumed
   effects and the next checkpoint together, and wait for storage acknowledgement
   before acknowledging durable delivery. JSON/fresh-VM recovery tests do not
   establish that crash boundary. Production stage/event execution remains
-  synchronous until its work cursors, lifecycle jobs and commit acknowledgements
+  synchronous until its work cursors, lifecycle jobs and receipt-gated delivery
   are also persistent.
 - Change forms now store maximum attributes and regeneration values as well as
   percentages. Legacy saves without the optional `actorValues` object retain
@@ -106,6 +132,13 @@ asynchronous SQLite save, then loads a fresh server and checks all participants
 and the persisted reference binding. Separate transaction tests check stale
 identities, phase changes, conflicting writes, failed handlers and non-atomic
 storage. This does not certify general world effects or native-client behavior.
+
+Receipt regressions delay and fail individual submissions, replay stale results,
+throw after consuming submission arguments, and remove/reuse actors between
+attempts. The SQLite receipt case waits for the exact receipt, reads complete
+owner/NPC rows through an independent connection, and reloads a fresh server.
+World-reset cases check abandoned write barriers, cleared indexes and cancelled
+timers. These checks do not yet exercise a persisted quest job or outbox.
 
 The private-copy restart regression saves a dead story NPC with changed
 attributes, equipment and an empty faction list, plus a placed ammunition stack,
