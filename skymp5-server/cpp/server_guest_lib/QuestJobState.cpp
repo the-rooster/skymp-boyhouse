@@ -82,13 +82,20 @@ void Bounded(const std::string& text, size_t limit)
     throw std::runtime_error("Quest job string out of bounds");
 }
 
-QuestJobState::Stage ReadStage(const Json& value, bool child)
+QuestJobState::Stage ReadStage(const Json& value, bool child, uint64_t version)
 {
-  if (child)
-    Fields(value,
-           { "node", "child", "quest", "contentHash", "stage", "cursor",
-             "accepted", "log", "script", "function", "token", "awaitKey",
-             "failure" });
+  if (child) {
+    if (version < 3)
+      Fields(value,
+             { "node", "child", "quest", "contentHash", "stage", "cursor",
+               "accepted", "log", "script", "function", "token", "awaitKey",
+               "failure" });
+    else
+      Fields(value,
+             { "node", "child", "quest", "contentHash", "stage", "cursor",
+               "accepted", "log", "script", "function", "token", "awaitKey",
+               "failure", "awaitKind", "timer" });
+  }
   QuestJobState::Stage stage;
   stage.node = Number(value.at("node"), QuestJobState::MaxOperations, child);
   stage.child = Number(value.at("child"), QuestJobState::MaxOperations);
@@ -107,15 +114,37 @@ QuestJobState::Stage ReadStage(const Json& value, bool child)
   stage.token = Text(value.at("token"), 256, true);
   stage.awaitKey = Text(value.at("awaitKey"), 128, true);
   stage.failure = Text(value.at("failure"), 1024, true);
+  stage.awaitKind = version < 3
+    ? (stage.cursor == "waiting" ? (stage.child ? "stage" : "bool") : "")
+    : Text(value.at("awaitKind"), 5, true);
+  if (version >= 3 && !value.at("timer").is_null()) {
+    const auto& timer = value.at("timer");
+    Fields(timer, { "policy", "issuedUnixMs", "dueUnixMs", "durationMs" });
+    if (Text(timer.at("policy"), 15) != "utc-deadline-v1")
+      throw std::runtime_error("Unsupported quest timer policy");
+    stage.timer =
+      QuestJobState::Timer{ Number(timer.at("issuedUnixMs"), MaxIdentity),
+                            Number(timer.at("dueUnixMs"), MaxIdentity),
+                            Number(timer.at("durationMs"), 86400000) };
+    if (stage.timer->durationMs > MaxIdentity - stage.timer->issuedUnixMs ||
+        stage.timer->dueUnixMs !=
+          stage.timer->issuedUnixMs + stage.timer->durationMs)
+      throw std::runtime_error("Invalid quest timer deadline");
+  }
   const bool pending = stage.child || stage.log || !stage.script.empty() ||
     !stage.function.empty() || !stage.token.empty() ||
-    !stage.awaitKey.empty() || !stage.failure.empty();
+    !stage.awaitKey.empty() || !stage.awaitKind.empty() || stage.timer ||
+    !stage.failure.empty();
   if (stage.cursor == "begin") {
     if (pending || stage.accepted)
       throw std::runtime_error("Quest stage begin cursor is not pristine");
   } else if (stage.cursor == "waiting") {
     if (!stage.accepted || stage.script.empty() || stage.function.empty() ||
-        stage.token.empty() || stage.awaitKey.empty())
+        stage.token.empty() || stage.awaitKey.empty() ||
+        (stage.awaitKind != "bool" && stage.awaitKind != "stage" &&
+         stage.awaitKind != "timer") ||
+        ((stage.awaitKind == "stage") != (stage.child != 0)) ||
+        ((stage.awaitKind == "timer") != stage.timer.has_value()))
       throw std::runtime_error("Invalid waiting quest stage cursor");
   } else if (stage.cursor == "done") {
     if (pending)
@@ -159,7 +188,7 @@ QuestJobState::Job ReadJob(const Json& saved, uint64_t version)
     value["children"] = Json::array();
     value["nextOperation"] = value.at("completions").size() + 1 +
       (value.at("cursor") == "waiting" ? 1 : 0);
-  } else
+  } else if (version == 2)
     Fields(
       value,
       { "id",      "generation",  "segment",  "command",      "actor",
@@ -168,8 +197,45 @@ QuestJobState::Job ReadJob(const Json& saved, uint64_t version)
         "script",  "function",    "token",    "awaitKey",     "failure",
         "events",  "completions", "node",     "child",        "nextOperation",
         "children" });
+  else
+    Fields(value, { "id",
+                    "generation",
+                    "segment",
+                    "command",
+                    "actor",
+                    "owner",
+                    "quest",
+                    "instance",
+                    "contentHash",
+                    "stage",
+                    "cursor",
+                    "accepted",
+                    "log",
+                    "instructions",
+                    "steps",
+                    "script",
+                    "function",
+                    "token",
+                    "awaitKey",
+                    "failure",
+                    "events",
+                    "completions",
+                    "node",
+                    "child",
+                    "nextOperation",
+                    "children",
+                    "automatic",
+                    "awaitKind",
+                    "timer",
+                    "contentMode" });
   QuestJobState::Job job;
-  static_cast<QuestJobState::Stage&>(job) = ReadStage(value, false);
+  static_cast<QuestJobState::Stage&>(job) = ReadStage(value, false, version);
+  job.automatic = version >= 3 ? Boolean(value.at("automatic")) : false;
+  job.contentMode = version >= 3 ? Text(value.at("contentMode"), 7) : "legacy";
+  if ((job.contentMode != "owned" && job.contentMode != "fixture" &&
+       job.contentMode != "legacy") ||
+      (job.automatic && job.contentMode == "legacy"))
+    throw std::runtime_error("Invalid quest job content provenance");
   if (job.node)
     throw std::runtime_error("Root quest stage has a child identity");
   job.id = Number(value.at("id"), MaxIdentity, true);
@@ -191,7 +257,7 @@ QuestJobState::Job ReadJob(const Json& saved, uint64_t version)
   if (!children.is_array() || children.size() >= QuestJobState::MaxDepth)
     throw std::runtime_error("Quest child stack depth exceeded");
   for (const auto& child : children)
-    job.children.push_back(ReadStage(child, true));
+    job.children.push_back(ReadStage(child, true, version));
   const auto& events = value.at("events");
   if (!events.is_array() || events.size() > QuestJobState::MaxEvents)
     throw std::runtime_error("Quest job event limit exceeded");
@@ -211,7 +277,23 @@ QuestJobState::Job ReadJob(const Json& saved, uint64_t version)
   for (const auto& [token, result] : completions.items()) {
     if (!operations.insert(Operation(job, token)).second)
       throw std::runtime_error("Duplicate quest completion");
-    job.completions.emplace(token, Boolean(result));
+    QuestJobState::Completion completion;
+    if (version < 3)
+      completion = Boolean(result);
+    else {
+      if (!result.is_object() || !result.contains("kind"))
+        throw std::runtime_error("Invalid quest completion fields");
+      const auto kind = Text(result.at("kind"), 4);
+      if (kind == "bool") {
+        Fields(result, { "kind", "value" });
+        completion = Boolean(result.at("value"));
+      } else if (kind == "none") {
+        Fields(result, { "kind" });
+        completion = QuestJobState::Completion::None();
+      } else
+        throw std::runtime_error("Unsupported quest completion kind");
+    }
+    job.completions.emplace(token, completion);
   }
   if (version == 1 && job.cursor == "waiting" &&
       job.token !=
@@ -230,8 +312,9 @@ QuestJobState::Job ReadJob(const Json& saved, uint64_t version)
     }
     if (index + 1 < stages.size()) {
       const auto& child = *stages[index + 1];
-      if (stage.cursor != "waiting" || stage.awaitKey != "quest-stage" ||
-          stage.child != child.node || child.node <= stage.node ||
+      if (stage.cursor != "waiting" || stage.awaitKind != "stage" ||
+          stage.awaitKey != "quest-stage" || stage.child != child.node ||
+          child.node <= stage.node ||
           Operation(job, stage.token) != child.node)
         throw std::runtime_error(
           "Quest stage stack has inconsistent parent links");
@@ -261,6 +344,13 @@ Json SaveStage(const QuestJobState::Stage& stage)
     Bounded(*text, 1024);
   Bounded(stage.token, 256);
   Bounded(stage.awaitKey, 128);
+  Bounded(stage.awaitKind, 5);
+  Json timer = nullptr;
+  if (stage.timer)
+    timer = { { "policy", "utc-deadline-v1" },
+              { "issuedUnixMs", stage.timer->issuedUnixMs },
+              { "dueUnixMs", stage.timer->dueUnixMs },
+              { "durationMs", stage.timer->durationMs } };
   return {
     { "node", stage.node },         { "child", stage.child },
     { "quest", stage.quest },       { "contentHash", stage.contentHash },
@@ -268,13 +358,15 @@ Json SaveStage(const QuestJobState::Stage& stage)
     { "accepted", stage.accepted }, { "log", stage.log },
     { "script", stage.script },     { "function", stage.function },
     { "token", stage.token },       { "awaitKey", stage.awaitKey },
-    { "failure", stage.failure }
+    { "failure", stage.failure },   { "awaitKind", stage.awaitKind },
+    { "timer", std::move(timer) }
   };
 }
 
 Json SaveJob(const QuestJobState::Job& job)
 {
   Bounded(job.command, 128);
+  Bounded(job.contentMode, 7);
   for (const auto* text : { &job.actor, &job.owner, &job.instance })
     Bounded(*text, 300);
   if (job.events.size() > QuestJobState::MaxEvents ||
@@ -291,8 +383,17 @@ Json SaveJob(const QuestJobState::Job& job)
                        { "count", event.count },
                        { "added", event.added } });
   }
-  for (const auto& [token, result] : job.completions)
+  auto completions = Json::object();
+  for (const auto& [token, result] : job.completions) {
     Bounded(token, 256);
+    if (result.kind == QuestJobState::Completion::Kind::Boolean)
+      completions[token] = { { "kind", "bool" }, { "value", result.value } };
+    else if (result.kind == QuestJobState::Completion::Kind::None &&
+             !result.value)
+      completions[token] = { { "kind", "none" } };
+    else
+      throw std::runtime_error("Invalid typed quest completion");
+  }
   auto children = Json::array();
   for (const auto& child : job.children)
     children.push_back(SaveStage(child));
@@ -308,7 +409,9 @@ Json SaveJob(const QuestJobState::Job& job)
                   { "instructions", job.instructions },
                   { "steps", job.steps },
                   { "events", std::move(events) },
-                  { "completions", job.completions },
+                  { "completions", std::move(completions) },
+                  { "automatic", job.automatic },
+                  { "contentMode", job.contentMode },
                   { "children", std::move(children) } });
   return result;
 }
@@ -344,7 +447,7 @@ QuestJobState QuestJobState::Read(const nlohmann::json& value)
 {
   Fields(value,
          { "schemaVersion", "generation", "nextJob", "active", "completed" });
-  const auto version = Number(value.at("schemaVersion"), 2, true);
+  const auto version = Number(value.at("schemaVersion"), 3, true);
   QuestJobState result;
   result.generation = Number(value.at("generation"), MaxIdentity, true);
   result.nextJob = Number(value.at("nextJob"), MaxIdentity, true);
@@ -386,7 +489,7 @@ nlohmann::json QuestJobState::Save() const
   auto history = Json::array();
   for (const auto& job : completed)
     history.push_back(SaveJob(job));
-  Json result = { { "schemaVersion", 2 },
+  Json result = { { "schemaVersion", 3 },
                   { "generation", generation },
                   { "nextJob", nextJob },
                   { "active", active ? SaveJob(*active) : Json(nullptr) },
@@ -435,6 +538,8 @@ void QuestJobState::ValidateHeap(const nlohmann::json& heap) const
         instructions > active->instructions ||
         (stage == &active->Current() &&
          instructions != active->instructions) ||
+        !SameScriptName(continuation.at("resultType"),
+                        stage->awaitKind == "timer" ? "None" : "Bool") ||
         outer.at("kind") != "method" || outer.at("state") != "" ||
         !SameScriptName(outer.at("rootScript"), stage->script) ||
         !SameScriptName(outer.at("script"), stage->script) ||

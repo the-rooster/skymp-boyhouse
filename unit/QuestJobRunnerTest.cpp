@@ -1,4 +1,5 @@
 #include "QuestJobRunner.h"
+#include "QuestJobClock.h"
 #include "QuestJournal.h"
 #include "QuestScriptRuntime.h"
 #include "QuestVmState.h"
@@ -6,10 +7,12 @@
 #include "database_drivers/SqliteDatabase.h"
 #include "save_storages/AsyncSaveStorage.h"
 #include "save_storages/ISaveStorage.h"
+#include <algorithm>
 #include <catch2/catch_all.hpp>
 #include <chrono>
 #include <exception>
 #include <filesystem>
+#include <limits>
 #include <random>
 #include <thread>
 
@@ -1539,4 +1542,726 @@ TEST_CASE("Child stage VMs share the parent's cumulative instruction budget",
   RequireReady(f.SubmitChild());
   f.Tick();
   REQUIRE(f.storage->submissions.size() == 1);
+}
+
+namespace {
+constexpr uint32_t kTimerQuest = 0x2d512;
+constexpr auto kTimerCommand = "utility-timer";
+struct TimerProgram
+{
+  Program program;
+  QuestJobRunner::MetadataOverrides metadata;
+  TimerProgram(std::vector<float> seconds = { 1.0f },
+               const char* native = "Wait", bool fail = false,
+               bool wrongSlot = false)
+  {
+    auto function = Reward(2);
+    function.code.instructions.pop_back();
+    if (wrongSlot)
+      function.locals.push_back({ "wrongResult", "Bool" });
+    for (size_t index = 0; index < seconds.size(); ++index) {
+      function.code.instructions.push_back(
+        { FunctionCode::kOp_CallStatic,
+          { VarValue("Utility"), VarValue(native),
+            Name(wrongSlot ? "wrongResult" : "temp"), VarValue(1),
+            VarValue(static_cast<double>(seconds[index])) } });
+      function.code.instructions.push_back(
+        { FunctionCode::kOp_CallMethod,
+          { VarValue("AddItem"), Name("target"), Name("temp"), VarValue(3),
+            Name("gold"), VarValue(index ? 5 : 3), VarValue(true) } });
+    }
+    if (fail)
+      function.code.instructions.push_back(
+        { FunctionCode::kOp_CallMethod,
+          { VarValue("UnsupportedTimerSuffix"), Name("self"), Name("temp"),
+            VarValue(0) } });
+    function.code.instructions.push_back(
+      { FunctionCode::kOp_Return, { VarValue::None() } });
+    program.script->objectTable[0].states = { { "",
+                                                { { "Timer", function } } } };
+    program.metadata.fragments = { { 5, 0, 1, "JobFixture", "Timer" } };
+    metadata[kTimerQuest] = program.metadata;
+  }
+  std::vector<PexScript::Lazy> Scripts() const { return program.Scripts(); }
+  void Enable(MpActor& actor) const
+  {
+    actor.SetPropertyValueDump(QuestJournal::kEnabled,
+                               "[\"2d512:Skyrim.esm\"]", false, false);
+  }
+};
+
+struct TimerFixture : Fixture
+{
+  TimerProgram content;
+  std::shared_ptr<QuestJobTime> time =
+    std::make_shared<QuestJobTime>(QuestJobTime{ 1000000, 5000 });
+  TimerFixture(std::vector<float> seconds = { 1.0f },
+               const char* native = "Wait", bool fail = false,
+               bool wrongSlot = false)
+    : content(std::move(seconds), native, fail, wrongSlot)
+  {
+    content.Enable(Owner());
+    Jobs().SetClock([time = time] { return *time; });
+  }
+  QuestJobRunner::Result SubmitTimer(bool automatic = false)
+  {
+    return Jobs().Submit(Owner(), kTimerCommand, kTimerQuest, 5,
+                         content.metadata, content.Scripts(), automatic);
+  }
+  QuestJobRunner::Result AdvanceTimer()
+  {
+    return Jobs().Advance(Owner(), kTimerCommand, content.metadata,
+                          content.Scripts());
+  }
+  QuestJobRunner::Result InspectTimer()
+  {
+    return Jobs().Inspect(Owner(), kTimerCommand);
+  }
+  QuestJobRunner::Result AckTimer(size_t index)
+  {
+    storage->Complete(index);
+    Tick();
+    return InspectTimer();
+  }
+};
+
+void RequireSleeping(const QuestJobRunner::Result& result)
+{
+  REQUIRE(result.status == Status::Sleeping);
+  REQUIRE(result.token.empty());
+  REQUIRE(result.key.empty());
+}
+}
+
+TEST_CASE("Managed Utility waits preserve native millisecond conversion and "
+          "None results",
+          "[Quest][QuestJobs][Timers]")
+{
+  const auto native = GENERATE("Wait", "WaitMenuMode");
+  struct Case
+  {
+    float seconds;
+    uint64_t duration;
+    bool queues;
+  };
+  const std::vector<Case> cases{
+    { -2.0f, 0, false },          { -0.0f, 0, false },
+    { 0.0f, 0, false },           { 0.0001f, 0, true },
+    { 0.0019f, 1, true },         { 1.2349f, 1234, true },
+    { 86400.0f, 86400000, true }, { 1.0e20f, 86400000, true }
+  };
+  for (const auto& test : cases) {
+    INFO(native << " seconds=" << test.seconds);
+    TimerFixture f({ test.seconds }, native);
+    size_t clockReads = 0;
+    f.Jobs().SetClock([&] {
+      ++clockReads;
+      return *f.time;
+    });
+    RequirePending(f.SubmitTimer());
+    if (!test.queues) {
+      REQUIRE(clockReads == 0);
+      REQUIRE(f.Gold() == 15);
+      const auto jobs = QuestJournal::JobState(f.Owner());
+      REQUIRE_FALSE(jobs.active);
+      REQUIRE(jobs.completed.back().completions.empty());
+      REQUIRE(jobs.completed.back().nextOperation == 1);
+      f.Tick();
+      REQUIRE(f.AckTimer(0).status == Status::Completed);
+      continue;
+    }
+    REQUIRE(f.Gold() == 12);
+    const auto job = QuestJournal::JobState(f.Owner()).active;
+    REQUIRE(job);
+    REQUIRE(job->Current().timer);
+    REQUIRE(job->Current().timer->issuedUnixMs == 1000000);
+    REQUIRE(job->Current().timer->durationMs == test.duration);
+    REQUIRE(job->Current().timer->dueUnixMs == 1000000 + test.duration);
+    const auto token = job->Current().token;
+    REQUIRE_THROWS(f.Jobs().Resume(f.Owner(), kTimerCommand, token, true,
+                                   f.content.metadata, f.content.Scripts()));
+    f.Tick();
+    const auto observed = f.AckTimer(0);
+    if (test.duration)
+      RequireSleeping(observed);
+    else
+      RequireReady(observed);
+    f.time->steadyMs += test.duration;
+    RequireReady(f.InspectTimer());
+    REQUIRE_THROWS(f.Jobs().Resume(f.Owner(), kTimerCommand, token, false,
+                                   f.content.metadata, f.content.Scripts()));
+    RequirePending(f.AdvanceTimer());
+    REQUIRE(f.Gold() == 15);
+    f.Tick();
+    REQUIRE(f.AckTimer(1).status == Status::Completed);
+    const auto completed = QuestJournal::JobState(f.Owner()).completed.back();
+    REQUIRE(completed.completions.at(token).kind ==
+            QuestJobState::Completion::Kind::None);
+    REQUIRE(f.SubmitTimer().status == Status::Completed);
+    REQUIRE(f.Gold() == 15);
+  }
+}
+
+TEST_CASE(
+  "Nonfinite waits and malformed None destinations cannot publish rewards",
+  "[Quest][QuestJobs][Timers][Rollback]")
+{
+  const auto invalid = GENERATE(0, 1, 2, 3);
+  const float seconds = invalid == 0 ? std::numeric_limits<float>::quiet_NaN()
+    : invalid == 1                   ? std::numeric_limits<float>::infinity()
+    : invalid == 2                   ? -std::numeric_limits<float>::infinity()
+                                     : 1.0f;
+  TimerFixture f({ seconds }, "Wait", false, invalid == 3);
+  const auto before = QuestJournal::Snapshot(f.Owner());
+  const auto jobs = QuestJournal::JobState(f.Owner()).Save();
+  REQUIRE_THROWS(f.SubmitTimer());
+  REQUIRE(f.Gold() == 10);
+  REQUIRE(QuestJournal::Snapshot(f.Owner()) == before);
+  REQUIRE(QuestJournal::JobState(f.Owner()).Save() == jobs);
+  REQUIRE(QuestJournal::ScriptState(f.Owner()).empty());
+}
+
+TEST_CASE("Elapsed timers remain hidden behind failed saves without "
+          "restarting the delay",
+          "[Quest][QuestJobs][Timers][SaveReceipt]")
+{
+  TimerFixture f;
+  RequirePending(f.SubmitTimer());
+  f.time->steadyMs += 1500;
+  f.time->unixMs += 1500;
+  RequirePending(f.InspectTimer());
+  RequirePending(f.AdvanceTimer());
+  REQUIRE(f.Gold() == 12);
+  f.Tick();
+  const auto original = Serialized(f.storage->submissions[0].forms);
+  f.storage->Complete(
+    0, std::make_exception_ptr(std::runtime_error("timer save")));
+  f.Tick();
+  RequirePending(f.InspectTimer());
+  REQUIRE(Serialized(f.storage->submissions[1].forms) == original);
+  f.storage->Complete(0);
+  f.Tick();
+  RequirePending(f.InspectTimer());
+  RequireReady(f.AckTimer(1));
+  REQUIRE(f.Gold() == 12);
+  RequirePending(f.AdvanceTimer());
+  REQUIRE(f.Gold() == 15);
+  f.Tick();
+  REQUIRE(f.AckTimer(2).status == Status::Completed);
+}
+
+TEST_CASE(
+  "Live quest timers use steady time across UTC jumps and consecutive waits",
+  "[Quest][QuestJobs][Timers]")
+{
+  TimerFixture f({ 1.0f, 2.0f }, "WaitMenuMode");
+  f.SubmitTimer();
+  f.Tick();
+  RequireSleeping(f.AckTimer(0));
+  f.time->unixMs += 86400000;
+  RequireSleeping(f.InspectTimer());
+  f.time->unixMs = 1;
+  RequireSleeping(f.AdvanceTimer());
+  f.time->steadyMs += 999;
+  RequireSleeping(f.InspectTimer());
+  ++f.time->steadyMs;
+  RequireReady(f.InspectTimer());
+  RequirePending(f.AdvanceTimer());
+  REQUIRE(f.Gold() == 15);
+  f.Tick();
+  RequireSleeping(f.AckTimer(1));
+  const auto second =
+    QuestJournal::JobState(f.Owner()).active->Current().timer;
+  REQUIRE(second);
+  REQUIRE(second->issuedUnixMs == 1);
+  REQUIRE(second->durationMs == 2000);
+  f.time->unixMs = 999999999;
+  f.time->steadyMs += 1999;
+  RequireSleeping(f.InspectTimer());
+  ++f.time->steadyMs;
+  RequireReady(f.InspectTimer());
+  f.AdvanceTimer();
+  REQUIRE(f.Gold() == 20);
+  f.Tick();
+  REQUIRE(f.AckTimer(2).status == Status::Completed);
+}
+
+TEST_CASE(
+  "Parent and child timer waits retain their own deadlines and None slots",
+  "[Quest][QuestJobs][Timers][ChildStages]")
+{
+  ChildFixture f;
+  auto time = std::make_shared<QuestJobTime>(QuestJobTime{ 1000000, 5000 });
+  f.Jobs().SetClock([time] { return *time; });
+  auto& functions =
+    f.content.program.script->objectTable[0].states[0].functions;
+  auto& parent = functions[0].function.code.instructions;
+  const auto stageCall =
+    std::find_if(parent.begin(), parent.end(), [](const auto& op) {
+      return op.op == FunctionCode::kOp_CallMethod &&
+        std::string(static_cast<const char*>(op.args[0])) == "SetStage";
+    });
+  REQUIRE(stageCall != parent.end());
+  parent.insert(stageCall,
+                { FunctionCode::kOp_CallStatic,
+                  { VarValue("Utility"), VarValue("Wait"), Name("temp"),
+                    VarValue(1), VarValue(1.0) } });
+  auto& child = functions[1].function.code.instructions;
+  const auto childWait =
+    std::find_if(child.begin(), child.end(), [](const auto& op) {
+      return op.op == FunctionCode::kOp_CallStatic &&
+        std::string(static_cast<const char*>(op.args[0])) == "FixtureAwait";
+    });
+  REQUIRE(childWait != child.end());
+  *childWait = { FunctionCode::kOp_CallStatic,
+                 { VarValue("Utility"), VarValue("WaitMenuMode"), Name("temp"),
+                   VarValue(1), VarValue(1.0) } };
+  f.SubmitChild();
+  f.Tick();
+  RequireSleeping(f.AckChild(0));
+  REQUIRE(f.Gold() == 12);
+  time->steadyMs += 1000;
+  f.Advance();
+  f.Tick();
+  RequireReady(f.AckChild(1));
+  REQUIRE(f.Gold() == 12);
+  f.Advance();
+  f.Tick();
+  RequireSleeping(f.AckChild(2));
+  REQUIRE(f.Gold() == 15);
+  time->steadyMs += 999;
+  RequireSleeping(f.InspectChild());
+  ++time->steadyMs;
+  RequireReady(f.InspectChild());
+  f.Advance();
+  f.Tick();
+  RequireReady(f.AckChild(3));
+  REQUIRE(f.Gold() == 19);
+  f.Advance();
+  f.Tick();
+  REQUIRE(f.AckChild(4).status == Status::Completed);
+  REQUIRE(f.Gold() == 28);
+  const auto completions =
+    QuestJournal::JobState(f.Owner()).completed.back().completions;
+  REQUIRE(completions.size() == 3);
+  size_t voids = 0, booleans = 0;
+  for (const auto& [token, completion] : completions) {
+    if (completion.kind == QuestJobState::Completion::Kind::None)
+      ++voids;
+    else {
+      REQUIRE(completion.value);
+      ++booleans;
+    }
+  }
+  REQUIRE(voids == 2);
+  REQUIRE(booleans == 1);
+}
+
+TEST_CASE(
+  "SQLite timer recovery credits UTC downtime and clamps clock rollback",
+  "[Quest][QuestJobs][Timers][SQLite]")
+{
+  const auto recovery = GENERATE(0, 1, 2);
+  const uint64_t recoveredUnix = recovery == 0 ? 1004000
+    : recovery == 1                            ? 1020000
+                                               : 995000;
+  const uint64_t remaining = recovery == 0 ? 6000 : recovery == 1 ? 0 : 10000;
+  SqliteFiles files;
+  TimerProgram content({ 10.0f });
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    auto& jobs = server.worldState.GetQuestJobs();
+    jobs.SetClock([] { return QuestJobTime{ 1000000, 5000 }; });
+    Initialize(server);
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    content.Enable(owner);
+    jobs.Submit(owner, kTimerCommand, kTimerQuest, 5, content.metadata,
+                content.Scripts());
+    RequireSleeping(WaitForDurable(server, owner, kTimerCommand));
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 12);
+  }
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    auto time =
+      std::make_shared<QuestJobTime>(QuestJobTime{ recoveredUnix, 100 });
+    auto& jobs = server.worldState.GetQuestJobs();
+    jobs.SetClock([time] { return *time; });
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    const auto observed = jobs.Inspect(owner, kTimerCommand);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 12);
+    if (remaining) {
+      RequireSleeping(observed);
+      time->unixMs = 999999999;
+      time->steadyMs += remaining - 1;
+      RequireSleeping(jobs.Inspect(owner, kTimerCommand));
+      ++time->steadyMs;
+    } else
+      RequireReady(observed);
+    RequireReady(jobs.Inspect(owner, kTimerCommand));
+    RequirePending(
+      jobs.Advance(owner, kTimerCommand, content.metadata, content.Scripts()));
+    REQUIRE(WaitForDurable(server, owner, kTimerCommand).status ==
+            Status::Completed);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 15);
+  }
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    auto& jobs = server.worldState.GetQuestJobs();
+    const auto before = QuestJournal::Snapshot(owner);
+    REQUIRE(jobs.Inspect(owner, kTimerCommand).status == Status::Completed);
+    REQUIRE(jobs
+              .Submit(owner, kTimerCommand, kTimerQuest, 5, content.metadata,
+                      content.Scripts())
+              .status == Status::Completed);
+    REQUIRE(QuestJournal::Snapshot(owner) == before);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 15);
+  }
+}
+
+TEST_CASE("Automatic timer jobs recover and finish through server ticks alone",
+          "[Quest][QuestJobs][Timers][Scheduler][SQLite]")
+{
+  SqliteFiles files;
+  TimerProgram content({ 1.0f });
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    auto& jobs = server.worldState.GetQuestJobs();
+    jobs.SetClock([] { return QuestJobTime{ 1000000, 5000 }; });
+    jobs.SetSchedulerFixtureContent(content.metadata, content.Scripts());
+    Initialize(server);
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    content.Enable(owner);
+    jobs.Submit(owner, kTimerCommand, kTimerQuest, 5, content.metadata,
+                content.Scripts(), true);
+    RequireSleeping(WaitForDurable(server, owner, kTimerCommand));
+    REQUIRE(QuestJournal::JobState(owner).active->automatic);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 12);
+  }
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    auto& jobs = server.worldState.GetQuestJobs();
+    jobs.SetClock([] { return QuestJobTime{ 1005000, 100 }; });
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    server.worldState.Tick();
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 12);
+    RequireReady(jobs.Inspect(owner, kTimerCommand));
+    jobs.SetSchedulerFixtureContent(content.metadata, content.Scripts());
+    const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (jobs.Inspect(owner, kTimerCommand).status != Status::Completed &&
+           std::chrono::steady_clock::now() < deadline) {
+      server.worldState.Tick();
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(jobs.Inspect(owner, kTimerCommand).status == Status::Completed);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 15);
+    const auto before = QuestJournal::Snapshot(owner);
+    for (int index = 0; index < 4; ++index)
+      server.worldState.Tick();
+    REQUIRE(QuestJournal::Snapshot(owner) == before);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 15);
+  }
+}
+
+namespace {
+MpActor& TimerActor(PartOne& server, const TimerProgram& content, uint32_t id,
+                    uint32_t gold = 10)
+{
+  server.CreateActor(id, { 1, 2, 3 }, 0, 0x3c);
+  auto& actor = server.worldState.GetFormAt<MpActor>(id);
+  actor.SetWorldInstance("campaign:" + std::to_string(id) + ":timer-pump");
+  actor.SetInventory(Inventory().AddItem(0xf, gold));
+  content.Enable(actor);
+  return actor;
+}
+}
+
+TEST_CASE(
+  "Automatic quest scheduling shares bounded passes across 32 campaigns",
+  "[Quest][QuestJobs][Timers][Scheduler]")
+{
+  TimerProgram content({ 1.0f, 1.0f });
+  PartOne server;
+  server.AttachEspm(&GetEspmLoader());
+  auto storage = std::make_shared<ControlledStorage>();
+  server.AttachSaveStorage(storage);
+  auto time = std::make_shared<QuestJobTime>(QuestJobTime{ 1000000, 5000 });
+  auto& jobs = server.worldState.GetQuestJobs();
+  jobs.SetClock([time] { return *time; });
+  jobs.SetSchedulerFixtureContent(content.metadata, content.Scripts());
+  std::vector<MpActor*> actors;
+  for (uint32_t index = 0; index < 32; ++index) {
+    auto& actor = TimerActor(server, content, 0xff007000 + index);
+    actors.push_back(&actor);
+    RequirePending(jobs.Submit(actor, kTimerCommand, kTimerQuest, 5,
+                               content.metadata, content.Scripts(), true));
+  }
+  // Hold every timer asleep while all exact initial save receipts drain.
+  for (size_t index = 0; index < 32; ++index)
+    server.worldState.Tick();
+  for (auto* actor : actors) {
+    RequireSleeping(jobs.Inspect(*actor, kTimerCommand));
+    REQUIRE(actor->GetInventory().GetItemCount(0xf) == 12);
+  }
+  time->steadyMs += 1000;
+  size_t advanced = 0;
+  for (size_t pass = 0; pass < 8 && advanced < actors.size(); ++pass) {
+    server.worldState.Tick();
+    const auto nowAdvanced = static_cast<size_t>(
+      std::count_if(actors.begin(), actors.end(), [](auto* actor) {
+        return actor->GetInventory().GetItemCount(0xf) == 15;
+      }));
+    REQUIRE(nowAdvanced > advanced);
+    REQUIRE(nowAdvanced - advanced <= 8);
+    advanced = nowAdvanced;
+    for (auto* actor : actors)
+      REQUIRE(actor->GetInventory().GetItemCount(0xf) <= 15);
+  }
+  REQUIRE(advanced == 32);
+  time->steadyMs += 1000;
+  size_t completed = 0;
+  for (size_t pass = 0; pass < 160 && completed < actors.size(); ++pass) {
+    server.worldState.Tick();
+    completed = static_cast<size_t>(
+      std::count_if(actors.begin(), actors.end(), [&](auto* actor) {
+        return jobs.Inspect(*actor, kTimerCommand).status == Status::Completed;
+      }));
+  }
+  REQUIRE(completed == 32);
+  for (auto* actor : actors) {
+    REQUIRE(actor->GetInventory().GetItemCount(0xf) == 20);
+    REQUIRE(
+      QuestJournal::JobState(*actor).completed.back().completions.size() == 2);
+  }
+}
+
+TEST_CASE("One failing automatic quest is quarantined without starving other "
+          "campaigns",
+          "[Quest][QuestJobs][Timers][Scheduler][Rollback]")
+{
+  TimerProgram content;
+  auto& function =
+    content.program.script->objectTable[0].states[0].functions[0].function;
+  function.locals.push_back({ "count", "Int" });
+  function.locals.push_back({ "badCampaign", "Bool" });
+  function.code.instructions.pop_back();
+  const std::vector<FunctionCode::Instruction> conditionalFailure = {
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("GetItemCount"), Name("target"), Name("count"), VarValue(1),
+        Name("gold") } },
+    { FunctionCode::kOp_CompareEQ,
+      { Name("badCampaign"), Name("count"), VarValue(45) } },
+    { FunctionCode::kOp_JumpF, { Name("badCampaign"), VarValue(2) } },
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("UnsupportedAutomaticSuffix"), Name("self"), Name("temp"),
+        VarValue(0) } },
+    { FunctionCode::kOp_Return, { VarValue::None() } }
+  };
+  function.code.instructions.insert(function.code.instructions.end(),
+                                    conditionalFailure.begin(),
+                                    conditionalFailure.end());
+  PartOne server;
+  server.AttachEspm(&GetEspmLoader());
+  auto storage = std::make_shared<ControlledStorage>();
+  server.AttachSaveStorage(storage);
+  auto time = std::make_shared<QuestJobTime>(QuestJobTime{ 1000000, 5000 });
+  auto& jobs = server.worldState.GetQuestJobs();
+  jobs.SetClock([time] { return *time; });
+  jobs.SetSchedulerFixtureContent(content.metadata, content.Scripts());
+  auto& bad = TimerActor(server, content, 0xff007100, 40);
+  auto& one = TimerActor(server, content, 0xff007101);
+  auto& two = TimerActor(server, content, 0xff007102);
+  for (auto* actor : { &bad, &one, &two })
+    jobs.Submit(*actor, kTimerCommand, kTimerQuest, 5, content.metadata,
+                content.Scripts(), true);
+  for (size_t index = 0; index < 3; ++index)
+    server.worldState.Tick();
+  RequireSleeping(jobs.Inspect(bad, kTimerCommand));
+  const auto checkpoint = QuestJournal::Snapshot(bad);
+  const auto heap = QuestJournal::ScriptState(bad);
+  time->steadyMs += 1000;
+  for (size_t index = 0; index < 12; ++index)
+    server.worldState.Tick();
+  const auto failed = jobs.Inspect(bad, kTimerCommand);
+  REQUIRE(failed.status == Status::Failed);
+  REQUIRE(failed.error.find("UnsupportedAutomaticSuffix") !=
+          std::string::npos);
+  REQUIRE(failed.token.empty());
+  REQUIRE(failed.key.empty());
+  REQUIRE(bad.GetInventory().GetItemCount(0xf) == 42);
+  REQUIRE(QuestJournal::Snapshot(bad) == checkpoint);
+  REQUIRE(QuestJournal::ScriptState(bad) == heap);
+  for (auto* actor : { &one, &two }) {
+    REQUIRE(jobs.Inspect(*actor, kTimerCommand).status == Status::Completed);
+    REQUIRE(actor->GetInventory().GetItemCount(0xf) == 15);
+  }
+  const auto submissions = storage->submissions.size();
+  for (size_t index = 0; index < 8; ++index)
+    server.worldState.Tick();
+  REQUIRE(jobs.Inspect(bad, kTimerCommand).status == Status::Failed);
+  REQUIRE(QuestJournal::Snapshot(bad) == checkpoint);
+  REQUIRE(storage->submissions.size() == submissions);
+}
+
+TEST_CASE(
+  "A failed automatic submission cannot retain an obsolete scheduler identity",
+  "[Quest][QuestJobs][Timers][Scheduler][Rollback]")
+{
+  const bool changedInstance = GENERATE(false, true);
+  TimerFixture f;
+  f.storage->automatic = true;
+  f.Jobs().SetSchedulerFixtureContent(f.content.metadata, f.content.Scripts());
+  const auto nextJob = QuestJournal::JobState(f.Owner()).nextJob;
+  REQUIRE_THROWS(f.Jobs().Submit(f.Owner(), "failed-A", kTimerQuest, 65535,
+                                 f.content.metadata, f.content.Scripts(),
+                                 true));
+  REQUIRE(f.Gold() == 10);
+  REQUIRE(QuestJournal::JobState(f.Owner()).nextJob == nextJob);
+  if (changedInstance)
+    f.Owner().SetWorldInstance("campaign:" + std::to_string(kOwner) +
+                               ":timer-phase");
+  const std::string command = changedInstance ? "failed-A" : "successful-B";
+  // No Tick between attempts. The reused numeric ID must not retain the
+  // previous command or, when the command is reused, its previous phase.
+  const auto submitted =
+    f.Jobs().Submit(f.Owner(), command, kTimerQuest, 5, f.content.metadata,
+                    f.content.Scripts(), true);
+  RequirePending(submitted);
+  REQUIRE(submitted.job == nextJob);
+  REQUIRE(f.Gold() == 12);
+  f.time->steadyMs += 1000;
+  for (size_t index = 0; index < 5; ++index)
+    f.Tick();
+  REQUIRE(f.Jobs().Inspect(f.Owner(), command).status == Status::Completed);
+  if (!changedInstance)
+    REQUIRE_THROWS(f.Jobs().Inspect(f.Owner(), "failed-A"));
+  REQUIRE(f.Gold() == 15);
+  REQUIRE(QuestJournal::JobState(f.Owner()).completed.size() == 1);
+  REQUIRE(QuestJournal::JobState(f.Owner()).completed.back().command ==
+          command);
+  REQUIRE(QuestJournal::JobState(f.Owner()).completed.back().instance ==
+          f.Owner().GetWorldInstance());
+}
+
+TEST_CASE(
+  "Clearing the world inside a scheduled clock check cannot revive its work",
+  "[Quest][QuestJobs][Timers][Scheduler][Clear]")
+{
+  TimerFixture f;
+  f.storage->automatic = true;
+  f.Jobs().SetSchedulerFixtureContent(f.content.metadata, f.content.Scripts());
+  bool clearOnClock = false;
+  f.Jobs().SetClock([&]() -> QuestJobTime {
+    if (clearOnClock) {
+      clearOnClock = false;
+      f.server.worldState.Clear();
+      throw std::runtime_error("world cleared during scheduled clock check");
+    }
+    return *f.time;
+  });
+  f.SubmitTimer(true);
+  f.Tick();
+  RequireSleeping(f.InspectTimer());
+  const auto retained = f.server.worldState.LookupFormByIdNoLoad(kOwner);
+  REQUIRE(retained);
+  auto* oldActor = retained->AsActor();
+  REQUIRE(oldActor);
+  const auto before = MpChangeForm::ToJson(oldActor->GetChangeForm());
+  f.time->steadyMs += 1000;
+  clearOnClock = true;
+  REQUIRE_NOTHROW(f.Tick());
+  REQUIRE_FALSE(clearOnClock);
+  REQUIRE_FALSE(f.server.worldState.LookupFormByIdNoLoad(kOwner));
+  REQUIRE(oldActor->GetInventory().GetItemCount(0xf) == 12);
+  REQUIRE(MpChangeForm::ToJson(oldActor->GetChangeForm()) == before);
+  REQUIRE(f.Jobs().Inspect(*oldActor, kTimerCommand).status == Status::Failed);
+  f.server.CreateActor(kOwner, { 7, 8, 9 }, 0, 0x3c);
+  auto& replacement = f.server.worldState.GetFormAt<MpActor>(kOwner);
+  replacement.SetInventory(Inventory().AddItem(0xf, 100));
+  for (size_t index = 0; index < 3; ++index)
+    REQUIRE_NOTHROW(f.Tick());
+  REQUIRE(replacement.GetInventory().GetItemCount(0xf) == 100);
+  REQUIRE(QuestJournal::JobState(replacement).completed.empty());
+  REQUIRE_FALSE(QuestJournal::JobState(replacement).active);
+}
+
+TEST_CASE(
+  "Durably sleeping jobs keep their persistence backend until completion",
+  "[Quest][QuestJobs][Timers][SaveReceipt]")
+{
+  TimerFixture f;
+  f.SubmitTimer();
+  f.Tick();
+  RequireSleeping(f.AckTimer(0));
+  auto replacement = std::make_shared<ControlledStorage>();
+  REQUIRE_NOTHROW(f.server.worldState.AttachSaveStorage(f.storage));
+  REQUIRE_THROWS(f.server.worldState.AttachSaveStorage(replacement));
+  REQUIRE_THROWS(f.server.worldState.AttachSaveStorage(nullptr));
+  RequireSleeping(f.InspectTimer());
+  REQUIRE(f.Gold() == 12);
+  f.time->steadyMs += 1000;
+  f.AdvanceTimer();
+  f.Tick();
+  REQUIRE(f.AckTimer(1).status == Status::Completed);
+  REQUIRE(f.Gold() == 15);
+  REQUIRE_NOTHROW(f.server.worldState.AttachSaveStorage(replacement));
+  REQUIRE_NOTHROW(f.server.worldState.AttachSaveStorage(nullptr));
+}
+
+TEST_CASE("Automatic submissions and recovered timer continuations retain "
+          "their content provider",
+          "[Quest][QuestJobs][Timers][Scheduler]")
+{
+  SECTION(
+    "automatic admission rejects mismatched scheduler content before rewards")
+  {
+    TimerFixture f;
+    TimerProgram other({ 2.0f });
+    f.Jobs().SetSchedulerFixtureContent(other.metadata, other.Scripts());
+    const auto before = QuestJournal::Snapshot(f.Owner());
+    REQUIRE_THROWS(f.SubmitTimer(true));
+    REQUIRE(f.Gold() == 10);
+    REQUIRE(QuestJournal::Snapshot(f.Owner()) == before);
+    REQUIRE_FALSE(QuestJournal::JobState(f.Owner()).active);
+    REQUIRE(QuestJournal::ScriptState(f.Owner()).empty());
+  }
+  SECTION("fixture input cannot resume a saved owned timer with an identical "
+          "content hash")
+  {
+    TimerFixture f;
+    f.SubmitTimer();
+    f.Tick();
+    RequireSleeping(f.AckTimer(0));
+    auto saved = f.Owner().GetChangeForm();
+    auto journal =
+      Json::parse(saved.dynamicFields.GetValueDump(QuestJournal::kProperty));
+    const auto hash = journal.at("jobs").at("active").at("contentHash");
+    // Only provider provenance differs. Matching bytes do not authorize a
+    // fixture overload to enter production-owned execution.
+    journal["jobs"]["active"]["contentMode"] = "owned";
+    saved.dynamicFields.SetValueDump(QuestJournal::kProperty, journal.dump());
+    PartOne restarted;
+    restarted.AttachEspm(&GetEspmLoader());
+    auto storage = std::make_shared<ControlledStorage>();
+    restarted.AttachSaveStorage(storage);
+    restarted.worldState.LoadChangeForm(saved, FormCallbacks::DoNothing());
+    auto& actor = restarted.worldState.GetFormAt<MpActor>(kOwner);
+    auto& jobs = restarted.worldState.GetQuestJobs();
+    jobs.SetClock([] { return QuestJobTime{ 1005000, 100 }; });
+    RequireReady(jobs.Inspect(actor, kTimerCommand));
+    REQUIRE(QuestJournal::JobState(actor).active->contentHash ==
+            hash.get<std::string>());
+    const auto before = QuestJournal::Snapshot(actor);
+    REQUIRE_THROWS(jobs.Advance(actor, kTimerCommand, f.content.metadata,
+                                f.content.Scripts()));
+    REQUIRE(actor.GetInventory().GetItemCount(0xf) == 12);
+    REQUIRE(QuestJournal::Snapshot(actor) == before);
+    REQUIRE(storage->submissions.empty());
+  }
 }

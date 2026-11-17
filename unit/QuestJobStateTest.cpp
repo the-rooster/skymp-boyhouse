@@ -38,6 +38,7 @@ QuestJobState Waiting()
   job.script = "QF_Test";
   job.function = "Fragment_0";
   job.awaitKey = "operation";
+  job.awaitKind = "bool";
   job.token = job.NextToken();
   ++job.nextOperation;
   job.events.push_back({ "14:Skyrim.esm", "f:Skyrim.esm", "", 2, true });
@@ -48,13 +49,17 @@ QuestJobState Done(QuestJobState state)
 {
   auto job = *state.active;
   if (!job.token.empty())
-    job.completions[job.token] = true;
+    job.completions[job.token] = job.awaitKind == "timer"
+      ? QuestJobState::Completion::None()
+      : QuestJobState::Completion(true);
   job.cursor = "done";
   job.log = 0;
   job.script.clear();
   job.function.clear();
   job.token.clear();
   job.awaitKey.clear();
+  job.awaitKind.clear();
+  job.timer.reset();
   job.failure.clear();
   job.events.clear();
   state.active.reset();
@@ -68,23 +73,24 @@ Json Heap(const QuestJobState::Job& job,
 {
   const auto& stage =
     selected ? *selected : static_cast<const QuestJobState::Stage&>(job);
-  Json frame = { { "schemaVersion", 2 },
-                 { "scope", job.Scope(stage) },
-                 { "receiver", { { "type", 0 }, { "value", stage.quest } } },
-                 { "kind", "method" },
-                 { "rootScript", stage.script },
-                 { "script", stage.script },
-                 { "state", "" },
-                 { "function", stage.function },
-                 { "contentHashes",
-                   Json::array({ { { "script", stage.script },
-                                   { "hash", stage.contentHash } } }) },
-                 { "resultType", "None" },
-                 { "instruction", 1 },
-                 { "executedInstructions",
-                   instructions ? instructions : job.instructions },
-                 { "locals", Json::array() },
-                 { "callers", Json::array() } };
+  Json frame = {
+    { "schemaVersion", 2 },
+    { "scope", job.Scope(stage) },
+    { "receiver", { { "type", 0 }, { "value", stage.quest } } },
+    { "kind", "method" },
+    { "rootScript", stage.script },
+    { "script", stage.script },
+    { "state", "" },
+    { "function", stage.function },
+    { "contentHashes",
+      Json::array(
+        { { { "script", stage.script }, { "hash", stage.contentHash } } }) },
+    { "resultType", stage.awaitKind == "timer" ? "None" : "Bool" },
+    { "instruction", 1 },
+    { "executedInstructions", instructions ? instructions : job.instructions },
+    { "locals", Json::array() },
+    { "callers", Json::array() }
+  };
   return { { "schemaVersion", 6 },
            { "scripts", Json::object() },
            { "arrays", Json::object() },
@@ -99,6 +105,7 @@ QuestJobState Nested(bool waitingChild = false)
   auto& job = *state.active;
   job.child = 1;
   job.awaitKey = "quest-stage";
+  job.awaitKind = "stage";
   QuestJobState::Stage child;
   child.node = 1;
   child.quest = "2aa57:Skyrim.esm";
@@ -110,6 +117,7 @@ QuestJobState Nested(bool waitingChild = false)
     child.script = "QF_Child";
     child.function = "Fragment_1";
     child.awaitKey = "external";
+    child.awaitKind = "bool";
     child.token = job.NextToken();
     ++job.nextOperation;
     job.segment = 2;
@@ -152,19 +160,50 @@ void FinishChild(QuestJobState::Job& job)
   ++job.instructions;
 }
 
-Json Legacy(const QuestJobState& state)
+Json Legacy(const QuestJobState& state, uint64_t version = 1)
 {
   auto saved = state.Save();
-  saved["schemaVersion"] = 1;
-  auto strip = [](Json& job) {
-    for (const char* field : { "node", "child", "children", "nextOperation" })
-      job.erase(field);
+  saved["schemaVersion"] = version;
+  auto strip = [version](Json& job) {
+    job.erase("automatic");
+    job.erase("contentMode");
+    job.erase("awaitKind");
+    job.erase("timer");
+    for (auto& child : job["children"]) {
+      child.erase("awaitKind");
+      child.erase("timer");
+    }
+    for (auto& completion : job["completions"])
+      completion = completion.at("value").get<bool>();
+    if (version == 1)
+      for (const char* field :
+           { "node", "child", "children", "nextOperation" })
+        job.erase(field);
   };
   if (!saved["active"].is_null())
     strip(saved["active"]);
   for (auto& job : saved["completed"])
     strip(job);
   return saved;
+}
+
+QuestJobState MigratedLegacy(QuestJobState state)
+{
+  if (state.active)
+    state.active->contentMode = "legacy";
+  for (auto& job : state.completed)
+    job.contentMode = "legacy";
+  return state;
+}
+
+QuestJobState TimerWaiting()
+{
+  auto state = Waiting();
+  state.active->awaitKind = "timer";
+  state.active->awaitKey = "Utility.Wait";
+  state.active->timer =
+    QuestJobState::Timer{ 1700000000000, 1700000000100, 100 };
+  return state;
 }
 
 struct JobStorage
@@ -254,7 +293,7 @@ TEST_CASE("Quest jobs reject corrupt exact fields identities and cursor state",
   std::vector<std::function<void(Json&)>> corrupt = {
     [](Json& v) { v["unknown"] = 1; },
     [](Json& v) { v.erase("active"); },
-    [](Json& v) { v["schemaVersion"] = 3; },
+    [](Json& v) { v["schemaVersion"] = 4; },
     [](Json& v) { v["generation"] = 0; },
     [](Json& v) { v["nextJob"] = 1; },
     [](Json& v) { v["nextJob"] = UINT64_MAX; },
@@ -562,6 +601,9 @@ TEST_CASE("Personal job ownership remains locked while visiting another host",
   REQUIRE_NOTHROW(QuestJournal::RequireJobAccess(*f.actor));
   REQUIRE_NOTHROW(QuestJournal::RequirePersonalJobAccess(host));
   REQUIRE_THROWS(QuestJournal::RequirePersonalJobAccess(*f.actor));
+  REQUIRE_FALSE(QuestJournal::JobState(*f.actor).active);
+  REQUIRE(QuestJournal::PersonalJobState(*f.actor).Save() == Begin().Save());
+  REQUIRE_FALSE(QuestJournal::PersonalJobState(host).active);
 }
 
 TEST_CASE(
@@ -571,12 +613,13 @@ TEST_CASE(
   for (const auto& state : { Begin(), Waiting(), Done(Waiting()) }) {
     const auto legacy = Legacy(state);
     const auto migrated = QuestJobState::Read(legacy);
-    REQUIRE(migrated.Save() == state.Save());
-    REQUIRE(migrated.Save()["schemaVersion"] == 2);
+    REQUIRE(migrated.Save() == MigratedLegacy(state).Save());
+    REQUIRE(migrated.Save()["schemaVersion"] == 3);
   }
   auto external = Waiting();
   external.active->awaitKey = "quest-stage";
-  REQUIRE(QuestJobState::Read(Legacy(external)).Save() == external.Save());
+  REQUIRE(QuestJobState::Read(Legacy(external)).Save() ==
+          MigratedLegacy(external).Save());
   auto legacy = Legacy(Waiting());
   SECTION("extra new field is not accepted in legacy schema")
   {
@@ -611,7 +654,8 @@ TEST_CASE("Nested quest stages retain separate scopes and one global "
   REQUIRE_NOTHROW(state.Save());
   REQUIRE_NOTHROW(state.ValidateHeap(NestedHeap(*state.active)));
   REQUIRE_FALSE(state.active->events.empty());
-  REQUIRE(state.active->completions.at("quest-job:1:1:2"));
+  REQUIRE(state.active->completions.at("quest-job:1:1:2") ==
+          QuestJobState::Completion(true));
   REQUIRE(state.active->NextToken() == "quest-job:1:1:3");
 }
 
@@ -696,10 +740,12 @@ TEST_CASE("Quest stage depth and operation bounds include pending ancestors",
     auto& parent = job.Current();
     parent.child = node;
     parent.awaitKey = "quest-stage";
+    parent.awaitKind = "stage";
     QuestJobState::Stage child = parent;
     child.node = node;
     child.child = 0;
     child.awaitKey = "external";
+    child.awaitKind = "bool";
     child.token = job.NextToken();
     ++job.nextOperation;
     job.children.push_back(child);
@@ -709,10 +755,12 @@ TEST_CASE("Quest stage depth and operation bounds include pending ancestors",
   auto& parent = job.Current();
   parent.child = 128;
   parent.awaitKey = "quest-stage";
+  parent.awaitKind = "stage";
   auto child = parent;
   child.node = 128;
   child.child = 0;
   child.awaitKey = "external";
+  child.awaitKind = "bool";
   child.token = job.NextToken();
   ++job.nextOperation;
   job.children.push_back(child);
@@ -793,6 +841,7 @@ TEST_CASE("Journal refuses rewriting live children ancestors or unrequested "
     job.token = job.NextToken();
     ++job.nextOperation;
     job.awaitKey = "external";
+    job.awaitKind = "bool";
   }
   SECTION("invent completed operation while keeping current wait")
   {
@@ -906,4 +955,277 @@ TEST_CASE(
   job.token = job.NextToken();
   ++job.nextOperation;
   REQUIRE_THROWS(state.Save());
+}
+
+TEST_CASE("Schema two jobs migrate typed completions and pending kinds",
+          "[Quest][QuestJob]")
+{
+  for (const auto& state :
+       { Begin(), Waiting(), Done(Waiting()), Nested(), Nested(true) }) {
+    const auto migrated = QuestJobState::Read(Legacy(state, 2));
+    REQUIRE(migrated.Save() == MigratedLegacy(state).Save());
+    const auto& job =
+      migrated.active ? *migrated.active : migrated.completed.back();
+    REQUIRE_FALSE(job.automatic);
+    REQUIRE_FALSE(job.timer);
+    for (const auto& [token, completion] : job.completions)
+      REQUIRE(completion.kind == QuestJobState::Completion::Kind::Boolean);
+  }
+  auto external = Waiting();
+  external.active->awaitKey = "quest-stage";
+  REQUIRE(QuestJobState::Read(Legacy(external, 2)).active->awaitKind ==
+          "bool");
+  auto corrupt = Legacy(Nested(), 2);
+  corrupt["active"]["children"][0]["timer"] = nullptr;
+  REQUIRE_THROWS(QuestJobState::Read(corrupt));
+}
+
+TEST_CASE("Timer jobs round trip UTC deadlines and typed None completions",
+          "[Quest][QuestJob]")
+{
+  auto state = TimerWaiting();
+  state.active->automatic = true;
+  for (const auto& value : { state, Done(state) })
+    REQUIRE(QuestJobState::Read(value.Save()).Save() == value.Save());
+  const auto saved = state.Save();
+  REQUIRE(saved["schemaVersion"] == 3);
+  REQUIRE(saved["active"]["timer"]["policy"] == "utc-deadline-v1");
+  const auto done = Done(state);
+  const auto& job = done.completed.front();
+  REQUIRE(job.completions.at("quest-job:1:1:1") ==
+          QuestJobState::Completion::None());
+  REQUIRE((done.Save()["completed"][0]["completions"]["quest-job:1:1:1"] ==
+           Json{ { "kind", "none" } }));
+  REQUIRE_NOTHROW(state.ValidateHeap(Heap(*state.active)));
+  REQUIRE_NOTHROW(done.ValidateHeap(Json::object()));
+  constexpr uint64_t max = 9007199254740991ULL;
+  state.active->timer = QuestJobState::Timer{ max - 86400000, max, 86400000 };
+  REQUIRE_NOTHROW(state.Save());
+  state.active->timer = QuestJobState::Timer{ max, max, 0 };
+  REQUIRE_NOTHROW(state.Save());
+}
+
+TEST_CASE(
+  "Timer codecs reject inconsistent deadlines wait kinds and exact fields",
+  "[Quest][QuestJob]")
+{
+  const auto original = TimerWaiting().Save();
+  const std::vector<std::function<void(Json&)>> corrupt = {
+    [](Json& v) { v["active"]["automatic"] = 1; },
+    [](Json& v) { v["active"].erase("automatic"); },
+    [](Json& v) { v["active"]["awaitKind"] = ""; },
+    [](Json& v) { v["active"]["awaitKind"] = "other"; },
+    [](Json& v) { v["active"]["awaitKind"] = "bool"; },
+    [](Json& v) { v["active"]["awaitKind"] = "stage"; },
+    [](Json& v) { v["active"]["child"] = 1; },
+    [](Json& v) { v["active"]["timer"] = nullptr; },
+    [](Json& v) { v["active"]["timer"] = false; },
+    [](Json& v) { v["active"]["timer"]["extra"] = 0; },
+    [](Json& v) { v["active"]["timer"].erase("policy"); },
+    [](Json& v) { v["active"]["timer"]["policy"] = "game-time"; },
+    [](Json& v) { v["active"]["timer"]["issuedUnixMs"] = -1; },
+    [](Json& v) { v["active"]["timer"]["issuedUnixMs"] = 1.0; },
+    [](Json& v) { v["active"]["timer"]["dueUnixMs"] = 1700000000101ULL; },
+    [](Json& v) { v["active"]["timer"]["dueUnixMs"] = 9007199254740992ULL; },
+    [](Json& v) { v["active"]["timer"]["durationMs"] = 86400001; },
+    [](Json& v) {
+      v["active"]["timer"]["issuedUnixMs"] = 9007199254740991ULL;
+      v["active"]["timer"]["dueUnixMs"] = 9007199254740991ULL;
+    }
+  };
+  for (size_t index = 0; index < corrupt.size(); ++index) {
+    INFO("Timer corruption " << index);
+    auto value = original;
+    corrupt[index](value);
+    REQUIRE_THROWS(QuestJobState::Read(value));
+  }
+  auto begin = Begin();
+  begin.active->timer = TimerWaiting().active->timer;
+  REQUIRE_THROWS(begin.Save());
+  auto done = Done(TimerWaiting());
+  done.completed.front().awaitKind = "timer";
+  REQUIRE_THROWS(done.Save());
+}
+
+TEST_CASE("Completion codecs reject malformed kinds and hidden None values",
+          "[Quest][QuestJob]")
+{
+  auto state = Done(Waiting());
+  const auto original = state.Save();
+  const std::vector<Json> corrupt = {
+    true,
+    Json{ { "kind", "bool" } },
+    Json{ { "kind", "bool" }, { "value", 1 } },
+    Json{ { "kind", "none" }, { "value", false } },
+    Json{ { "kind", "number" }, { "value", 1 } },
+    Json{ { "kind", "bool" }, { "value", true }, { "extra", 0 } }
+  };
+  for (const auto& completion : corrupt) {
+    auto value = original;
+    value["completed"][0]["completions"]["quest-job:1:1:1"] = completion;
+    REQUIRE_THROWS(QuestJobState::Read(value));
+  }
+  auto& completion = state.completed.front().completions.at("quest-job:1:1:1");
+  completion = QuestJobState::Completion::None();
+  completion.value = true;
+  REQUIRE_THROWS(state.Save());
+  completion.value = false;
+  completion.kind = static_cast<QuestJobState::Completion::Kind>(255);
+  REQUIRE_THROWS(state.Save());
+}
+
+TEST_CASE(
+  "The terminal continuation result type must match the durable wait kind",
+  "[Quest][QuestJob]")
+{
+  for (const auto& state : { Waiting(), TimerWaiting(), Nested() }) {
+    const auto& job = *state.active;
+    auto heap = Heap(job);
+    REQUIRE_NOTHROW(state.ValidateHeap(heap));
+    auto& leaf = heap["continuations"][job.token];
+    auto caller = leaf;
+    for (const char* field :
+         { "schemaVersion", "scope", "executedInstructions", "callers" })
+      caller.erase(field);
+    caller["resultType"] = "None";
+    leaf["callers"].push_back(caller);
+    REQUIRE_NOTHROW(state.ValidateHeap(heap));
+    leaf["resultType"] = job.awaitKind == "timer" ? "Bool" : "None";
+    REQUIRE_THROWS(state.ValidateHeap(heap));
+  }
+}
+
+TEST_CASE("Journal consumes timer waits only with typed None results",
+          "[Quest][QuestJob]")
+{
+  Fixture f;
+  f.Start();
+  const auto waiting = TimerWaiting();
+  QuestJournal::AtomicJob(*f.actor, 1, [&] {
+    QuestJournal::SetScriptState(*f.actor, Heap(*waiting.active));
+    QuestJournal::SetJobState(*f.actor, waiting);
+  });
+  const auto before = f.Saved();
+  auto done = Done(waiting);
+  done.completed.front().completions[waiting.active->token] = false;
+  REQUIRE_NOTHROW(done.Save());
+  REQUIRE_THROWS(QuestJournal::AtomicJob(*f.actor, 1, [&] {
+    QuestJournal::SetScriptState(*f.actor, Json::object());
+    QuestJournal::SetJobState(*f.actor, done);
+  }));
+  REQUIRE(f.Saved() == before);
+  done.completed.front().completions[waiting.active->token] =
+    QuestJobState::Completion::None();
+  REQUIRE_NOTHROW(QuestJournal::AtomicJob(*f.actor, 1, [&] {
+    QuestJournal::SetScriptState(*f.actor, Json::object());
+    QuestJournal::SetJobState(*f.actor, done);
+  }));
+  REQUIRE(QuestJournal::JobState(*f.actor).Save() == done.Save());
+}
+
+TEST_CASE(
+  "Journal cannot change a pending timer or automatic scheduling policy",
+  "[Quest][QuestJob]")
+{
+  Fixture f;
+  f.Start();
+  auto state = TimerWaiting();
+  QuestJournal::AtomicJob(*f.actor, 1, [&] {
+    QuestJournal::SetScriptState(*f.actor, Heap(*state.active));
+    QuestJournal::SetJobState(*f.actor, state);
+  });
+  const auto before = f.Saved();
+  SECTION("deadline")
+  {
+    ++state.active->timer->issuedUnixMs;
+    ++state.active->timer->dueUnixMs;
+  }
+  SECTION("duration")
+  {
+    ++state.active->timer->durationMs;
+    ++state.active->timer->dueUnixMs;
+  }
+  SECTION("wait kind")
+  {
+    state.active->awaitKind = "bool";
+    state.active->timer.reset();
+  }
+  SECTION("automatic policy")
+  {
+    state.active->automatic = true;
+  }
+  SECTION("content provenance")
+  {
+    state.active->contentMode = "fixture";
+  }
+  REQUIRE_NOTHROW(state.Save());
+  REQUIRE_THROWS(QuestJournal::AtomicJob(*f.actor, 1, [&] {
+    QuestJournal::SetScriptState(*f.actor, Heap(*state.active));
+    QuestJournal::SetJobState(*f.actor, state);
+  }));
+  REQUIRE(f.Saved() == before);
+}
+
+TEST_CASE("Journal rejects None for Boolean waits and child-stage results",
+          "[Quest][QuestJob]")
+{
+  Fixture f;
+  f.Start();
+  QuestJobState waiting;
+  SECTION("external Boolean")
+  {
+    waiting = Waiting();
+    QuestJournal::AtomicJob(*f.actor, 1, [&] {
+      QuestJournal::SetScriptState(*f.actor, Heap(*waiting.active));
+      QuestJournal::SetJobState(*f.actor, waiting);
+    });
+  }
+  SECTION("child stage")
+  {
+    waiting = Nested();
+    QuestJournal::AtomicJob(*f.actor, 1, [&] {
+      QuestJournal::SetScriptState(*f.actor, NestedHeap(*waiting.active));
+      QuestJournal::SetJobState(*f.actor, waiting);
+    });
+    FinishChild(*waiting.active);
+    QuestJournal::AtomicJob(*f.actor, 1, [&] {
+      QuestJournal::SetScriptState(*f.actor, NestedHeap(*waiting.active));
+      QuestJournal::SetJobState(*f.actor, waiting);
+    });
+  }
+  const auto before = f.Saved();
+  auto candidate = waiting;
+  candidate.active->children.clear();
+  candidate.active->child = 0;
+  candidate = Done(candidate);
+  candidate.completed.front().completions[waiting.active->token] =
+    QuestJobState::Completion::None();
+  REQUIRE_NOTHROW(candidate.Save());
+  REQUIRE_THROWS(QuestJournal::AtomicJob(*f.actor, 1, [&] {
+    QuestJournal::SetScriptState(*f.actor, Json::object());
+    QuestJournal::SetJobState(*f.actor, candidate);
+  }));
+  REQUIRE(f.Saved() == before);
+}
+
+TEST_CASE(
+  "Content provenance survives saves and legacy jobs cannot become automatic",
+  "[Quest][QuestJob]")
+{
+  auto state = TimerWaiting();
+  for (const auto* mode : { "owned", "fixture", "legacy" }) {
+    state.active->contentMode = mode;
+    REQUIRE(QuestJobState::Read(state.Save()).Save() == state.Save());
+  }
+  state.active->automatic = true;
+  REQUIRE_THROWS(state.Save());
+  state.active->contentMode = "fixture";
+  REQUIRE_NOTHROW(state.Save());
+  auto missing = state.Save();
+  missing["active"].erase("contentMode");
+  REQUIRE_THROWS(QuestJobState::Read(missing));
+  for (const auto* invalid : { "", "mod", "OWNED" }) {
+    state.active->contentMode = invalid;
+    REQUIRE_THROWS(state.Save());
+  }
 }

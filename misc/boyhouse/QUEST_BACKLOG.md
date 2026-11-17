@@ -56,7 +56,6 @@ Generated static analysis. Counts include internal/helper quests and potential d
 | API | Quest records affected |
 | --- | ---: |
 | quest.stop | 877 |
-| utility.wait | 444 |
 | actor.setactorvalue | 283 |
 | actor.getactorvalue | 270 |
 | scene.start | 264 |
@@ -85,6 +84,7 @@ Generated static analysis. Counts include internal/helper quests and potential d
 | objectreference.getcurrentlocation | 118 |
 | quest.start | 114 |
 | location.ischild | 98 |
+| referencealias.clear | 97 |
 
 ## Most widely referenced missing condition functions
 
@@ -124,7 +124,7 @@ Implement shared capabilities, then rerun this report and the regression suites.
 
 ## Reproducibility
 
-Capability registry SHA-256: ed69ae468b7a3fd6825698d3a9f9dc84ebc16d70523f818813f5c1896d228deb
+Capability registry SHA-256: 4b58b7530dd668c9030d97d1c92c6a0c7809b528bcd366b0c04f7535646cacc1
 
 - Skyrim.esm: e198c3b85e5e48e0c92a6580d8f66e644256b68d812ee32b61735cf9b753df73
 - Update.esm: b298b0f65fa0127fd13c1f5ef6bb30eaf9d21fd19f5e6f8f91f829c9007d3280

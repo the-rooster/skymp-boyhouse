@@ -1,4 +1,5 @@
 #pragma once
+#include "QuestJobClock.h"
 #include "QuestJobState.h"
 #include "libespm/QuestScriptData.h"
 #include "papyrus-vm/PexScript.h"
@@ -15,13 +16,17 @@ public:
   // Called within the coordinator's AtomicJob segment. The caller persists
   // the updated job alongside the heap; this function never dispatches an
   // awaited operation. Fixture awaits are explicitly opt-in test injection.
+  // timerAnchor is provisional output: publish it only after AtomicJob
+  // succeeds, and never resume it before that segment's durable receipt.
   static void ExecuteJobSegment(
     MpActor& actor, QuestJobState::Job& job,
     const espm::QuestScriptData& metadata,
     const std::vector<PexScript::Lazy>& scripts,
-    std::optional<bool> completion = {}, bool fixtureAwait = false,
+    std::optional<QuestJobState::Completion> completion = {},
+    bool fixtureAwait = false,
     const std::map<uint32_t, espm::QuestScriptData>& overrides = {},
-    const std::string& contentManifest = {});
+    const std::string& contentManifest = {}, const QuestJobClock& clock = {},
+    std::optional<QuestJobTimerAnchor>* timerAnchor = nullptr);
   // Trusted experimental stage execution. The quest adapter remains
   // responsible for startup, alias filling and external effects. Unsupported
   // natives throw and roll back journal/VM state. No client packet invokes
@@ -58,8 +63,10 @@ private:
     const espm::QuestScriptData& metadata,
     const std::vector<PexScript::Lazy>& scripts, uint32_t loadedReference = 0,
     const char* referenceEvent = nullptr, uint32_t eventSource = 0,
-    QuestJobState::Job* job = nullptr, std::optional<bool> completion = {},
+    QuestJobState::Job* job = nullptr,
+    std::optional<QuestJobState::Completion> completion = {},
     bool fixtureAwait = false,
     const std::map<uint32_t, espm::QuestScriptData>& overrides = {},
-    const std::string& contentManifest = {});
+    const std::string& contentManifest = {}, const QuestJobClock& clock = {},
+    std::optional<QuestJobTimerAnchor>* timerAnchor = nullptr);
 };

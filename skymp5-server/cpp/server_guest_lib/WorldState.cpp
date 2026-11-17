@@ -178,6 +178,19 @@ void WorldState::AttachSaveStorage(
         pImpl->saveTickActive)))
     throw std::runtime_error(
       "Cannot replace save storage with outstanding writes");
+  if (pImpl->saveStorage) {
+    // Backend replacement is a configuration action, not a tick hot path.
+    // A durable continuation must never start writing into a different store
+    // that lacks its previously committed effects and private references.
+    for (const auto& [id, form] : forms) {
+      if (auto* actor = form->AsActor(); actor &&
+          actor->GetDynamicFields().GetValueDump(QuestJournal::kProperty) !=
+            "null" &&
+          QuestJournal::PersonalJobState(*actor).active)
+        throw std::runtime_error(
+          "Cannot replace save storage with active quest jobs");
+    }
+  }
   spdlog::info("AttachSaveStorage - db fixes installed");
 
   pImpl->saveStorage = saveStorage;
@@ -279,6 +292,10 @@ void WorldState::AddForm(std::unique_ptr<MpForm> form, uint32_t formId,
     } else {
       refr->ApplyChangeForm(*optionalChangeFormToApply);
     }
+    if (auto* actor = refr->AsActor(); actor &&
+        optionalChangeFormToApply->dynamicFields.GetValueDump(
+          QuestJournal::kProperty) != "null")
+      GetQuestJobs().OnActorLoaded(*actor);
   }
 }
 
@@ -287,6 +304,9 @@ void WorldState::Tick()
   const auto now = std::chrono::system_clock::now();
   TickSaveStorage(now);
   TickTimers(now);
+  if (pImpl->questJobs && !pImpl->formLoadingInProgress &&
+      !pImpl->saveTickActive && !pImpl->clearing)
+    pImpl->questJobs->Pump();
 }
 
 QuestJobRunner& WorldState::GetQuestJobs()

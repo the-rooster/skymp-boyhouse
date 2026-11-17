@@ -24,8 +24,10 @@
 #include "script_objects/CampaignQuestObject.h"
 #include "script_objects/MpFormGameObject.h"
 #include "script_storages/IScriptStorage.h"
+#include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 namespace {
 using Json = nlohmann::json;
@@ -522,11 +524,14 @@ void QuestScriptRuntime::ExecuteReferenceEvent(
 void QuestScriptRuntime::ExecuteJobSegment(
   MpActor& actor, QuestJobState::Job& job,
   const espm::QuestScriptData& metadata,
-  const std::vector<PexScript::Lazy>& scripts, std::optional<bool> completion,
-  bool fixtureAwait,
+  const std::vector<PexScript::Lazy>& scripts,
+  std::optional<QuestJobState::Completion> completion, bool fixtureAwait,
   const std::map<uint32_t, espm::QuestScriptData>& overrides,
-  const std::string& contentManifest)
+  const std::string& contentManifest, const QuestJobClock& clock,
+  std::optional<QuestJobTimerAnchor>* timerAnchor)
 {
+  if (timerAnchor)
+    timerAnchor->reset();
   if (!QuestJournal::HasActiveTransaction())
     throw std::runtime_error("Quest job execution requires its transaction");
   const auto jobs = QuestJournal::JobState(actor);
@@ -537,7 +542,8 @@ void QuestScriptRuntime::ExecuteJobSegment(
   const auto id =
     FormDesc::FromString(current.quest).ToFormId(actor.GetParent()->espmFiles);
   Execute(actor, id, current.stage, metadata, scripts, 0, nullptr, 0, &job,
-          completion, fixtureAwait, overrides, contentManifest);
+          completion, fixtureAwait, overrides, contentManifest, clock,
+          timerAnchor);
 }
 
 bool QuestScriptRuntime::Execute(
@@ -545,9 +551,10 @@ bool QuestScriptRuntime::Execute(
   const espm::QuestScriptData& metadata,
   const std::vector<PexScript::Lazy>& scripts, uint32_t loadedReference,
   const char* referenceEvent, uint32_t eventSource, QuestJobState::Job* job,
-  std::optional<bool> completion, bool fixtureAwait,
+  std::optional<QuestJobState::Completion> completion, bool fixtureAwait,
   const std::map<uint32_t, espm::QuestScriptData>& overrides,
-  const std::string& contentManifest)
+  const std::string& contentManifest, const QuestJobClock& clock,
+  std::optional<QuestJobTimerAnchor>* timerAnchor)
 {
   if (!actor.GetParent())
     throw std::runtime_error("Unregistered campaign actor");
@@ -605,7 +612,58 @@ bool QuestScriptRuntime::Execute(
           work->token = job->NextToken();
           ++job->nextOperation;
           work->awaitKey = key;
+          work->awaitKind = "bool";
           vm.RequestSuspension(work->token, "Bool");
+        });
+    }
+    // The shared server has no global menu pause. Both elapsed-time natives
+    // therefore use continuous server time; game-calendar waits stay blocked.
+    // Do not register ordinary PapyrusUtility's non-durable Promise timers.
+    for (const auto* name : { "Wait", "WaitMenuMode" }) {
+      vm.RegisterFunction(
+        "Utility", name, FunctionType::GlobalFunction,
+        [&, name](VarValue, std::vector<VarValue> args) -> VarValue {
+          if (args.size() != 1 || args[0].promise ||
+              (args[0].GetType() != VarValue::kType_Float &&
+               args[0].GetType() != VarValue::kType_Integer))
+            throw std::invalid_argument("Utility wait requires one number");
+          const double seconds = args[0].GetType() == VarValue::kType_Integer
+            ? static_cast<double>(static_cast<int32_t>(args[0]))
+            : static_cast<double>(args[0]);
+          if (!std::isfinite(seconds))
+            throw std::invalid_argument(
+              "Utility wait requires finite seconds");
+          // Owned native cores complete nonpositive arguments without queuing
+          // a timer. This path is safe in synchronous event/load execution.
+          if (seconds <= 0)
+            return VarValue::None();
+          if (!managedFragment || !job || !work || !clock || !timerAnchor)
+            throw std::runtime_error(
+              "Positive Utility wait requires a durable timer context");
+          if (job->nextOperation > QuestJobState::MaxOperations)
+            throw std::runtime_error("Quest timer operation limit exceeded");
+          // Native MULSS rounds in float32 before CVTTSS2SI truncates. Clamp
+          // first to retain its 24-hour cap without integer overflow/wrapping.
+          // Positive sub-millisecond arguments still queue a zero-ms timer.
+          const float milliseconds =
+            static_cast<float>(std::min(seconds, 86400.0)) * 1000.0f;
+          const auto duration = static_cast<uint64_t>(milliseconds);
+          const auto now = clock();
+          constexpr uint64_t maxUnixMs = 9007199254740991ULL;
+          if (now.unixMs > maxUnixMs || duration > maxUnixMs - now.unixMs ||
+              duration > std::numeric_limits<uint64_t>::max() - now.steadyMs)
+            throw std::overflow_error("Quest timer deadline overflow");
+          const auto token = job->NextToken();
+          const QuestJobState::Timer timer{ now.unixMs, now.unixMs + duration,
+                                            duration };
+          const QuestJobTimerAnchor anchor{ token, now.steadyMs + duration };
+          work->token = token;
+          ++job->nextOperation;
+          work->awaitKind = "timer";
+          work->awaitKey = std::string("Utility.") + name;
+          work->timer = timer;
+          *timerAnchor = anchor;
+          vm.RequestSuspension(work->token, "None");
         });
     }
     auto policy = std::make_shared<HeuristicPolicy>(&world);
@@ -1314,6 +1372,7 @@ bool QuestScriptRuntime::Execute(
             ++job->nextOperation;
             work->child = child.node;
             work->awaitKey = "quest-stage";
+            work->awaitKind = "stage";
             job->children.push_back(std::move(child));
             vm.RequestSuspension(work->token, "Bool");
           }
@@ -1441,16 +1500,32 @@ bool QuestScriptRuntime::Execute(
                 if (!completion || work->script != fragment.script ||
                     work->function != fragment.function || work->child)
                   throw std::runtime_error("Saved quest fragment mismatch");
+                const bool timer = work->awaitKind == "timer";
+                if ((!timer && work->awaitKind != "bool" &&
+                     work->awaitKind != "stage") ||
+                    completion->kind !=
+                      (timer ? QuestJobState::Completion::Kind::None
+                             : QuestJobState::Completion::Kind::Boolean) ||
+                    (timer && (completion->value || !work->timer)) ||
+                    (!timer && work->timer))
+                  throw std::runtime_error("Quest completion type mismatch");
                 const auto saved =
                   state.TakeContinuation(job->Scope(*work), work->token);
+                if (Lower(saved.resultType) != (timer ? "none" : "bool"))
+                  throw std::runtime_error(
+                    "Quest continuation result type mismatch");
                 if (!job->completions.emplace(work->token, *completion).second)
                   throw std::runtime_error(
                     "Quest completion already consumed");
                 work->token.clear();
                 work->awaitKey.clear();
+                work->awaitKind.clear();
+                work->timer.reset();
                 work->cursor = "begin";
                 execution = script->ResumeFunction(
-                  job->Scope(*work), saved, VarValue(*completion), stack);
+                  job->Scope(*work), saved,
+                  timer ? VarValue::None() : VarValue(completion->value),
+                  stack);
               } else {
                 work->script = fragment.script;
                 work->function = fragment.function;
@@ -1584,6 +1659,8 @@ bool QuestScriptRuntime::Execute(
         work->function.clear();
         work->token.clear();
         work->awaitKey.clear();
+        work->awaitKind.clear();
+        work->timer.reset();
         work->failure.clear();
       }
     }

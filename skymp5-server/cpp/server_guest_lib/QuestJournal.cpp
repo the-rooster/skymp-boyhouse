@@ -703,7 +703,12 @@ nlohmann::json QuestJournal::PersonalScriptState(MpActor& actor)
 
 QuestJobState QuestJournal::JobState(MpActor& actor)
 {
-  const auto ledger = Read(Owner(actor));
+  return PersonalJobState(Owner(actor));
+}
+
+QuestJobState QuestJournal::PersonalJobState(MpActor& owner)
+{
+  const auto ledger = Read(owner);
   return ledger.contains("jobs") ? QuestJobState::Read(ledger.at("jobs"))
                                  : QuestJobState{};
 }
@@ -755,6 +760,8 @@ void QuestJournal::SetJobState(MpActor& actor, const QuestJobState& state)
     if (candidate->id != prior.id ||
         candidate->generation != prior.generation ||
         candidate->command != prior.command ||
+        candidate->automatic != prior.automatic ||
+        candidate->contentMode != prior.contentMode ||
         candidate->actor != prior.actor || candidate->owner != prior.owner ||
         candidate->quest != prior.quest ||
         candidate->instance != prior.instance ||
@@ -775,10 +782,10 @@ void QuestJournal::SetJobState(MpActor& actor, const QuestJobState& state)
     const auto sameStage = [](const Stage& a, const Stage& b) {
       return std::tie(a.node, a.child, a.quest, a.contentHash, a.stage,
                       a.cursor, a.accepted, a.log, a.script, a.function,
-                      a.token, a.awaitKey, a.failure) ==
+                      a.token, a.awaitKey, a.awaitKind, a.timer, a.failure) ==
         std::tie(b.node, b.child, b.quest, b.contentHash, b.stage, b.cursor,
                  b.accepted, b.log, b.script, b.function, b.token, b.awaitKey,
-                 b.failure);
+                 b.awaitKind, b.timer, b.failure);
     };
     std::vector<const Stage*> before{ &prior }, after{ candidate };
     for (const auto& child : prior.children)
@@ -798,20 +805,25 @@ void QuestJournal::SetJobState(MpActor& actor, const QuestJobState& state)
       const auto completion = candidate->completions.find(parent.token);
       if (child.cursor != "done" ||
           completion == candidate->completions.end() ||
-          completion->second != child.accepted)
+          completion->second != QuestJobState::Completion(child.accepted))
         throw std::runtime_error(
           "Job transaction dropped unfinished child work");
     }
-    std::string consumed;
+    const Stage* consumed = nullptr;
     if (before.size() != shared)
-      consumed = before[before.size() - 2]->token;
+      consumed = before[before.size() - 2];
     else if (prior.Current().cursor == "waiting" &&
              prior.Current().token != after[shared - 1]->token)
-      consumed = prior.Current().token;
+      consumed = &prior.Current();
     for (const auto& [token, result] : candidate->completions)
-      if (!prior.completions.contains(token) && token != consumed)
+      if (!prior.completions.contains(token) &&
+          (!consumed || token != consumed->token ||
+           result.kind !=
+             (consumed->awaitKind == "timer"
+                ? QuestJobState::Completion::Kind::None
+                : QuestJobState::Completion::Kind::Boolean)))
         throw std::runtime_error(
-          "Job transaction completed an unrequested operation");
+          "Job transaction completed an unrequested or mistyped operation");
     for (size_t index = 0; index < shared; ++index) {
       const auto& oldStage = *before[index];
       const auto& nextStage = *after[index];
@@ -842,6 +854,8 @@ void QuestJournal::SetJobState(MpActor& actor, const QuestJobState& state)
                    oldStage.script != nextStage.script ||
                    oldStage.function != nextStage.function ||
                    oldStage.awaitKey != nextStage.awaitKey ||
+                   oldStage.awaitKind != nextStage.awaitKind ||
+                   oldStage.timer != nextStage.timer ||
                    nextStage.cursor != "waiting")
           throw std::runtime_error(
             "Job transaction rewrote a pending operation");

@@ -44,6 +44,7 @@ public:
   static std::shared_ptr<const SaveReceipt> AtomicJob(
     MpActor& actor, uint64_t jobId, const std::function<void()>& execute);
   static QuestJobState JobState(MpActor& actor);
+  static QuestJobState PersonalJobState(MpActor& owner);
   static void SetJobState(MpActor& actor, const QuestJobState& state);
   // Only quest/journal mutation is leased; ordinary physical gameplay is not.
   static void RequireJobAccess(MpActor& actor);

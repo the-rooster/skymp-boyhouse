@@ -17,6 +17,33 @@ struct QuestJobState
     uint32_t count = 0;
     bool added = false;
   };
+  struct Timer
+  {
+    uint64_t issuedUnixMs = 0, dueUnixMs = 0, durationMs = 0;
+    bool operator==(const Timer&) const = default;
+  };
+  struct Completion
+  {
+    enum class Kind
+    {
+      Boolean,
+      None
+    };
+    Kind kind = Kind::Boolean;
+    bool value = false;
+    Completion() = default;
+    Completion(bool result)
+      : value(result)
+    {
+    }
+    static Completion None()
+    {
+      Completion result;
+      result.kind = Kind::None;
+      return result;
+    }
+    bool operator==(const Completion&) const = default;
+  };
   struct Stage
   {
     uint64_t node = 0, child = 0;
@@ -27,15 +54,18 @@ struct QuestJobState
     std::string cursor = "begin";
     bool accepted = false;
     uint32_t log = 0;
-    std::string script, function, token, awaitKey, failure;
+    std::string script, function, token, awaitKey, awaitKind, failure;
+    std::optional<Timer> timer;
   };
   struct Job : Stage
   {
     uint64_t id = 0, generation = 1, segment = 0, nextOperation = 1;
     std::string command, actor, owner, instance;
+    std::string contentMode = "owned";
+    bool automatic = false;
     uint32_t instructions = 0, steps = 0;
     std::vector<Event> events;
-    std::map<std::string, bool> completions;
+    std::map<std::string, Completion> completions;
     std::deque<Stage> children;
     std::string Scope() const;
     std::string Scope(const Stage& stage) const;

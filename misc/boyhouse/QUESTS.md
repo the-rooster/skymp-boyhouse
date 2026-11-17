@@ -79,9 +79,10 @@ rebinding stack policy and committing token consumption, resumed effects and any
 replacement frame in one campaign transaction.
 
 The existing `ExecuteStage` API remains synchronous. The experimental durable
-coordinator below uses these entry points, but no production Utility.Wait,
-Start/Stop/Reset or latent event is enabled. Lifecycle ordering and real native
-operation delivery remain unfinished. See [STORAGE.md](STORAGE.md).
+coordinator below uses these entry points for child stages and elapsed waits.
+Start/Stop/Reset and positive waits in event/load handlers remain unsupported.
+Lifecycle ordering and other native operation delivery remain unfinished.
+See [STORAGE.md](STORAGE.md).
 
 ### Durable stage work
 
@@ -115,18 +116,23 @@ sequential repeats are supported. Ordinary synchronous `ExecuteStage` and
 inventory-handler stage calls retain their existing behavior.
 
 Private journal schema 2 adds validated job state; its nested work codec is now
-schema 2 and reads the previous single-stage schema 1. Ordinary untouched journals
+schema 3 and reads previous work schemas 1/2. It preserves typed Boolean/None
+completions, timer requests, scheduling intent and content provenance. Migrated
+jobs stay manual; they do not silently begin executing. Ordinary untouched journals
 remain schema 1. Public snapshots explicitly project the existing schema-1
 progress/context fields, excluding jobs, operation tokens and the VM. Job and
 stack ownership, outer fragment binding, content signatures and budgets are
 validated together at commit. Failed resumed execution keeps the last saved
-checkpoint and effects intact. There is no automatic retry of script execution.
+checkpoint and effects intact. The automatic scheduler quarantines a failing
+job for the current process lifetime. A trusted host can call `Retry` after
+addressing its cause; reconstruction may retry it once again.
 
-`Pending` exposes no operation token or final result. `Ready`, `Waiting` and `Completed`
+`Pending` exposes no operation token or final result. `Ready`, `Sleeping`,
+`Waiting` and `Completed`
 are visible only after the matching receipt becomes durable. After a fresh
 server loads persisted jobs, their saved state replaces process-local receipts.
 `Ready` exposes no child completion token; the host calls `Advance`. A pending
-internal child result cannot be supplied through `Resume`. Duplicate commands
+internal child or timer result cannot be supplied through Boolean `Resume`. Duplicate commands
 and consumed completions report existing work; conflicting values fail.
 Operation tokens are campaign-scoped; a future external dispatcher must include
 the owning campaign in its delivery/deduplication identity.
@@ -148,8 +154,50 @@ history while visiting another host. This does not provide a global gameplay
 lease over every physical action between segments. Completed history currently
 has a hard 256-command limit with no eviction; new work is refused at capacity
 to avoid replaying old rewards. Scalable deduplication retention, real external
-operation delivery, automatic host scheduling, latent event cursors, lifecycle
+operation delivery, latent event cursors, lifecycle
 semantics and real-client playthroughs remain required for full quest support.
+
+### Elapsed waits and automatic scheduling
+
+Managed `Utility.Wait` and `WaitMenuMode` use continuous server time: a player's
+menu does not pause everyone else's shared world. Both resume with `None`.
+Non-positive finite durations complete immediately, without allocating a timer;
+positive durations multiply in float32 and truncate to milliseconds, with a
+one-day cap before integer conversion. A positive duration below one millisecond
+still yields through a saved timer. Nonfinite values are rejected. The distinction
+between elapsed seconds and `WaitGameTime`'s hours is present in the
+[vanilla Utility script](https://raw.githubusercontent.com/ianpatt/skse64/master/scripts/vanilla/Utility.psc).
+The elapsed implementation was also checked against the owned executable;
+the upstream placeholder game calendar is not enabled in this runner.
+
+Each timer stores its issued UTC time, deadline and duration under
+`utc-deadline-v1`, alongside the continuation and preceding effects. Its exact
+receipt must become durable before resumption, even when the deadline passed
+while storage was delayed. A live countdown uses the monotonic sample captured
+at the native call, so later wall-clock corrections do not accelerate it.
+Recovery credits downtime using saved UTC, clamps remaining time to the original
+duration, then uses a fresh monotonic anchor. This recovery policy assumes a
+trustworthy UTC clock: a forward correction across a restart can shorten a wait;
+a rollback can extend it by up to the original interval. No arbitrary clock-jump
+guarantee is claimed. Clock objects/VM stacks/native callbacks are never saved.
+
+Owned-content submissions opt into `WorldState::Tick` scheduling. Loaded owners
+are indexed once; the pump does not scan all world forms. Each pass considers
+at most 64 campaigns and executes at most eight segments, with one attempt per
+campaign in round-robin order. Pending receipts, sleeping timers and external
+waits use cached fast paths. The original initiating actor and campaign context
+must still be available; another actor is never substituted. Content, adapter,
+or script failures quarantine that job without stopping other campaigns.
+This bounds segment counts, not worst-case CPU time within one segment; real
+32-player latency and initial full-content parsing still need measurement.
+
+Fixture submissions remain manual unless explicitly requested otherwise. An
+automatic fixture must match its injected scheduler content before committing;
+after recovery it waits until that provider is supplied. Persisted content mode
+also guards manual APIs. Clearing the world stops scheduling, and changing or
+detaching storage is refused while any personal job remains active. No addon or
+client packet yet submits these jobs, and positive event/load-handler waits
+still require saved recipient/attachment cursors.
 
 ### Repeatable stages and lifecycle metadata
 
@@ -361,7 +409,7 @@ parents, container UI and other spatial effects are outside this transaction;
 they still need campaign-specific integration. Movement is also outside the
 script transaction. Automatic alias fills, remaining natives and latent handlers
 remain restricted. Controlled script tests do not certify any vanilla quest or
-establish throughput for 16ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“32 players.
+establish throughput for 16ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ32 players.
 
 ### Creating private reference copies
 
@@ -415,7 +463,7 @@ location playable. Automatic entry, engine-side transition application, cross-ar
 enable-parent change propagation, scale/ownership/lock overlays, NPC auto-calculated
 stats, respawns and durable lifecycle delivery remain unfinished. The factory
 currently copies the relevant world indexes during a batch; this needs measurement
-and optimization before a 16ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“32 player rollout. Requests are bounded to 4,096
+and optimization before a 16ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ32 player rollout. Requests are bounded to 4,096
 references, a radius of 65,536 units, and a 100,000-entry/8 MiB owner ledger;
 streaming and ledger partitioning are required for a full world.
 
@@ -785,3 +833,17 @@ These use owned quest metadata with generated fragments, not quest playthroughs.
 No quest is certified playable. Skyrim, the installed client and staging deployment
 were untouched. Automatic host scheduling, real native timing and latent events,
 lifecycle semantics and broader gameplay integration remain unfinished.
+
+The durable-timer batch passed the Linux server build and full verification
+on 2026-11-17 UTC: 719 native cases / 455,183 assertions, 368 JavaScript
+tests, 47 Python tests, addon and both protocol smokes, and SQLite recovery
+of 32 characters. Its 70 focused cases (2,011 assertions)
+cover elapsed waits and typed None resumption, native numeric behavior, delayed
+receipts and failed writes, live wall-clock changes, UTC recovery/rollback bounds,
+child timers, old job migration, and automatic recovery. Scheduler tests cover
+32 campaigns with bounded fair passes, isolated script failures, failed-submission
+identity reuse, fixture provider/provenance checks, active-job storage replacement
+refusal, and a clock callback clearing the world without reviving old work.
+These use owned metadata with generated fragments, not real quest playthroughs
+or a production latency/load measurement. Both client installation and staging
+deployment were untouched; Skyrim was not launched. No quest is certified playable.
