@@ -232,6 +232,67 @@ class FormatTests(unittest.TestCase):
 
 
 class DependencyTests(unittest.TestCase):
+    def test_quest_lifecycle_discovery_uses_exact_flag_bits_and_stage_scope(self):
+        quest_bits = {0x0001: "quest.start-game-enabled",
+                      0x0008: "quest.repeatable-stages",
+                      0x0100: "quest.run-once"}
+        for bit in range(16):
+            mask = 1 << bit
+            with self.subTest(quest_flags=mask):
+                quest = summary(values=[(b"DNAM", struct.pack("<HBBII", mask, 50, 65, 0, 6))])
+                expected = {quest_bits[mask]: {"Skyrim.esm:00002A/record/DNAM"}} if mask in quest_bits else {}
+                self.assertEqual(dict(quest["features"]), expected)
+        stage_bits = {0x02: "quest.startup-stages",
+                      0x04: "quest.shutdown-stages",
+                      0x08: "quest.keep-instance-data"}
+        for bit in range(8):
+            mask = 1 << bit
+            with self.subTest(stage_flags=mask):
+                quest = summary(values=[(b"INDX", struct.pack("<HBB", 10, 0, 0)),
+                                        (b"INDX", struct.pack("<HBB", 20, mask, 0))])
+                expected = {stage_bits[mask]: {"Skyrim.esm:00002A/stage:20/INDX"}} if mask in stage_bits else {}
+                self.assertEqual(dict(quest["features"]), expected)
+                self.assertEqual(quest["stages"], {10, 20})
+
+    def test_quest_lifecycle_discovery_remains_independent_of_support_and_unknowns(self):
+        quest = summary(values=[(b"DNAM", struct.pack("<HBBII", 0x0109, 0, 0, 0, 0)),
+                                (b"INDX", struct.pack("<HBB", 10, 0x0e, 0)),
+                                (b"INDX", struct.pack("<HBB", 20, 0x02, 0)),
+                                (b"VMAD", b"bad")])
+        registry = {**REGISTRY, "featureSubsets": ["quest.repeatable-stages"]}
+        result = analyze({quest["id"]: quest}, {}, registry)
+        row = result["quests"][0]
+        caps = {cap["id"]: cap["status"] for cap in row["capabilities"]}
+        self.assertEqual(caps, {"quest.repeatable-stages": "implemented-subset",
+                                "quest.start-game-enabled": "missing",
+                                "quest.run-once": "missing",
+                                "quest.startup-stages": "missing",
+                                "quest.shutdown-stages": "missing",
+                                "quest.keep-instance-data": "missing"})
+        self.assertEqual(quest["features"]["quest.startup-stages"],
+                         {"Skyrim.esm:00002A/stage:10/INDX", "Skyrim.esm:00002A/stage:20/INDX"})
+        self.assertTrue(row["unknowns"])
+        self.assertFalse(row["analysisComplete"])
+        self.assertEqual(row["status"], "untested")
+        self.assertEqual(result["summary"]["certifiedPlayable"], 0)
+
+    def test_quest_lifecycle_discovery_ignores_other_bytes_and_record_types(self):
+        quest = summary(values=[(b"DNAM", struct.pack("<HBBII", 0, 0xff, 0xff, 0xffffffff, 0xffffffff)),
+                                (b"INDX", struct.pack("<HBB", 0xffff, 0, 0xff))])
+        self.assertEqual(dict(quest["features"]), {})
+        self.assertEqual(quest["stages"], {0xffff})
+        other = summary("PACK", values=[(b"DNAM", b"\xff"), (b"INDX", b"\xff")])
+        self.assertFalse(any(name.startswith("quest.") for name in other["features"]))
+        self.assertEqual(other["stages"], set())
+
+    def test_quest_lifecycle_discovery_rejects_inexact_field_sizes(self):
+        for tag, size, message in ((b"DNAM", 12, "Invalid quest data size"),
+                                    (b"INDX", 4, "Invalid quest stage size")):
+            for actual in (*range(size), size + 1, size * 2):
+                with self.subTest(tag=tag, size=actual):
+                    with self.assertRaisesRegex(ValueError, message):
+                        summary(values=[(tag, bytes(actual))])
+
     def test_load_order_owner_remap_and_deletion(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp)
@@ -338,7 +399,7 @@ class DependencyTests(unittest.TestCase):
                 struct.pack_into("<I", condition, 12, 0x01000031)
                 struct.pack_into("<IIi", condition, 20, 2, 0x32, -1)
                 quest = summarize_record("QUST", 0, 0x0100002a,
-                    [(b"INDX", struct.pack("<H", 10)), (b"QSDT", b"\0"),
+                    [(b"INDX", struct.pack("<HBB", 10, 0, 0)), (b"QSDT", b"\0"),
                      (b"CTDA", bytes(condition))], (), origins, "Dragonborn.esm")
                 expected = {"Skyrim.esm:000032"}
                 if function in (47, 71, 73):
@@ -365,7 +426,7 @@ class DependencyTests(unittest.TestCase):
                 condition = bytearray(32)
                 struct.pack_into("<H", condition, 8, function)
                 struct.pack_into("<IIi", condition, 20, 5, 0xdeadbeef, alias_id)
-                quest = summary(values=[(b"INDX", struct.pack("<H", 10)),
+                quest = summary(values=[(b"INDX", struct.pack("<HBB", 10, 0, 0)),
                     (b"QSDT", b"\0"), (b"CTDA", bytes(condition))])
                 self.assertEqual(quest["refs"], set())
                 supported = function in (46, 71, 73) and alias_id >= 0
@@ -380,7 +441,7 @@ class DependencyTests(unittest.TestCase):
                         condition = bytearray(32)
                         struct.pack_into("<H", condition, 8, function)
                         struct.pack_into("<II", condition, 20, run_on, 0x14)
-                        prefix = [(b"INDX", struct.pack("<H", 10)), (b"QSDT", b"\0")] if stage_log else []
+                        prefix = [(b"INDX", struct.pack("<HBB", 10, 0, 0)), (b"QSDT", b"\0")] if stage_log else []
                         quest = summary(values=prefix + [(b"CTDA", bytes(condition))])
                         features = quest["features"]
                         if run_on == 0:
@@ -394,7 +455,7 @@ class DependencyTests(unittest.TestCase):
             condition = bytearray(32)
             struct.pack_into("<H", condition, 8, function)
             struct.pack_into("<II", condition, 20, 2, 0x14)
-            quest = summary(values=[(b"INDX", struct.pack("<H", 10)),
+            quest = summary(values=[(b"INDX", struct.pack("<HBB", 10, 0, 0)),
                 (b"QSDT", b"\0"), (b"CTDA", bytes(condition))])
             self.assertNotIn("condition.run-on:2", quest["features"])
             self.assertNotIn("condition.stage-run-on:2:private-reference", quest["features"])

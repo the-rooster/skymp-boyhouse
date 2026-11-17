@@ -30,12 +30,54 @@ The runner now implements:
 - Stage conditions may compare against a GLOB (`UseGlobal`). The comparison is resolved in the same campaign immediately before each log, so earlier fragments' uncommitted writes affect later branches. Other special condition flags remain unsupported. Regressions use MQ101's original faction-path conditions and CWObj's original cross-quest/global comparisons with controlled fragment bodies, including character reload, guest isolation and rollback. They are condition tests, not playthroughs of those quests.
 - `GetDisabled` (35) and `GetItemCount` (47) accept explicit Run On Reference targets; `GetDead` (46) also accepts Run On Quest Alias when the owning quest's existing alias resolver supplies a logical actor reference. Alias ID zero is valid and comes from CTDA byte 28, not the reference field at byte 24. PlayerRef resolves to the campaign owner; other evaluated targets require a bound private copy in that owner's current area. Evaluated missing copies, empty or unsupported alias fills, and nonactor `GetDead` targets fail the transaction. Implicit Subject/Target, dialogue, scenes, package conditions, and alias-fill condition execution remain unsupported.
 - Physical conditions use tracked reference snapshots and the transaction's staged inventory/visibility values. Item counts require initialized private inventories and the same concrete-item subset as inventory natives (including carryable lights, excluding FormLists, leveled lists and currently keys). Counts above signed-int32 range fail; comparisons retain exact integer counts. The compiler validates every selected-stage clause, including clauses skipped by OR. Comparison globals, item metadata and explicit target record types are checked before each log's short-circuit evaluation: non-player targets must be live placed REFR/ACHR records, and `GetDead` requires ACHR. Skipped branches do not resolve private copies or fill aliases. These predicates do not add death simulation, visibility propagation or alias lifecycle effects.
-- Nested `SetStage`/`SetCurrentStageID` calls execute target fragments in the same VM, campaign, instruction budget and transaction. Cross-quest calls require the target quest's own adapter opt-in. Visited stages break cycles; invalid targets and failures roll back every affected quest. `Start`, `Stop` and `Reset` execution still require lifecycle/event support.
+- Nested `SetStage`/`SetCurrentStageID` calls execute target fragments in the same VM, campaign, instruction budget and transaction. Cross-quest calls require the target quest's own adapter opt-in. Ordinary visited stages do not rerun; authored repeatable stages can execute again as described below. Invalid targets and failures roll back every affected quest. `Start`, `Stop` and `Reset` execution still require lifecycle/event support.
 - One in-memory commit for journal changes, script variables, supported inventory effects and the private-copy visibility subset described below. Unsupported natives, missing bindings, stale contexts, invalid property targets, invalid array access, runaway execution, and latent calls throw before publication and discard the transaction. A VM-wide instruction budget also covers nested calls and synchronous inventory handlers. Postcommit replication failures quarantine observers; they do not undo an already published reward or visibility change.
 
-Original MQ102 stage 100 and DA04 stage 5 are execution fixtures. The DA04 fragment displays objective 5; a guest's execution changes only the host's journal. MQ102 stage 100 has no visible objective effect from a fresh journal. Other stages reach cross-quest adapter gates, map-marker effects, alias operations and nested lifecycle execution. Their first failure can move as earlier dependencies are implemented. Those operations fail rather than being omitted. These fixtures do not start or play the quests: no initialization events, complete alias filling/effects, dialogue, scene execution, rewards, or world overlays are supplied. Repeated stages are currently idempotent, even for quests that eventually need repeatable-stage semantics.
+Original MQ102 stage 100 and DA04 stage 5 are execution fixtures. The DA04 fragment displays objective 5; a guest's execution changes only the host's journal. MQ102 stage 100 has no visible objective effect from a fresh journal. Other stages reach cross-quest adapter gates, map-marker effects, alias operations and nested lifecycle execution. Their first failure can move as earlier dependencies are implemented. Those operations fail rather than being omitted. These fixtures do not start or play the quests: no initialization events, complete alias filling/effects, dialogue, scene execution, rewards, or world overlays are supplied.
 
 VM save schema 4 separates script roots, a campaign-local array heap, campaign globals, and resolved alias bindings. Schema 2/3 saves and legacy inline saves migrate on a successful transaction. Multiple variables/scripts retain one allocation across fragments and character reloads, including mutations through a script whose other sharers are unloaded. Equal-valued allocations remain separate; null and empty arrays remain distinct. Unreachable allocations are collected. Papyrus equality compares array identities and recognizes typed null arrays as None. The runner remains an experimental subset; latent stacks, timers and object lifecycle persistence are unfinished.
+
+### Repeatable stages and lifecycle metadata
+
+The runner honors the owned QUST `AllowRepeatedStages` flag for a running quest.
+Each authorized repeat re-evaluates its log conditions and executes eligible
+fragments. Visited-stage history remains unique and the highest stage never
+decreases. Each repeat advances the journal revision, including a fragment that
+only adds an inventory reward without changing VM variables. A retry with the
+previous `expectedRevision` is refused by the addon. Commands without a revision
+are deliberate invocations, not automatically deduplicated network requests.
+
+Sequential nested visits are supported. Reentering a still-active repeatable
+stage requires the engine's asynchronous completion model and is refused with
+rollback; it is never silently treated as an ordinary visited-stage no-op.
+Stopped repeated visits require startup support and are refused. Unsupported
+effects, stale contexts and later fragment failures roll back the revision and
+all staged effects together. Ordinary state-only `questCommand` setters remain
+idempotent and do not execute repeats.
+
+Stage visitation precedes log conditions. The QSDT completion flag takes effect
+before its fragment, so script queries observe completion in that transaction.
+Completion does not stop the quest; Miscellaneous quests retain their active
+flag, and completing an already-completed quest does nothing. A valid stage
+without log items records visitation but returns false. Ambiguous duplicate
+authored stage indices are refused instead of merging their log lists.
+
+`QuestLifecycleData` owns and bounds-checks the exact DNAM flags, priority,
+type and unknown bytes, ENAM event identifier, ordered stage indices/flags,
+and separately scoped dialogue/story conditions. Stage/objective/alias
+conditions cannot become quest-start conditions. Unknown metadata is retained
+for future lifecycle gates. The owned catalog has 126 repeatable quest records;
+this is metadata coverage, not 126 playable quests.
+
+The lifecycle audit uses the owned 1.7.104 executable identified in
+[CLIENT_RUNTIME.md](CLIENT_RUNTIME.md). Native Start can wait for startup and
+accepts an already-running quest; its restart veto depends on RunOnce and the
+instance history, not simply completion. Stop requests shutdown without waiting
+for it. Reset can restart or shut down according to configuration. Non-RunOnce
+startup resets quest and alias VM instances, and stage completion waits for log
+callbacks. Those behaviors require durable lifecycle jobs, script continuations,
+alias effects and correct event ordering. The isolated runner still rejects
+Start/Stop/Reset; raw journal flags are not an implementation of these natives.
 
 ### Campaign forms and alias subset
 
@@ -520,7 +562,7 @@ The [dependency analyzer](DEPENDENCIES.md) discovers shared work across the full
 
 | Gate | Required work and evidence |
 | --- | --- |
-| Original quest execution | Extend the implemented scoped fragment runner with startup/stop events, alias filling and alias scripts, nested quest lifecycle transitions, repeatable stages, and the remaining condition/native semantics. The existing global VM must not become an alternate campaign-effect path. |
+| Original quest execution | Extend the implemented scoped fragment runner with startup/shutdown scheduling, alias filling and alias scripts, nested quest lifecycle transitions, asynchronous stage completion, and the remaining condition/native semantics. The existing global VM must not become an alternate campaign-effect path. |
 | VM persistence | Shared arrays, variables, globals and alias bindings now persist; add alias lifecycle, timers, latent continuations, content hashes and content migrations. Restart during a stage/reward must neither lose nor duplicate effects. |
 | World overlays | Explicit entry/recovery prepares private references and experimental projection replaces originals. Extend the transactional visibility subset with enable-parent propagation and lifecycle, plus death, inventory, globals, factions, locations, doors and encounters with their complete mutation/event semantics. Add automatic area entry and broader native acceptance. |
 | Dialogue and story | Implement topic/response selection, conditions, aliases, scenes, packages, story-manager events, radiants, followers, and quest item/reward behavior. Every mutating effect must carry campaign context. |
@@ -548,3 +590,15 @@ node misc/boyhouse/protocol-smoke.cjs --projection
 ```
 
 The native suite also parses every owned quest's VMAD and every PEX in the owned vanilla script archive, executes original MQ102/DA04 fragments, and checks shared-heap persistence, old-save migration, reset collection, conditional guest execution, nested same/cross-quest stage calls, failure rollback and instruction budgets. Alias regressions cover owned metadata, host/guest identities, target and script-variable persistence, reset, stopped/cross-quest boundaries, invalid saves and dynamic lookup rejection. The addon smoke exercises original-fragment execution through the public server binding. Protocol bots exercise the full server login/party flow and rejected client writes. None of these substitutes for an in-game quest playthrough.
+
+The repeat-stage/lifecycle-metadata batch passed the Linux server build and full
+verification on 2026-11-17 UTC: 586 native cases / 424,152 assertions, 368
+JavaScript tests, 47 Python tests, addon smoke, ordinary and projection protocol
+smokes, and SQLite recovery of 32 characters. Regressions cover conditional
+branch changes between repeats, repeated inventory rewards with unchanged VM
+variables, guest isolation, restart, stale revisions and failing-fragment
+rollback. The owned scan reports 2,274 quests, 14,026 PEX objects, 642 discovered
+capabilities, no parse failures or explicit unresolved static dependencies, and
+zero certified playable quests. Runtime-dependent dispatch remains on 1,146
+quest records. The registry guards 127 source files. No Skyrim launch, client
+installation update or staging deployment was part of this batch.

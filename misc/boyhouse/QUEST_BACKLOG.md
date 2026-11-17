@@ -25,14 +25,18 @@ Generated static analysis. Counts include internal/helper quests and potential d
 | forms.asset-bindings | 1108 |
 | condition.run-on:7 | 1062 |
 | alias.properties | 1058 |
+| quest.startup-stages | 726 |
 | alias.scripts | 699 |
 | engine.packages | 592 |
 | alias.fill.forced-reference | 547 |
 | alias.fill.matching-or-script | 520 |
 | world.campaign-player | 493 |
 | alias.location | 486 |
+| quest.start-game-enabled | 423 |
 | condition.run-on:0:physical | 403 |
+| quest.run-once | 402 |
 | alias.fill.created-reference | 384 |
+| quest.shutdown-stages | 378 |
 | condition.run-on:2 | 301 |
 | condition.run-on:5 | 277 |
 | alias.fill.location-or-alias | 265 |
@@ -43,6 +47,7 @@ Generated static analysis. Counts include internal/helper quests and potential d
 | quest.log-flags | 72 |
 | alias.fill.external-alias | 63 |
 | condition.run-on:3 | 31 |
+| quest.keep-instance-data | 22 |
 | condition.run-on:6 | 7 |
 | condition.run-on:4 | 3 |
 
@@ -119,7 +124,7 @@ Implement shared capabilities, then rerun this report and the regression suites.
 
 ## Reproducibility
 
-Capability registry SHA-256: 480d4a05a3cd1ac61395e750cb15286fb2eb947c7608a0b088383b6809275479
+Capability registry SHA-256: cfff68122cb5907ad53252ec68f140cd078a676869d9780b637acc13e737d0b3
 
 - Skyrim.esm: e198c3b85e5e48e0c92a6580d8f66e644256b68d812ee32b61735cf9b753df73
 - Update.esm: b298b0f65fa0127fd13c1f5ef6bb30eaf9d21fd19f5e6f8f91f829c9007d3280

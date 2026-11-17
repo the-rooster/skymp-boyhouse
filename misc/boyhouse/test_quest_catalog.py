@@ -17,7 +17,7 @@ def group(body):
 
 class CatalogTests(unittest.TestCase):
     def test_compressed_quest_in_group(self):
-        body = field(b"EDID", b"Fixture\0") + field(b"INDX", struct.pack("<H", 10))
+        body = field(b"EDID", b"Fixture\0") + field(b"INDX", struct.pack("<HBB", 10, 0, 0))
         payload = struct.pack("<I", len(body)) + zlib.compress(body)
         data = group(record(b"QUST", 42, payload, 0x40000))
         result = list(records(io.BytesIO(data), len(data)))

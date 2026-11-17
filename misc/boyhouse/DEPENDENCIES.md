@@ -144,10 +144,17 @@ GMST with an out-of-range master index. It is not guessed into another master.
 
 ## Using the backlog
 
-Counts rank impact, not implementation order or effort. The next foundation is
-campaign reference identity/overlays and alias filling. Lifecycle and event
-execution, transactional world/inventory effects, condition contexts,
-dialogue/scenes and latent continuation persistence build on that foundation.
+Lifecycle discovery records the exact owned DNAM and INDX flags for repeatable
+stages, start-game-enabled quests, run-once quests, startup/shutdown stages and
+keep-instance-data stages. Stage flags retain their stage index in evidence.
+DNAM must be 12 bytes and INDX four bytes. Only repeatable stage execution has a
+registered runtime subset; the other flags describe dependencies, not working
+startup, shutdown or reset support. See `QUESTS.md` for the execution limits.
+
+Counts rank impact, not implementation order or effort. Campaign reference
+identity and overlays provide a foundation; complete alias filling, lifecycle
+and event execution, transactional world effects, condition contexts,
+dialogue/scenes and latent continuation persistence remain required.
 Existing engine-wide gates such as client projection and phase transitions apply
 even to records with few observed script dependencies.
 

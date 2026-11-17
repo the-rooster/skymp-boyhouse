@@ -12,25 +12,27 @@ namespace {
 using Json = nlohmann::json;
 constexpr uint32_t kQuest =
   0x4e50d; // MQ102: record validation only, not execution
+constexpr uint32_t kRepeatQuest = 0x2aa57; // Owned AllowRepeatedStages fixture.
+constexpr uint32_t kMiscQuest = 0x10d9f4; // Owned Misc quest (DNAM type 6).
 struct Fixture
 {
   PartOne server;
   Fixture() { server.AttachEspm(&GetEspmLoader()); }
-  MpActor& Add(uint32_t id)
+  MpActor& Add(uint32_t id, uint32_t questId = kQuest)
   {
     server.CreateActor(id, { 1, 2, 3 }, 0, 0x3c);
     auto& actor = server.worldState.GetFormAt<MpActor>(id);
     actor.SetPropertyValueDump(
       QuestJournal::kEnabled,
-      Json::array({ FormDesc::FromFormId(kQuest, server.worldState.espmFiles)
+      Json::array({ FormDesc::FromFormId(questId, server.worldState.espmFiles)
                       .ToString() })
         .dump(),
       false, false);
     return actor;
   }
-  bool Apply(MpActor& actor, Json command)
+  bool Apply(MpActor& actor, Json command, uint32_t questId = kQuest)
   {
-    command["quest"] = kQuest;
+    command["quest"] = questId;
     return QuestJournal::Apply(actor, command);
   }
 };
@@ -129,6 +131,222 @@ TEST_CASE(
     f.Apply(actor, { { "op", "setStage" }, { "index", 20 } }),
     "Quest execution adapter is not enabled for this campaign");
   REQUIRE(QuestJournal::Snapshot(actor) == saved);
+}
+
+TEST_CASE("Intentional repeated stages advance revision without changing "
+          "unique progress and survive restart",
+          "[Quest][RepeatedStages]")
+{
+  Fixture f;
+  auto& owner = f.Add(0xff000001, kRepeatQuest);
+  auto& guest = f.Add(0xff000002, kRepeatQuest);
+  f.Apply(owner, { { "op", "setStage" }, { "index", 10 } }, kRepeatQuest);
+  f.Apply(owner, { { "op", "setStage" }, { "index", 20 } }, kRepeatQuest);
+  f.Apply(owner,
+          { { "op", "setObjectiveDisplayed" }, { "index", 10 },
+            { "value", true } },
+          kRepeatQuest);
+  const auto before = QuestJournal::Get(owner, kRepeatQuest);
+  const auto revision =
+    QuestJournal::Snapshot(owner).at("revision").get<uint64_t>();
+  REQUIRE_FALSE(f.Apply(owner,
+                        { { "op", "setStage" }, { "index", 10 } },
+                        kRepeatQuest));
+  REQUIRE(QuestJournal::Snapshot(owner).at("revision") == revision);
+  const auto instance =
+    "campaign:" + std::to_string(owner.GetFormId()) + ":repeat";
+  owner.SetWorldInstance(instance);
+  guest.SetWorldInstance(instance);
+  QuestJournal::Atomic(guest, [&] {
+    QuestJournal::RecordRepeatedStage(guest, kRepeatQuest, 10);
+    QuestJournal::RecordRepeatedStage(guest, kRepeatQuest, 10);
+    REQUIRE(QuestJournal::Get(guest, kRepeatQuest) == before);
+    REQUIRE(QuestJournal::Snapshot(guest).at("revision") == revision + 2);
+  });
+  REQUIRE(QuestJournal::Get(owner, kRepeatQuest) == before);
+  REQUIRE(QuestJournal::Snapshot(owner).at("revision") == revision + 2);
+  REQUIRE(QuestJournal::ScriptState(owner).empty());
+  REQUIRE_THROWS_WITH(
+    f.Apply(owner,
+            { { "op", "setStage" }, { "index", 10 },
+              { "expectedRevision", revision } },
+            kRepeatQuest),
+    "Stale quest revision");
+  guest.SetWorldInstance("");
+  REQUIRE(QuestJournal::Get(guest, kRepeatQuest).at("stages").empty());
+  REQUIRE(QuestJournal::Snapshot(guest).at("revision") == 0);
+  owner.SetWorldInstance("");
+  const auto encoded = MpChangeForm::ToJson(owner.GetChangeForm()).dump();
+  simdjson::dom::parser parser;
+  auto parsed = parser.parse(encoded).value();
+  Fixture restored;
+  auto& reloaded = restored.Add(owner.GetFormId(), kRepeatQuest);
+  reloaded.ApplyChangeForm(MpChangeForm::JsonToChangeForm(parsed));
+  QuestJournal::Atomic(reloaded, [&] {
+    QuestJournal::RecordRepeatedStage(reloaded, kRepeatQuest, 10);
+  });
+  REQUIRE(QuestJournal::Get(reloaded, kRepeatQuest) == before);
+  REQUIRE(QuestJournal::Snapshot(reloaded).at("revision") == revision + 3);
+}
+
+TEST_CASE("Repeated stage records require authored permission and an active "
+          "visited campaign stage",
+          "[Quest][RepeatedStages]")
+{
+  Fixture f;
+  auto& actor = f.Add(0xff000001, kRepeatQuest);
+  auto& stranger = f.Add(0xff000002, kRepeatQuest);
+  f.Apply(actor, { { "op", "setStage" }, { "index", 10 } }, kRepeatQuest);
+  REQUIRE_THROWS(QuestJournal::RecordRepeatedStage(actor, kRepeatQuest, 10));
+  SECTION("unvisited existing stage")
+  {
+    REQUIRE_THROWS(QuestJournal::Atomic(actor, [&] {
+      QuestJournal::RecordRepeatedStage(actor, kRepeatQuest, 20);
+    }));
+  }
+  SECTION("nonexistent stage")
+  {
+    REQUIRE_THROWS(QuestJournal::Atomic(actor, [&] {
+      QuestJournal::RecordRepeatedStage(actor, kRepeatQuest, 65535);
+    }));
+  }
+  SECTION("stopped quest")
+  {
+    f.Apply(actor, { { "op", "stop" } }, kRepeatQuest);
+    const auto stopped = QuestJournal::Snapshot(actor);
+    REQUIRE_THROWS(QuestJournal::Atomic(actor, [&] {
+      QuestJournal::RecordRepeatedStage(actor, kRepeatQuest, 10);
+    }));
+    REQUIRE(QuestJournal::Snapshot(actor) == stopped);
+  }
+  SECTION("disabled adapter")
+  {
+    actor.SetPropertyValueDump(QuestJournal::kEnabled, "[]", false, false);
+    REQUIRE_THROWS(QuestJournal::Atomic(actor, [&] {
+      QuestJournal::RecordRepeatedStage(actor, kRepeatQuest, 10);
+    }));
+  }
+  SECTION("other campaign")
+  {
+    REQUIRE_THROWS(QuestJournal::Atomic(actor, [&] {
+      QuestJournal::RecordRepeatedStage(stranger, kRepeatQuest, 10);
+    }));
+  }
+  SECTION("nonrepeatable quest")
+  {
+    auto& ordinary = f.Add(0xff000003);
+    f.Apply(ordinary, { { "op", "setStage" }, { "index", 10 } });
+    const auto before = QuestJournal::Snapshot(ordinary);
+    REQUIRE_THROWS_WITH(
+      QuestJournal::Atomic(ordinary, [&] {
+        QuestJournal::RecordRepeatedStage(ordinary, kQuest, 10);
+      }),
+      "Quest does not allow repeated stages");
+    REQUIRE(QuestJournal::Snapshot(ordinary) == before);
+  }
+  SECTION("raw state setter cannot request a replay")
+  {
+    const auto before = QuestJournal::Snapshot(actor);
+    REQUIRE_FALSE(f.Apply(
+      actor,
+      { { "op", "setStage" }, { "index", 10 }, { "repeat", true } },
+      kRepeatQuest));
+    REQUIRE_THROWS(f.Apply(
+      actor, { { "op", "repeatStage" }, { "index", 10 } }, kRepeatQuest));
+    REQUIRE(QuestJournal::Snapshot(actor) == before);
+  }
+}
+
+TEST_CASE("Repeated stage revision changes roll back and preserve limits",
+          "[Quest][RepeatedStages]")
+{
+  Fixture f;
+  auto& actor = f.Add(0xff000001, kRepeatQuest);
+  f.Apply(actor, { { "op", "setStage" }, { "index", 10 } }, kRepeatQuest);
+  SECTION("exception after recording")
+  {
+    const auto before =
+      actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty);
+    REQUIRE_THROWS(QuestJournal::Atomic(actor, [&] {
+      QuestJournal::RecordRepeatedStage(actor, kRepeatQuest, 10);
+      throw std::runtime_error("Later fragment failed");
+    }));
+    REQUIRE(actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
+            before);
+  }
+  SECTION("actor changes phase before commit")
+  {
+    const auto before =
+      actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty);
+    REQUIRE_THROWS(QuestJournal::Atomic(actor, [&] {
+      QuestJournal::RecordRepeatedStage(actor, kRepeatQuest, 10);
+      actor.SetWorldInstance("campaign:4278190081:changed");
+    }));
+    REQUIRE(actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
+            before);
+  }
+  SECTION("revision exhausted")
+  {
+    auto ledger = Json::parse(
+      actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty));
+    ledger["revision"] = uint64_t(9007199254740991ULL);
+    const auto before = ledger.dump();
+    actor.SetPropertyValueDump(QuestJournal::kProperty, before, false, false);
+    REQUIRE_THROWS_WITH(
+      QuestJournal::Atomic(actor, [&] {
+        QuestJournal::RecordRepeatedStage(actor, kRepeatQuest, 10);
+      }),
+      "Quest revision exhausted");
+    REQUIRE(actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
+            before);
+  }
+  SECTION("revision growth exceeds ledger size limit")
+  {
+    auto ledger = Json::parse(
+      actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty));
+    ledger["revision"] = uint64_t(9);
+    ledger["padding"] = "";
+    ledger["padding"] = std::string(8 * 1024 * 1024 - ledger.dump().size(), 'x');
+    const auto before = ledger.dump();
+    REQUIRE(before.size() == 8 * 1024 * 1024);
+    actor.SetPropertyValueDump(QuestJournal::kProperty, before, false, false);
+    REQUIRE_THROWS_WITH(
+      QuestJournal::Atomic(actor, [&] {
+        QuestJournal::RecordRepeatedStage(actor, kRepeatQuest, 10);
+      }),
+      "Campaign journal too large");
+    REQUIRE(actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
+            before);
+  }
+}
+
+TEST_CASE("Quest completion preserves running and miscellaneous active state",
+          "[Quest][QuestCompletion]")
+{
+  const auto id = GENERATE(kQuest, kMiscQuest);
+  Fixture f;
+  auto& actor = f.Add(0xff000001, id);
+  f.Apply(actor, { { "op", "start" } }, id);
+  f.Apply(actor, { { "op", "setActive" }, { "value", true } }, id);
+  REQUIRE(f.Apply(actor, { { "op", "complete" } }, id));
+  const auto completed = QuestJournal::Get(actor, id);
+  REQUIRE(completed.at("completed") == true);
+  REQUIRE(completed.at("running") == true);
+  REQUIRE(completed.at("active") == (id == kMiscQuest));
+  // A subsequent completion cannot undo an explicit activation, even for an
+  // ordinary quest whose first completion cleared that flag.
+  f.Apply(actor, { { "op", "setActive" }, { "value", true } }, id);
+  const auto before = QuestJournal::Snapshot(actor);
+  REQUIRE_FALSE(f.Apply(actor, { { "op", "complete" } }, id));
+  REQUIRE(QuestJournal::Snapshot(actor) == before);
+  REQUIRE_THROWS(QuestJournal::Atomic(actor, [&] {
+    f.Apply(actor, { { "op", "reset" } }, id);
+    f.Apply(actor, { { "op", "start" } }, id);
+    f.Apply(actor, { { "op", "setActive" }, { "value", true } }, id);
+    f.Apply(actor, { { "op", "complete" } }, id);
+    throw std::runtime_error("Later fragment failed");
+  }));
+  REQUIRE(QuestJournal::Snapshot(actor) == before);
 }
 
 TEST_CASE(

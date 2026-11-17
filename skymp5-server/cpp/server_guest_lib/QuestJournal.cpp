@@ -5,6 +5,7 @@
 #include "QuestVmState.h"
 #include "WorldState.h"
 #include "libespm/QUST.h"
+#include "libespm/QuestLifecycleData.h"
 #include "libespm/RecordHeaderAccess.h"
 #include <algorithm>
 #include <charconv>
@@ -347,8 +348,18 @@ bool QuestJournal::Apply(MpActor& actor, const nlohmann::json& command)
       QuestVmState::ResetQuest(ledger["vm"], def.key + "/");
     }
   } else if (op == "complete") {
-    quest["completed"] = true;
-    quest["active"] = false;
+    if (quest["completed"] != true) {
+      auto& world = *owner.GetParent();
+      const auto record = world.GetEspm().GetBrowser().LookupById(id);
+      const auto metadata =
+        espm::QuestLifecycleData::Read(record.rec, world.GetEspmCache());
+      quest["completed"] = true;
+      // Native completion preserves a miscellaneous quest's active flag and
+      // never stops the quest. Repeated completion is a no-op, including when
+      // a script explicitly reactivated an already-completed quest.
+      if (metadata.questType != 6)
+        quest["active"] = false;
+    }
   } else if (op == "setActive") {
     quest["active"] = command.at("value").get<bool>();
   } else if (op == "setStage") {
@@ -412,6 +423,49 @@ bool QuestJournal::Apply(MpActor& actor, const nlohmann::json& command)
   else
     owner.SetPropertyValueDump(kProperty, dump, false, false);
   return true;
+}
+
+void QuestJournal::RecordRepeatedStage(MpActor& actor, uint32_t questId,
+                                       uint16_t stage)
+{
+  if (!actor.GetParent())
+    throw std::runtime_error("Unregistered quest transaction participant");
+  auto& owner = Owner(actor);
+  if (!transaction || transaction->owner != &owner)
+    throw std::runtime_error(
+      "Repeated stage execution requires an owning quest transaction");
+  RequireAdapter(actor, questId);
+  const auto def = Lookup(owner, questId);
+  auto& world = *owner.GetParent();
+  const auto record = world.GetEspm().GetBrowser().LookupById(questId);
+  if (!record.rec || record.rec->IsDeleted())
+    throw std::invalid_argument("Expected a live repeated quest record");
+  const auto metadata =
+    espm::QuestLifecycleData::Read(record.rec, world.GetEspmCache());
+  if (!(metadata.flags & espm::QuestLifecycleData::AllowRepeatedStages))
+    throw std::runtime_error("Quest does not allow repeated stages");
+  if (!def.stages.count(stage))
+    throw std::invalid_argument("Stage does not exist in this quest");
+  if (std::count_if(metadata.stages.begin(), metadata.stages.end(),
+                    [stage](const auto& entry) {
+                      return entry.index == stage;
+                    }) != 1)
+    throw std::runtime_error("Repeated stage definition is ambiguous");
+  auto ledger = Read(owner);
+  const auto found = ledger.at("quests").find(def.key);
+  if (found == ledger.at("quests").end() || found->at("running") != true)
+    throw std::runtime_error("Repeated stage requires a running quest");
+  const auto& stages = found->at("stages");
+  if (std::find(stages.begin(), stages.end(), stage) == stages.end())
+    throw std::runtime_error("Repeated stage has not been visited");
+  const auto revision = ledger.at("revision").get<uint64_t>();
+  if (revision == kMaxRevision)
+    throw std::overflow_error("Quest revision exhausted");
+  ledger["revision"] = revision + 1;
+  Validate(ledger);
+  if (ledger.dump().size() > 8 * 1024 * 1024)
+    throw std::runtime_error("Campaign journal too large");
+  transaction->ledger = std::move(ledger);
 }
 
 void QuestJournal::Atomic(MpActor& actor, const std::function<void()>& execute)

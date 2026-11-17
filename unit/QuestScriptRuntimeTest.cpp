@@ -6,6 +6,7 @@
 #include "QuestVmState.h"
 #include "TestUtils.hpp"
 #include "papyrus-vm/Reader.h"
+#include "libespm/QuestLifecycleData.h"
 #include "save_storages/ISaveStorage.h"
 #include "script_objects/CampaignAliasObject.h"
 #include "script_objects/CampaignFormObject.h"
@@ -3615,5 +3616,319 @@ TEST_CASE("Fresh player subscription rejects nested OnLoad visibility after "
     REQUIRE(storage->batches[0].at(owner.GetIdx())->inv.GetItemCount(0xf) ==
             7);
     f.server.worldState.SetCampaignVisibilityCallbacks({}, {});
+  }
+}
+
+namespace {
+constexpr uint32_t kRepeatQuest = 0x2aa57;
+constexpr auto kRepeatScript = "2aa57:Skyrim.esm/boyhousefixture";
+void EnableRuntimeQuest(MpActor& actor, uint32_t questId)
+{
+  const auto key =
+    FormDesc::FromFormId(questId, actor.GetParent()->espmFiles).ToString();
+  actor.SetPropertyValueDump(QuestJournal::kEnabled,
+                            nlohmann::json::array({ key }).dump(), false,
+                            false);
+}
+int RepeatCounter(MpActor& actor)
+{
+  return QuestJournal::ScriptState(actor)
+    .at("scripts")
+    .at(kRepeatScript)
+    .at("values")
+    .at("boyhousefixture/counter")
+    .at("value")
+    .get<int>();
+}
+}
+
+TEST_CASE("Owned repeatable stages rerun in the host campaign without "
+          "duplicating stage history",
+          "[Quest][QuestVM][RepeatableStage]")
+{
+  Fixture f;
+  auto& owner = f.Add(0xff008001);
+  auto& guest = f.Add(0xff008002);
+  EnableRuntimeQuest(owner, kRepeatQuest);
+  const auto record = GetEspmLoader().GetBrowser().LookupById(kRepeatQuest);
+  REQUIRE(espm::QuestLifecycleData::Read(record.rec,
+                                        f.server.worldState.GetEspmCache())
+            .flags & espm::QuestLifecycleData::AllowRepeatedStages);
+  const auto phase =
+    "campaign:" + std::to_string(owner.GetFormId()) + ":repeated";
+  owner.SetWorldInstance(phase);
+  guest.SetWorldInstance(phase);
+  REQUIRE(f.Run(guest, 10, kRepeatQuest));
+  REQUIRE(f.Run(guest, 20, kRepeatQuest));
+  const auto revision = QuestJournal::Snapshot(owner).at("revision");
+  REQUIRE(f.Run(guest, 10, kRepeatQuest));
+  REQUIRE(RepeatCounter(owner) == 3);
+  REQUIRE(QuestJournal::Snapshot(owner).at("revision") > revision);
+  const auto progress = QuestJournal::Get(owner, kRepeatQuest);
+  REQUIRE(progress.at("stages") == nlohmann::json::array({ 10, 20 }));
+  REQUIRE(progress.at("stage") == 20);
+  REQUIRE(progress.at("objectives").at("10").at("displayed") == true);
+  guest.SetWorldInstance("");
+  REQUIRE(QuestJournal::Get(guest, kRepeatQuest).at("stages").empty());
+  REQUIRE(QuestJournal::ScriptState(guest).empty());
+}
+
+TEST_CASE("Repeated stages re-evaluate owned log conditions against current "
+          "campaign variables",
+          "[Quest][QuestVM][RepeatableStage][QuestVariableConditions]")
+{
+  Fixture f;
+  constexpr uint32_t questId = 0x15d24;
+  constexpr auto stateKey = "15d24:Skyrim.esm/boyhousefixture";
+  auto& actor = f.Add(0xff008001);
+  EnableRuntimeQuest(actor, questId);
+  f.fixture->userFlagTable.push_back({ "Conditional", 4 });
+  auto& object = f.fixture->objectTable[0];
+  object.userFlags = 16;
+  object.variables.push_back(
+    { "::pTGRDUPlanted_var", "Bool", 16, VarValue(false) });
+  auto first = f.Fragment(), second = first;
+  first.code.instructions = {
+    { FunctionCode::kOp_IAdd,
+      { Id("counter"), Id("counter"), VarValue(1) } },
+    { FunctionCode::kOp_Return, { VarValue::None() } }
+  };
+  second.code.instructions = first.code.instructions;
+  second.code.instructions[0].args[2] = VarValue(10);
+  object.states[0].functions = { { "First", first }, { "Second", second } };
+  f.metadata.fragments = { { 20, 0, 1, "BoyhouseFixture", "First" },
+                           { 20, 1, 1, "BoyhouseFixture", "Second" } };
+  auto counter = [&] {
+    return QuestJournal::ScriptState(actor)
+      .at("scripts").at(stateKey).at("values")
+      .at("boyhousefixture/counter").at("value").get<int>();
+  };
+  REQUIRE(f.Run(actor, 20, questId));
+  REQUIRE(counter() == 1);
+  // Simulate a later event changing the conditional quest variable. The next
+  // visit must select the other original CTDA log, not reuse its first choice.
+  auto state = QuestJournal::ScriptState(actor);
+  state["scripts"][stateKey]["values"]
+       ["boyhousefixture/::ptgrduplanted_var"]["value"] = true;
+  QuestJournal::Atomic(actor, [&] {
+    QuestJournal::SetScriptState(actor, state);
+  });
+  REQUIRE(f.Run(actor, 20, questId));
+  REQUIRE(counter() == 11);
+  REQUIRE(QuestJournal::Get(actor, questId).at("stages") ==
+          nlohmann::json::array({ 20 }));
+  const auto before = actor.GetDynamicFields().GetValueDump(
+    QuestJournal::kProperty);
+  object.states[0].functions[1].function.code.instructions.insert(
+    object.states[0].functions[1].function.code.instructions.end() - 1,
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("MissingInRepeatedBranch"), Id("self"), Id("temp"),
+        VarValue(0) } });
+  REQUIRE_THROWS_WITH(f.Run(actor, 20, questId),
+                      Catch::Matchers::ContainsSubstring(
+                        "MissingInRepeatedBranch"));
+  REQUIRE(actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
+          before);
+  REQUIRE(counter() == 11);
+}
+
+TEST_CASE("Sequential nested repeat visits execute twice but active repeat "
+          "cycles roll back",
+          "[Quest][QuestVM][RepeatableStage]")
+{
+  Fixture f;
+  auto& actor = f.Add(0xff008001);
+  EnableRuntimeQuest(actor, kRepeatQuest);
+  SECTION("sequential calls are separate visits")
+  {
+    auto caller = f.Fragment();
+    const FunctionCode::Instruction call{
+      FunctionCode::kOp_CallMethod,
+      { VarValue("SetStage"), Id("self"), Id("temp"), VarValue(1),
+        VarValue(20) }
+    };
+    caller.code.instructions = {
+      call, call, { FunctionCode::kOp_Return, { VarValue::None() } }
+    };
+    f.fixture->objectTable[0].states[0].functions.push_back(
+      { "CallTwice", caller });
+    f.metadata.fragments[0].function = "CallTwice";
+    REQUIRE(f.Run(actor, 10, kRepeatQuest));
+    REQUIRE(RepeatCounter(actor) == 2);
+    REQUIRE(f.Run(actor, 10, kRepeatQuest));
+    REQUIRE(RepeatCounter(actor) == 4);
+    REQUIRE(QuestJournal::Get(actor, kRepeatQuest).at("stages") ==
+            nlohmann::json::array({ 10, 20 }));
+  }
+  SECTION("an active repeated stage needs asynchronous scheduling")
+  {
+    f.Fragment().code.instructions.insert(
+      f.Fragment().code.instructions.end() - 1,
+      { FunctionCode::kOp_CallMethod,
+        { VarValue("SetStage"), Id("self"), Id("temp"), VarValue(1),
+          VarValue(10) } });
+    const auto before = QuestJournal::Snapshot(actor);
+    REQUIRE_THROWS_WITH(
+      f.Run(actor, 10, kRepeatQuest),
+      Catch::Matchers::ContainsSubstring("requires scheduling"));
+    REQUIRE(QuestJournal::Snapshot(actor) == before);
+    REQUIRE(QuestJournal::ScriptState(actor).empty());
+  }
+}
+
+TEST_CASE("Pure reward repeats advance revision and persist without changing "
+          "VM variables while failed repeats roll back",
+          "[Quest][QuestVM][RepeatableStage]")
+{
+  Fixture f;
+  InventoryFragment(f);
+  // Keep every script variable unchanged: the revision cannot rely on a
+  // counter or on a changed serialized VM to record the repeated reward.
+  f.Fragment().code.instructions.erase(
+    f.Fragment().code.instructions.begin() + 3);
+  auto storage = std::make_shared<RuntimeIntegrationStorage>();
+  f.server.AttachSaveStorage(storage);
+  auto& actor = f.Add(0xff008001);
+  EnableRuntimeQuest(actor, kRepeatQuest);
+  actor.SetInventory(Inventory().AddItem(0xf, 10));
+  REQUIRE(f.Run(actor, 10, kRepeatQuest));
+  const auto variables = QuestJournal::ScriptState(actor);
+  const auto revision = QuestJournal::Snapshot(actor).at("revision");
+  REQUIRE(f.Run(actor, 10, kRepeatQuest));
+  REQUIRE(actor.GetInventory().GetItemCount(0xf) == 20);
+  REQUIRE(QuestJournal::ScriptState(actor) == variables);
+  REQUIRE(QuestJournal::Snapshot(actor).at("revision") > revision);
+  f.server.worldState.Tick();
+  REQUIRE(storage->batches.size() == 1);
+  const auto& saved = storage->batches.back().at(actor.GetIdx());
+  REQUIRE(saved.has_value());
+  REQUIRE(saved->inv.GetItemCount(0xf) == 20);
+  const auto before = actor.GetDynamicFields().GetValueDump(
+    QuestJournal::kProperty);
+  f.Fragment().code.instructions.insert(
+    f.Fragment().code.instructions.end() - 1,
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("MissingAfterRepeatedReward"), Id("self"), Id("temp"),
+        VarValue(0) } });
+  REQUIRE_THROWS_WITH(
+    f.Run(actor, 10, kRepeatQuest),
+    Catch::Matchers::ContainsSubstring("MissingAfterRepeatedReward"));
+  REQUIRE(actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
+          before);
+  REQUIRE(actor.GetInventory().GetItemCount(0xf) == 20);
+  f.server.worldState.Tick();
+  REQUIRE(storage->batches.size() == 1);
+
+  Fixture restarted;
+  InventoryFragment(restarted);
+  restarted.Fragment().code.instructions.erase(
+    restarted.Fragment().code.instructions.begin() + 3);
+  auto& restored = restarted.Add(actor.GetFormId());
+  restored.ApplyChangeForm(*saved);
+  REQUIRE(restarted.Run(restored, 10, kRepeatQuest));
+  REQUIRE(restored.GetInventory().GetItemCount(0xf) == 25);
+  REQUIRE(QuestJournal::ScriptState(restored) == variables);
+  REQUIRE(QuestJournal::Get(restored, kRepeatQuest).at("stages") ==
+          nlohmann::json::array({ 10 }));
+}
+
+TEST_CASE("Repeated stage execution cannot silently restart a stopped quest",
+          "[Quest][QuestVM][RepeatableStage]")
+{
+  Fixture f;
+  auto& actor = f.Add(0xff008001);
+  EnableRuntimeQuest(actor, kRepeatQuest);
+  REQUIRE(f.Run(actor, 10, kRepeatQuest));
+  QuestJournal::Apply(actor, { { "quest", kRepeatQuest }, { "op", "stop" } });
+  const auto before = actor.GetDynamicFields().GetValueDump(
+    QuestJournal::kProperty);
+  REQUIRE_THROWS(f.Run(actor, 10, kRepeatQuest));
+  REQUIRE(actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
+          before);
+  REQUIRE(RepeatCounter(actor) == 1);
+}
+
+TEST_CASE("A stage without log items records visitation but returns false",
+          "[Quest][QuestVM][QuestLifecycle]")
+{
+  Fixture f;
+  constexpr uint32_t questId = 0x1075b1;
+  auto& actor = f.Add(0xff008001);
+  EnableRuntimeQuest(actor, questId);
+  f.metadata.fragments.clear();
+  const auto before = QuestJournal::Snapshot(actor).at("revision");
+  REQUIRE_FALSE(f.Run(actor, 0, questId));
+  REQUIRE(QuestJournal::Get(actor, questId).at("stages") ==
+          nlohmann::json::array({ 0 }));
+  REQUIRE(QuestJournal::Snapshot(actor).at("revision") > before);
+  REQUIRE(QuestJournal::ScriptState(actor).empty());
+  const auto saved = QuestJournal::Snapshot(actor);
+  REQUIRE_FALSE(f.Run(actor, 0, questId));
+  REQUIRE(QuestJournal::Snapshot(actor) == saved);
+}
+
+TEST_CASE("Duplicate authored stage indices cannot merge unrelated log lists",
+          "[Quest][QuestVM][QuestLifecycle]")
+{
+  Fixture f;
+  constexpr uint32_t questId = 0x786b9;
+  auto& actor = f.Add(0xff008001);
+  EnableRuntimeQuest(actor, questId);
+  f.metadata.fragments = { { 0, 0, 1, "BoyhouseFixture", "Fragment" } };
+  const auto before = QuestJournal::Snapshot(actor);
+  REQUIRE_THROWS_WITH(
+    f.Run(actor, 0, questId),
+    Catch::Matchers::ContainsSubstring("Ambiguous duplicate quest stage"));
+  REQUIRE(QuestJournal::Snapshot(actor) == before);
+  REQUIRE(QuestJournal::ScriptState(actor).empty());
+}
+
+TEST_CASE("Completion log flags apply before fragment queries and roll back "
+          "with a failing fragment",
+          "[Quest][QuestVM][QuestLifecycle]")
+{
+  Fixture f;
+  constexpr uint32_t questId = 0x10d9f4;
+  const bool fail = GENERATE(false, true);
+  auto& actor = f.Add(0xff008001);
+  EnableRuntimeQuest(actor, questId);
+  QuestJournal::Apply(
+    actor, { { "quest", questId }, { "op", "setActive" }, { "value", true } });
+  f.metadata.fragments = { { 100, 0, 1, "BoyhouseFixture", "Fragment" } };
+  for (const auto* name : { "completedAtEntry", "activeAtEntry",
+                            "runningAtEntry" })
+    f.fixture->objectTable[0].variables.push_back(
+      { name, "Bool", 0, VarValue(false) });
+  f.Fragment().code.instructions = {
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("IsCompleted"), Id("self"), Id("completedAtEntry"),
+        VarValue(0) } },
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("IsActive"), Id("self"), Id("activeAtEntry"), VarValue(0) } },
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("IsRunning"), Id("self"), Id("runningAtEntry"), VarValue(0) } },
+    { FunctionCode::kOp_Return, { VarValue::None() } }
+  };
+  if (fail)
+    f.Fragment().code.instructions.insert(
+      f.Fragment().code.instructions.end() - 1,
+      { FunctionCode::kOp_CallMethod,
+        { VarValue("MissingAfterCompletion"), Id("self"), Id("temp"),
+          VarValue(0) } });
+  const auto before = QuestJournal::Snapshot(actor);
+  if (fail) {
+    REQUIRE_THROWS(f.Run(actor, 100, questId));
+    REQUIRE(QuestJournal::Snapshot(actor) == before);
+    REQUIRE(QuestJournal::ScriptState(actor).empty());
+  } else {
+    REQUIRE(f.Run(actor, 100, questId));
+    const auto variables = QuestJournal::ScriptState(actor)
+                             .at("scripts")
+                             .at("10d9f4:Skyrim.esm/boyhousefixture")
+                             .at("values");
+    for (const auto* name : { "completedatentry", "activeatentry",
+                              "runningatentry" })
+      REQUIRE(variables.at(std::string("boyhousefixture/") + name)
+                .at("value") == true);
   }
 }

@@ -89,12 +89,26 @@ def summarize_record(typ, flags, form, values, groups, origins, plugin):
         where = f"{key}/{context}/{tag.decode('ascii')}"
         if tag == b"EDID":
             result["editorId"] = data.rstrip(b"\0").decode("utf-8")
+        elif tag == b"DNAM" and typ == "QUST":
+            if len(data) != 12:
+                raise ValueError("Invalid quest data size")
+            quest_flags = struct.unpack_from("<H", data)[0]
+            for mask, name in ((0x0001, "start-game-enabled"),
+                               (0x0008, "repeatable-stages"),
+                               (0x0100, "run-once")):
+                if quest_flags & mask:
+                    feature("quest." + name, where)
         elif tag == b"INDX" and typ == "QUST":
-            if len(data) < 2:
-                raise ValueError("Truncated quest stage")
+            if len(data) != 4:
+                raise ValueError("Invalid quest stage size")
             stage = struct.unpack_from("<H", data)[0]
             result["stages"].add(stage)
             context = f"stage:{stage}"
+            for mask, name in ((0x02, "startup-stages"),
+                               (0x04, "shutdown-stages"),
+                               (0x08, "keep-instance-data")):
+                if data[2] & mask:
+                    feature("quest." + name, f"{key}/{context}/INDX")
         elif tag == b"QOBJ" and typ == "QUST":
             if len(data) != 2:
                 raise ValueError("Invalid objective index")

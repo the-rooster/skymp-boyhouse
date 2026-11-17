@@ -13,6 +13,7 @@
 #include "libespm/CTDA.h"
 #include "libespm/GroupHeader.h"
 #include "libespm/QuestAliasData.h"
+#include "libespm/QuestLifecycleData.h"
 #include "libespm/RecordHeaderAccess.h"
 #include "papyrus-vm/Reader.h"
 #include "script_classes/PapyrusQuest.h"
@@ -565,6 +566,7 @@ bool QuestScriptRuntime::Execute(MpActor& actor, uint32_t questId,
     std::function<std::shared_ptr<IGameObject>(uint32_t, uint32_t)>
       resolveAlias;
     std::map<uint32_t, espm::QuestAliasData> aliasDefinitions;
+    std::map<uint32_t, espm::QuestLifecycleData> lifecycleDefinitions;
     std::map<std::pair<uint32_t, uint32_t>,
              std::shared_ptr<CampaignAliasObject>>
       aliases;
@@ -692,6 +694,17 @@ bool QuestScriptRuntime::Execute(MpActor& actor, uint32_t questId,
 
     auto questKey = [&](uint32_t id) {
       return FormDesc::FromFormId(id, world.espmFiles).ToString();
+    };
+    auto lifecycle = [&](uint32_t id) -> const espm::QuestLifecycleData& {
+      auto it = lifecycleDefinitions.find(id);
+      if (it == lifecycleDefinitions.end()) {
+        const auto rec = world.GetEspm().GetBrowser().LookupById(id);
+        it = lifecycleDefinitions
+               .emplace(id, espm::QuestLifecycleData::Read(
+                              rec.rec, world.GetEspmCache()))
+               .first;
+      }
+      return it->second;
     };
     auto definitions = [&](uint32_t id) -> const espm::QuestAliasData& {
       auto it = aliasDefinitions.find(id);
@@ -1175,6 +1188,7 @@ bool QuestScriptRuntime::Execute(MpActor& actor, uint32_t questId,
       return formId(value);
     };
     size_t depth = 0;
+    std::set<std::pair<uint32_t, uint16_t>> activeStages;
     std::function<bool(uint32_t, uint16_t)> execute;
     for (const auto* name : { "SetStage", "SetCurrentStageID" }) {
       vm.RegisterFunction(
@@ -1208,20 +1222,21 @@ bool QuestScriptRuntime::Execute(MpActor& actor, uint32_t questId,
         ~DepthGuard() { --depth; }
       } guard{ depth };
       const auto target = world.GetEspm().GetBrowser().LookupById(targetId);
-      if (!target.rec || target.rec->GetType() != "QUST")
+      if (!target.rec || target.rec->IsDeleted() ||
+          target.rec->GetType() != "QUST")
         throw std::invalid_argument("Expected nested quest record");
       const auto data = targetId == questId
         ? metadata
         : espm::QuestScriptData::Read(target.rec, world.GetEspmCache());
+      const auto& lifecycleData = lifecycle(targetId);
+      const auto stageCount = std::count_if(
+        lifecycleData.stages.begin(), lifecycleData.stages.end(),
+        [&](const auto& definition) { return definition.index == targetStage; });
+      if (stageCount != 1)
+        throw std::runtime_error(stageCount == 0
+                                   ? "Quest stage does not exist"
+                                   : "Ambiguous duplicate quest stage index");
       const auto logs = ReadLogs(target, targetStage, world);
-      if (!QuestJournal::Apply(actor,
-                               { { "quest", targetId },
-                                 { "op", "setStage" },
-                                 { "index", targetStage } }))
-        return false;
-      auto object =
-        std::dynamic_pointer_cast<CampaignQuestObject>(resolve(targetId));
-
       std::set<uint32_t> seen;
       for (const auto& fragment : data.fragments) {
         if (fragment.stage != targetStage)
@@ -1231,12 +1246,45 @@ bool QuestScriptRuntime::Execute(MpActor& actor, uint32_t questId,
           throw std::runtime_error(
             "Invalid or duplicate quest fragment log binding");
       }
+      const auto identity = std::make_pair(targetId, targetStage);
+      if (!QuestJournal::Apply(actor, { { "quest", targetId },
+                                       { "op", "setStage" },
+                                       { "index", targetStage } })) {
+        if (!(lifecycleData.flags &
+              espm::QuestLifecycleData::AllowRepeatedStages))
+          return false;
+        // Sequential repeat visits are intentional. Reentering a still-active
+        // stage needs queued/latent execution, which this synchronous runner
+        // cannot reproduce. Refuse it rather than dropping or duplicating work.
+        if (activeStages.count(identity))
+          throw std::runtime_error(
+            "Reentrant repeated quest stage requires scheduling");
+        QuestJournal::RecordRepeatedStage(actor, targetId, targetStage);
+      }
+      // The native dispatcher records a valid stage even when it has no log
+      // items, but returns false and has no fragment work to dispatch.
+      if (logs.empty())
+        return false;
+      activeStages.insert(identity);
+      struct ActiveStageGuard
+      {
+        std::set<std::pair<uint32_t, uint16_t>>& active;
+        std::pair<uint32_t, uint16_t> identity;
+        ~ActiveStageGuard() { active.erase(identity); }
+      } activeStageGuard{ activeStages, identity };
+      auto object =
+        std::dynamic_pointer_cast<CampaignQuestObject>(resolve(targetId));
       for (size_t logIndex = 0; logIndex < logs.size(); ++logIndex) {
         const bool passes = CampaignCondition::Evaluate(
           logs[logIndex].conditions,
           { actor, targetId, readGlobalId, readQuestVariable, conditionAlias });
         if (!passes)
           continue;
+        // QSDT completion precedes the fragment. Its IsCompleted/IsActive
+        // queries must observe that transition in this same transaction.
+        if (logs[logIndex].flags & 1)
+          QuestJournal::Apply(actor,
+                              { { "quest", targetId }, { "op", "complete" } });
         for (const auto& fragment : data.fragments) {
           if (fragment.stage != targetStage || fragment.logEntry != logIndex)
             continue;
@@ -1258,9 +1306,6 @@ bool QuestScriptRuntime::Execute(MpActor& actor, uint32_t questId,
             throw std::runtime_error(
               "Latent quest fragment requires durable continuation support");
         }
-        if (logs[logIndex].flags & 1)
-          QuestJournal::Apply(actor,
-                              { { "quest", targetId }, { "op", "complete" } });
       }
       return true;
     };

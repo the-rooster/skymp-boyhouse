@@ -94,6 +94,23 @@ assert.deepEqual(progress(owner), afterFragment);
 server.set(owner, "private.boyhouse.questAdapters", [key, "2d512:Skyrim.esm"]);
 server.set(guest, "questExecuteStage", { quest: 0x2d512, stage: 5 });
 assert.equal(progress(owner).quests["2d512:Skyrim.esm"].objectives["5"].displayed, true);
+// An original repeatable quest with an unconditional, nonempty stage log and
+// no fragment at that stage. Unit fixtures cover repeated inventory rewards;
+// this exercises the real addon revision boundary without enabling the quest.
+const repeatQuest = 0xd980b, repeatKey = "d980b:Skyrim.esm";
+server.set(owner, "private.boyhouse.questAdapters", [key, "2d512:Skyrim.esm", repeatKey]);
+server.set(guest, "questExecuteStage", { quest: repeatQuest, stage: 50 });
+const repeatBefore = progress(owner);
+server.set(guest, "questExecuteStage", {
+  quest: repeatQuest, stage: 50, expectedRevision: repeatBefore.revision,
+});
+const repeatAfter = progress(owner);
+assert.ok(repeatAfter.revision > repeatBefore.revision);
+assert.deepEqual(repeatAfter.quests[repeatKey].stages, [50]);
+assert.throws(() => server.set(guest, "questExecuteStage", {
+  quest: repeatQuest, stage: 50, expectedRevision: repeatBefore.revision,
+}), /Stale quest revision/);
+assert.deepEqual(progress(owner), repeatAfter);
 const { QuestJournalFeed } = require("../../skymp5-server/ts/campaign/questJournalFeed.js");
 const packets = [];
 const feed = new QuestJournalFeed({ connected: () => true, actor: user => ids[user], read: progress,
