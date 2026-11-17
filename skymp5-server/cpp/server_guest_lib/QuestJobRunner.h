@@ -52,6 +52,7 @@ public:
   {
     Stage,
     Interaction,
+    ReferenceLoad,
     Unknown
   };
   struct Result
@@ -83,6 +84,13 @@ public:
                      const MetadataOverrides& overrides,
                      const std::vector<PexScript::Lazy>& scripts,
                      bool automatic = false);
+  Result SubmitLoad(MpActor& actor, const Request& command,
+                    MpObjectReference& target);
+  Result SubmitLoad(MpActor& actor, const Request& command,
+                    MpObjectReference& target,
+                    const MetadataOverrides& overrides,
+                    const std::vector<PexScript::Lazy>& scripts,
+                    bool automatic = false);
   Result Resume(MpActor& actor, const Request& command,
                 const std::string& token, bool completion);
   Result Resume(MpActor& actor, const Request& command,

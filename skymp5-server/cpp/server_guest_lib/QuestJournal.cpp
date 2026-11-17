@@ -42,6 +42,7 @@ struct Transaction
   std::map<uint32_t, ReferenceEdit> references;
   std::optional<uint64_t> jobId;
   bool jobTransitionApplied = false;
+  const Json* initialLedger = nullptr;
 };
 thread_local Transaction* transaction = nullptr;
 
@@ -83,7 +84,8 @@ void RequireUnchangedContinuations(const QuestJobState& before,
 // Host dispatch advances one saved boundary without executing script work.
 // The native child-stack rules below govern root/handler body execution.
 bool ValidateDispatchTransition(const QuestJobState::Job& prior,
-                                const QuestJobState::Job& next)
+                                const QuestJobState::Job& next,
+                                bool referenceWasInitialized)
 {
   using Stage = QuestJobState::Stage;
   if (next.events.size() < prior.events.size() ||
@@ -93,12 +95,37 @@ bool ValidateDispatchTransition(const QuestJobState::Job& prior,
       "Job transaction rewrote inventory event history");
   const bool host = prior.cursor == "done" &&
     (!prior.handler || prior.handler->cursor == "done");
-  const bool primary =
-    prior.kind == QuestJobState::Kind::Interaction && !prior.interactionDone;
+  const bool primary = prior.HasPrimaryEvent();
   const bool finishPrimary = primary && host && !prior.handler &&
     prior.dispatch && !prior.dispatch->captured &&
     prior.dispatch->recipient == prior.dispatch->recipients.size();
-  if (next.interactionDone != (finishPrimary ? true : prior.interactionDone))
+  const bool load = prior.kind == QuestJobState::Kind::ReferenceLoad;
+  const bool skipLoadInit = load && host && !prior.handler &&
+    !prior.dispatch && prior.loadPhase == QuestJobState::LoadPhase::Init &&
+    referenceWasInitialized;
+  auto expectedPhase = prior.loadPhase;
+  if (load && (finishPrimary || skipLoadInit)) {
+    switch (prior.loadPhase) {
+      case QuestJobState::LoadPhase::Init:
+        expectedPhase = QuestJobState::LoadPhase::CellLoad;
+        break;
+      case QuestJobState::LoadPhase::CellLoad:
+        expectedPhase = QuestJobState::LoadPhase::Load;
+        break;
+      case QuestJobState::LoadPhase::Load:
+        expectedPhase = QuestJobState::LoadPhase::Done;
+        break;
+      case QuestJobState::LoadPhase::Done:
+        throw std::runtime_error("Completed load has another primary event");
+    }
+  }
+  if (next.loadPhase != expectedPhase)
+    throw std::runtime_error(
+      "Job changed reference load phase outside its boundary");
+  if (next.interactionDone !=
+      (finishPrimary && prior.kind == QuestJobState::Kind::Interaction
+         ? true
+         : prior.interactionDone))
     throw std::runtime_error(
       "Job transaction changed interaction completion outside its boundary");
   if (!host) {
@@ -122,6 +149,14 @@ bool ValidateDispatchTransition(const QuestJobState::Job& prior,
     throw std::runtime_error(
       "Event dispatch crossed a script execution boundary");
   const auto instructions = next.instructions - prior.instructions;
+  if (skipLoadInit) {
+    if (instructions || next.dispatch || next.handler ||
+        next.eventHead != prior.eventHead ||
+        next.nextHandler != prior.nextHandler)
+      throw std::runtime_error(
+        "Initialized reference skipped more than OnInit");
+    return true;
+  }
   if (prior.handler) {
     auto expected = *prior.dispatch;
     ++expected.attachment;
@@ -321,8 +356,24 @@ void Validate(const Json& ledger, bool validateHeap = true)
           field != "referenceInit")
         throw std::runtime_error("Unknown private campaign journal field");
     const auto jobs = QuestJobState::Read(ledger.at("jobs"));
-    if (validateHeap)
+    if (validateHeap) {
       jobs.ValidateHeap(ledger.value("vm", Json::object()));
+      const auto initialized = ledger.value("referenceInit", Json::object());
+      const auto checkLoad = [&](const QuestJobState::Job& job) {
+        if (!job.referenceLoad)
+          return;
+        const bool marked = initialized.contains(job.referenceLoad->target);
+        if ((job.loadPhase != QuestJobState::LoadPhase::Init && !marked) ||
+            (job.loadPhase == QuestJobState::LoadPhase::Init && job.dispatch &&
+             marked))
+          throw std::runtime_error(
+            "Reference load phase disagrees with its initialization marker");
+      };
+      for (const auto& [id, job] : jobs.live)
+        checkLoad(job);
+      for (const auto& job : jobs.completed)
+        checkLoad(job);
+    }
   } else if (ledger.contains("jobs"))
     throw std::runtime_error("Quest jobs require private journal schema two");
   if (ledger.contains("referenceInit")) {
@@ -710,6 +761,7 @@ std::shared_ptr<const SaveReceipt> QuestJournal::AtomicImpl(
   const auto initialJournal = owner.GetDynamicFields().GetValueDump(kProperty);
   Transaction local{ &owner, initial, {}, {} };
   local.jobId = jobId;
+  local.initialLedger = &initial;
   transaction = &local;
   try {
     execute();
@@ -987,6 +1039,7 @@ void QuestJournal::SetJobState(MpActor& actor, const QuestJobState& state)
         candidate->environmentHash != prior.environmentHash ||
         candidate->kind != prior.kind ||
         candidate->interaction != prior.interaction ||
+        candidate->referenceLoad != prior.referenceLoad ||
         candidate->actor != prior.actor || candidate->owner != prior.owner ||
         candidate->quest != prior.quest ||
         candidate->instance != prior.instance ||
@@ -1003,7 +1056,12 @@ void QuestJournal::SetJobState(MpActor& actor, const QuestJobState& state)
       if (!candidate->completions.contains(token) ||
           candidate->completions.at(token) != result)
         throw std::runtime_error("Job transaction rewrote a completion");
-    if (!ValidateDispatchTransition(prior, *candidate)) {
+    const bool referenceWasInitialized = prior.referenceLoad &&
+      transaction->initialLedger->contains("referenceInit") &&
+      transaction->initialLedger->at("referenceInit")
+        .contains(prior.referenceLoad->target);
+    if (!ValidateDispatchTransition(prior, *candidate,
+                                    referenceWasInitialized)) {
       using Stage = QuestJobState::Stage;
       const auto sameStage = [](const Stage& a, const Stage& b) {
         return a == b;
@@ -1169,6 +1227,17 @@ void QuestJournal::MarkReferenceInitialized(MpActor& actor, uint32_t original)
   if (ledger.contains("referenceInit") &&
       ledger.at("referenceInit").contains(key))
     return;
+  if (transaction->jobId) {
+    const auto jobs = JobState(actor);
+    const auto* job = jobs.FindLive(*transaction->jobId);
+    if (!job || job->kind != QuestJobState::Kind::ReferenceLoad ||
+        !job->referenceLoad || job->referenceLoad->target != key ||
+        job->loadPhase != QuestJobState::LoadPhase::Init || job->handler ||
+        !job->children.empty() || !job->dispatch || job->dispatch->captured ||
+        job->dispatch->recipient != job->dispatch->recipients.size())
+      throw std::runtime_error(
+        "Reference initialization requires its completed OnInit boundary");
+  }
   const auto revision = ledger.at("revision").get<uint64_t>();
   if (revision == kMaxRevision)
     throw std::overflow_error("Quest revision exhausted");

@@ -14,7 +14,21 @@ struct QuestJobState
   enum class Kind
   {
     Stage,
-    Interaction
+    Interaction,
+    ReferenceLoad
+  };
+  enum class LoadPhase
+  {
+    Init,
+    CellLoad,
+    Load,
+    Done
+  };
+  struct ReferenceLoad
+  {
+    std::string target, reference;
+    std::vector<std::string> templates;
+    bool operator==(const ReferenceLoad&) const = default;
   };
   struct Interaction
   {
@@ -92,6 +106,8 @@ struct QuestJobState
     Kind kind = Kind::Stage;
     std::optional<Interaction> interaction;
     bool interactionDone = true;
+    std::optional<ReferenceLoad> referenceLoad;
+    LoadPhase loadPhase = LoadPhase::Done;
     uint64_t id = 0, generation = 1, segment = 0, nextOperation = 1;
     std::string command, actor, owner, instance;
     std::string contentMode = "owned";
@@ -113,6 +129,8 @@ struct QuestJobState
     const Stage& Current() const;
     bool IsComplete() const;
     bool IsPristine() const;
+    const char* PrimaryEventName() const;
+    bool HasPrimaryEvent() const;
     bool operator==(const Job&) const = default;
   };
   struct RetiredRange

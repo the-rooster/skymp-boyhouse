@@ -617,9 +617,17 @@ QuestJobRunner::Result QuestJobRunner::Inspect(MpActor& actor,
                current.awaitKey };
     return { Status::Ready, job->id };
   }();
-  result.kind = job->kind == QuestJobState::Kind::Interaction
-    ? ResultKind::Interaction
-    : ResultKind::Stage;
+  switch (job->kind) {
+    case QuestJobState::Kind::Stage:
+      result.kind = ResultKind::Stage;
+      break;
+    case QuestJobState::Kind::Interaction:
+      result.kind = ResultKind::Interaction;
+      break;
+    case QuestJobState::Kind::ReferenceLoad:
+      result.kind = ResultKind::ReferenceLoad;
+      break;
+  }
   return result;
 }
 
@@ -710,6 +718,40 @@ QuestJobRunner::Result QuestJobRunner::SubmitEvent(
                           hashManifest, true, automatic);
 }
 
+QuestJobRunner::Result QuestJobRunner::SubmitLoad(MpActor& actor,
+                                                  const Request& command,
+                                                  MpObjectReference& target)
+{
+  if (const auto retired = Retired(actor, command))
+    return *retired;
+  QuestJobState::Job job;
+  job.kind = QuestJobState::Kind::ReferenceLoad;
+  job.cursor = "done";
+  job.loadPhase = QuestJobState::LoadPhase::Init;
+  job.referenceLoad = QuestScriptRuntime::CaptureReferenceLoad(actor, target);
+  const auto& pinned = Scripts();
+  return AdmitWithContent(actor, command, std::move(job), pinned, {}, manifest,
+                          false, true);
+}
+
+QuestJobRunner::Result QuestJobRunner::SubmitLoad(
+  MpActor& actor, const Request& command, MpObjectReference& target,
+  const MetadataOverrides& overrides,
+  const std::vector<PexScript::Lazy>& sources, bool automatic)
+{
+  if (const auto retired = Retired(actor, command))
+    return *retired;
+  QuestJobState::Job job;
+  job.kind = QuestJobState::Kind::ReferenceLoad;
+  job.cursor = "done";
+  job.loadPhase = QuestJobState::LoadPhase::Init;
+  job.referenceLoad = QuestScriptRuntime::CaptureReferenceLoad(actor, target);
+  const auto hashManifest = QuestJobContent::WithMetadataOverrides(
+    world, QuestJobContent::ScriptManifest(sources), overrides);
+  return AdmitWithContent(actor, command, std::move(job), sources, overrides,
+                          hashManifest, true, automatic);
+}
+
 QuestJobRunner::Result QuestJobRunner::AdmitWithContent(
   MpActor& actor, const Request& command, QuestJobState::Job job,
   const std::vector<PexScript::Lazy>& sources,
@@ -737,6 +779,7 @@ QuestJobRunner::Result QuestJobRunner::AdmitWithContent(
     RequireContext(actor, *prior);
     RequireMode(*prior, fixtureAwait);
     if (prior->kind != job.kind || prior->interaction != job.interaction ||
+        prior->referenceLoad != job.referenceLoad ||
         prior->quest != job.quest || prior->stage != job.stage ||
         prior->contentHash != job.contentHash)
       throw std::runtime_error("Quest command was reused for different work");
@@ -744,6 +787,11 @@ QuestJobRunner::Result QuestJobRunner::AdmitWithContent(
     return Inspect(actor, command);
   }
   RequireReady(actor);
+  for (const auto& [id, live] : jobs.live) {
+    if (job.referenceLoad && live.referenceLoad &&
+        job.referenceLoad->target == live.referenceLoad->target)
+      throw std::runtime_error("Reference already has a pending load job");
+  }
   const auto legacyCount =
     std::count_if(jobs.completed.begin(), jobs.completed.end(),
                   [](const auto& job) { return !job.sequenced; }) +
@@ -841,7 +889,7 @@ QuestJobRunner::Result QuestJobRunner::Resume(
     throw std::invalid_argument("Unknown quest job command");
   if (job->kind != QuestJobState::Kind::Stage)
     throw std::invalid_argument(
-      "Interaction jobs require a complete metadata override map");
+      "Reference jobs require a complete metadata override map");
   const auto quest =
     FormDesc::FromString(job->quest).ToFormId(world.espmFiles);
   return Resume(actor, command, token, completion,

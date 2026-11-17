@@ -200,6 +200,21 @@ Json SaveDispatch(const QuestJobState::Dispatch& dispatch)
   };
 }
 
+std::vector<std::string> ReadTemplates(const Json& values)
+{
+  if (!values.is_array() || values.size() > 128)
+    throw std::runtime_error("Quest reference template limit exceeded");
+  std::vector<std::string> result;
+  std::set<std::string> seen;
+  for (const auto& value : values) {
+    const auto identity = Identity(value, false);
+    if (!seen.insert(identity).second)
+      throw std::runtime_error("Duplicate quest reference template");
+    result.push_back(identity);
+  }
+  return result;
+}
+
 QuestJobState::Interaction ReadInteraction(const Json& value)
 {
   Fields(value,
@@ -217,21 +232,8 @@ QuestJobState::Interaction ReadInteraction(const Json& value)
   interaction.source = Identity(value.at("source"), false);
   interaction.targetReference = Identity(value.at("targetReference"), true);
   interaction.sourceReference = Identity(value.at("sourceReference"), true);
-  const auto templates = [](const Json& values) {
-    if (!values.is_array() || values.size() > 128)
-      throw std::runtime_error("Quest interaction template limit exceeded");
-    std::vector<std::string> result;
-    std::set<std::string> seen;
-    for (const auto& value : values) {
-      const auto identity = Identity(value, false);
-      if (!seen.insert(identity).second)
-        throw std::runtime_error("Duplicate quest interaction template");
-      result.push_back(identity);
-    }
-    return result;
-  };
-  interaction.targetTemplates = templates(value.at("targetTemplates"));
-  interaction.sourceTemplates = templates(value.at("sourceTemplates"));
+  interaction.targetTemplates = ReadTemplates(value.at("targetTemplates"));
+  interaction.sourceTemplates = ReadTemplates(value.at("sourceTemplates"));
   return interaction;
 }
 
@@ -245,7 +247,7 @@ Json SaveInteraction(const QuestJobState::Interaction& interaction)
   for (const auto* templates :
        { &interaction.targetTemplates, &interaction.sourceTemplates }) {
     if (templates->size() > 128)
-      throw std::runtime_error("Quest interaction template limit exceeded");
+      throw std::runtime_error("Quest reference template limit exceeded");
     for (const auto& name : *templates)
       Bounded(name, 300);
   }
@@ -258,7 +260,60 @@ Json SaveInteraction(const QuestJobState::Interaction& interaction)
            { "sourceTemplates", interaction.sourceTemplates } };
 }
 
-bool InertInteractionRoot(const QuestJobState::Stage& stage)
+QuestJobState::ReferenceLoad ReadReferenceLoad(const Json& value)
+{
+  Fields(value, { "target", "reference", "templates" });
+  QuestJobState::ReferenceLoad load{ Identity(value.at("target"), false),
+                                     Identity(value.at("reference"), true),
+                                     ReadTemplates(value.at("templates")) };
+  if (load.target == "14:Skyrim.esm")
+    throw std::runtime_error("PlayerRef cannot be a reference-load target");
+  return load;
+}
+
+Json SaveReferenceLoad(const QuestJobState::ReferenceLoad& load)
+{
+  Bounded(load.target, 300);
+  Bounded(load.reference, 300);
+  if (load.templates.size() > 128)
+    throw std::runtime_error("Reference-load template limit exceeded");
+  for (const auto& name : load.templates)
+    Bounded(name, 300);
+  return { { "target", load.target },
+           { "reference", load.reference },
+           { "templates", load.templates } };
+}
+
+QuestJobState::LoadPhase ReadLoadPhase(const Json& value)
+{
+  const auto phase = Text(value, 8);
+  if (phase == "init")
+    return QuestJobState::LoadPhase::Init;
+  if (phase == "cellLoad")
+    return QuestJobState::LoadPhase::CellLoad;
+  if (phase == "load")
+    return QuestJobState::LoadPhase::Load;
+  if (phase == "done")
+    return QuestJobState::LoadPhase::Done;
+  throw std::runtime_error("Unsupported reference-load phase");
+}
+
+const char* SaveLoadPhase(QuestJobState::LoadPhase phase)
+{
+  switch (phase) {
+    case QuestJobState::LoadPhase::Init:
+      return "init";
+    case QuestJobState::LoadPhase::CellLoad:
+      return "cellLoad";
+    case QuestJobState::LoadPhase::Load:
+      return "load";
+    case QuestJobState::LoadPhase::Done:
+      return "done";
+  }
+  throw std::runtime_error("Unsupported typed reference-load phase");
+}
+
+bool InertHostRoot(const QuestJobState::Stage& stage)
 {
   QuestJobState::Stage inert;
   inert.cursor = "done";
@@ -397,6 +452,9 @@ QuestJobState::Job ReadJob(const Json& saved, uint64_t version)
         "children" });
   else {
     auto fields = value;
+    if (version >= 8)
+      for (const auto* field : { "referenceLoad", "loadPhase" })
+        fields.erase(field);
     if (version >= 7)
       for (const auto* field : { "kind", "interaction", "interactionDone" })
         fields.erase(field);
@@ -441,27 +499,40 @@ QuestJobState::Job ReadJob(const Json& saved, uint64_t version)
   }
   QuestJobState::Job job;
   if (version >= 7) {
-    const auto kind = Text(value.at("kind"), 11);
+    const auto kind = Text(value.at("kind"), 13);
     if (kind == "stage")
       job.kind = QuestJobState::Kind::Stage;
     else if (kind == "interaction")
       job.kind = QuestJobState::Kind::Interaction;
+    else if (version >= 8 && kind == "referenceLoad")
+      job.kind = QuestJobState::Kind::ReferenceLoad;
     else
       throw std::runtime_error("Unsupported quest job kind");
     job.interactionDone = Boolean(value.at("interactionDone"));
     if (!value.at("interaction").is_null())
       job.interaction = ReadInteraction(value.at("interaction"));
   }
+  if (version >= 8) {
+    job.loadPhase = ReadLoadPhase(value.at("loadPhase"));
+    if (!value.at("referenceLoad").is_null())
+      job.referenceLoad = ReadReferenceLoad(value.at("referenceLoad"));
+  }
   const bool interaction = job.kind == QuestJobState::Kind::Interaction;
+  const bool referenceLoad = job.kind == QuestJobState::Kind::ReferenceLoad;
+  const bool hostRoot = interaction || referenceLoad;
+  if (referenceLoad != job.referenceLoad.has_value() ||
+      (!referenceLoad && job.loadPhase != QuestJobState::LoadPhase::Done))
+    throw std::runtime_error(
+      "Quest job reference-load payload does not match its kind");
   if (interaction != job.interaction.has_value() ||
       (!interaction && !job.interactionDone))
     throw std::runtime_error(
       "Quest job interaction payload does not match its kind");
   static_cast<QuestJobState::Stage&>(job) =
-    ReadStage(value, false, version, false, interaction);
-  if (interaction && !InertInteractionRoot(job))
+    ReadStage(value, false, version, false, hostRoot);
+  if (hostRoot && !InertHostRoot(job))
     throw std::runtime_error(
-      "Interaction root contains executable quest stage state");
+      "Host event root contains executable quest stage state");
   job.automatic = version >= 3 ? Boolean(value.at("automatic")) : false;
   job.sequenced = version >= 5 ? Boolean(value.at("sequenced")) : false;
   job.contentMode = version >= 3 ? Text(value.at("contentMode"), 7) : "legacy";
@@ -475,7 +546,7 @@ QuestJobState::Job ReadJob(const Json& saved, uint64_t version)
   if ((job.contentMode != "owned" && job.contentMode != "fixture" &&
        job.contentMode != "legacy") ||
       (job.automatic && job.contentMode == "legacy") ||
-      (interaction &&
+      (hostRoot &&
        (job.environmentHash.empty() || job.contentMode == "legacy")))
     throw std::runtime_error("Invalid quest job content provenance");
   if (job.node)
@@ -496,6 +567,9 @@ QuestJobState::Job ReadJob(const Json& saved, uint64_t version)
     throw std::runtime_error("Invalid canonical sequenced quest command");
   job.actor = Identity(value.at("actor"), true);
   job.owner = Identity(value.at("owner"), true);
+  if (referenceLoad && job.actor != job.owner)
+    throw std::runtime_error(
+      "Reference-load root must execute as its campaign owner");
   job.instance = Text(value.at("instance"), 300, true);
   job.instructions =
     static_cast<uint32_t>(Number(value.at("instructions"), 100000));
@@ -526,7 +600,7 @@ QuestJobState::Job ReadJob(const Json& saved, uint64_t version)
       job.dispatch = ReadDispatch(value.at("dispatch"));
     if (!value.at("handler").is_null())
       job.handler =
-        ReadStage(value.at("handler"), false, version, true, interaction);
+        ReadStage(value.at("handler"), false, version, true, hostRoot);
   }
   if (job.cursor != "done") {
     if (job.dispatch || job.handler || job.eventHead || job.nextHandler != 1)
@@ -536,22 +610,34 @@ QuestJobState::Job ReadJob(const Json& saved, uint64_t version)
     throw std::runtime_error("Completed quest root retains native children");
   if (version < 4 && job.cursor == "done" && !job.events.empty())
     throw std::runtime_error("Legacy completed quest retains events");
-  const bool primary = interaction && !job.interactionDone;
+  const auto* primaryName = job.PrimaryEventName();
+  const bool primary = primaryName != nullptr;
   if (primary && job.eventHead)
     throw std::runtime_error(
-      "Inventory FIFO advanced before primary interaction completion");
+      "Inventory FIFO advanced before primary event completion");
   if (job.dispatch) {
+    const auto& target = primary
+      ? (referenceLoad ? job.referenceLoad->target : job.interaction->target)
+      : (job.eventHead < job.events.size() ? job.events[job.eventHead].target
+                                           : std::string{});
     if ((!primary && job.eventHead == job.events.size()) ||
-        job.dispatch->recipients.front() !=
-          (primary ? job.interaction->target
-                   : job.events[job.eventHead].target))
+        job.dispatch->recipients.front() != target)
       throw std::runtime_error(
         "Quest event dispatch has no matching target payload");
-    if (primary && job.dispatch->captured && !job.dispatch->recipient &&
-        (job.dispatch->reference != job.interaction->targetReference ||
-         job.dispatch->templates != job.interaction->targetTemplates))
+    if (referenceLoad && job.loadPhase == QuestJobState::LoadPhase::Init &&
+        job.dispatch->recipients.size() != 1)
       throw std::runtime_error(
-        "Interaction dispatch changed its captured target binding");
+        "Reference initialization cannot fan out to aliases");
+    if (primary && job.dispatch->captured && !job.dispatch->recipient) {
+      const auto& reference = referenceLoad ? job.referenceLoad->reference
+                                            : job.interaction->targetReference;
+      const auto& templates = referenceLoad ? job.referenceLoad->templates
+                                            : job.interaction->targetTemplates;
+      if (job.dispatch->reference != reference ||
+          job.dispatch->templates != templates)
+        throw std::runtime_error(
+          "Primary event dispatch changed its captured target binding");
+    }
     for (size_t index = 1; index < job.dispatch->recipients.size(); ++index)
       if (!job.dispatch->recipients[index].is_object())
         throw std::runtime_error(
@@ -560,8 +646,8 @@ QuestJobState::Job ReadJob(const Json& saved, uint64_t version)
   if (job.handler) {
     const auto& handler = *job.handler;
     const auto& identity = *handler.handlerIdentity;
-    const auto function = primary
-      ? job.interaction->name
+    const std::string function = primary
+      ? primaryName
       : (job.eventHead < job.events.size() && job.events[job.eventHead].added
            ? "OnItemAdded"
            : "OnItemRemoved");
@@ -638,7 +724,7 @@ QuestJobState::Job ReadJob(const Json& saved, uint64_t version)
   // completion, including parent waits whose children are still on the stack.
   if (operations.size() != job.nextOperation - 1)
     throw std::runtime_error("Quest operation history has missing identities");
-  if ((job.cursor == "begin" || (interaction && !job.segment)) &&
+  if ((job.cursor == "begin" || (hostRoot && !job.segment)) &&
       !job.IsPristine())
     throw std::runtime_error("Quest job initial cursor is not pristine");
   return job;
@@ -684,7 +770,8 @@ Json SaveStage(const QuestJobState::Stage& stage)
 Json SaveJob(const QuestJobState::Job& job)
 {
   if (job.kind != QuestJobState::Kind::Stage &&
-      job.kind != QuestJobState::Kind::Interaction)
+      job.kind != QuestJobState::Kind::Interaction &&
+      job.kind != QuestJobState::Kind::ReferenceLoad)
     throw std::runtime_error("Unsupported typed quest job kind");
   Bounded(job.command, 128);
   Bounded(job.contentMode, 7);
@@ -722,10 +809,17 @@ Json SaveJob(const QuestJobState::Job& job)
   auto result = SaveStage(job);
   result.update(
     { { "kind",
-        job.kind == QuestJobState::Kind::Stage ? "stage" : "interaction" },
+        job.kind == QuestJobState::Kind::Stage
+          ? "stage"
+          : (job.kind == QuestJobState::Kind::Interaction ? "interaction"
+                                                          : "referenceLoad") },
       { "interaction",
         job.interaction ? SaveInteraction(*job.interaction) : Json(nullptr) },
       { "interactionDone", job.interactionDone },
+      { "referenceLoad",
+        job.referenceLoad ? SaveReferenceLoad(*job.referenceLoad)
+                          : Json(nullptr) },
+      { "loadPhase", SaveLoadPhase(job.loadPhase) },
       { "id", job.id },
       { "generation", job.generation },
       { "segment", job.segment },
@@ -782,8 +876,8 @@ const QuestJobState::Stage& QuestJobState::Job::Current() const
 
 bool QuestJobState::Job::IsComplete() const
 {
-  return cursor == "done" && interactionDone && children.empty() && !handler &&
-    !dispatch && eventHead == events.size();
+  return cursor == "done" && interactionDone && loadPhase == LoadPhase::Done &&
+    children.empty() && !handler && !dispatch && eventHead == events.size();
 }
 
 bool QuestJobState::Job::IsPristine() const
@@ -792,15 +886,44 @@ bool QuestJobState::Job::IsPristine() const
       nextHandler != 1 || eventHead || !children.empty() || handler ||
       dispatch || !events.empty() || !completions.empty())
     return false;
+  if (kind == Kind::ReferenceLoad)
+    return referenceLoad && loadPhase == LoadPhase::Init && !interaction &&
+      interactionDone && InertHostRoot(*this);
   if (kind == Kind::Interaction)
-    return interaction && !interactionDone && InertInteractionRoot(*this);
-  if (kind != Kind::Stage || interaction || !interactionDone)
+    return interaction && !interactionDone && !referenceLoad &&
+      loadPhase == LoadPhase::Done && InertHostRoot(*this);
+  if (kind != Kind::Stage || interaction || !interactionDone ||
+      referenceLoad || loadPhase != LoadPhase::Done)
     return false;
   Stage pristine;
   pristine.quest = quest;
   pristine.contentHash = contentHash;
   pristine.stage = stage;
   return static_cast<const Stage&>(*this) == pristine;
+}
+
+const char* QuestJobState::Job::PrimaryEventName() const
+{
+  if (kind == Kind::Interaction && interaction && !interactionDone)
+    return interaction->name.c_str();
+  if (kind == Kind::ReferenceLoad && referenceLoad) {
+    switch (loadPhase) {
+      case LoadPhase::Init:
+        return "OnInit";
+      case LoadPhase::CellLoad:
+        return "OnCellLoad";
+      case LoadPhase::Load:
+        return "OnLoad";
+      case LoadPhase::Done:
+        return nullptr;
+    }
+  }
+  return nullptr;
+}
+
+bool QuestJobState::Job::HasPrimaryEvent() const
+{
+  return PrimaryEventName() != nullptr;
 }
 
 std::string QuestJobState::Job::NextToken() const
@@ -810,7 +933,7 @@ std::string QuestJobState::Job::NextToken() const
 
 QuestJobState QuestJobState::Read(const nlohmann::json& value)
 {
-  const auto version = Number(value.at("schemaVersion"), 7, true);
+  const auto version = Number(value.at("schemaVersion"), 8, true);
   if (version >= 6)
     Fields(value,
            { "schemaVersion", "generation", "nextJob", "retiredThrough",
@@ -872,6 +995,7 @@ QuestJobState QuestJobState::Read(const nlohmann::json& value)
     live.push_back(value.at("active"));
   previous = 0;
   size_t stageCount = 0;
+  std::set<std::string> loadTargets;
   for (const auto& saved : live) {
     auto job = ReadJob(saved, version);
     if (job.IsComplete() || job.id <= previous ||
@@ -881,6 +1005,9 @@ QuestJobState QuestJobState::Read(const nlohmann::json& value)
     previous = job.id;
     if (job.kind == Kind::Stage && ++stageCount > MaxStageLive)
       throw std::runtime_error("Live quest stage root limit exceeded");
+    if (job.referenceLoad &&
+        !loadTargets.insert(job.referenceLoad->target).second)
+      throw std::runtime_error("Duplicate live reference-load target");
     identity(job, true);
     if (!result.live.empty()) {
       const auto& first = result.live.begin()->second;
@@ -1084,7 +1211,7 @@ nlohmann::json QuestJobState::Save() const
   auto ranges = Json::array();
   for (const auto& range : retiredRanges)
     ranges.push_back({ { "first", range.first }, { "last", range.last } });
-  Json result = { { "schemaVersion", 7 },
+  Json result = { { "schemaVersion", 8 },
                   { "generation", generation },
                   { "nextJob", nextJob },
                   { "retiredThrough", retiredThrough },

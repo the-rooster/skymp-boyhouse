@@ -190,10 +190,14 @@ Json Legacy(const QuestJobState& state, uint64_t version = 1)
   if (version < 5)
     saved.erase("retiredThrough");
   auto strip = [version](Json& job) {
-    REQUIRE(job["kind"] == "stage");
-    job.erase("kind");
-    job.erase("interaction");
-    job.erase("interactionDone");
+    job.erase("referenceLoad");
+    job.erase("loadPhase");
+    if (version < 7) {
+      REQUIRE(job["kind"] == "stage");
+      job.erase("kind");
+      job.erase("interaction");
+      job.erase("interactionDone");
+    }
     if (version < 6)
       job.erase("environmentHash");
     if (version < 5)
@@ -483,6 +487,37 @@ QuestJobState InteractionHandler(bool waiting = false, bool alias = false)
   return state;
 }
 
+QuestJobState ReferenceLoadBegin()
+{
+  auto state = InteractionBegin();
+  auto& job = state.live.at(1);
+  job.kind = QuestJobState::Kind::ReferenceLoad;
+  job.interaction.reset();
+  job.interactionDone = true;
+  job.referenceLoad = QuestJobState::ReferenceLoad{ "10:Skyrim.esm",
+                                                    "3001",
+                                                    { "7:Skyrim.esm" } };
+  job.loadPhase = QuestJobState::LoadPhase::Init;
+  return state;
+}
+
+QuestJobState ReferenceLoadHandler(QuestJobState::LoadPhase phase,
+                                   bool waiting = false, bool alias = false)
+{
+  auto state = InteractionHandler(waiting, alias);
+  auto& job = state.live.at(1);
+  job.kind = QuestJobState::Kind::ReferenceLoad;
+  job.interaction.reset();
+  job.interactionDone = true;
+  job.referenceLoad = ReferenceLoadBegin().live.at(1).referenceLoad;
+  job.loadPhase = phase;
+  REQUIRE(job.PrimaryEventName());
+  job.handler->handlerIdentity->function = job.PrimaryEventName();
+  if (waiting)
+    job.handler->function = job.PrimaryEventName();
+  return state;
+}
+
 QuestJobState::Job Numbered(QuestJobState::Job job, uint64_t id,
                             bool sequenced = true)
 {
@@ -652,7 +687,7 @@ TEST_CASE("Quest jobs reject corrupt exact fields identities and cursor state",
   std::vector<std::function<void(Json&)>> corrupt = {
     [](Json& v) { v["unknown"] = 1; },
     [](Json& v) { v.erase("live"); },
-    [](Json& v) { v["schemaVersion"] = 8; },
+    [](Json& v) { v["schemaVersion"] = 9; },
     [](Json& v) { v["generation"] = 0; },
     [](Json& v) { v["nextJob"] = 1; },
     [](Json& v) { v["nextJob"] = UINT64_MAX; },
@@ -978,7 +1013,7 @@ TEST_CASE(
     const auto legacy = Legacy(state);
     const auto migrated = QuestJobState::Read(legacy);
     REQUIRE(migrated.Save() == MigratedLegacy(state).Save());
-    REQUIRE(migrated.Save()["schemaVersion"] == 7);
+    REQUIRE(migrated.Save()["schemaVersion"] == 8);
   }
   auto external = Waiting();
   Single(external)->awaitKey = "quest-stage";
@@ -1352,7 +1387,7 @@ TEST_CASE("Timer jobs round trip UTC deadlines and typed None completions",
   for (const auto& value : { state, Done(state) })
     REQUIRE(QuestJobState::Read(value.Save()).Save() == value.Save());
   const auto saved = state.Save();
-  REQUIRE(saved["schemaVersion"] == 7);
+  REQUIRE(saved["schemaVersion"] == 8);
   REQUIRE(saved["live"][0]["timer"]["policy"] == "utc-deadline-v1");
   const auto done = Done(state);
   const auto& job = done.completed.front();
@@ -1950,7 +1985,7 @@ TEST_CASE(
     auto migrated = QuestJobState::Read(legacy);
     REQUIRE(migrated.Save() == original.Save());
     REQUIRE(migrated.retiredThrough == 0);
-    REQUIRE(migrated.Save()["schemaVersion"] == 7);
+    REQUIRE(migrated.Save()["schemaVersion"] == 8);
     if (Single(migrated)) {
       REQUIRE_FALSE(Single(migrated)->sequenced);
       REQUIRE(Single(migrated)->Scope() == Single(original)->Scope());
@@ -2665,7 +2700,7 @@ TEST_CASE("Schema six histories migrate as stages without changing stacks or "
                                 SelectedHandler(true), multiple }) {
     const auto migrated = QuestJobState::Read(Legacy(original, 6));
     REQUIRE(migrated.Save() == original.Save());
-    REQUIRE(migrated.Save()["schemaVersion"] == 7);
+    REQUIRE(migrated.Save()["schemaVersion"] == 8);
     for (const auto& [id, job] : migrated.live) {
       REQUIRE(job.kind == QuestJobState::Kind::Stage);
       REQUIRE_FALSE(job.interaction);
@@ -2968,4 +3003,349 @@ TEST_CASE(
   old["live"][0]["environmentHash"] = std::string(64, 'e');
   old["nextJob"] = 18;
   REQUIRE_THROWS(QuestJobState::Read(old));
+}
+
+TEST_CASE(
+  "Schema seven stages and interactions migrate without reference-load work",
+  "[Quest][QuestJob]")
+{
+  auto interactionDone = InteractionBegin();
+  interactionDone.live.at(1).interactionDone = true;
+  HostStep(interactionDone.live.at(1), 1);
+  CompleteLive(interactionDone, 1);
+  for (const auto& original :
+       { Begin(), Waiting(), Nested(true), Done(Waiting()), InteractionBegin(),
+         InteractionHandler(true), InteractionHandler(true, true),
+         interactionDone }) {
+    const auto migrated = QuestJobState::Read(Legacy(original, 7));
+    REQUIRE(migrated.Save() == original.Save());
+    REQUIRE(migrated.Save()["schemaVersion"] == 8);
+    for (const auto& [id, job] : migrated.live) {
+      REQUIRE_FALSE(job.referenceLoad);
+      REQUIRE(job.loadPhase == QuestJobState::LoadPhase::Done);
+    }
+    REQUIRE_NOTHROW(migrated.ValidateHeap(AllLiveHeap(migrated)));
+  }
+  auto old = Legacy(InteractionBegin(), 7);
+  old["live"][0]["referenceLoad"] = nullptr;
+  REQUIRE_THROWS(QuestJobState::Read(old));
+  old = Legacy(InteractionBegin(), 7);
+  old["live"][0]["loadPhase"] = "done";
+  REQUIRE_THROWS(QuestJobState::Read(old));
+  old = Legacy(InteractionBegin(), 7);
+  old["live"][0]["kind"] = "referenceLoad";
+  REQUIRE_THROWS(QuestJobState::Read(old));
+}
+
+TEST_CASE("Reference-load roots retain typed phases and inert quest anchors",
+          "[Quest][QuestJob]")
+{
+  using Phase = QuestJobState::LoadPhase;
+  auto state = ReferenceLoadBegin();
+  auto& job = state.live.at(1);
+  REQUIRE(job.IsPristine());
+  REQUIRE_FALSE(job.IsComplete());
+  REQUIRE(job.kind == QuestJobState::Kind::ReferenceLoad);
+  REQUIRE_FALSE(job.interaction);
+  REQUIRE(job.interactionDone);
+  REQUIRE(job.quest.empty());
+  REQUIRE(job.contentHash.empty());
+  REQUIRE(job.cursor == "done");
+  REQUIRE_FALSE(job.accepted);
+  REQUIRE(QuestJobState::Read(state.Save()).Save() == state.Save());
+  for (const auto& [phase, name] : std::vector<std::pair<Phase, std::string>>{
+         { Phase::Init, "OnInit" },
+         { Phase::CellLoad, "OnCellLoad" },
+         { Phase::Load, "OnLoad" } }) {
+    job.loadPhase = phase;
+    if (phase != Phase::Init)
+      HostStep(job);
+    REQUIRE(job.HasPrimaryEvent());
+    REQUIRE(std::string(job.PrimaryEventName()) == name);
+    REQUIRE_FALSE(job.IsComplete());
+    REQUIRE(QuestJobState::Read(state.Save()).Save() == state.Save());
+    REQUIRE_NOTHROW(state.ValidateHeap(Json::object()));
+  }
+  job.loadPhase = Phase::Done;
+  HostStep(job);
+  REQUIRE_FALSE(job.HasPrimaryEvent());
+  REQUIRE(job.PrimaryEventName() == nullptr);
+  REQUIRE(job.IsComplete());
+  REQUIRE_FALSE(job.IsPristine());
+  CompleteLive(state, 1);
+  REQUIRE(QuestJobState::Read(state.Save()).Save() == state.Save());
+  REQUIRE_FALSE(Single(Begin())->HasPrimaryEvent());
+  REQUIRE(std::string(Single(InteractionBegin())->PrimaryEventName()) ==
+          "OnActivate");
+}
+
+TEST_CASE("Reference-load payload and phase codecs reject malformed ownership "
+          "and kinds",
+          "[Quest][QuestJob]")
+{
+  const auto original = ReferenceLoadBegin().Save();
+  const std::vector<std::function<void(Json&)>> corrupt = {
+    [](Json& v) { v["live"][0]["kind"] = "ReferenceLoad"; },
+    [](Json& v) { v["live"][0]["referenceLoad"] = nullptr; },
+    [](Json& v) { v["live"][0].erase("referenceLoad"); },
+    [](Json& v) { v["live"][0].erase("loadPhase"); },
+    [](Json& v) { v["live"][0]["loadPhase"] = "onInit"; },
+    [](Json& v) { v["live"][0]["loadPhase"] = "cellload"; },
+    [](Json& v) { v["live"][0]["loadPhase"] = 0; },
+    [](Json& v) { v["live"][0]["actor"] = "3002"; },
+    [](Json& v) { v["live"][0]["referenceLoad"]["target"] = "14:Skyrim.esm"; },
+    [](Json& v) { v["live"][0]["referenceLoad"]["target"] = "3001"; },
+    [](Json& v) {
+      v["live"][0]["referenceLoad"]["target"] = "010:Skyrim.esm";
+    },
+    [](Json& v) {
+      v["live"][0]["referenceLoad"]["reference"] = "10:Skyrim.esm";
+    },
+    [](Json& v) { v["live"][0]["referenceLoad"]["reference"] = "03001"; },
+    [](Json& v) { v["live"][0]["referenceLoad"]["reference"] = ""; },
+    [](Json& v) {
+      v["live"][0]["referenceLoad"]["templates"] =
+        Json::array({ "7:Skyrim.esm", "7:Skyrim.esm" });
+    },
+    [](Json& v) {
+      v["live"][0]["referenceLoad"]["templates"] = Json::array({ "3001" });
+    },
+    [](Json& v) {
+      v["live"][0]["referenceLoad"]["templates"] = Json::object();
+    },
+    [](Json& v) {
+      v["live"][0]["referenceLoad"]["templates"] =
+        std::vector<std::string>(129, "7:Skyrim.esm");
+    },
+    [](Json& v) { v["live"][0]["referenceLoad"]["extra"] = 1; },
+    [](Json& v) { v["live"][0]["environmentHash"] = ""; },
+    [](Json& v) { v["live"][0]["contentMode"] = "legacy"; },
+    [](Json& v) { v["live"][0]["interactionDone"] = false; },
+    [](Json& v) {
+      v["live"][0]["interaction"] =
+        InteractionBegin().Save()["live"][0]["interaction"];
+    },
+    [](Json& v) { v["live"][0]["quest"] = "4e50d:Skyrim.esm"; },
+    [](Json& v) { v["live"][0]["contentHash"] = std::string(64, 'a'); },
+    [](Json& v) { v["live"][0]["stage"] = 10; },
+    [](Json& v) { v["live"][0]["accepted"] = true; },
+    [](Json& v) { v["live"][0]["cursor"] = "begin"; }
+  };
+  for (size_t index = 0; index < corrupt.size(); ++index) {
+    INFO("Reference-load corruption " << index);
+    auto saved = original;
+    corrupt[index](saved);
+    REQUIRE_THROWS(QuestJobState::Read(saved));
+  }
+  auto invalid = ReferenceLoadBegin();
+  invalid.live.at(1).loadPhase = static_cast<QuestJobState::LoadPhase>(99);
+  REQUIRE_THROWS(invalid.Save());
+  invalid = Begin();
+  invalid.live.at(1).referenceLoad =
+    ReferenceLoadBegin().live.at(1).referenceLoad;
+  REQUIRE_THROWS(invalid.Save());
+  invalid = InteractionBegin();
+  invalid.live.at(1).loadPhase = QuestJobState::LoadPhase::Init;
+  REQUIRE_THROWS(invalid.Save());
+}
+
+TEST_CASE("Reference-load initial cursor cannot skip its saved Init boundary",
+          "[Quest][QuestJob]")
+{
+  using Phase = QuestJobState::LoadPhase;
+  for (auto phase : { Phase::CellLoad, Phase::Load, Phase::Done }) {
+    auto invalid = ReferenceLoadBegin();
+    invalid.live.at(1).loadPhase = phase;
+    REQUIRE_FALSE(invalid.live.at(1).IsPristine());
+    REQUIRE_THROWS(invalid.Save());
+  }
+  auto skipped = ReferenceLoadBegin();
+  auto& job = skipped.live.at(1);
+  job.loadPhase = Phase::CellLoad;
+  HostStep(job); // Runtime can durably skip Init for an already initialized
+                 // reference.
+  REQUIRE(job.instructions == 0);
+  REQUIRE_FALSE(job.IsPristine());
+  REQUIRE_NOTHROW(skipped.Save());
+  REQUIRE_NOTHROW(skipped.ValidateHeap(Json::object()));
+}
+
+TEST_CASE("Reference-load phases bind exact handler events and only Init "
+          "excludes aliases",
+          "[Quest][QuestJob]")
+{
+  using Phase = QuestJobState::LoadPhase;
+  for (auto phase : { Phase::Init, Phase::CellLoad, Phase::Load }) {
+    for (bool waiting : { false, true }) {
+      auto state = ReferenceLoadHandler(phase, waiting);
+      auto& job = state.live.at(1);
+      REQUIRE(job.handler->quest.empty());
+      REQUIRE(job.handler->contentHash.empty());
+      REQUIRE(job.handler->stage == 0);
+      REQUIRE(job.handler->handlerIdentity->function ==
+              job.PrimaryEventName());
+      REQUIRE(QuestJobState::Read(state.Save()).Save() == state.Save());
+      REQUIRE_NOTHROW(state.ValidateHeap(AllLiveHeap(state)));
+      auto wrong = state;
+      wrong.live.at(1).handler->handlerIdentity->function = "OnActivate";
+      if (waiting)
+        wrong.live.at(1).handler->function = "OnActivate";
+      REQUIRE_THROWS(wrong.Save());
+      wrong = state;
+      wrong.live.at(1).handler->quest = "4e50d:Skyrim.esm";
+      REQUIRE_THROWS(wrong.Save());
+      auto alias = ReferenceLoadHandler(phase, waiting, true);
+      if (phase == Phase::Init)
+        REQUIRE_THROWS(alias.Save());
+      else {
+        REQUIRE_NOTHROW(alias.Save());
+        REQUIRE_NOTHROW(alias.ValidateHeap(AllLiveHeap(alias)));
+      }
+    }
+  }
+  auto state = ReferenceLoadHandler(Phase::Init, true);
+  auto& job = state.live.at(1);
+  auto heap = AllLiveHeap(state);
+  heap["continuations"][job.handler->token]["function"] = "OnCellLoad";
+  REQUIRE_THROWS(state.ValidateHeap(heap));
+  const auto original = state.Save();
+  for (const auto* field : { "reference", "templates" }) {
+    auto wrong = original;
+    wrong["live"][0]["dispatch"][field] = std::string(field) == "reference"
+      ? Json("3002")
+      : Json::array({ "8:Skyrim.esm" });
+    REQUIRE_THROWS(QuestJobState::Read(wrong));
+  }
+  auto noCapture = ReferenceLoadBegin();
+  auto& initial = noCapture.live.at(1);
+  initial.dispatch = QuestJobState::Dispatch{};
+  initial.dispatch->recipients = {
+    initial.referenceLoad->target,
+    Json{ { "kind", "alias" }, { "quest", "4e50d:Skyrim.esm" }, { "id", 1 } }
+  };
+  HostStep(initial, 1);
+  REQUIRE_THROWS(noCapture.Save());
+}
+
+TEST_CASE(
+  "Reference-load native children retain real quest identity and parent scope",
+  "[Quest][QuestJob]")
+{
+  auto state = ReferenceLoadHandler(QuestJobState::LoadPhase::Load, true);
+  auto& job = state.live.at(1);
+  job.handler->awaitKind = "stage";
+  job.handler->awaitKey = "quest-stage";
+  job.handler->timer.reset();
+  job.handler->child = 1;
+  job.children.push_back(Single(Nested(true))->children.front());
+  job.nextOperation = 3;
+  job.instructions = 7;
+  HostStep(job);
+  REQUIRE(job.Current().quest == "2aa57:Skyrim.esm");
+  REQUIRE(job.Scope(*job.handler) == "quest-job:1:1:handler:1");
+  REQUIRE(job.Scope(job.Current()) == "quest-job:1:1:node:1");
+  REQUIRE_NOTHROW(state.Save());
+  REQUIRE_NOTHROW(state.ValidateHeap(AllLiveHeap(state)));
+  auto malformed = state;
+  malformed.live.at(1).children.back().quest.clear();
+  malformed.live.at(1).children.back().contentHash.clear();
+  malformed.live.at(1).children.back().stage = 0;
+  REQUIRE_THROWS(malformed.Save());
+  FinishChild(job);
+  REQUIRE_NOTHROW(state.Save());
+  REQUIRE_NOTHROW(state.ValidateHeap(AllLiveHeap(state)));
+}
+
+TEST_CASE("Reference-load primary phases finish before generated inventory "
+          "notifications",
+          "[Quest][QuestJob]")
+{
+  using Phase = QuestJobState::LoadPhase;
+  for (auto phase : { Phase::Init, Phase::CellLoad, Phase::Load }) {
+    auto state = ReferenceLoadHandler(phase, true);
+    state.live.at(1).events.push_back(
+      { "14:Skyrim.esm", "f:Skyrim.esm", "", 1, true });
+    REQUIRE_NOTHROW(state.Save());
+    auto early = state;
+    early.live.at(1).eventHead = 1;
+    REQUIRE_THROWS(early.Save());
+    early = state;
+    early.live.at(1).loadPhase = Phase::Done;
+    REQUIRE_THROWS(early.Save());
+  }
+  auto state = ReferenceLoadBegin();
+  auto& job = state.live.at(1);
+  job.loadPhase = Phase::Done;
+  job.events.push_back({ "14:Skyrim.esm", "f:Skyrim.esm", "", 1, true });
+  HostStep(job);
+  REQUIRE_FALSE(job.IsComplete());
+  REQUIRE_FALSE(job.HasPrimaryEvent());
+  REQUIRE_NOTHROW(state.Save());
+  auto inventory = SelectedHandler(true);
+  job.dispatch = inventory.live.at(1).dispatch;
+  job.handler = inventory.live.at(1).handler;
+  job.handler->quest.clear();
+  job.handler->contentHash.clear();
+  job.handler->stage = 0;
+  job.nextHandler = 2;
+  job.nextOperation = 2;
+  HostStep(job, 2);
+  REQUIRE_NOTHROW(state.Save());
+  REQUIRE_NOTHROW(state.ValidateHeap(AllLiveHeap(state)));
+  job.completions[job.handler->token] = true;
+  job.handler.reset();
+  job.dispatch.reset();
+  job.eventHead = 1;
+  HostStep(job);
+  REQUIRE(job.IsComplete());
+  CompleteLive(state, 1);
+  REQUIRE_NOTHROW(state.Save());
+}
+
+TEST_CASE("Reference-load target is unique among live roots but can be loaded "
+          "again after completion",
+          "[Quest][QuestJob]")
+{
+  auto state = ReferenceLoadBegin();
+  state.live.emplace(2, Numbered(*Single(ReferenceLoadBegin()), 2));
+  state.nextJob = 3;
+  REQUIRE_THROWS(state.Save());
+  state.live.at(2).referenceLoad->reference = "3002";
+  REQUIRE_THROWS(state.Save()); // A replacement physical copy does not create
+                                // a new logical target.
+  state.live.at(2).referenceLoad->target = "11:Skyrim.esm";
+  REQUIRE_NOTHROW(state.Save());
+  auto& first = state.live.at(1);
+  first.loadPhase = QuestJobState::LoadPhase::Done;
+  first.events.push_back({ "14:Skyrim.esm", "f:Skyrim.esm", "", 1, true });
+  HostStep(first);
+  state.live.at(2).referenceLoad->target = first.referenceLoad->target;
+  REQUIRE_THROWS(
+    state.Save()); // Generated inventory work still owns the live load slot.
+  first.eventHead = 1;
+  CompleteLive(state, 1);
+  REQUIRE_NOTHROW(state.Save());
+  state.live.emplace(3, Numbered(*Single(InteractionBegin()), 3));
+  state.nextJob = 4;
+  REQUIRE_NOTHROW(
+    state.Save()); // Independent interactions use their own root identity.
+}
+
+TEST_CASE("Reference-load roots share the twenty live slots while stage slots "
+          "remain reserved",
+          "[Quest][QuestJob]")
+{
+  QuestJobState state;
+  for (uint64_t id = 1; id <= QuestJobState::MaxLive; ++id) {
+    auto job = Numbered(*Single(ReferenceLoadBegin()), state.nextJob++);
+    job.referenceLoad->target = "100" + std::to_string(id) + ":Skyrim.esm";
+    job.referenceLoad->reference = "30" + std::to_string(id);
+    state.live.emplace(id, job);
+  }
+  REQUIRE_NOTHROW(state.Save());
+  REQUIRE_NOTHROW(state.ValidateHeap(Json::object()));
+  auto extra = Numbered(*Single(ReferenceLoadBegin()), state.nextJob++);
+  extra.referenceLoad->target = "200:Skyrim.esm";
+  state.live.emplace(extra.id, extra);
+  REQUIRE_THROWS(state.Save());
 }

@@ -423,12 +423,11 @@ ReferenceEventContext ReadInteraction(MpActor* requestedActor,
   return { actor, original, sourceOriginal };
 }
 
-std::vector<std::string> InteractionTemplates(
-  const MpObjectReference& reference)
+std::vector<std::string> ReferenceTemplates(const MpObjectReference& reference)
 {
   const auto& chain = reference.GetChangeForm().templateChain;
   if (chain.size() > 128)
-    throw std::runtime_error("Campaign interaction template limit exceeded");
+    throw std::runtime_error("Campaign reference template limit exceeded");
   std::vector<std::string> result;
   result.reserve(chain.size());
   for (const auto& entry : chain)
@@ -510,8 +509,8 @@ QuestJobState::Interaction QuestScriptRuntime::CaptureInteraction(
            FormDesc::FromFormId(context.source, world.espmFiles).ToString(),
            target.GetChangeForm().formDesc.ToString(),
            source.GetChangeForm().formDesc.ToString(),
-           InteractionTemplates(target),
-           InteractionTemplates(source) };
+           ReferenceTemplates(target),
+           ReferenceTemplates(source) };
 }
 
 void QuestScriptRuntime::ValidateInteraction(
@@ -537,6 +536,41 @@ void QuestScriptRuntime::ValidateInteraction(
     if (FormDesc::FromString(event.source).ToFormId(world->espmFiles) != 0x14)
       QuestJournal::ReadInventory(actor, *source);
   }
+}
+
+QuestJobState::ReferenceLoad QuestScriptRuntime::CaptureReferenceLoad(
+  MpActor& actor, MpObjectReference& target)
+{
+  auto* world = actor.GetParent();
+  if (!world || actor.IsDeleted() || target.GetParent() != world ||
+      target.IsDeleted() ||
+      world->LookupFormByIdNoLoad(actor.GetFormId()).get() != &actor ||
+      world->LookupFormByIdNoLoad(target.GetFormId()).get() != &target ||
+      !target.SharesWorldInstance(actor) ||
+      &QuestJournal::Owner(actor) != &actor)
+    throw std::runtime_error("Campaign load requires its registered owner");
+  const auto [owner, original] = CampaignReferenceBinding::Context(target);
+  if (owner != &actor)
+    throw std::runtime_error("Reference load belongs to another campaign");
+  return { FormDesc::FromFormId(original, world->espmFiles).ToString(),
+           target.GetChangeForm().formDesc.ToString(),
+           ReferenceTemplates(target) };
+}
+
+void QuestScriptRuntime::ValidateReferenceLoad(
+  MpActor& actor, const QuestJobState::ReferenceLoad& load)
+{
+  auto* world = actor.GetParent();
+  if (!world || actor.IsDeleted() ||
+      world->LookupFormByIdNoLoad(actor.GetFormId()).get() != &actor)
+    throw std::runtime_error("Campaign load owner is unavailable");
+  const auto targetForm = world->LookupFormByIdNoLoad(
+    FormDesc::FromString(load.reference).ToFormId(world->espmFiles));
+  auto* target = targetForm ? targetForm->AsObjectReference() : nullptr;
+  if (!target || CaptureReferenceLoad(actor, *target) != load)
+    throw std::runtime_error("Saved campaign load binding changed");
+  if (QuestJournal::HasActiveTransaction())
+    QuestJournal::ReadInventory(actor, *target);
 }
 
 bool QuestScriptRuntime::ExecuteStage(MpActor& actor, uint32_t questId,
@@ -630,6 +664,12 @@ void QuestScriptRuntime::ExecuteJobSegment(
     source =
       FormDesc::FromString(job.interaction->source).ToFormId(world.espmFiles);
     name = job.interaction->name.c_str();
+  } else if (job.kind == QuestJobState::Kind::ReferenceLoad) {
+    if (!job.referenceLoad)
+      throw std::runtime_error("Reference load job has no saved payload");
+    ValidateReferenceLoad(actor, *job.referenceLoad);
+    target = FormDesc::FromString(job.referenceLoad->target)
+               .ToFormId(world.espmFiles);
   }
   Execute(actor, id, current.stage, metadata, scripts, target, name, source,
           &job, completion, fixtureAwait, overrides, contentManifest, clock,
@@ -1740,18 +1780,23 @@ bool QuestScriptRuntime::Execute(
                         : VarValue::None()
       };
     };
-    // The primary interaction and its later scripted inventory notifications
-    // use the same saved recipient/attachment/handler dispatcher. Completing
-    // the primary never consumes an inventory FIFO position.
-    const bool primaryInteraction = job &&
-      job->kind == QuestJobState::Kind::Interaction && !job->interactionDone;
+    // Primary interaction/load events and later inventory notifications share
+    // the saved dispatcher. Each load phase captures its own recipient roster;
+    // retiring a primary event never consumes an inventory FIFO position.
+    const auto* primaryName = job ? job->PrimaryEventName() : nullptr;
+    const bool primaryInteraction =
+      primaryName && job->kind == QuestJobState::Kind::Interaction;
+    const bool primaryLoad =
+      primaryName && job->kind == QuestJobState::Kind::ReferenceLoad;
     const auto dispatchName = [&]() -> const char* {
-      return primaryInteraction
-        ? job->interaction->name.c_str()
+      return primaryName
+        ? primaryName
         : (inventoryEvents.at(job->eventHead).added ? "OnItemAdded"
                                                     : "OnItemRemoved");
     };
     const auto dispatchArguments = [&]() {
+      if (primaryLoad)
+        return std::vector<VarValue>{};
       return primaryInteraction
         ? std::vector<VarValue>{ VarValue(resolve(eventSource).get()) }
         : eventArguments(inventoryEvents.at(job->eventHead));
@@ -1845,20 +1890,45 @@ bool QuestScriptRuntime::Execute(
           executedWork = true;
         }
       } else if (!job->dispatch) {
-        const auto target = primaryInteraction
-          ? loadedReference
-          : inventoryEvents.at(job->eventHead).target;
-        QuestJobState::Dispatch dispatch;
-        for (const auto& recipient : eventRecipients(target, true))
-          dispatch.recipients.push_back(encodeObject(recipient.get()));
-        job->dispatch = std::move(dispatch);
+        if (primaryLoad && job->loadPhase == QuestJobState::LoadPhase::Init &&
+            QuestJournal::ReferenceInitialized(actor, loadedReference)) {
+          // A completed OnInit is permanent for this campaign reference. The
+          // durable skip is a host boundary, with no script instructions.
+          job->loadPhase = QuestJobState::LoadPhase::CellLoad;
+        } else {
+          const auto target = primaryName
+            ? loadedReference
+            : inventoryEvents.at(job->eventHead).target;
+          const bool includeAliases =
+            !primaryLoad || job->loadPhase != QuestJobState::LoadPhase::Init;
+          QuestJobState::Dispatch dispatch;
+          for (const auto& recipient : eventRecipients(target, includeAliases))
+            dispatch.recipients.push_back(encodeObject(recipient.get()));
+          job->dispatch = std::move(dispatch);
+        }
       } else {
         auto& dispatch = *job->dispatch;
         if (dispatch.recipient == dispatch.recipients.size()) {
+          if (primaryLoad && job->loadPhase == QuestJobState::LoadPhase::Init)
+            QuestJournal::MarkReferenceInitialized(actor, loadedReference);
           job->dispatch.reset();
           if (primaryInteraction)
             job->interactionDone = true;
-          else
+          else if (primaryLoad) {
+            switch (job->loadPhase) {
+              case QuestJobState::LoadPhase::Init:
+                job->loadPhase = QuestJobState::LoadPhase::CellLoad;
+                break;
+              case QuestJobState::LoadPhase::CellLoad:
+                job->loadPhase = QuestJobState::LoadPhase::Load;
+                break;
+              case QuestJobState::LoadPhase::Load:
+                job->loadPhase = QuestJobState::LoadPhase::Done;
+                break;
+              default:
+                throw std::runtime_error("Invalid reference load phase");
+            }
+          } else
             ++job->eventHead;
         } else if (!dispatch.captured) {
           roster(dispatch, true);
@@ -1932,6 +2002,8 @@ bool QuestScriptRuntime::Execute(
         "Campaign load reference changed during execution");
     if (job && job->kind == QuestJobState::Kind::Interaction)
       ValidateInteraction(actor, *job->interaction);
+    else if (job && job->kind == QuestJobState::Kind::ReferenceLoad)
+      ValidateReferenceLoad(actor, *job->referenceLoad);
     for (const auto& [key, holder] : variables)
       state.SetScript(key, holder->Save());
     QuestJournal::SetScriptState(actor, state.Save());

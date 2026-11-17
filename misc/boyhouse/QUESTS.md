@@ -790,7 +790,7 @@ the result is retained. The sequence is the campaign's global job ID, including
 IDs consumed by older string-keyed commands. Keep the typed ID across retries;
 its diagnostic command spelling is not an interchangeable legacy key.
 
-Schema7 migrates schemas1-6 without changing command identities, scopes or
+Schema8 migrates schemas1-7 without changing command identities, scopes or
 continuations. Completed string-keyed commands remain permanent; live plus
 completed legacy commands retain the 256-command cap. Numbered live roots reserve
 a recent-result slot: at most 32 numbered live roots and full completed records
@@ -885,6 +885,51 @@ body: a handler waiting on its own queued notification remains unsupported.
 Causal outbox release with lineage budgets, reference-load/OnInit generations,
 quest lifecycle and client integration remain required. No complete quest is
 certified playable.
+
+## Durable reference-load execution
+
+Trusted host code can submit a bound campaign reference with SubmitLoad. Its
+schema8 ReferenceLoad root captures the canonical and physical target and template
+chain. Only the campaign owner can initiate it, and at most one live load root
+exists per canonical target. A matching retained request inspects existing work;
+a different request for the same live target is refused. This does not yet
+assign or deduplicate production subscription/load occurrences.
+
+The root sequences OnInit, OnCellLoad and OnLoad using saved recipient, attachment
+and selected handler cursors. OnInit addresses only attached reference scripts;
+later phases snapshot attached scripts and running scripted aliases separately.
+All phases share one aggregate budget, native child stack and inventory FIFO.
+Each handler may wait and resume after a restart without repeating its prefix.
+
+The final OnInit dispatch boundary writes the permanent ReferenceInitialized
+marker and advances to OnCellLoad in one atomic save. In-memory state can reflect
+that snapshot while its receipt is Pending; further execution remains blocked
+until it is Durable. Full journal validation checks phase/marker consistency,
+and a job lease cannot mark initialization before its exhausted OnInit dispatch.
+If already initialized, a new load skips OnInit through a zero-instruction saved
+host step, then runs OnCellLoad and OnLoad again. Generated inventory events drain
+after all three phases. ResultKind::ReferenceLoad has no accepted stage result.
+
+Completed means all callback/FIFO work is durably finished. It is not a blanket
+interaction lock: after initialization, independent interactions can wake a
+waiting OnCellLoad/OnLoad handler on the same reference. Pre-initialization
+interaction admission remains refused; broader initialization reentrancy is a
+remaining lifecycle concern. Completing load callbacks must not be confused
+with the engine/subscription eligibility needed to receive a future event.
+
+Production Subscribe and trigger paths still use their earlier synchronous
+behavior. A nested restoration barrier, bounded deferred event occurrences,
+per-load generation identity, cancellation and readiness integration are still
+required before wiring native ingress. Saved-form restore order can currently
+trigger synchronous callbacks; the trusted backend tests do not claim to fix
+that path. Schemas1-7 migrate without changing existing job kinds or scopes.
+This trusted recipe serializes CellLoad callback completion before Load. Native
+event occurrence and concurrent callback requirements must be audited before
+using that sequence for production subscriptions; a callback depending on a
+later event in the same recipe cannot wake itself. The owned-script audit
+confirms latent load work and game-state-dependent loops, without proving a
+specific CellLoad dependency on an OnLoad-only write.
+No complete quest or live multiplayer playthrough is certified by these tests.
 
 ## Verification commands
 
@@ -1046,3 +1091,15 @@ These generated script/runtime fixtures do not certify full quests or establish
 production latency. Actual player action admission, atomic default effects,
 causal inventory outbox release and lifecycle integration remain unfinished.
 Skyrim was not launched; the installed client and staging were unchanged.
+
+The durable-reference-load batch passed the Linux server build and full
+verification on 2026-11-17 UTC: 800 native cases / 486,915 assertions,
+368 JavaScript tests, 47 Python tests, addon and both protocol
+smokes, and SQLite recovery of 32 characters. Its 87 focused cases
+(5,473 assertions) cover saved load phases, initialization
+markers and receipt boundaries, handler/child recovery, alias event membership,
+repeated load behavior, independent interaction wake-up and schema migration.
+These generated runtime fixtures do not certify complete quests or production
+latency. Production subscription/trigger restoration ordering, load occurrence
+deduplication and physical player-action integration remain unfinished. Skyrim
+was not launched; the installed client and staging were unchanged.

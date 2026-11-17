@@ -21,6 +21,12 @@ public:
     MpObjectReference& source);
   static void ValidateInteraction(MpActor& actor,
                                   const QuestJobState::Interaction& event);
+  // Load work belongs to the campaign owner and may precede initialization.
+  // Capture/validation preserve the physical target and its chosen templates.
+  static QuestJobState::ReferenceLoad CaptureReferenceLoad(
+    MpActor& actor, MpObjectReference& target);
+  static void ValidateReferenceLoad(MpActor& actor,
+                                    const QuestJobState::ReferenceLoad& load);
   // Called within the selected root's AtomicJob lease. Other live roots share
   // the current campaign heap but retain their own saved stacks and budgets.
   // The caller persists the updated job alongside the heap. It never

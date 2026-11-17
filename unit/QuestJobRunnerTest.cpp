@@ -4589,3 +4589,682 @@ TEST_CASE("Retired interaction requests retain opaque terminal identity",
   REQUIRE(InteractionField(f.Owner(), "prefixes") == 1);
   REQUIRE(InteractionField(f.Owner(), "suffixes") == 1);
 }
+
+namespace {
+using LoadPhase = QuestJobState::LoadPhase;
+
+struct LoadProgram
+{
+  InteractionProgram interaction;
+  LoadProgram(bool waitInit = true, bool child = false, bool pollLoad = false)
+    : interaction(false, false, child)
+  {
+    auto& base = interaction.handlerBase->objectTable[0];
+    base.variables = { { "initPrefixes", "Int", 0, VarValue(0) },
+                       { "initSuffixes", "Int", 0, VarValue(0) },
+                       { "cells", "Int", 0, VarValue(0) },
+                       { "loads", "Int", 0, VarValue(0) },
+                       { "interactions", "Int", 0, VarValue(0) },
+                       { "ready", "Bool", 0, VarValue(false) } };
+    auto init = Reward(2);
+    init.locals.insert(init.locals.end(),
+                       { { "quest", "Quest" }, { "accepted", "Bool" } });
+    init.code.instructions.pop_back();
+    init.code.instructions.push_back(
+      { FunctionCode::kOp_IAdd,
+        { Name("initPrefixes"), Name("initPrefixes"), VarValue(1) } });
+    if (waitInit)
+      init.code.instructions.push_back(
+        { FunctionCode::kOp_CallStatic,
+          { VarValue("Utility"), VarValue("Wait"), Name("temp"), VarValue(1),
+            VarValue(1.0) } });
+    if (child) {
+      init.code.instructions.push_back(
+        { FunctionCode::kOp_CallStatic,
+          { VarValue("Game"), VarValue("GetForm"), Name("quest"), VarValue(1),
+            VarValue(static_cast<int32_t>(kRetentionQuest)) } });
+      init.code.instructions.push_back(
+        { FunctionCode::kOp_CallMethod,
+          { VarValue("SetStage"), Name("quest"), Name("accepted"), VarValue(1),
+            VarValue(10) } });
+    }
+    init.code.instructions.push_back(
+      { FunctionCode::kOp_IAdd,
+        { Name("initSuffixes"), Name("initSuffixes"), VarValue(1) } });
+    init.code.instructions.push_back(
+      { FunctionCode::kOp_CallMethod,
+        { VarValue("AddItem"), Name("target"), Name("temp"), VarValue(3),
+          Name("gold"), VarValue(3), VarValue(true) } });
+    init.code.instructions.push_back(
+      { FunctionCode::kOp_Return, { VarValue::None() } });
+    auto cell = Reward(5);
+    cell.code.instructions.insert(
+      cell.code.instructions.begin(),
+      { FunctionCode::kOp_IAdd,
+        { Name("cells"), Name("cells"), VarValue(1) } });
+    auto load = Reward(7);
+    load.code.instructions.insert(
+      load.code.instructions.begin(),
+      { FunctionCode::kOp_IAdd,
+        { Name("loads"), Name("loads"), VarValue(1) } });
+    if (pollLoad) {
+      load.code.instructions.pop_back();
+      load.code.instructions.insert(
+        load.code.instructions.end(),
+        { { FunctionCode::kOp_JumpT, { Name("ready"), VarValue(3) } },
+          { FunctionCode::kOp_CallStatic,
+            { VarValue("Utility"), VarValue("WaitMenuMode"), Name("temp"),
+              VarValue(1), VarValue(1.0) } },
+          { FunctionCode::kOp_Jump, { VarValue(-2) } },
+          { FunctionCode::kOp_Return, { VarValue::None() } } });
+    }
+    FunctionInfo activate;
+    activate.valid = true;
+    activate.returnType = "None";
+    activate.params = { { "source", "ObjectReference" } };
+    activate.code.instructions = {
+      { FunctionCode::kOp_Assign, { Name("ready"), VarValue(true) } },
+      { FunctionCode::kOp_IAdd,
+        { Name("interactions"), Name("interactions"), VarValue(1) } },
+      { FunctionCode::kOp_Return, { VarValue::None() } }
+    };
+    base.states = { { "busy",
+                      { { "OnInit", init },
+                        { "OnCellLoad", cell },
+                        { "OnLoad", load },
+                        { "OnActivate", activate } } } };
+
+    espm::QuestScriptData::Alias alias;
+    alias.object.type = 1;
+    alias.object.formId = kParentQuest;
+    alias.object.alias = 1;
+    alias.version = 5;
+    alias.objectFormat = 2;
+    alias.scripts = { { "LoadAlias", 0, {} } };
+    interaction.concurrent.metadata.at(kParentQuest).aliases.push_back(alias);
+    auto script = std::make_shared<PexScript>();
+    script->source = "LoadAlias";
+    Object object;
+    object.NameIndex = script->source;
+    object.parentClassName = "ReferenceAlias";
+    object.variables = { { "inits", "Int", 0, VarValue(0) },
+                         { "cells", "Int", 0, VarValue(0) },
+                         { "loads", "Int", 0, VarValue(0) } };
+    auto aliasInit = Reward(100);
+    aliasInit.code.instructions.insert(
+      aliasInit.code.instructions.begin(),
+      { FunctionCode::kOp_IAdd,
+        { Name("inits"), Name("inits"), VarValue(1) } });
+    auto aliasCell = Reward(11);
+    aliasCell.code.instructions.insert(
+      aliasCell.code.instructions.begin(),
+      { FunctionCode::kOp_IAdd,
+        { Name("cells"), Name("cells"), VarValue(1) } });
+    auto aliasLoad = Reward(13);
+    aliasLoad.code.instructions.insert(
+      aliasLoad.code.instructions.begin(),
+      { FunctionCode::kOp_IAdd,
+        { Name("loads"), Name("loads"), VarValue(1) } });
+    object.states = { { "",
+                        { { "OnInit", aliasInit },
+                          { "OnCellLoad", aliasCell },
+                          { "OnLoad", aliasLoad } } } };
+    script->objectTable.push_back(object);
+    interaction.concurrent.program.bases.push_back(script);
+  }
+  auto Scripts() const { return interaction.Scripts(); }
+  const auto& Metadata() const { return interaction.Metadata(); }
+  void Enable(MpActor& owner) const
+  {
+    interaction.Enable(owner);
+    // Fixture preparation only: aliases belong to an already running quest.
+    REQUIRE(QuestJournal::Apply(
+      owner, { { "quest", kParentQuest }, { "op", "start" } }));
+    QuestJournal::Atomic(owner, [&] {
+      QuestVmState state(QuestJournal::ScriptState(owner), {}, {});
+      state.SetAliasBinding("4e50d:Skyrim.esm/alias:1", "6debb:Skyrim.esm");
+      QuestJournal::SetScriptState(owner, state.Save());
+    });
+  }
+};
+
+int LoadCounterBeforeDispatch(MpActor& owner, const LoadProgram& content,
+                              const char* name)
+{
+  const auto& variables =
+    content.interaction.handlerBase->objectTable[0].variables;
+  const auto declaration =
+    std::find_if(variables.begin(), variables.end(),
+                 [&](const auto& variable) { return variable.name == name; });
+  REQUIRE(declaration != variables.end());
+  REQUIRE(declaration->typeName == "Int");
+  REQUIRE(declaration->value.GetType() == VarValue::kType_Integer);
+  REQUIRE(static_cast<int32_t>(declaration->value) == 0);
+  const auto values = QuestJournal::ScriptState(owner)
+                        .at("scripts")
+                        .at(kInteractionState)
+                        .at("values");
+  const std::string key = std::string("interactionbase/") + name;
+  // Variables persists requested slots lazily. Before a callback is entered,
+  // its declared zero may be absent; completed-callback checks stay strict.
+  return values.contains(key) ? values.at(key).at("value").get<int>() : 0;
+}
+
+int LoadAliasField(MpActor& owner, const char* field)
+{
+  const auto heap = QuestJournal::ScriptState(owner);
+  const auto root = "4e50d:Skyrim.esm/alias:1/loadalias";
+  if (!heap.contains("scripts") || !heap.at("scripts").contains(root))
+    return 0;
+  const auto& values = heap.at("scripts").at(root).at("values");
+  const std::string key = std::string("loadalias/") + field;
+  return values.contains(key) ? values.at(key).at("value").get<int>() : 0;
+}
+
+void RequireReferenceLoad(const QuestJobRunner::Result& result)
+{
+  REQUIRE(result.kind == QuestJobRunner::ResultKind::ReferenceLoad);
+  REQUIRE_FALSE(result.accepted);
+}
+
+struct LoadFixture : Fixture
+{
+  LoadProgram content;
+  std::shared_ptr<QuestJobTime> time =
+    std::make_shared<QuestJobTime>(QuestJobTime{ 1000000, 5000 });
+  LoadFixture(bool waitInit = true, bool child = false, bool pollLoad = false)
+    : content(waitInit, child, pollLoad)
+  {
+    content.Enable(Owner());
+    BindInteractionTarget(server, Owner());
+    storage->automatic = true;
+    Tick();
+    storage->submissions.clear();
+    storage->automatic = false;
+    Jobs().SetClock([time = time] { return *time; });
+  }
+  MpObjectReference& Target()
+  {
+    return server.worldState.GetFormAt<MpObjectReference>(kInteractionCopy);
+  }
+  QuestJobRunner::Result SubmitLoad(const RequestId& request,
+                                    bool automatic = false)
+  {
+    return Jobs().SubmitLoad(Owner(), request, Target(), content.Metadata(),
+                             content.Scripts(), automatic);
+  }
+  QuestJobRunner::Result AdvanceLoad(const RequestId& request)
+  {
+    return Jobs().Advance(Owner(), request, content.Metadata(),
+                          content.Scripts());
+  }
+  QuestJobRunner::Result InspectLoad(const RequestId& request)
+  {
+    return Jobs().Inspect(Owner(), request);
+  }
+  QuestJobRunner::Result DrainLoad(const RequestId& request)
+  {
+    return Drain(*this, request, content.Metadata(), content.Scripts());
+  }
+  QuestJobState::Job Live(const RequestId& request)
+  {
+    const auto state = QuestJournal::JobState(Owner());
+    const auto* job = state.FindLive(request.sequence);
+    REQUIRE(job);
+    return *job;
+  }
+  void AckLatest()
+  {
+    Tick();
+    REQUIRE_FALSE(storage->submissions.empty());
+    storage->Complete(storage->submissions.size() - 1);
+    Tick();
+  }
+  void Until(const RequestId& request,
+             const std::function<bool(const QuestJobState::Job&)>& reached)
+  {
+    for (size_t boundary = 0; boundary < 256; ++boundary) {
+      if (reached(Live(request)))
+        return;
+      const auto result = InspectLoad(request);
+      if (result.status == Status::Pending)
+        AckLatest();
+      else {
+        RequireReady(result);
+        RequirePending(AdvanceLoad(request));
+      }
+    }
+    FAIL("Reference load did not reach its expected host boundary");
+  }
+  void UntilTerminalPending(const RequestId& request)
+  {
+    for (size_t boundary = 0; boundary < 512; ++boundary) {
+      if (QuestJournal::JobState(Owner()).FindCompleted(request.sequence)) {
+        RequirePending(InspectLoad(request));
+        return;
+      }
+      const auto result = InspectLoad(request);
+      if (result.status == Status::Pending)
+        AckLatest();
+      else {
+        RequireReady(result);
+        RequirePending(AdvanceLoad(request));
+      }
+    }
+    FAIL("Reference load never reached its final receipt");
+  }
+};
+}
+
+TEST_CASE(
+  "Reference initialization and later load phases require exact receipts",
+  "[Quest][QuestJobs][ReferenceLoad][SaveReceipt]")
+{
+  LoadFixture f;
+  const auto request = f.Jobs().NextRequest(f.Owner());
+  RequirePending(f.SubmitLoad(request));
+  const auto waiting = f.DrainLoad(request);
+  RequireSleeping(waiting);
+  RequireReferenceLoad(waiting);
+  REQUIRE(f.Live(request).loadPhase == LoadPhase::Init);
+  REQUIRE(f.Gold() == 12);
+  REQUIRE_FALSE(
+    QuestJournal::ReferenceInitialized(f.Owner(), kInteractionOriginal));
+  REQUIRE(InteractionField(f.Owner(), "initprefixes") == 1);
+  REQUIRE(InteractionField(f.Owner(), "initsuffixes") == 0);
+  const auto earlyState = QuestJournal::JobState(f.Owner()).Save();
+  const auto earlyHeap = QuestJournal::ScriptState(f.Owner());
+  REQUIRE_THROWS(QuestJournal::AtomicJob(f.Owner(), request.sequence, [&] {
+    QuestJournal::MarkReferenceInitialized(f.Owner(), kInteractionOriginal);
+  }));
+  REQUIRE(QuestJournal::JobState(f.Owner()).Save() == earlyState);
+  REQUIRE(QuestJournal::ScriptState(f.Owner()) == earlyHeap);
+  REQUIRE_FALSE(
+    QuestJournal::ReferenceInitialized(f.Owner(), kInteractionOriginal));
+  REQUIRE(LoadAliasField(f.Owner(), "inits") == 0);
+  REQUIRE(InteractionOrder(f.Owner()) == 0);
+  REQUIRE(f.SubmitLoad(request).status == Status::Sleeping);
+  const auto another = f.Jobs().NextRequest(f.Owner());
+  REQUIRE_THROWS(f.SubmitLoad(another));
+  REQUIRE_THROWS(f.Jobs().SubmitEvent(
+    f.Owner(), another, f.Target(), "OnActivate", f.Owner(),
+    f.content.Metadata(), f.content.Scripts()));
+  f.time->steadyMs += 1000;
+  RequirePending(f.AdvanceLoad(request));
+  REQUIRE(f.Live(request).handler->cursor == "done");
+  REQUIRE(f.Gold() == 15);
+  REQUIRE_FALSE(
+    QuestJournal::ReferenceInitialized(f.Owner(), kInteractionOriginal));
+  f.AckLatest();
+  REQUIRE_FALSE(
+    QuestJournal::ReferenceInitialized(f.Owner(), kInteractionOriginal));
+  f.Until(request, [&](const auto& job) {
+    if (job.loadPhase == LoadPhase::Init)
+      REQUIRE_FALSE(
+        QuestJournal::ReferenceInitialized(f.Owner(), kInteractionOriginal));
+    return job.loadPhase == LoadPhase::CellLoad;
+  });
+  RequirePending(f.InspectLoad(request));
+  REQUIRE(QuestJournal::ReferenceInitialized(f.Owner(), kInteractionOriginal));
+  REQUIRE(LoadCounterBeforeDispatch(f.Owner(), f.content, "cells") == 0);
+  REQUIRE(LoadAliasField(f.Owner(), "cells") == 0);
+  REQUIRE(InteractionOrder(f.Owner()) == 0);
+  REQUIRE_THROWS(f.Jobs().SubmitEvent(
+    f.Owner(), another, f.Target(), "OnActivate", f.Owner(),
+    f.content.Metadata(), f.content.Scripts()));
+  f.Tick();
+  const auto failed = f.storage->submissions.size() - 1;
+  const auto bytes = Serialized(f.storage->submissions[failed].forms);
+  f.storage->Complete(
+    failed, std::make_exception_ptr(std::runtime_error("init phase receipt")));
+  f.Tick();
+  REQUIRE(Serialized(f.storage->submissions.back().forms) == bytes);
+  RequirePending(f.AdvanceLoad(request));
+  REQUIRE(LoadCounterBeforeDispatch(f.Owner(), f.content, "cells") == 0);
+  f.storage->Complete(failed);
+  f.Tick();
+  RequirePending(f.InspectLoad(request));
+  f.AckLatest();
+  f.UntilTerminalPending(request);
+  REQUIRE(f.Gold() == 51);
+  REQUIRE(InteractionField(f.Owner(), "initprefixes") == 1);
+  REQUIRE(InteractionField(f.Owner(), "initsuffixes") == 1);
+  REQUIRE(InteractionField(f.Owner(), "cells") == 1);
+  REQUIRE(InteractionField(f.Owner(), "loads") == 1);
+  REQUIRE(LoadAliasField(f.Owner(), "inits") == 0);
+  REQUIRE(LoadAliasField(f.Owner(), "cells") == 1);
+  REQUIRE(LoadAliasField(f.Owner(), "loads") == 1);
+  REQUIRE(EventField(f.Owner(), "interactioninventoryobserver",
+                     "interactioninventoryobserver/calls") == 6);
+  const auto terminal = QuestJournal::JobState(f.Owner());
+  REQUIRE(terminal.FindCompleted(request.sequence)->loadPhase ==
+          LoadPhase::Done);
+  RequirePending(f.SubmitLoad(request));
+  f.Tick();
+  const auto finalWrite = f.storage->submissions.size() - 1;
+  const auto finalBytes = Serialized(f.storage->submissions[finalWrite].forms);
+  f.storage->Complete(
+    finalWrite,
+    std::make_exception_ptr(std::runtime_error("final load receipt")));
+  f.Tick();
+  REQUIRE(Serialized(f.storage->submissions.back().forms) == finalBytes);
+  RequirePending(f.InspectLoad(request));
+  REQUIRE(f.Gold() == 51);
+  f.AckLatest();
+  const auto complete = f.InspectLoad(request);
+  REQUIRE(complete.status == Status::Completed);
+  RequireReferenceLoad(complete);
+  const auto before = QuestJournal::JobState(f.Owner()).Save();
+  REQUIRE(f.SubmitLoad(request).status == Status::Completed);
+  REQUIRE_THROWS(f.Jobs().SubmitEvent(
+    f.Owner(), request, f.Target(), "OnActivate", f.Owner(),
+    f.content.Metadata(), f.content.Scripts()));
+  REQUIRE_THROWS(f.Jobs().Submit(f.Owner(), request, kParentQuest, 10,
+                                 f.content.Metadata(), f.content.Scripts()));
+  REQUIRE(QuestJournal::JobState(f.Owner()).Save() == before);
+  // A fresh load cycle skips Init but still delivers both later phases.
+  const auto repeated = f.Jobs().NextRequest(f.Owner());
+  RequirePending(f.SubmitLoad(repeated));
+  REQUIRE(f.Gold() == 51);
+  const auto repeat = f.DrainLoad(repeated);
+  REQUIRE(repeat.status == Status::Completed);
+  RequireReferenceLoad(repeat);
+  REQUIRE(f.Gold() == 87);
+  REQUIRE(InteractionField(f.Owner(), "initprefixes") == 1);
+  REQUIRE(InteractionField(f.Owner(), "initsuffixes") == 1);
+  REQUIRE(InteractionField(f.Owner(), "cells") == 2);
+  REQUIRE(InteractionField(f.Owner(), "loads") == 2);
+  REQUIRE(LoadAliasField(f.Owner(), "inits") == 0);
+  REQUIRE(LoadAliasField(f.Owner(), "cells") == 2);
+  REQUIRE(LoadAliasField(f.Owner(), "loads") == 2);
+}
+
+TEST_CASE(
+  "An initialized OnLoad stack can be woken by a same-target interaction",
+  "[Quest][QuestJobs][ReferenceLoad][Interactions][ConcurrentStacks]")
+{
+  LoadFixture f(false, false, true);
+  const auto load = f.Jobs().NextRequest(f.Owner());
+  f.SubmitLoad(load);
+  RequireSleeping(f.DrainLoad(load));
+  REQUIRE(f.Live(load).loadPhase == LoadPhase::Load);
+  REQUIRE(QuestJournal::ReferenceInitialized(f.Owner(), kInteractionOriginal));
+  REQUIRE(f.Gold() == 38);
+  REQUIRE(InteractionField(f.Owner(), "loads") == 1);
+  REQUIRE(LoadAliasField(f.Owner(), "loads") == 0);
+  REQUIRE(InteractionOrder(f.Owner()) == 0);
+  const auto token = f.Live(load).handler->token;
+  const auto frame =
+    QuestJournal::ScriptState(f.Owner()).at("continuations").at(token);
+  const auto event = f.Jobs().NextRequest(f.Owner());
+  RequirePending(
+    f.Jobs().SubmitEvent(f.Owner(), event, f.Target(), "OnActivate", f.Owner(),
+                         f.content.Metadata(), f.content.Scripts()));
+  const auto activated =
+    Drain(f, event, f.content.Metadata(), f.content.Scripts());
+  REQUIRE(activated.status == Status::Completed);
+  RequireInteraction(activated);
+  REQUIRE(InteractionField(f.Owner(), "ready") == true);
+  REQUIRE(InteractionField(f.Owner(), "interactions") == 1);
+  REQUIRE(QuestJournal::ScriptState(f.Owner()).at("continuations").at(token) ==
+          frame);
+  REQUIRE(f.Gold() == 38);
+  RequireSleeping(f.InspectLoad(load));
+  f.time->steadyMs += 1000;
+  RequirePending(f.AdvanceLoad(load));
+  const auto complete = f.DrainLoad(load);
+  REQUIRE(complete.status == Status::Completed);
+  RequireReferenceLoad(complete);
+  REQUIRE(f.Gold() == 51);
+  REQUIRE(InteractionField(f.Owner(), "loads") == 1);
+  REQUIRE(LoadAliasField(f.Owner(), "loads") == 1);
+  REQUIRE(QuestJournal::ScriptState(f.Owner()).at("continuations").empty());
+}
+
+TEST_CASE("OnInit child waits and phase markers survive SQLite restarts",
+          "[Quest][QuestJobs][ReferenceLoad][ChildStages][SQLite]")
+{
+  SqliteFiles files;
+  LoadProgram content(true, true);
+  RequestId request;
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    Initialize(server);
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    content.Enable(owner);
+    auto& target = BindInteractionTarget(server, owner);
+    auto& jobs = server.worldState.GetQuestJobs();
+    jobs.SetClock([] { return QuestJobTime{ 1000000, 5000 }; });
+    request = jobs.NextRequest(owner);
+    jobs.SubmitLoad(owner, request, target, content.Metadata(),
+                    content.Scripts());
+    RequireSleeping(DrainStored(server, owner, request, content.Metadata(),
+                                content.Scripts()));
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 12);
+    REQUIRE_FALSE(
+      QuestJournal::ReferenceInitialized(owner, kInteractionOriginal));
+    REQUIRE(InteractionField(owner, "initprefixes") == 1);
+  }
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    auto& jobs = server.worldState.GetQuestJobs();
+    jobs.SetClock([] { return QuestJobTime{ 1002000, 100 }; });
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    RequireReady(jobs.Inspect(owner, request));
+    jobs.Advance(owner, request, content.Metadata(), content.Scripts());
+    RequireReady(WaitForDurable(server, owner, request));
+    REQUIRE(QuestJournal::JobState(owner)
+              .FindLive(request.sequence)
+              ->children.back()
+              .cursor == "begin");
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 12);
+    REQUIRE_FALSE(
+      QuestJournal::ReferenceInitialized(owner, kInteractionOriginal));
+    jobs.Advance(owner, request, content.Metadata(), content.Scripts());
+    RequireSleeping(WaitForDurable(server, owner, request));
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 16);
+    REQUIRE(QuestJournal::ScriptState(owner).at("continuations").size() == 2);
+    REQUIRE_FALSE(
+      QuestJournal::ReferenceInitialized(owner, kInteractionOriginal));
+  }
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    auto& jobs = server.worldState.GetQuestJobs();
+    jobs.SetClock([] { return QuestJobTime{ 1004000, 100 }; });
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    jobs.Advance(owner, request, content.Metadata(), content.Scripts());
+    RequireReady(WaitForDurable(server, owner, request));
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 22);
+    REQUIRE_FALSE(
+      QuestJournal::ReferenceInitialized(owner, kInteractionOriginal));
+    jobs.Advance(owner, request, content.Metadata(), content.Scripts());
+    RequireReady(WaitForDurable(server, owner, request));
+    REQUIRE(QuestJournal::JobState(owner)
+              .FindLive(request.sequence)
+              ->handler->cursor == "done");
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 25);
+    REQUIRE(InteractionField(owner, "initsuffixes") == 1);
+    REQUIRE_FALSE(
+      QuestJournal::ReferenceInitialized(owner, kInteractionOriginal));
+  }
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    auto& jobs = server.worldState.GetQuestJobs();
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    REQUIRE_FALSE(
+      QuestJournal::ReferenceInitialized(owner, kInteractionOriginal));
+    for (size_t boundary = 0; boundary < 32; ++boundary) {
+      const auto state = QuestJournal::JobState(owner);
+      if (state.FindLive(request.sequence)->loadPhase == LoadPhase::CellLoad)
+        break;
+      REQUIRE_FALSE(
+        QuestJournal::ReferenceInitialized(owner, kInteractionOriginal));
+      jobs.Advance(owner, request, content.Metadata(), content.Scripts());
+      RequireReady(WaitForDurable(server, owner, request));
+    }
+    REQUIRE(
+      QuestJournal::JobState(owner).FindLive(request.sequence)->loadPhase ==
+      LoadPhase::CellLoad);
+    REQUIRE(QuestJournal::ReferenceInitialized(owner, kInteractionOriginal));
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 25);
+    REQUIRE(LoadCounterBeforeDispatch(owner, content, "cells") == 0);
+    REQUIRE(LoadAliasField(owner, "inits") == 0);
+    REQUIRE(InteractionOrder(owner) == 0);
+  }
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    const auto complete = DrainStored(server, owner, request,
+                                      content.Metadata(), content.Scripts());
+    REQUIRE(complete.status == Status::Completed);
+    RequireReferenceLoad(complete);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 61);
+    REQUIRE(InteractionField(owner, "initprefixes") == 1);
+    REQUIRE(InteractionField(owner, "initsuffixes") == 1);
+    REQUIRE(LoadAliasField(owner, "inits") == 0);
+    REQUIRE(LoadAliasField(owner, "cells") == 1);
+    REQUIRE(LoadAliasField(owner, "loads") == 1);
+    REQUIRE(EventField(owner, "interactioninventoryobserver",
+                       "interactioninventoryobserver/calls") == 8);
+    REQUIRE(QuestJournal::ScriptState(owner).at("continuations").empty());
+    const auto state = QuestJournal::JobState(owner);
+    REQUIRE(state.FindCompleted(request.sequence)->loadPhase ==
+            LoadPhase::Done);
+    REQUIRE(state.FindCompleted(request.sequence)->completions.size() == 3);
+  }
+}
+
+TEST_CASE(
+  "Reference load admission and recovered target pins fail before handlers",
+  "[Quest][QuestJobs][ReferenceLoad][Rollback]")
+{
+  const auto corruption = GENERATE(0, 1);
+  LoadFixture f(false);
+  const auto request = f.Jobs().NextRequest(f.Owner());
+  f.server.CreateActor(kOwner + 1, { 1, 2, 3 }, 0, 0x3c);
+  auto& guest = f.server.worldState.GetFormAt<MpActor>(kOwner + 1);
+  guest.SetWorldInstance(f.Owner().GetWorldInstance());
+  const auto before = QuestJournal::JobState(f.Owner()).Save();
+  const auto heapBefore = QuestJournal::ScriptState(f.Owner());
+  REQUIRE_THROWS(f.Jobs().SubmitLoad(
+    guest, request, f.Target(), f.content.Metadata(), f.content.Scripts()));
+  REQUIRE_THROWS(f.Jobs().SubmitLoad(
+    f.Owner(), request, f.Owner(), f.content.Metadata(), f.content.Scripts()));
+  const auto phase = f.Target().GetWorldInstance();
+  f.Target().SetWorldInstance("campaign:" + std::to_string(kOwner) + ":other");
+  REQUIRE_THROWS(f.SubmitLoad(request));
+  f.Target().SetWorldInstance(phase);
+  REQUIRE(QuestJournal::JobState(f.Owner()).Save() == before);
+  REQUIRE(QuestJournal::ScriptState(f.Owner()) == heapBefore);
+  REQUIRE(f.Gold() == 10);
+  f.SubmitLoad(request);
+  f.AckLatest();
+  auto ownerSave = f.Owner().GetChangeForm();
+  const auto targetSave = f.Target().GetChangeForm();
+  auto journal =
+    Json::parse(ownerSave.dynamicFields.GetValueDump(QuestJournal::kProperty));
+  auto state = QuestJobState::Read(journal.at("jobs"));
+  auto* job = state.FindLive(request.sequence);
+  REQUIRE(job);
+  REQUIRE(job->kind == QuestJobState::Kind::ReferenceLoad);
+  REQUIRE(job->referenceLoad->target == "6debb:Skyrim.esm");
+  if (corruption == 0)
+    job->referenceLoad->reference =
+      f.Owner().GetChangeForm().formDesc.ToString();
+  else
+    job->referenceLoad->templates.push_back("13bbd:Skyrim.esm");
+  journal["jobs"] = state.Save();
+  ownerSave.dynamicFields.SetValueDump(QuestJournal::kProperty,
+                                       journal.dump());
+  PartOne restarted;
+  restarted.AttachEspm(&GetEspmLoader());
+  auto storage = std::make_shared<ControlledStorage>();
+  restarted.AttachSaveStorage(storage);
+  // Keep this backend recovery check separate from ordinary subscription
+  // ingress.
+  restarted.worldState.LoadChangeForm(ownerSave, FormCallbacks::DoNothing());
+  restarted.worldState.LoadChangeForm(targetSave, FormCallbacks::DoNothing());
+  auto& owner = restarted.worldState.GetFormAt<MpActor>(kOwner);
+  const auto checkpoint = QuestJournal::JobState(owner).Save();
+  const auto heap = QuestJournal::ScriptState(owner);
+  REQUIRE_THROWS(restarted.worldState.GetQuestJobs().Advance(
+    owner, request, f.content.Metadata(), f.content.Scripts()));
+  REQUIRE(QuestJournal::JobState(owner).Save() == checkpoint);
+  REQUIRE(QuestJournal::ScriptState(owner) == heap);
+  REQUIRE_FALSE(
+    QuestJournal::ReferenceInitialized(owner, kInteractionOriginal));
+  REQUIRE(owner.GetInventory().GetItemCount(0xf) == 10);
+  REQUIRE(storage->submissions.empty());
+}
+
+TEST_CASE("Automatic reference loads recover initialization without replay",
+          "[Quest][QuestJobs][ReferenceLoad][SQLite][Scheduler]")
+{
+  SqliteFiles files;
+  LoadProgram content;
+  RequestId request;
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    Initialize(server);
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    content.Enable(owner);
+    auto& target = BindInteractionTarget(server, owner);
+    auto& jobs = server.worldState.GetQuestJobs();
+    jobs.SetClock([] { return QuestJobTime{ 1000000, 5000 }; });
+    jobs.SetSchedulerFixtureContent(content.Metadata(), content.Scripts());
+    request = jobs.NextRequest(owner);
+    jobs.SubmitLoad(owner, request, target, content.Metadata(),
+                    content.Scripts(), true);
+    const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (jobs.Inspect(owner, request).status != Status::Sleeping &&
+           std::chrono::steady_clock::now() < deadline) {
+      server.worldState.Tick();
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    RequireSleeping(jobs.Inspect(owner, request));
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 12);
+    REQUIRE_FALSE(
+      QuestJournal::ReferenceInitialized(owner, kInteractionOriginal));
+    REQUIRE(
+      QuestJournal::JobState(owner).FindLive(request.sequence)->automatic);
+  }
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    auto& jobs = server.worldState.GetQuestJobs();
+    jobs.SetClock([] { return QuestJobTime{ 1002000, 100 }; });
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    RequireReady(jobs.Inspect(owner, request));
+    server.worldState.Tick();
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 12);
+    REQUIRE_FALSE(
+      QuestJournal::ReferenceInitialized(owner, kInteractionOriginal));
+    jobs.SetSchedulerFixtureContent(content.Metadata(), content.Scripts());
+    const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (jobs.Inspect(owner, request).status != Status::Completed &&
+           std::chrono::steady_clock::now() < deadline) {
+      server.worldState.Tick();
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const auto complete = jobs.Inspect(owner, request);
+    REQUIRE(complete.status == Status::Completed);
+    RequireReferenceLoad(complete);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 51);
+    REQUIRE(QuestJournal::ReferenceInitialized(owner, kInteractionOriginal));
+    REQUIRE(InteractionField(owner, "initprefixes") == 1);
+    REQUIRE(InteractionField(owner, "initsuffixes") == 1);
+    REQUIRE(InteractionField(owner, "cells") == 1);
+    REQUIRE(InteractionField(owner, "loads") == 1);
+    REQUIRE(LoadAliasField(owner, "inits") == 0);
+    REQUIRE(LoadAliasField(owner, "cells") == 1);
+    REQUIRE(LoadAliasField(owner, "loads") == 1);
+  }
+}
