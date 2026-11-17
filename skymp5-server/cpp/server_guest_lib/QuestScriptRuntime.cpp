@@ -383,18 +383,67 @@ struct ReferenceEventContext
   uint32_t source;
 };
 
+void RequireInteractionName(const std::string& name)
+{
+  if (name != "OnActivate" && name != "OnTriggerEnter" &&
+      name != "OnTriggerLeave" && name != "OnTrigger" &&
+      name != "SkympOnActivateClose")
+    throw std::runtime_error("Unsupported event in campaign event dispatcher");
+}
+
+ReferenceEventContext ReadInteraction(MpActor* requestedActor,
+                                      MpObjectReference& target,
+                                      const std::string& name,
+                                      MpObjectReference& source)
+{
+  RequireInteractionName(name);
+  auto* world = target.GetParent();
+  if (!world || target.IsDeleted() || source.GetParent() != world ||
+      world->LookupFormByIdNoLoad(target.GetFormId()).get() != &target ||
+      world->LookupFormByIdNoLoad(source.GetFormId()).get() != &source ||
+      source.IsDeleted() || !target.SharesWorldInstance(source))
+    throw std::runtime_error("Campaign interaction reference is unavailable");
+  const auto [owner, original] = CampaignReferenceBinding::Context(target);
+  auto* player = source.AsActor();
+  const bool playerSource = player &&
+    (player->GetBaseId() == 7 || player->GetChangeForm().profileId >= 0);
+  auto* actor = playerSource ? player : owner;
+  if (!actor || (requestedActor && requestedActor != actor) ||
+      actor->GetParent() != world || actor->IsDeleted() ||
+      world->LookupFormByIdNoLoad(actor->GetFormId()).get() != actor ||
+      !target.SharesWorldInstance(*actor) ||
+      &QuestJournal::Owner(*actor) != owner)
+    throw std::runtime_error("Interaction belongs to another campaign actor");
+  if (playerSource)
+    return { actor, original, 0x14 };
+  const auto [sourceOwner, sourceOriginal] =
+    CampaignReferenceBinding::Context(source);
+  if (sourceOwner != owner)
+    throw std::runtime_error("Interaction belongs to another campaign");
+  return { actor, original, sourceOriginal };
+}
+
+std::vector<std::string> InteractionTemplates(
+  const MpObjectReference& reference)
+{
+  const auto& chain = reference.GetChangeForm().templateChain;
+  if (chain.size() > 128)
+    throw std::runtime_error("Campaign interaction template limit exceeded");
+  std::vector<std::string> result;
+  result.reserve(chain.size());
+  for (const auto& entry : chain)
+    result.push_back(entry.ToString());
+  return result;
+}
+
 ReferenceEventContext ReadReferenceEvent(MpObjectReference& target,
                                          const char* eventName,
                                          const VarValue* arguments,
                                          size_t count)
 {
-  if (!eventName ||
-      (std::strcmp(eventName, "OnActivate") &&
-       std::strcmp(eventName, "OnTriggerEnter") &&
-       std::strcmp(eventName, "OnTriggerLeave") &&
-       std::strcmp(eventName, "OnTrigger") &&
-       std::strcmp(eventName, "SkympOnActivateClose")))
+  if (!eventName)
     throw std::runtime_error("Unsupported event in campaign event dispatcher");
+  RequireInteractionName(eventName);
   if (count != 1 || !arguments || arguments[0].promise)
     throw std::invalid_argument("Campaign interaction needs one reference");
   const auto* object = arguments[0].GetType() == VarValue::kType_Object
@@ -402,24 +451,9 @@ ReferenceEventContext ReadReferenceEvent(MpObjectReference& target,
     : nullptr;
   auto* native = object ? object->GetFormPtrNoLoad() : nullptr;
   auto* source = native ? native->AsObjectReference() : nullptr;
-  auto* world = target.GetParent();
-  if (!world || !source || source->GetParent() != world ||
-      world->LookupFormByIdNoLoad(source->GetFormId()).get() != source ||
-      source->IsDeleted() || !target.SharesWorldInstance(*source))
+  if (!source)
     throw std::runtime_error("Campaign interaction source is unavailable");
-  const auto [owner, original] = CampaignReferenceBinding::Context(target);
-  auto* player = source->AsActor();
-  if (player &&
-      (player->GetBaseId() == 7 || player->GetChangeForm().profileId >= 0)) {
-    if (&QuestJournal::Owner(*player) != owner)
-      throw std::runtime_error("Interaction belongs to another campaign");
-    return { player, original, 0x14 };
-  }
-  const auto [sourceOwner, sourceOriginal] =
-    CampaignReferenceBinding::Context(*source);
-  if (sourceOwner != owner)
-    throw std::runtime_error("Interaction belongs to another campaign");
-  return { owner, original, sourceOriginal };
+  return ReadInteraction(nullptr, target, eventName, *source);
 }
 
 std::vector<PexScript::Lazy> LoadCampaignScripts(WorldState& world)
@@ -460,6 +494,49 @@ std::vector<PexScript::Lazy> LoadCampaignScripts(WorldState& world)
 std::vector<PexScript::Lazy> QuestScriptRuntime::LoadScripts(WorldState& world)
 {
   return LoadCampaignScripts(world);
+}
+
+QuestJobState::Interaction QuestScriptRuntime::CaptureInteraction(
+  MpActor& actor, MpObjectReference& target, const std::string& name,
+  MpObjectReference& source)
+{
+  const auto context = ReadInteraction(&actor, target, name, source);
+  if (!QuestJournal::ReferenceInitialized(actor, context.target))
+    throw std::runtime_error(
+      "Campaign interaction requires reference initialization");
+  auto& world = *actor.GetParent();
+  return { name,
+           FormDesc::FromFormId(context.target, world.espmFiles).ToString(),
+           FormDesc::FromFormId(context.source, world.espmFiles).ToString(),
+           target.GetChangeForm().formDesc.ToString(),
+           source.GetChangeForm().formDesc.ToString(),
+           InteractionTemplates(target),
+           InteractionTemplates(source) };
+}
+
+void QuestScriptRuntime::ValidateInteraction(
+  MpActor& actor, const QuestJobState::Interaction& event)
+{
+  auto* world = actor.GetParent();
+  if (!world || actor.IsDeleted() ||
+      world->LookupFormByIdNoLoad(actor.GetFormId()).get() != &actor)
+    throw std::runtime_error("Campaign interaction actor is unavailable");
+  const auto targetForm = world->LookupFormByIdNoLoad(
+    FormDesc::FromString(event.targetReference).ToFormId(world->espmFiles));
+  const auto sourceForm = world->LookupFormByIdNoLoad(
+    FormDesc::FromString(event.sourceReference).ToFormId(world->espmFiles));
+  auto* target = targetForm ? targetForm->AsObjectReference() : nullptr;
+  auto* source = sourceForm ? sourceForm->AsObjectReference() : nullptr;
+  if (!target || !source ||
+      CaptureInteraction(actor, *target, event.name, *source) != event)
+    throw std::runtime_error("Saved campaign interaction binding changed");
+  if (QuestJournal::HasActiveTransaction()) {
+    QuestJournal::ReadInventory(actor, *target);
+    // A visiting player is the exact initiating actor, not a bound campaign
+    // inventory target. Its script argument is still the owner's PlayerRef.
+    if (FormDesc::FromString(event.source).ToFormId(world->espmFiles) != 0x14)
+      QuestJournal::ReadInventory(actor, *source);
+  }
 }
 
 bool QuestScriptRuntime::ExecuteStage(MpActor& actor, uint32_t questId,
@@ -538,10 +615,24 @@ void QuestScriptRuntime::ExecuteJobSegment(
   if (!selected || selected->generation != job.generation)
     throw std::runtime_error("Quest job does not own this execution segment");
   const auto& current = job.Current();
-  const auto id =
-    FormDesc::FromString(current.quest).ToFormId(actor.GetParent()->espmFiles);
-  Execute(actor, id, current.stage, metadata, scripts, 0, nullptr, 0, &job,
-          completion, fixtureAwait, overrides, contentManifest, clock,
+  auto& world = *actor.GetParent();
+  const auto id = current.quest.empty()
+    ? 0
+    : FormDesc::FromString(current.quest).ToFormId(world.espmFiles);
+  uint32_t target = 0, source = 0;
+  const char* name = nullptr;
+  if (job.kind == QuestJobState::Kind::Interaction) {
+    if (!job.interaction)
+      throw std::runtime_error("Interaction job has no saved payload");
+    ValidateInteraction(actor, *job.interaction);
+    target =
+      FormDesc::FromString(job.interaction->target).ToFormId(world.espmFiles);
+    source =
+      FormDesc::FromString(job.interaction->source).ToFormId(world.espmFiles);
+    name = job.interaction->name.c_str();
+  }
+  Execute(actor, id, current.stage, metadata, scripts, target, name, source,
+          &job, completion, fixtureAwait, overrides, contentManifest, clock,
           timerAnchor);
 }
 
@@ -587,8 +678,10 @@ bool QuestScriptRuntime::Execute(
         if (!QuestJournal::ReferenceInitialized(actor, loadedReference))
           throw std::runtime_error(
             "Campaign interaction requires reference initialization");
-        auto& source = CampaignReferenceBinding::Resolve(actor, eventSource);
-        QuestJournal::ReadInventory(actor, source);
+        if (eventSource != 0x14) {
+          auto& source = CampaignReferenceBinding::Resolve(actor, eventSource);
+          QuestJournal::ReadInventory(actor, source);
+        }
       }
     }
     VirtualMachine vm(scripts);
@@ -1647,6 +1740,22 @@ bool QuestScriptRuntime::Execute(
                         : VarValue::None()
       };
     };
+    // The primary interaction and its later scripted inventory notifications
+    // use the same saved recipient/attachment/handler dispatcher. Completing
+    // the primary never consumes an inventory FIFO position.
+    const bool primaryInteraction = job &&
+      job->kind == QuestJobState::Kind::Interaction && !job->interactionDone;
+    const auto dispatchName = [&]() -> const char* {
+      return primaryInteraction
+        ? job->interaction->name.c_str()
+        : (inventoryEvents.at(job->eventHead).added ? "OnItemAdded"
+                                                    : "OnItemRemoved");
+    };
+    const auto dispatchArguments = [&]() {
+      return primaryInteraction
+        ? std::vector<VarValue>{ VarValue(resolve(eventSource).get()) }
+        : eventArguments(inventoryEvents.at(job->eventHead));
+    };
     // Resolve canonical receivers through this transaction's fresh object set.
     // Membership was selected once; an alias may legitimately change its
     // target while an earlier handler is running.
@@ -1726,10 +1835,9 @@ bool QuestScriptRuntime::Execute(
           if (!implementation || !implementation->IsValid())
             throw std::runtime_error(
               "Saved quest handler implementation is missing");
-          const auto& event = inventoryEvents.at(job->eventHead);
           const auto result =
             managedCall(implementation, identity.state, identity.function,
-                        eventArguments(event));
+                        dispatchArguments());
           if (result.value.promise)
             throw std::runtime_error(
               "Quest handler returned an unmanaged promise");
@@ -1737,16 +1845,21 @@ bool QuestScriptRuntime::Execute(
           executedWork = true;
         }
       } else if (!job->dispatch) {
-        const auto& event = inventoryEvents.at(job->eventHead);
+        const auto target = primaryInteraction
+          ? loadedReference
+          : inventoryEvents.at(job->eventHead).target;
         QuestJobState::Dispatch dispatch;
-        for (const auto& recipient : eventRecipients(event.target, true))
+        for (const auto& recipient : eventRecipients(target, true))
           dispatch.recipients.push_back(encodeObject(recipient.get()));
         job->dispatch = std::move(dispatch);
       } else {
         auto& dispatch = *job->dispatch;
         if (dispatch.recipient == dispatch.recipients.size()) {
           job->dispatch.reset();
-          ++job->eventHead;
+          if (primaryInteraction)
+            job->interactionDone = true;
+          else
+            ++job->eventHead;
         } else if (!dispatch.captured) {
           roster(dispatch, true);
         } else {
@@ -1759,10 +1872,8 @@ bool QuestScriptRuntime::Execute(
             dispatch.templates.clear();
             dispatch.reference.clear();
           } else {
-            const auto& event = inventoryEvents.at(job->eventHead);
             const auto selected = vm.SelectEventHandler(
-              roots.at(dispatch.attachment),
-              event.added ? "OnItemAdded" : "OnItemRemoved");
+              roots.at(dispatch.attachment), dispatchName());
             if (!selected) {
               ++dispatch.attachment;
             } else {
@@ -1786,11 +1897,11 @@ bool QuestScriptRuntime::Execute(
           }
         }
       }
-    } else if (referenceEvent) {
+    } else if (referenceEvent && !job) {
       dispatchReferenceEvent(loadedReference, referenceEvent,
                              { VarValue(resolve(eventSource).get()) }, true);
       changed = true;
-    } else if (loadedReference) {
+    } else if (loadedReference && !job) {
       if (!QuestJournal::ReferenceInitialized(actor, loadedReference)) {
         // An alias's OnInit belongs to quest startup, not its target's load.
         dispatchReferenceEvent(loadedReference, "OnInit", {}, false);
@@ -1819,6 +1930,8 @@ bool QuestScriptRuntime::Execute(
         &CampaignReferenceBinding::Resolve(actor, loadedReference) != loaded)
       throw std::runtime_error(
         "Campaign load reference changed during execution");
+    if (job && job->kind == QuestJobState::Kind::Interaction)
+      ValidateInteraction(actor, *job->interaction);
     for (const auto& [key, holder] : variables)
       state.SetScript(key, holder->Save());
     QuestJournal::SetScriptState(actor, state.Save());

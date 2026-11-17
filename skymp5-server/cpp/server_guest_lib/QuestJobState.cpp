@@ -200,8 +200,73 @@ Json SaveDispatch(const QuestJobState::Dispatch& dispatch)
   };
 }
 
+QuestJobState::Interaction ReadInteraction(const Json& value)
+{
+  Fields(value,
+         { "name", "target", "source", "targetReference", "sourceReference",
+           "targetTemplates", "sourceTemplates" });
+  QuestJobState::Interaction interaction;
+  interaction.name = Text(value.at("name"), 32);
+  if (interaction.name != "OnActivate" &&
+      interaction.name != "OnTriggerEnter" &&
+      interaction.name != "OnTriggerLeave" &&
+      interaction.name != "OnTrigger" &&
+      interaction.name != "SkympOnActivateClose")
+    throw std::runtime_error("Unsupported quest interaction event");
+  interaction.target = Identity(value.at("target"), false);
+  interaction.source = Identity(value.at("source"), false);
+  interaction.targetReference = Identity(value.at("targetReference"), true);
+  interaction.sourceReference = Identity(value.at("sourceReference"), true);
+  const auto templates = [](const Json& values) {
+    if (!values.is_array() || values.size() > 128)
+      throw std::runtime_error("Quest interaction template limit exceeded");
+    std::vector<std::string> result;
+    std::set<std::string> seen;
+    for (const auto& value : values) {
+      const auto identity = Identity(value, false);
+      if (!seen.insert(identity).second)
+        throw std::runtime_error("Duplicate quest interaction template");
+      result.push_back(identity);
+    }
+    return result;
+  };
+  interaction.targetTemplates = templates(value.at("targetTemplates"));
+  interaction.sourceTemplates = templates(value.at("sourceTemplates"));
+  return interaction;
+}
+
+Json SaveInteraction(const QuestJobState::Interaction& interaction)
+{
+  Bounded(interaction.name, 32);
+  for (const auto* text :
+       { &interaction.target, &interaction.source,
+         &interaction.targetReference, &interaction.sourceReference })
+    Bounded(*text, 300);
+  for (const auto* templates :
+       { &interaction.targetTemplates, &interaction.sourceTemplates }) {
+    if (templates->size() > 128)
+      throw std::runtime_error("Quest interaction template limit exceeded");
+    for (const auto& name : *templates)
+      Bounded(name, 300);
+  }
+  return { { "name", interaction.name },
+           { "target", interaction.target },
+           { "source", interaction.source },
+           { "targetReference", interaction.targetReference },
+           { "sourceReference", interaction.sourceReference },
+           { "targetTemplates", interaction.targetTemplates },
+           { "sourceTemplates", interaction.sourceTemplates } };
+}
+
+bool InertInteractionRoot(const QuestJobState::Stage& stage)
+{
+  QuestJobState::Stage inert;
+  inert.cursor = "done";
+  return stage == inert;
+}
+
 QuestJobState::Stage ReadStage(const Json& value, bool child, uint64_t version,
-                               bool handler = false)
+                               bool handler = false, bool emptyAnchor = false)
 {
   if (child || handler) {
     auto fields = value;
@@ -228,13 +293,17 @@ QuestJobState::Stage ReadStage(const Json& value, bool child, uint64_t version,
     throw std::runtime_error(
       "Quest event handler cannot use a native child node");
   stage.child = Number(value.at("child"), QuestJobState::MaxOperations);
-  stage.quest = Identity(value.at("quest"), false);
-  stage.contentHash = Text(value.at("contentHash"), 64);
-  if (stage.contentHash.size() != 64 ||
-      stage.contentHash.find_first_not_of("0123456789abcdef") !=
-        std::string::npos)
-    throw std::runtime_error("Invalid quest job content hash");
+  stage.quest = Identity(value.at("quest"), false, emptyAnchor);
+  stage.contentHash = Text(value.at("contentHash"), 64, emptyAnchor);
   stage.stage = static_cast<uint16_t>(Number(value.at("stage"), 65535));
+  if (emptyAnchor) {
+    if (!stage.quest.empty() || !stage.contentHash.empty() || stage.stage)
+      throw std::runtime_error(
+        "Interaction handler retains a quest stage anchor");
+  } else if (stage.contentHash.size() != 64 ||
+             stage.contentHash.find_first_not_of("0123456789abcdef") !=
+               std::string::npos)
+    throw std::runtime_error("Invalid quest job content hash");
   stage.cursor = Text(value.at("cursor"), 7);
   stage.accepted = Boolean(value.at("accepted"));
   stage.log = static_cast<uint32_t>(Number(value.at("log"), 100000));
@@ -328,6 +397,9 @@ QuestJobState::Job ReadJob(const Json& saved, uint64_t version)
         "children" });
   else {
     auto fields = value;
+    if (version >= 7)
+      for (const auto* field : { "kind", "interaction", "interactionDone" })
+        fields.erase(field);
     if (version >= 6)
       fields.erase("environmentHash");
     if (version >= 5)
@@ -368,7 +440,28 @@ QuestJobState::Job ReadJob(const Json& saved, uint64_t version)
                      "contentMode" });
   }
   QuestJobState::Job job;
-  static_cast<QuestJobState::Stage&>(job) = ReadStage(value, false, version);
+  if (version >= 7) {
+    const auto kind = Text(value.at("kind"), 11);
+    if (kind == "stage")
+      job.kind = QuestJobState::Kind::Stage;
+    else if (kind == "interaction")
+      job.kind = QuestJobState::Kind::Interaction;
+    else
+      throw std::runtime_error("Unsupported quest job kind");
+    job.interactionDone = Boolean(value.at("interactionDone"));
+    if (!value.at("interaction").is_null())
+      job.interaction = ReadInteraction(value.at("interaction"));
+  }
+  const bool interaction = job.kind == QuestJobState::Kind::Interaction;
+  if (interaction != job.interaction.has_value() ||
+      (!interaction && !job.interactionDone))
+    throw std::runtime_error(
+      "Quest job interaction payload does not match its kind");
+  static_cast<QuestJobState::Stage&>(job) =
+    ReadStage(value, false, version, false, interaction);
+  if (interaction && !InertInteractionRoot(job))
+    throw std::runtime_error(
+      "Interaction root contains executable quest stage state");
   job.automatic = version >= 3 ? Boolean(value.at("automatic")) : false;
   job.sequenced = version >= 5 ? Boolean(value.at("sequenced")) : false;
   job.contentMode = version >= 3 ? Text(value.at("contentMode"), 7) : "legacy";
@@ -381,7 +474,9 @@ QuestJobState::Job ReadJob(const Json& saved, uint64_t version)
     throw std::runtime_error("Invalid quest job environment hash");
   if ((job.contentMode != "owned" && job.contentMode != "fixture" &&
        job.contentMode != "legacy") ||
-      (job.automatic && job.contentMode == "legacy"))
+      (job.automatic && job.contentMode == "legacy") ||
+      (interaction &&
+       (job.environmentHash.empty() || job.contentMode == "legacy")))
     throw std::runtime_error("Invalid quest job content provenance");
   if (job.node)
     throw std::runtime_error("Root quest stage has a child identity");
@@ -430,7 +525,8 @@ QuestJobState::Job ReadJob(const Json& saved, uint64_t version)
     if (!value.at("dispatch").is_null())
       job.dispatch = ReadDispatch(value.at("dispatch"));
     if (!value.at("handler").is_null())
-      job.handler = ReadStage(value.at("handler"), false, version, true);
+      job.handler =
+        ReadStage(value.at("handler"), false, version, true, interaction);
   }
   if (job.cursor != "done") {
     if (job.dispatch || job.handler || job.eventHead || job.nextHandler != 1)
@@ -440,11 +536,22 @@ QuestJobState::Job ReadJob(const Json& saved, uint64_t version)
     throw std::runtime_error("Completed quest root retains native children");
   if (version < 4 && job.cursor == "done" && !job.events.empty())
     throw std::runtime_error("Legacy completed quest retains events");
+  const bool primary = interaction && !job.interactionDone;
+  if (primary && job.eventHead)
+    throw std::runtime_error(
+      "Inventory FIFO advanced before primary interaction completion");
   if (job.dispatch) {
-    if (job.eventHead == job.events.size() ||
-        job.dispatch->recipients.front() != job.events[job.eventHead].target)
+    if ((!primary && job.eventHead == job.events.size()) ||
+        job.dispatch->recipients.front() !=
+          (primary ? job.interaction->target
+                   : job.events[job.eventHead].target))
       throw std::runtime_error(
         "Quest event dispatch has no matching target payload");
+    if (primary && job.dispatch->captured && !job.dispatch->recipient &&
+        (job.dispatch->reference != job.interaction->targetReference ||
+         job.dispatch->templates != job.interaction->targetTemplates))
+      throw std::runtime_error(
+        "Interaction dispatch changed its captured target binding");
     for (size_t index = 1; index < job.dispatch->recipients.size(); ++index)
       if (!job.dispatch->recipients[index].is_object())
         throw std::runtime_error(
@@ -453,6 +560,11 @@ QuestJobState::Job ReadJob(const Json& saved, uint64_t version)
   if (job.handler) {
     const auto& handler = *job.handler;
     const auto& identity = *handler.handlerIdentity;
+    const auto function = primary
+      ? job.interaction->name
+      : (job.eventHead < job.events.size() && job.events[job.eventHead].added
+           ? "OnItemAdded"
+           : "OnItemRemoved");
     if (!job.dispatch || !job.dispatch->captured ||
         job.dispatch->attachment == job.dispatch->roots.size() ||
         handler.quest != job.quest || handler.contentHash != job.contentHash ||
@@ -462,9 +574,7 @@ QuestJobState::Job ReadJob(const Json& saved, uint64_t version)
           job.dispatch->recipients[job.dispatch->recipient] ||
         !SameScriptName(job.dispatch->roots[job.dispatch->attachment],
                         identity.rootScript) ||
-        !SameScriptName(identity.function,
-                        job.events[job.eventHead].added ? "OnItemAdded"
-                                                        : "OnItemRemoved") ||
+        !SameScriptName(identity.function, function) ||
         (handler.cursor == "waiting" &&
          (!SameScriptName(handler.script, identity.implementation) ||
           !SameScriptName(handler.function, identity.function))))
@@ -528,11 +638,9 @@ QuestJobState::Job ReadJob(const Json& saved, uint64_t version)
   // completion, including parent waits whose children are still on the stack.
   if (operations.size() != job.nextOperation - 1)
     throw std::runtime_error("Quest operation history has missing identities");
-  if (job.cursor == "begin" &&
-      (job.segment || job.instructions || job.steps ||
-       job.nextOperation != 1 || !job.events.empty() ||
-       !job.completions.empty() || !job.children.empty()))
-    throw std::runtime_error("Quest job begin cursor is not pristine");
+  if ((job.cursor == "begin" || (interaction && !job.segment)) &&
+      !job.IsPristine())
+    throw std::runtime_error("Quest job initial cursor is not pristine");
   return job;
 }
 
@@ -575,6 +683,9 @@ Json SaveStage(const QuestJobState::Stage& stage)
 
 Json SaveJob(const QuestJobState::Job& job)
 {
+  if (job.kind != QuestJobState::Kind::Stage &&
+      job.kind != QuestJobState::Kind::Interaction)
+    throw std::runtime_error("Unsupported typed quest job kind");
   Bounded(job.command, 128);
   Bounded(job.contentMode, 7);
   Bounded(job.environmentHash, 64);
@@ -610,7 +721,12 @@ Json SaveJob(const QuestJobState::Job& job)
     children.push_back(SaveStage(child));
   auto result = SaveStage(job);
   result.update(
-    { { "id", job.id },
+    { { "kind",
+        job.kind == QuestJobState::Kind::Stage ? "stage" : "interaction" },
+      { "interaction",
+        job.interaction ? SaveInteraction(*job.interaction) : Json(nullptr) },
+      { "interactionDone", job.interactionDone },
+      { "id", job.id },
       { "generation", job.generation },
       { "segment", job.segment },
       { "nextOperation", job.nextOperation },
@@ -666,8 +782,25 @@ const QuestJobState::Stage& QuestJobState::Job::Current() const
 
 bool QuestJobState::Job::IsComplete() const
 {
-  return cursor == "done" && children.empty() && !handler && !dispatch &&
-    eventHead == events.size();
+  return cursor == "done" && interactionDone && children.empty() && !handler &&
+    !dispatch && eventHead == events.size();
+}
+
+bool QuestJobState::Job::IsPristine() const
+{
+  if (segment || instructions || steps || nextOperation != 1 ||
+      nextHandler != 1 || eventHead || !children.empty() || handler ||
+      dispatch || !events.empty() || !completions.empty())
+    return false;
+  if (kind == Kind::Interaction)
+    return interaction && !interactionDone && InertInteractionRoot(*this);
+  if (kind != Kind::Stage || interaction || !interactionDone)
+    return false;
+  Stage pristine;
+  pristine.quest = quest;
+  pristine.contentHash = contentHash;
+  pristine.stage = stage;
+  return static_cast<const Stage&>(*this) == pristine;
 }
 
 std::string QuestJobState::Job::NextToken() const
@@ -677,7 +810,7 @@ std::string QuestJobState::Job::NextToken() const
 
 QuestJobState QuestJobState::Read(const nlohmann::json& value)
 {
-  const auto version = Number(value.at("schemaVersion"), 6, true);
+  const auto version = Number(value.at("schemaVersion"), 7, true);
   if (version >= 6)
     Fields(value,
            { "schemaVersion", "generation", "nextJob", "retiredThrough",
@@ -738,6 +871,7 @@ QuestJobState QuestJobState::Read(const nlohmann::json& value)
   } else if (!value.at("active").is_null())
     live.push_back(value.at("active"));
   previous = 0;
+  size_t stageCount = 0;
   for (const auto& saved : live) {
     auto job = ReadJob(saved, version);
     if (job.IsComplete() || job.id <= previous ||
@@ -745,6 +879,8 @@ QuestJobState QuestJobState::Read(const nlohmann::json& value)
          job.id <= result.completed.back().id))
       throw std::runtime_error("Completed or unordered live quest job");
     previous = job.id;
+    if (job.kind == Kind::Stage && ++stageCount > MaxStageLive)
+      throw std::runtime_error("Live quest stage root limit exceeded");
     identity(job, true);
     if (!result.live.empty()) {
       const auto& first = result.live.begin()->second;
@@ -790,8 +926,8 @@ QuestJobState QuestJobState::Read(const nlohmann::json& value)
   if (version == 5 && !result.live.empty() &&
       result.live.begin()->second.sequenced) {
     // Schema 5 admitted exactly one root and enforced this bound throughout
-    // its lifetime. Measure its original canonical shape, before adding the
-    // schema 6 environment field, so valid near-limit saves still migrate.
+    // its lifetime. Measure its original canonical shape, before adding
+    // environment and interaction fields, so valid near-limit saves migrate.
     size_t bytes = 0;
     for (const auto& job : completed) {
       if (!job.at("sequenced").get<bool>())
@@ -948,7 +1084,7 @@ nlohmann::json QuestJobState::Save() const
   auto ranges = Json::array();
   for (const auto& range : retiredRanges)
     ranges.push_back({ { "first", range.first }, { "last", range.last } });
-  Json result = { { "schemaVersion", 6 },
+  Json result = { { "schemaVersion", 7 },
                   { "generation", generation },
                   { "nextJob", nextJob },
                   { "retiredThrough", retiredThrough },

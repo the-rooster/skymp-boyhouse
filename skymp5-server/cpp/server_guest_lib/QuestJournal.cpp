@@ -93,6 +93,14 @@ bool ValidateDispatchTransition(const QuestJobState::Job& prior,
       "Job transaction rewrote inventory event history");
   const bool host = prior.cursor == "done" &&
     (!prior.handler || prior.handler->cursor == "done");
+  const bool primary =
+    prior.kind == QuestJobState::Kind::Interaction && !prior.interactionDone;
+  const bool finishPrimary = primary && host && !prior.handler &&
+    prior.dispatch && !prior.dispatch->captured &&
+    prior.dispatch->recipient == prior.dispatch->recipients.size();
+  if (next.interactionDone != (finishPrimary ? true : prior.interactionDone))
+    throw std::runtime_error(
+      "Job transaction changed interaction completion outside its boundary");
   if (!host) {
     if (next.eventHead != prior.eventHead ||
         next.nextHandler != prior.nextHandler ||
@@ -136,10 +144,10 @@ bool ValidateDispatchTransition(const QuestJobState::Job& prior,
   const auto& dispatch = *prior.dispatch;
   if (!dispatch.captured && dispatch.recipient == dispatch.recipients.size()) {
     if (instructions || next.dispatch || next.handler ||
-        next.eventHead != prior.eventHead + 1 ||
+        next.eventHead != prior.eventHead + (primary ? 0 : 1) ||
         next.nextHandler != prior.nextHandler)
       throw std::runtime_error(
-        "Job transaction did not retire exactly one inventory event");
+        "Job transaction did not retire exactly one event");
     return true;
   }
   if (!next.dispatch || next.eventHead != prior.eventHead ||
@@ -941,7 +949,7 @@ void QuestJournal::SetJobState(MpActor& actor, const QuestJobState& state)
     throw std::runtime_error("Job transaction changed another job identity");
   if (!priorJob &&
       (id != previous.nextJob || !state.FindLive(id) ||
-       candidate->cursor != "begin"))
+       !candidate->IsPristine()))
     throw std::runtime_error(
       "New quest job must first install its pristine root");
   if (!priorJob) {
@@ -977,6 +985,8 @@ void QuestJournal::SetJobState(MpActor& actor, const QuestJobState& state)
         candidate->automatic != prior.automatic ||
         candidate->contentMode != prior.contentMode ||
         candidate->environmentHash != prior.environmentHash ||
+        candidate->kind != prior.kind ||
+        candidate->interaction != prior.interaction ||
         candidate->actor != prior.actor || candidate->owner != prior.owner ||
         candidate->quest != prior.quest ||
         candidate->instance != prior.instance ||
@@ -1105,7 +1115,7 @@ void QuestJournal::SetJobState(MpActor& actor, const QuestJobState& state)
   // A pristine initial install exposes the new job to script/native guards.
   // Every other transition must receive its own durable receipt before the
   // next cursor can advance; repeated identical calls above remain harmless.
-  if (priorJob || !state.FindLive(id) || candidate->cursor != "begin")
+  if (priorJob || !state.FindLive(id) || !candidate->IsPristine())
     transaction->jobTransitionApplied = true;
 }
 

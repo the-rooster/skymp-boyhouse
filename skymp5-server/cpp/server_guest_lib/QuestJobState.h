@@ -11,6 +11,17 @@
 // commits one segment at a time; job identities survive process restarts.
 struct QuestJobState
 {
+  enum class Kind
+  {
+    Stage,
+    Interaction
+  };
+  struct Interaction
+  {
+    std::string name, target, source, targetReference, sourceReference;
+    std::vector<std::string> targetTemplates, sourceTemplates;
+    bool operator==(const Interaction&) const = default;
+  };
   struct Event
   {
     std::string target, item, container;
@@ -78,6 +89,9 @@ struct QuestJobState
   };
   struct Job : Stage
   {
+    Kind kind = Kind::Stage;
+    std::optional<Interaction> interaction;
+    bool interactionDone = true;
     uint64_t id = 0, generation = 1, segment = 0, nextOperation = 1;
     std::string command, actor, owner, instance;
     std::string contentMode = "owned";
@@ -98,6 +112,7 @@ struct QuestJobState
     Stage& Current();
     const Stage& Current() const;
     bool IsComplete() const;
+    bool IsPristine() const;
     bool operator==(const Job&) const = default;
   };
   struct RetiredRange
@@ -109,7 +124,8 @@ struct QuestJobState
   std::map<uint64_t, Job> live;
   std::vector<RetiredRange> retiredRanges;
   std::vector<Job> completed;
-  static constexpr size_t MaxLive = 16;
+  static constexpr size_t MaxLive = 20;
+  static constexpr size_t MaxStageLive = 16;
   static constexpr size_t MaxCompleted = 256;
   static constexpr size_t MaxRecentCompleted = 32;
   static constexpr size_t MaxRecentBytes = 1024 * 1024;

@@ -9,6 +9,7 @@
 
 class MpActor;
 class MpForm;
+class MpObjectReference;
 class WorldState;
 
 // Trusted host coordinator. Waiting requests and completed results are only
@@ -47,12 +48,20 @@ public:
     const std::optional<RequestId> sequence;
   };
   using MetadataOverrides = std::map<uint32_t, espm::QuestScriptData>;
+  enum class ResultKind
+  {
+    Stage,
+    Interaction,
+    Unknown
+  };
   struct Result
   {
     Status status = Status::Pending;
     uint64_t job = 0;
     bool accepted = false;
     std::string token, key, error;
+    // accepted is meaningful only for Stage results.
+    ResultKind kind = ResultKind::Unknown;
   };
   // Prospective only: does not reserve, publish or acknowledge an admission.
   RequestId NextRequest(MpActor& actor);
@@ -65,6 +74,15 @@ public:
                 uint16_t stage, const MetadataOverrides& overrides,
                 const std::vector<PexScript::Lazy>& scripts,
                 bool automatic = false);
+  Result SubmitEvent(MpActor& actor, const Request& command,
+                     MpObjectReference& target, const std::string& name,
+                     MpObjectReference& source);
+  Result SubmitEvent(MpActor& actor, const Request& command,
+                     MpObjectReference& target, const std::string& name,
+                     MpObjectReference& source,
+                     const MetadataOverrides& overrides,
+                     const std::vector<PexScript::Lazy>& scripts,
+                     bool automatic = false);
   Result Resume(MpActor& actor, const Request& command,
                 const std::string& token, bool completion);
   Result Resume(MpActor& actor, const Request& command,
@@ -142,6 +160,10 @@ private:
                            const std::vector<PexScript::Lazy>&,
                            const MetadataOverrides&, const std::string&,
                            bool fixtureAwait, bool automatic);
+  Result AdmitWithContent(MpActor&, const Request&, QuestJobState::Job,
+                          const std::vector<PexScript::Lazy>&,
+                          const MetadataOverrides&, const std::string&,
+                          bool fixtureAwait, bool automatic);
   Result ResumeWithContent(MpActor&, const Request&, const std::string&, bool,
                            const std::vector<PexScript::Lazy>&,
                            const MetadataOverrides&, const std::string&,

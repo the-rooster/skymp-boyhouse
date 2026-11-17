@@ -1,10 +1,12 @@
 #include "QuestJobRunner.h"
+#include "CampaignReferenceBinding.h"
 #include "QuestJobClock.h"
 #include "QuestJournal.h"
 #include "QuestScriptRuntime.h"
 #include "QuestVmState.h"
 #include "TestUtils.hpp"
 #include "database_drivers/SqliteDatabase.h"
+#include "libespm/REFR.h"
 #include "save_storages/AsyncSaveStorage.h"
 #include "save_storages/ISaveStorage.h"
 #include <algorithm>
@@ -3851,4 +3853,739 @@ TEST_CASE(
   REQUIRE(f.InspectRoot(second).status == Status::Failed);
   REQUIRE(f.Gold() == 31);
   REQUIRE(QuestJournal::ScriptState(f.Owner()) == before);
+}
+
+namespace {
+constexpr uint32_t kInteractionOriginal = 0x6debb;
+constexpr uint32_t kInteractionCopy = 0xff006180;
+constexpr uint32_t kInteractionNpc = 0xff006181;
+constexpr auto kInteractionState =
+  "reference:6debb:Skyrim.esm/defaultsetstagetrigscript";
+
+struct InteractionProgram
+{
+  ConcurrentProgram concurrent;
+  std::shared_ptr<PexScript> handlerBase;
+  InteractionProgram(bool wake = true, bool waits = true, bool child = false)
+    : concurrent(false)
+  {
+    auto& quest = concurrent.program.script->objectTable[0];
+    FunctionInfo wakeFunction;
+    wakeFunction.valid = true;
+    wakeFunction.returnType = "None";
+    wakeFunction.code.instructions = {
+      { FunctionCode::kOp_Assign, { Name("scalar"), VarValue(99) } },
+      { FunctionCode::kOp_ArraySetElement,
+        { Name("shared"), VarValue(0), VarValue(9) } },
+      { FunctionCode::kOp_Assign, { Name("ready"), VarValue(true) } },
+      { FunctionCode::kOp_Return, { VarValue::None() } }
+    };
+    quest.states[0].functions.push_back({ "Wake", wakeFunction });
+    if (child) {
+      auto function = Reward(4);
+      function.code.instructions.pop_back();
+      function.code.instructions.push_back(
+        { FunctionCode::kOp_CallStatic,
+          { VarValue("Utility"), VarValue("WaitMenuMode"), Name("temp"),
+            VarValue(1), VarValue(1.0) } });
+      function.code.instructions.push_back(
+        { FunctionCode::kOp_CallMethod,
+          { VarValue("AddItem"), Name("target"), Name("temp"), VarValue(3),
+            Name("gold"), VarValue(6), VarValue(true) } });
+      function.code.instructions.push_back(
+        { FunctionCode::kOp_Return, { VarValue::None() } });
+      quest.states[0].functions[2].function = std::move(function);
+    }
+
+    handlerBase = std::make_shared<PexScript>();
+    handlerBase->source = "InteractionBase";
+    Object base;
+    base.NameIndex = handlerBase->source;
+    base.parentClassName = "ObjectReference";
+    base.variables = { { "prefixes", "Int", 0, VarValue(0) },
+                       { "suffixes", "Int", 0, VarValue(0) },
+                       { "sourceId", "Int", 0, VarValue(0) },
+                       { "lastSource", "ObjectReference", 0,
+                         VarValue::None() } };
+    auto handler = Reward(3);
+    handler.params = { { "source", "ObjectReference" } };
+    handler.locals.insert(handler.locals.end(),
+                          { { "quest", "Quest" },
+                            { "script", "JobFixture" },
+                            { "accepted", "Bool" } });
+    handler.code.instructions.pop_back();
+    handler.code.instructions.push_back(
+      { FunctionCode::kOp_IAdd,
+        { Name("prefixes"), Name("prefixes"), VarValue(1) } });
+    handler.code.instructions.push_back(
+      { FunctionCode::kOp_Assign, { Name("lastSource"), Name("source") } });
+    handler.code.instructions.push_back(
+      { FunctionCode::kOp_CallMethod,
+        { VarValue("GetFormID"), Name("source"), Name("sourceId"),
+          VarValue(0) } });
+    if (wake) {
+      handler.code.instructions.push_back(
+        { FunctionCode::kOp_CallStatic,
+          { VarValue("Game"), VarValue("GetForm"), Name("quest"), VarValue(1),
+            VarValue(static_cast<int32_t>(kParentQuest)) } });
+      handler.code.instructions.push_back(
+        { FunctionCode::kOp_Cast, { Name("script"), Name("quest") } });
+      handler.code.instructions.push_back(
+        { FunctionCode::kOp_CallMethod,
+          { VarValue("Wake"), Name("script"), Name("temp"), VarValue(0) } });
+    }
+    handler.code.instructions.push_back(
+      { FunctionCode::kOp_Assign, { Name("::State"), VarValue("idle") } });
+    if (waits)
+      handler.code.instructions.push_back(
+        { FunctionCode::kOp_CallStatic,
+          { VarValue("Utility"), VarValue("Wait"), Name("temp"), VarValue(1),
+            VarValue(2.0) } });
+    if (child) {
+      handler.code.instructions.push_back(
+        { FunctionCode::kOp_CallStatic,
+          { VarValue("Game"), VarValue("GetForm"), Name("quest"), VarValue(1),
+            VarValue(static_cast<int32_t>(kRetentionQuest)) } });
+      handler.code.instructions.push_back(
+        { FunctionCode::kOp_CallMethod,
+          { VarValue("SetStage"), Name("quest"), Name("accepted"), VarValue(1),
+            VarValue(10) } });
+    }
+    handler.code.instructions.push_back(
+      { FunctionCode::kOp_IAdd,
+        { Name("suffixes"), Name("suffixes"), VarValue(1) } });
+    handler.code.instructions.push_back(
+      { FunctionCode::kOp_CallMethod,
+        { VarValue("AddItem"), Name("target"), Name("temp"), VarValue(3),
+          Name("gold"), VarValue(5), VarValue(true) } });
+    handler.code.instructions.push_back(
+      { FunctionCode::kOp_Return, { VarValue::None() } });
+    FunctionInfo ignored;
+    ignored.valid = true;
+    ignored.returnType = "None";
+    ignored.params = { { "source", "ObjectReference" } };
+    ignored.code.instructions = { { FunctionCode::kOp_Return,
+                                    { VarValue::None() } } };
+    base.states = {
+      { "busy", { { "OnActivate", handler } } },
+      { "idle", { { "OnActivate", ignored }, { "OnTriggerEnter", ignored } } }
+    };
+    handlerBase->objectTable.push_back(base);
+    auto attached = std::make_shared<PexScript>();
+    attached->source = "defaultSetStageTRIGScript";
+    Object derived;
+    derived.NameIndex = attached->source;
+    derived.parentClassName = handlerBase->source;
+    derived.autoStateName = "busy";
+    derived.variables = { { "::stage_var", "Int", 0, VarValue(0) } };
+    attached->objectTable.push_back(derived);
+    concurrent.program.bases.push_back(handlerBase);
+    concurrent.program.bases.push_back(attached);
+
+    espm::QuestScriptData::Alias alias;
+    alias.object.type = 1;
+    alias.object.formId = kParentQuest;
+    alias.object.alias = 3;
+    alias.version = 5;
+    alias.objectFormat = 2;
+    alias.scripts = { { "InteractionInventoryObserver", 0, {} } };
+    concurrent.metadata.at(kParentQuest).aliases = { alias };
+    auto observer = std::make_shared<PexScript>();
+    observer->source = "InteractionInventoryObserver";
+    Object object;
+    object.NameIndex = observer->source;
+    object.parentClassName = "ReferenceAlias";
+    object.variables = { { "order", "Int", 0, VarValue(0) },
+                         { "calls", "Int", 0, VarValue(0) } };
+    auto observed = EventFunction();
+    observed.code.instructions = {
+      { FunctionCode::kOp_IMultiply,
+        { Name("order"), Name("order"), VarValue(10) } },
+      { FunctionCode::kOp_IAdd,
+        { Name("order"), Name("order"), Name("count") } },
+      { FunctionCode::kOp_IAdd,
+        { Name("calls"), Name("calls"), VarValue(1) } },
+      { FunctionCode::kOp_Return, { VarValue::None() } }
+    };
+    object.states = { { "", { { "OnItemAdded", observed } } } };
+    observer->objectTable.push_back(object);
+    concurrent.program.bases.push_back(observer);
+  }
+  auto Scripts() const { return concurrent.Scripts(); }
+  const auto& Metadata() const { return concurrent.metadata; }
+  void Enable(MpActor& owner) const
+  {
+    concurrent.Enable(owner);
+    QuestJournal::Atomic(owner, [&] {
+      QuestVmState state(QuestJournal::ScriptState(owner), {}, {});
+      state.SetAliasBinding("4e50d:Skyrim.esm/alias:3", "14:Skyrim.esm");
+      QuestJournal::SetScriptState(owner, state.Save());
+    });
+  }
+};
+
+MpObjectReference& BindInteractionTarget(PartOne& server, MpActor& owner)
+{
+  auto& world = server.worldState;
+  const auto original =
+    world.GetEspm().GetBrowser().LookupById(kInteractionOriginal);
+  const auto data = reinterpret_cast<const espm::REFR*>(original.rec)
+                      ->GetData(world.GetEspmCache());
+  const auto base = original.ToGlobalId(data.baseId);
+  const auto type =
+    world.GetEspm().GetBrowser().LookupById(base).rec->GetType().ToString();
+  world.AddForm(
+    std::make_unique<MpObjectReference>(
+      LocationalData{ { 1, 2, 3 }, { 0, 0, 0 }, FormDesc::Tamriel() },
+      FormCallbacks::DoNothing(), base, type.c_str()),
+    kInteractionCopy);
+  auto& copy = world.GetFormAt<MpObjectReference>(kInteractionCopy);
+  copy.SetWorldInstance(owner.GetWorldInstance());
+  copy.SetInventory(Inventory());
+  CampaignReferenceBinding::Bind(owner, kInteractionOriginal, copy);
+  return copy;
+}
+
+MpActor& BindInteractionNpc(PartOne& server, MpActor& owner)
+{
+  server.worldState.AddForm(
+    std::make_unique<MpActor>(
+      LocationalData{ { 1, 2, 3 }, { 0, 0, 0 }, FormDesc::Tamriel() },
+      FormCallbacks::DoNothing(), 0x13bbd),
+    kInteractionNpc);
+  auto& copy = server.worldState.GetFormAt<MpActor>(kInteractionNpc);
+  copy.SetWorldInstance(owner.GetWorldInstance());
+  copy.SetInventory(Inventory().AddItem(0xf, 7));
+  CampaignReferenceBinding::Bind(owner, 0x1a677, copy);
+  return copy;
+}
+
+Json InteractionField(MpActor& owner, const char* field)
+{
+  std::string name = std::string("interactionbase/") + field;
+  return QuestJournal::ScriptState(owner)
+    .at("scripts")
+    .at(kInteractionState)
+    .at("values")
+    .at(name)
+    .at("value");
+}
+
+int InteractionOrder(MpActor& owner)
+{
+  return EventField(owner, "interactioninventoryobserver",
+                    "interactioninventoryobserver/order");
+}
+
+struct InteractionFixture : Fixture
+{
+  InteractionProgram content;
+  std::shared_ptr<QuestJobTime> time =
+    std::make_shared<QuestJobTime>(QuestJobTime{ 1000000, 5000 });
+  InteractionFixture(bool wake = true, bool waits = true, bool child = false,
+                     bool initialize = true)
+    : content(wake, waits, child)
+  {
+    content.Enable(Owner());
+    BindInteractionTarget(server, Owner());
+    if (initialize)
+      QuestScriptRuntime::ExecuteReferenceLoad(Owner(), kInteractionOriginal,
+                                               content.Scripts());
+    storage->automatic = true;
+    Tick();
+    storage->submissions.clear();
+    storage->automatic = false;
+    Jobs().SetClock([time = time] { return *time; });
+  }
+  MpObjectReference& Target()
+  {
+    return server.worldState.GetFormAt<MpObjectReference>(kInteractionCopy);
+  }
+  QuestJobRunner::Result SubmitInteraction(
+    const RequestId& request, MpActor& actor, MpObjectReference& source,
+    const std::string& name = "OnActivate")
+  {
+    return Jobs().SubmitEvent(actor, request, Target(), name, source,
+                              content.Metadata(), content.Scripts());
+  }
+  QuestJobRunner::Result SubmitInteraction(const RequestId& request)
+  {
+    return SubmitInteraction(request, Owner(), Owner());
+  }
+  QuestJobRunner::Result SubmitStage(const RequestId& request)
+  {
+    return Jobs().Submit(Owner(), request, kParentQuest, 10,
+                         content.Metadata(), content.Scripts());
+  }
+  QuestJobRunner::Result Advance(const RequestId& request)
+  {
+    return Jobs().Advance(Owner(), request, content.Metadata(),
+                          content.Scripts());
+  }
+  QuestJobRunner::Result Inspect(const RequestId& request)
+  {
+    return Jobs().Inspect(Owner(), request);
+  }
+  QuestJobRunner::Result DrainInteraction(const RequestId& request)
+  {
+    return Drain(*this, request, content.Metadata(), content.Scripts());
+  }
+  void AckLatest()
+  {
+    Tick();
+    REQUIRE_FALSE(storage->submissions.empty());
+    storage->Complete(storage->submissions.size() - 1);
+    Tick();
+  }
+  QuestJobState::Job Live(const RequestId& request)
+  {
+    const auto state = QuestJournal::JobState(Owner());
+    const auto* job = state.FindLive(request.sequence);
+    REQUIRE(job);
+    return *job;
+  }
+  void SelectHandler(const RequestId& request)
+  {
+    for (size_t boundary = 0; boundary < 32; ++boundary) {
+      if (Inspect(request).status == Status::Pending)
+        AckLatest();
+      if (Live(request).handler)
+        return;
+      RequireReady(Inspect(request));
+      RequirePending(Advance(request));
+    }
+    FAIL("Interaction did not select its handler");
+  }
+};
+
+void RequireInteraction(const QuestJobRunner::Result& result)
+{
+  REQUIRE(result.kind == QuestJobRunner::ResultKind::Interaction);
+  REQUIRE_FALSE(result.accepted);
+}
+}
+
+TEST_CASE(
+  "A saved OnActivate handler wakes a sleeping stage through the shared heap",
+  "[Quest][QuestJobs][Interactions][ConcurrentStacks][SaveReceipt]")
+{
+  InteractionFixture f;
+  REQUIRE(QuestJournal::ReferenceInitialized(f.Owner(), kInteractionOriginal));
+  const auto stage = f.Jobs().NextRequest(f.Owner());
+  f.SubmitStage(stage);
+  RequireSleeping(f.DrainInteraction(stage));
+  const auto stageToken = f.Live(stage).token;
+  const auto frame =
+    QuestJournal::ScriptState(f.Owner()).at("continuations").at(stageToken);
+  const auto event = f.Jobs().NextRequest(f.Owner());
+  RequirePending(f.SubmitInteraction(event));
+  REQUIRE(f.Gold() == 12);
+  REQUIRE_THROWS(f.SubmitStage(event));
+  REQUIRE_THROWS(f.SubmitInteraction(stage));
+  f.SelectHandler(event);
+  const auto selected = f.Live(event);
+  REQUIRE(selected.kind == QuestJobState::Kind::Interaction);
+  REQUIRE(selected.quest.empty());
+  REQUIRE(selected.contentHash.empty());
+  REQUIRE(selected.stage == 0);
+  REQUIRE_FALSE(selected.interactionDone);
+  REQUIRE(selected.handler->handlerIdentity->rootScript ==
+          "defaultSetStageTRIGScript");
+  REQUIRE(selected.handler->handlerIdentity->implementation ==
+          "InteractionBase");
+  REQUIRE(selected.handler->handlerIdentity->state == "busy");
+  RequirePending(f.Advance(event));
+  REQUIRE(f.Gold() == 15);
+  REQUIRE(InteractionField(f.Owner(), "prefixes") == 1);
+  REQUIRE(InteractionField(f.Owner(), "suffixes") == 0);
+  REQUIRE(ChildField(f.Owner(), kParentQuest, "ready").at("value") == true);
+  REQUIRE(
+    QuestJournal::ScriptState(f.Owner()).at("continuations").at(stageToken) ==
+    frame);
+  REQUIRE(InteractionOrder(f.Owner()) == 0);
+  f.time->steadyMs += 1000;
+  RequireReady(f.Inspect(stage));
+  RequirePending(f.Inspect(event));
+  REQUIRE_THROWS(f.Advance(stage));
+  f.Tick();
+  const auto failed = f.storage->submissions.size() - 1;
+  const auto bytes = Serialized(f.storage->submissions[failed].forms);
+  f.storage->Complete(
+    failed, std::make_exception_ptr(std::runtime_error("interaction prefix")));
+  f.Tick();
+  REQUIRE(Serialized(f.storage->submissions.back().forms) == bytes);
+  REQUIRE_THROWS(f.Advance(stage));
+  REQUIRE(f.Gold() == 15);
+  f.storage->Complete(failed);
+  f.Tick();
+  RequirePending(f.Inspect(event));
+  f.AckLatest();
+  RequireSleeping(f.Inspect(event));
+  RequireInteraction(f.Inspect(event));
+  RequirePending(f.Advance(stage));
+  const auto stageResult = f.DrainInteraction(stage);
+  REQUIRE(stageResult.status == Status::Completed);
+  REQUIRE(stageResult.kind == QuestJobRunner::ResultKind::Stage);
+  REQUIRE(stageResult.accepted);
+  REQUIRE(f.Gold() == 31);
+  REQUIRE(ChildField(f.Owner(), kParentQuest, "acaptured").at("value") == 7);
+  REQUIRE(ChildField(f.Owner(), kParentQuest, "aseen").at("value") == 9);
+  REQUIRE(InteractionOrder(f.Owner()) == 36);
+  RequireSleeping(f.Inspect(event));
+  f.time->steadyMs += 1000;
+  RequirePending(f.Advance(event));
+  REQUIRE(f.Gold() == 36);
+  REQUIRE(InteractionOrder(f.Owner()) == 36);
+  const auto complete = f.DrainInteraction(event);
+  REQUIRE(complete.status == Status::Completed);
+  RequireInteraction(complete);
+  REQUIRE(InteractionOrder(f.Owner()) == 3635);
+  REQUIRE(InteractionField(f.Owner(), "prefixes") == 1);
+  REQUIRE(InteractionField(f.Owner(), "suffixes") == 1);
+  REQUIRE(QuestJournal::ScriptState(f.Owner()).at("continuations").empty());
+  const auto before = QuestJournal::JobState(f.Owner()).Save();
+  RequireInteraction(f.SubmitInteraction(event));
+  REQUIRE(f.SubmitInteraction(event).status == Status::Completed);
+  REQUIRE_THROWS(
+    f.SubmitInteraction(event, f.Owner(), f.Owner(), "OnTriggerEnter"));
+  REQUIRE_THROWS(f.SubmitInteraction(event, f.Owner(), f.Target()));
+  REQUIRE_THROWS(f.SubmitStage(event));
+  REQUIRE(QuestJournal::JobState(f.Owner()).Save() == before);
+  REQUIRE(f.Gold() == 36);
+}
+
+TEST_CASE("Interaction roots preserve owner guest and NPC source identities",
+          "[Quest][QuestJobs][Interactions]")
+{
+  const auto sourceKind = GENERATE(0, 1, 2);
+  InteractionFixture f(false, false);
+  MpActor* actor = &f.Owner();
+  MpObjectReference* source = &f.Owner();
+  MpActor* guest = nullptr;
+  MpActor* npc = nullptr;
+  if (sourceKind == 1) {
+    f.server.CreateActor(kOwner + 1, { 1, 2, 3 }, 0, 0x3c);
+    guest = &f.server.worldState.GetFormAt<MpActor>(kOwner + 1);
+    guest->SetWorldInstance(f.Owner().GetWorldInstance());
+    guest->SetInventory(Inventory().AddItem(0xf, 100));
+    actor = guest;
+    source = guest;
+  } else if (sourceKind == 2) {
+    npc = &BindInteractionNpc(f.server, f.Owner());
+    source = npc;
+  }
+  const auto request = f.Jobs().NextRequest(*actor);
+  RequirePending(f.SubmitInteraction(request, *actor, *source));
+  for (size_t boundary = 0; boundary < 128; ++boundary) {
+    const auto result = f.Jobs().Inspect(*actor, request);
+    if (result.status == Status::Completed)
+      break;
+    if (result.status == Status::Pending)
+      f.AckLatest();
+    else {
+      RequireReady(result);
+      RequirePending(f.Jobs().Advance(*actor, request, f.content.Metadata(),
+                                      f.content.Scripts()));
+    }
+  }
+  const auto result = f.Jobs().Inspect(*actor, request);
+  REQUIRE(result.status == Status::Completed);
+  RequireInteraction(result);
+  REQUIRE(f.Gold() == 18);
+  REQUIRE(InteractionField(f.Owner(), "prefixes") == 1);
+  REQUIRE(InteractionField(f.Owner(), "suffixes") == 1);
+  const std::string original =
+    sourceKind == 2 ? "1a677:Skyrim.esm" : "14:Skyrim.esm";
+  REQUIRE(InteractionField(f.Owner(), "sourceid") ==
+          (sourceKind == 2 ? 0x1a677 : 0x14));
+  REQUIRE(InteractionField(f.Owner(), "lastsource") == original);
+  const auto saved = QuestJournal::JobState(f.Owner());
+  const auto* complete = saved.FindCompleted(request.sequence);
+  REQUIRE(complete);
+  REQUIRE(complete->actor == actor->GetChangeForm().formDesc.ToString());
+  REQUIRE(complete->interaction->source == original);
+  REQUIRE(complete->interaction->sourceReference ==
+          source->GetChangeForm().formDesc.ToString());
+  REQUIRE(complete->interaction->target == "6debb:Skyrim.esm");
+  REQUIRE(complete->interaction->targetReference ==
+          f.Target().GetChangeForm().formDesc.ToString());
+  if (guest) {
+    REQUIRE(guest->GetInventory().GetItemCount(0xf) == 100);
+    REQUIRE_THROWS(f.Jobs().Inspect(f.Owner(), request));
+  }
+  if (npc)
+    REQUIRE(npc->GetInventory().GetItemCount(0xf) == 7);
+  REQUIRE_FALSE(f.server.worldState.LookupFormByIdNoLoad(0x1a677));
+}
+
+TEST_CASE(
+  "Interaction handler child waits recover through SQLite without replay",
+  "[Quest][QuestJobs][Interactions][ChildStages][SQLite]")
+{
+  SqliteFiles files;
+  InteractionProgram content(true, true, true);
+  RequestId stage, event;
+  std::string childToken;
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    Initialize(server);
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    content.Enable(owner);
+    auto& target = BindInteractionTarget(server, owner);
+    QuestScriptRuntime::ExecuteReferenceLoad(owner, kInteractionOriginal,
+                                             content.Scripts());
+    auto& jobs = server.worldState.GetQuestJobs();
+    jobs.SetClock([] { return QuestJobTime{ 1000000, 5000 }; });
+    stage = jobs.NextRequest(owner);
+    jobs.Submit(owner, stage, kParentQuest, 10, content.Metadata(),
+                content.Scripts());
+    RequireSleeping(DrainStored(server, owner, stage, content.Metadata(),
+                                content.Scripts()));
+    event = jobs.NextRequest(owner);
+    jobs.SubmitEvent(owner, event, target, "OnActivate", owner,
+                     content.Metadata(), content.Scripts());
+    const auto waiting =
+      DrainStored(server, owner, event, content.Metadata(), content.Scripts());
+    RequireSleeping(waiting);
+    RequireInteraction(waiting);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 15);
+    REQUIRE(InteractionField(owner, "prefixes") == 1);
+    REQUIRE(InteractionOrder(owner) == 0);
+  }
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    auto& jobs = server.worldState.GetQuestJobs();
+    auto time = std::make_shared<QuestJobTime>(QuestJobTime{ 1001000, 100 });
+    jobs.SetClock([time] { return *time; });
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    RequireReady(jobs.Inspect(owner, stage));
+    RequireSleeping(jobs.Inspect(owner, event));
+    jobs.Advance(owner, stage, content.Metadata(), content.Scripts());
+    REQUIRE(
+      DrainStored(server, owner, stage, content.Metadata(), content.Scripts())
+        .status == Status::Completed);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 31);
+    REQUIRE(InteractionOrder(owner) == 36);
+    time->steadyMs += 1000;
+    jobs.Advance(owner, event, content.Metadata(), content.Scripts());
+    RequireReady(WaitForDurable(server, owner, event));
+    const auto state = QuestJournal::JobState(owner);
+    const auto* job = state.FindLive(event.sequence);
+    REQUIRE(job);
+    REQUIRE(job->children.size() == 1);
+    REQUIRE(job->children.back().cursor == "begin");
+    REQUIRE(job->handler->cursor == "waiting");
+    REQUIRE(job->handler->handlerIdentity->state == "busy");
+    REQUIRE_FALSE(job->interactionDone);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 31);
+  }
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    auto& jobs = server.worldState.GetQuestJobs();
+    jobs.SetClock([] { return QuestJobTime{ 1002000, 100 }; });
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    RequireReady(jobs.Inspect(owner, event));
+    jobs.Advance(owner, event, content.Metadata(), content.Scripts());
+    RequireSleeping(WaitForDurable(server, owner, event));
+    const auto state = QuestJournal::JobState(owner);
+    const auto* job = state.FindLive(event.sequence);
+    REQUIRE(job->children.back().cursor == "waiting");
+    childToken = job->children.back().token;
+    REQUIRE(QuestJournal::ScriptState(owner).at("continuations").size() == 2);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 35);
+    REQUIRE(InteractionOrder(owner) == 36);
+  }
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    auto& jobs = server.worldState.GetQuestJobs();
+    jobs.SetClock([] { return QuestJobTime{ 1004000, 100 }; });
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    REQUIRE_THROWS(jobs.Resume(owner, event, childToken, true,
+                               content.Metadata(), content.Scripts()));
+    jobs.Advance(owner, event, content.Metadata(), content.Scripts());
+    RequireReady(WaitForDurable(server, owner, event));
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 41);
+    REQUIRE(InteractionField(owner, "suffixes") == 0);
+    REQUIRE(InteractionOrder(owner) == 36);
+    jobs.Advance(owner, event, content.Metadata(), content.Scripts());
+    RequireReady(WaitForDurable(server, owner, event));
+    const auto state = QuestJournal::JobState(owner);
+    REQUIRE(state.FindLive(event.sequence)->handler->cursor == "done");
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 46);
+    REQUIRE(InteractionField(owner, "prefixes") == 1);
+    REQUIRE(InteractionField(owner, "suffixes") == 1);
+    REQUIRE(InteractionOrder(owner) == 36);
+  }
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    auto& jobs = server.worldState.GetQuestJobs();
+    const auto complete =
+      DrainStored(server, owner, event, content.Metadata(), content.Scripts());
+    REQUIRE(complete.status == Status::Completed);
+    RequireInteraction(complete);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 46);
+    REQUIRE(InteractionOrder(owner) == 363465);
+    REQUIRE(InteractionField(owner, "prefixes") == 1);
+    REQUIRE(InteractionField(owner, "suffixes") == 1);
+    const auto state = QuestJournal::JobState(owner);
+    const auto* saved = state.FindCompleted(event.sequence);
+    REQUIRE(saved->interactionDone);
+    REQUIRE(saved->events.size() == 4);
+    REQUIRE(saved->eventHead == saved->events.size());
+    REQUIRE(saved->completions.size() == 3);
+    REQUIRE(QuestJournal::ScriptState(owner).at("continuations").empty());
+    auto& target =
+      server.worldState.GetFormAt<MpObjectReference>(kInteractionCopy);
+    REQUIRE(jobs
+              .SubmitEvent(owner, event, target, "OnActivate", owner,
+                           content.Metadata(), content.Scripts())
+              .status == Status::Completed);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 46);
+  }
+}
+
+TEST_CASE(
+  "Interaction admission rejects unavailable context before publication",
+  "[Quest][QuestJobs][Interactions][Rollback]")
+{
+  InteractionFixture f(false, false, false, false);
+  const auto request = f.Jobs().NextRequest(f.Owner());
+  const auto before = QuestJournal::JobState(f.Owner()).Save();
+  REQUIRE_THROWS(f.SubmitInteraction(request));
+  REQUIRE_FALSE(
+    QuestJournal::ReferenceInitialized(f.Owner(), kInteractionOriginal));
+  REQUIRE(QuestJournal::JobState(f.Owner()).Save() == before);
+  REQUIRE(f.Gold() == 10);
+  QuestScriptRuntime::ExecuteReferenceLoad(f.Owner(), kInteractionOriginal,
+                                           f.content.Scripts());
+  const auto initialized = QuestJournal::ScriptState(f.Owner());
+  REQUIRE_THROWS(
+    f.SubmitInteraction(request, f.Owner(), f.Owner(), "OnDeath"));
+  REQUIRE_THROWS(f.Jobs().SubmitEvent(
+    f.Owner(), request, f.Owner(), "OnActivate", f.Owner(),
+    f.content.Metadata(), f.content.Scripts()));
+  f.server.CreateActor(kOwner + 1, { 1, 2, 3 }, 0, 0x3c);
+  auto& stranger = f.server.worldState.GetFormAt<MpActor>(kOwner + 1);
+  stranger.SetWorldInstance("campaign:" + std::to_string(kOwner + 1) +
+                            ":other");
+  REQUIRE_THROWS(f.SubmitInteraction(request, f.Owner(), stranger));
+  stranger.SetWorldInstance(f.Owner().GetWorldInstance());
+  REQUIRE_THROWS(f.SubmitInteraction(request, f.Owner(), stranger));
+  const auto phase = f.Target().GetWorldInstance();
+  f.Target().SetWorldInstance("campaign:" + std::to_string(kOwner) + ":other");
+  REQUIRE_THROWS(f.SubmitInteraction(request));
+  f.Target().SetWorldInstance(phase);
+  REQUIRE(QuestJournal::JobState(f.Owner()).Save() == before);
+  REQUIRE(QuestJournal::ScriptState(f.Owner()) == initialized);
+  REQUIRE(f.Gold() == 10);
+  RequirePending(f.SubmitInteraction(request));
+  f.AckLatest();
+  const auto checkpoint = QuestJournal::JobState(f.Owner()).Save();
+  const auto heap = QuestJournal::ScriptState(f.Owner());
+  f.Target().SetWorldInstance("campaign:" + std::to_string(kOwner) + ":other");
+  REQUIRE_THROWS(f.Advance(request));
+  REQUIRE(QuestJournal::JobState(f.Owner()).Save() == checkpoint);
+  REQUIRE(QuestJournal::ScriptState(f.Owner()) == heap);
+  f.Target().SetWorldInstance(phase);
+  const auto retained =
+    f.server.worldState.LookupFormByIdNoLoad(kInteractionCopy);
+  REQUIRE(retained);
+  f.server.worldState.DestroyForm(kInteractionCopy);
+  REQUIRE_THROWS(f.Advance(request));
+  REQUIRE_THROWS(f.Jobs().SubmitEvent(
+    f.Owner(), request, *retained->AsObjectReference(), "OnActivate",
+    f.Owner(), f.content.Metadata(), f.content.Scripts()));
+  REQUIRE(QuestJournal::JobState(f.Owner()).Save() == checkpoint);
+  REQUIRE(QuestJournal::ScriptState(f.Owner()) == heap);
+  REQUIRE(f.Gold() == 10);
+}
+
+TEST_CASE(
+  "Recovered interaction physical identities and templates remain pinned",
+  "[Quest][QuestJobs][Interactions][Rollback]")
+{
+  const auto corruption = GENERATE(0, 1, 2);
+  InteractionFixture f(false, false);
+  const auto request = f.Jobs().NextRequest(f.Owner());
+  f.SubmitInteraction(request);
+  f.AckLatest();
+  auto ownerSave = f.Owner().GetChangeForm();
+  const auto targetSave = f.Target().GetChangeForm();
+  auto journal =
+    Json::parse(ownerSave.dynamicFields.GetValueDump(QuestJournal::kProperty));
+  auto state = QuestJobState::Read(journal.at("jobs"));
+  auto* job = state.FindLive(request.sequence);
+  REQUIRE(job);
+  if (corruption == 0)
+    job->interaction->targetReference =
+      f.Owner().GetChangeForm().formDesc.ToString();
+  else if (corruption == 1)
+    job->interaction->targetTemplates.push_back("13bbd:Skyrim.esm");
+  else
+    job->interaction->sourceReference =
+      f.Target().GetChangeForm().formDesc.ToString();
+  journal["jobs"] = state.Save();
+  ownerSave.dynamicFields.SetValueDump(QuestJournal::kProperty,
+                                       journal.dump());
+  PartOne restarted;
+  restarted.AttachEspm(&GetEspmLoader());
+  auto storage = std::make_shared<ControlledStorage>();
+  restarted.AttachSaveStorage(storage);
+  // Match ordinary SQLite recovery order. Restoring a trigger first would
+  // cause owner positioning to enter the separate synchronous trigger path.
+  restarted.worldState.LoadChangeForm(ownerSave, FormCallbacks::DoNothing());
+  restarted.worldState.LoadChangeForm(targetSave, FormCallbacks::DoNothing());
+  auto& owner = restarted.worldState.GetFormAt<MpActor>(kOwner);
+  auto& jobs = restarted.worldState.GetQuestJobs();
+  const auto before = QuestJournal::JobState(owner).Save();
+  const auto heap = QuestJournal::ScriptState(owner);
+  REQUIRE_THROWS(
+    jobs.Advance(owner, request, f.content.Metadata(), f.content.Scripts()));
+  REQUIRE(QuestJournal::JobState(owner).Save() == before);
+  REQUIRE(QuestJournal::ScriptState(owner) == heap);
+  REQUIRE(owner.GetInventory().GetItemCount(0xf) == 10);
+  REQUIRE(storage->submissions.empty());
+}
+
+TEST_CASE("Retired interaction requests retain opaque terminal identity",
+          "[Quest][QuestJobs][Interactions][Retention]")
+{
+  InteractionFixture f(false, false);
+  const auto first = f.Jobs().NextRequest(f.Owner());
+  f.SubmitInteraction(first);
+  const auto complete = f.DrainInteraction(first);
+  REQUIRE(complete.status == Status::Completed);
+  RequireInteraction(complete);
+  REQUIRE(f.Gold() == 18);
+  // A legacy command with identical diagnostic text is a distinct request.
+  const auto sameName = RequestName(first);
+  f.Jobs().SubmitEvent(f.Owner(), sameName, f.Target(), "OnActivate",
+                       f.Owner(), f.content.Metadata(), f.content.Scripts());
+  const auto legacy =
+    Drain(f, sameName, f.content.Metadata(), f.content.Scripts());
+  REQUIRE(legacy.status == Status::Completed);
+  RequireInteraction(legacy);
+  for (size_t index = 0; index < 32; ++index) {
+    const auto next = f.Jobs().NextRequest(f.Owner());
+    f.SubmitInteraction(next);
+    REQUIRE(f.DrainInteraction(next).status == Status::Completed);
+    f.storage->submissions.clear();
+  }
+  const auto before = QuestJournal::JobState(f.Owner()).Save();
+  const auto retired = f.Inspect(first);
+  RequireRetired(retired);
+  REQUIRE(retired.kind == QuestJobRunner::ResultKind::Unknown);
+  RequireRetired(f.SubmitInteraction(first, f.Owner(), f.Owner(), "OnDeath"));
+  RequireRetired(f.SubmitStage(first));
+  REQUIRE(f.Jobs().Inspect(f.Owner(), sameName).status == Status::Completed);
+  REQUIRE(QuestJournal::JobState(f.Owner()).Save() == before);
+  REQUIRE(f.Gold() == 18);
+  REQUIRE(InteractionField(f.Owner(), "prefixes") == 1);
+  REQUIRE(InteractionField(f.Owner(), "suffixes") == 1);
 }

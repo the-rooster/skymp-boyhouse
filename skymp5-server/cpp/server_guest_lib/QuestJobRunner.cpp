@@ -570,51 +570,57 @@ QuestJobRunner::Result QuestJobRunner::Inspect(MpActor& actor,
   if (!job)
     throw std::invalid_argument("Unknown quest job command");
   RequireContext(actor, *job);
-  const auto& owner = QuestJournal::Owner(actor);
-  if (const auto found = barriers.find(owner.GetFormId());
-      found != barriers.end()) {
-    const auto& barrier = found->second;
-    if (barrier.owner.lock().get() != &owner)
-      throw std::runtime_error("Quest job owner was replaced");
-    if (barrier.job == job->id && barrier.generation == job->generation &&
-        (barrier.busy ||
-         (barrier.receipt &&
-          barrier.receipt->GetState() == SaveReceipt::State::Pending)))
-      return { Status::Pending, job->id };
-    if (barrier.job == job->id && barrier.generation == job->generation &&
-        barrier.receipt &&
-        barrier.receipt->GetState() == SaveReceipt::State::Abandoned)
-      return {
-        Status::Failed, job->id, false, {}, {}, "Quest save was abandoned"
-      };
-  }
-  const auto& current = job->Current();
-  if (const auto campaign = scheduled.find(owner.GetFormId());
-      campaign != scheduled.end()) {
-    const auto scheduledJob = campaign->second.jobs.find(job->id);
-    if (scheduledJob != campaign->second.jobs.end() &&
-        scheduledJob->second.generation == job->generation &&
-        scheduledJob->second.quarantined)
-      return { Status::Failed,
-               job->id,
-               false,
-               {},
-               {},
-               scheduledJob->second.error.empty()
-                 ? "Quest scheduler quarantined this job"
-                 : scheduledJob->second.error };
-  }
-  if (!current.failure.empty())
-    return { Status::Failed, job->id, false, {}, {}, current.failure };
-  if (job->IsComplete())
-    return { Status::Completed, job->id, job->accepted };
-  if (current.cursor == "waiting" && current.awaitKind == "timer")
-    return { TimerReady(actor, *job) ? Status::Ready : Status::Sleeping,
-             job->id };
-  if (current.cursor == "waiting" && !current.child)
-    return { Status::Waiting, job->id, job->accepted, current.token,
-             current.awaitKey };
-  return { Status::Ready, job->id };
+  auto result = [&]() -> Result {
+    const auto& owner = QuestJournal::Owner(actor);
+    if (const auto found = barriers.find(owner.GetFormId());
+        found != barriers.end()) {
+      const auto& barrier = found->second;
+      if (barrier.owner.lock().get() != &owner)
+        throw std::runtime_error("Quest job owner was replaced");
+      if (barrier.job == job->id && barrier.generation == job->generation &&
+          (barrier.busy ||
+           (barrier.receipt &&
+            barrier.receipt->GetState() == SaveReceipt::State::Pending)))
+        return { Status::Pending, job->id };
+      if (barrier.job == job->id && barrier.generation == job->generation &&
+          barrier.receipt &&
+          barrier.receipt->GetState() == SaveReceipt::State::Abandoned)
+        return {
+          Status::Failed, job->id, false, {}, {}, "Quest save was abandoned"
+        };
+    }
+    const auto& current = job->Current();
+    if (const auto campaign = scheduled.find(owner.GetFormId());
+        campaign != scheduled.end()) {
+      const auto scheduledJob = campaign->second.jobs.find(job->id);
+      if (scheduledJob != campaign->second.jobs.end() &&
+          scheduledJob->second.generation == job->generation &&
+          scheduledJob->second.quarantined)
+        return { Status::Failed,
+                 job->id,
+                 false,
+                 {},
+                 {},
+                 scheduledJob->second.error.empty()
+                   ? "Quest scheduler quarantined this job"
+                   : scheduledJob->second.error };
+    }
+    if (!current.failure.empty())
+      return { Status::Failed, job->id, false, {}, {}, current.failure };
+    if (job->IsComplete())
+      return { Status::Completed, job->id, job->accepted };
+    if (current.cursor == "waiting" && current.awaitKind == "timer")
+      return { TimerReady(actor, *job) ? Status::Ready : Status::Sleeping,
+               job->id };
+    if (current.cursor == "waiting" && !current.child)
+      return { Status::Waiting, job->id, job->accepted, current.token,
+               current.awaitKey };
+    return { Status::Ready, job->id };
+  }();
+  result.kind = job->kind == QuestJobState::Kind::Interaction
+    ? ResultKind::Interaction
+    : ResultKind::Stage;
+  return result;
 }
 
 QuestJobRunner::Result QuestJobRunner::Submit(MpActor& actor,
@@ -656,6 +662,60 @@ QuestJobRunner::Result QuestJobRunner::SubmitWithContent(
   const MetadataOverrides& overrides, const std::string& hashManifest,
   bool fixtureAwait, bool automatic)
 {
+  QuestJobState::Job job;
+  job.quest = FormDesc::FromFormId(quest, world.espmFiles).ToString();
+  job.stage = stage;
+  job.contentHash = QuestJobContent::Hash(
+    world, quest, Metadata(world, quest, overrides), hashManifest);
+  return AdmitWithContent(actor, command, std::move(job), sources, overrides,
+                          hashManifest, fixtureAwait, automatic);
+}
+
+QuestJobRunner::Result QuestJobRunner::SubmitEvent(MpActor& actor,
+                                                   const Request& command,
+                                                   MpObjectReference& target,
+                                                   const std::string& name,
+                                                   MpObjectReference& source)
+{
+  if (const auto retired = Retired(actor, command))
+    return *retired;
+  QuestJobState::Job job;
+  job.kind = QuestJobState::Kind::Interaction;
+  job.cursor = "done";
+  job.interactionDone = false;
+  job.interaction =
+    QuestScriptRuntime::CaptureInteraction(actor, target, name, source);
+  const auto& pinned = Scripts();
+  return AdmitWithContent(actor, command, std::move(job), pinned, {}, manifest,
+                          false, true);
+}
+
+QuestJobRunner::Result QuestJobRunner::SubmitEvent(
+  MpActor& actor, const Request& command, MpObjectReference& target,
+  const std::string& name, MpObjectReference& source,
+  const MetadataOverrides& overrides,
+  const std::vector<PexScript::Lazy>& sources, bool automatic)
+{
+  if (const auto retired = Retired(actor, command))
+    return *retired;
+  QuestJobState::Job job;
+  job.kind = QuestJobState::Kind::Interaction;
+  job.cursor = "done";
+  job.interactionDone = false;
+  job.interaction =
+    QuestScriptRuntime::CaptureInteraction(actor, target, name, source);
+  const auto hashManifest = QuestJobContent::WithMetadataOverrides(
+    world, QuestJobContent::ScriptManifest(sources), overrides);
+  return AdmitWithContent(actor, command, std::move(job), sources, overrides,
+                          hashManifest, true, automatic);
+}
+
+QuestJobRunner::Result QuestJobRunner::AdmitWithContent(
+  MpActor& actor, const Request& command, QuestJobState::Job job,
+  const std::vector<PexScript::Lazy>& sources,
+  const MetadataOverrides& overrides, const std::string& hashManifest,
+  bool fixtureAwait, bool automatic)
+{
   if (command.command.empty() || command.command.size() > 128 ||
       command.command.find('\0') != std::string::npos || stopped ||
       actor.GetParent() != &world)
@@ -673,15 +733,12 @@ QuestJobRunner::Result QuestJobRunner::SubmitWithContent(
   auto& owner = QuestJournal::Owner(actor);
   auto jobs = QuestJournal::JobState(actor);
   RequireRequest(actor, command, jobs);
-  const auto questKey =
-    FormDesc::FromFormId(quest, world.espmFiles).ToString();
-  const auto hash = QuestJobContent::Hash(
-    world, quest, Metadata(world, quest, overrides), hashManifest);
   if (const auto* prior = Find(jobs, command)) {
     RequireContext(actor, *prior);
     RequireMode(*prior, fixtureAwait);
-    if (prior->quest != questKey || prior->stage != stage ||
-        prior->contentHash != hash)
+    if (prior->kind != job.kind || prior->interaction != job.interaction ||
+        prior->quest != job.quest || prior->stage != job.stage ||
+        prior->contentHash != job.contentHash)
       throw std::runtime_error("Quest command was reused for different work");
     ValidateContent(*prior, overrides, hashManifest);
     return Inspect(actor, command);
@@ -692,7 +749,13 @@ QuestJobRunner::Result QuestJobRunner::SubmitWithContent(
                   [](const auto& job) { return !job.sequenced; }) +
     std::count_if(jobs.live.begin(), jobs.live.end(),
                   [](const auto& entry) { return !entry.second.sequenced; });
+  const auto stageCount =
+    std::count_if(jobs.live.begin(), jobs.live.end(), [](const auto& entry) {
+      return entry.second.kind == QuestJobState::Kind::Stage;
+    });
   if (jobs.live.size() >= QuestJobState::MaxLive ||
+      (job.kind == QuestJobState::Kind::Stage &&
+       stageCount >= QuestJobState::MaxStageLive) ||
       (!command.sequence && legacyCount >= QuestJobState::MaxCompleted) ||
       jobs.nextJob >= MaxIdentity)
     throw std::runtime_error(
@@ -708,8 +771,9 @@ QuestJobRunner::Result QuestJobRunner::SubmitWithContent(
         "Concurrent quest jobs require one pinned environment");
   auto retiredIds =
     command.sequence ? jobs.RetireForAdmission() : std::vector<uint64_t>{};
-  QuestJournal::RequireAdapter(actor, quest);
-  QuestJobState::Job job;
+  if (job.kind == QuestJobState::Kind::Stage)
+    QuestJournal::RequireAdapter(
+      actor, FormDesc::FromString(job.quest).ToFormId(world.espmFiles));
   job.id = jobs.nextJob++;
   job.generation = jobs.generation;
   job.command = command.command;
@@ -721,10 +785,7 @@ QuestJobRunner::Result QuestJobRunner::SubmitWithContent(
     FormDesc::FromFormId(actor.GetFormId(), world.espmFiles).ToString();
   job.owner =
     FormDesc::FromFormId(owner.GetFormId(), world.espmFiles).ToString();
-  job.quest = questKey;
   job.instance = actor.GetWorldInstance();
-  job.contentHash = hash;
-  job.stage = stage;
   RequireContext(actor, job);
   const auto jobId = job.id;
   jobs.live.emplace(jobId, std::move(job));
@@ -749,7 +810,8 @@ void QuestJobRunner::ValidateContent(const QuestJobState::Job& job,
                               hashManifest))
       throw std::runtime_error("Quest job content changed");
   };
-  check(job);
+  if (job.kind == QuestJobState::Kind::Stage)
+    check(job);
   for (const auto& child : job.children)
     check(child);
 }
@@ -777,6 +839,9 @@ QuestJobRunner::Result QuestJobRunner::Resume(
   const auto* job = Find(jobs, command);
   if (!job)
     throw std::invalid_argument("Unknown quest job command");
+  if (job->kind != QuestJobState::Kind::Stage)
+    throw std::invalid_argument(
+      "Interaction jobs require a complete metadata override map");
   const auto quest =
     FormDesc::FromString(job->quest).ToFormId(world.espmFiles);
   return Resume(actor, command, token, completion,
@@ -921,7 +986,8 @@ QuestJobRunner::Result QuestJobRunner::RunSegment(
         QuestJournal::RequireAdapter(
           actor, FormDesc::FromString(stage.quest).ToFormId(world.espmFiles));
       };
-      requireAdapter(job);
+      if (job.kind == QuestJobState::Kind::Stage)
+        requireAdapter(job);
       for (const auto& child : job.children)
         requireAdapter(child);
       if (submit)
@@ -936,13 +1002,16 @@ QuestJobRunner::Result QuestJobRunner::RunSegment(
         parent.child = 0;
         completion = child.accepted;
       }
-      const auto quest =
-        FormDesc::FromString(job.Current().quest).ToFormId(world.espmFiles);
-      QuestJournal::RequireAdapter(actor, quest);
+      espm::QuestScriptData metadata;
+      if (!job.Current().quest.empty()) {
+        const auto quest =
+          FormDesc::FromString(job.Current().quest).ToFormId(world.espmFiles);
+        QuestJournal::RequireAdapter(actor, quest);
+        metadata = Metadata(world, quest, overrides);
+      }
       QuestScriptRuntime::ExecuteJobSegment(
-        actor, job, Metadata(world, quest, overrides), sources, completion,
-        fixtureAwait, overrides, hashManifest, [this] { return Now(); },
-        &timerAnchor);
+        actor, job, metadata, sources, completion, fixtureAwait, overrides,
+        hashManifest, [this] { return Now(); }, &timerAnchor);
       ++job.segment;
       if (job.IsComplete()) {
         const auto where = std::lower_bound(

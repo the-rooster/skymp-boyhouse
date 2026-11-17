@@ -148,7 +148,7 @@ another segment executes. Master files must not change while loaded. Changed con
 not migrated. The initial full script parse/hash is not yet a performance-tested
 startup path.
 
-Up to 16 stage roots can remain live in one campaign, each with its own
+Up to 20 roots (at most 16 stages) can remain live in one campaign, each with its own
 continuation and timer. Exactly one transaction executes at a time, and every
 mutating admission or segment waits for the owner's latest save receipt.
 Ordinary quest mutation and private-reference allocation cannot overwrite live
@@ -790,7 +790,7 @@ the result is retained. The sequence is the campaign's global job ID, including
 IDs consumed by older string-keyed commands. Keep the typed ID across retries;
 its diagnostic command spelling is not an interchangeable legacy key.
 
-Schema6 migrates schemas1-5 without changing command identities, scopes or
+Schema7 migrates schemas1-6 without changing command identities, scopes or
 continuations. Completed string-keyed commands remain permanent; live plus
 completed legacy commands retain the 256-command cap. Numbered live roots reserve
 a recent-result slot: at most 32 numbered live roots and full completed records
@@ -841,18 +841,50 @@ overlapping another entered live stage remains refused.
 Per-root timer anchors and quarantine are separate from the campaign-wide write
 barrier. Inspect can report an older root's durable status while another save is
 Pending, but Advance/Resume cannot execute through that pending owner barrier.
-Round-robin scheduling considers up to 64 owners, scans at most 16 roots per
+Round-robin scheduling considers up to 64 owners, scans at most 20 roots per
 owner and attempts at most eight segments, one per owner per pass. These are
 work-count limits, not measured production latency guarantees.
 
-This batch supports concurrent trusted stage submissions. It does not yet admit
-independent reference/interaction event roots or connect client actions to durable
-delivery. Existing scripted inventory notifications still drain after their
-producer body completes. A body waiting on its own queued OnItemAdded, or a
-handler waiting on a later event in its own FIFO, remains unsupported. Independent
-event roots, causal outbox release with shared lineage budgets, load/OnInit
-generations, quest lifecycle and client integration remain required. No complete
-quest is certified playable.
+## Independent interaction execution
+
+Trusted host code can submit OnActivate, OnTriggerEnter, OnTriggerLeave,
+OnTrigger and SkympOnActivateClose through SubmitEvent. An interaction is a
+separate durable root, so its handler can update shared campaign variables
+while a stage is sleeping. It has no fabricated quest/stage anchor or accepted
+stage result. Result.kind distinguishes Stage and Interaction; retired identities
+have Unknown kind because their detailed payload was erased.
+
+Admission captures the canonical target/source, physical references and template
+chains before loading scripts. Every segment validates the saved routing,
+campaign ownership, phase, initialization and physical/template identity. Player
+sources must be the initiating actor and map to the campaign owner's PlayerRef
+inside scripts. A guest's actual inventory is not treated as the host inventory.
+NPC sources must be bound to the same campaign and submitted by its owner.
+These are persistent identity pins, not incarnation nonces: reloading an
+identical saved reference between segments is valid recovery. Transaction read
+guards retain the native lifetime and reject replacement during execution.
+
+The primary interaction uses the saved recipient/attachment/selected-handler
+dispatcher. Inherited and current-state handlers retain their exact selected
+implementation across waits, native child stages and recovery. Finishing the
+primary handler marks the interaction complete before draining its scripted
+inventory FIFO. Admission and every subsequent segment use the same exact-save
+receipt barrier as stage roots. Reusing a retained request for a different kind
+or payload is rejected. Schemas1-6 migrate to Stage roots unchanged.
+
+The 20-root total limit and 16-stage limit reserve four positions against stage
+saturation. They do not guarantee unlimited event throughput: interaction-only
+saturation still applies backpressure. All roots share the bounded environment,
+heap and campaign journal, and retain their own aggregate work budgets.
+
+This is a trusted server API. ClientActivateMessage/default activation and
+trigger packet paths are not yet wired to durable admission or stable retry
+identities. Default physical effects and player inventory transfers still need
+atomic integration. Scripted inventory notifications drain after their producer
+body: a handler waiting on its own queued notification remains unsupported.
+Causal outbox release with lineage budgets, reference-load/OnInit generations,
+quest lifecycle and client integration remain required. No complete quest is
+certified playable.
 
 ## Verification commands
 
@@ -1002,3 +1034,15 @@ Migration retains the original schema5 byte boundary. Runtime/storage fixtures
 do not certify full quests or establish production latency. Independent player
 event ingress and causal notification release still need implementation. Skyrim
 was not launched; the installed client and staging deployment were unchanged.
+
+The independent-interaction-roots batch passed the Linux server build and full
+verification on 2026-11-17 UTC: 786 native cases / 483,925 assertions,
+368 JavaScript tests, 47 Python tests, addon and both protocol
+smokes, and SQLite recovery of 32 characters. Its 137 focused cases
+(31,312 assertions) cover independent stage and interaction
+continuations, exact save barriers, shared campaign state, handler/child recovery,
+typed request conflicts, physical routing guards and schema migration.
+These generated script/runtime fixtures do not certify full quests or establish
+production latency. Actual player action admission, atomic default effects,
+causal inventory outbox release and lifecycle integration remain unfinished.
+Skyrim was not launched; the installed client and staging were unchanged.

@@ -13,6 +13,14 @@ class QuestScriptRuntime
 {
 public:
   static std::vector<PexScript::Lazy> LoadScripts(WorldState& world);
+  // Capture only registered, already-materialized private references. These
+  // helpers do not create copies or submit work. Validation inside AtomicJob
+  // also tracks target/NPC source reads; player source remains the initiator.
+  static QuestJobState::Interaction CaptureInteraction(
+    MpActor& actor, MpObjectReference& target, const std::string& name,
+    MpObjectReference& source);
+  static void ValidateInteraction(MpActor& actor,
+                                  const QuestJobState::Interaction& event);
   // Called within the selected root's AtomicJob lease. Other live roots share
   // the current campaign heap but retain their own saved stacks and budgets.
   // The caller persists the updated job alongside the heap. It never

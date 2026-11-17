@@ -98,8 +98,10 @@ Json Heap(const QuestJobState::Job& job,
     { "state", identity ? identity->state : "" },
     { "function", stage.function },
     { "contentHashes",
-      Json::array(
-        { { { "script", stage.script }, { "hash", stage.contentHash } } }) },
+      Json::array({ { { "script", stage.script },
+                      { "hash",
+                        stage.contentHash.empty() ? std::string(64, 'a')
+                                                  : stage.contentHash } } }) },
     { "resultType", stage.awaitKind == "timer" ? "None" : "Bool" },
     { "instruction", 1 },
     { "executedInstructions", instructions ? instructions : job.instructions },
@@ -179,14 +181,21 @@ Json Legacy(const QuestJobState& state, uint64_t version = 1)
 {
   auto saved = state.Save();
   saved["schemaVersion"] = version;
-  REQUIRE(saved["live"].size() <= 1);
-  saved["active"] = saved["live"].empty() ? Json(nullptr) : saved["live"][0];
-  saved.erase("live");
-  saved.erase("retiredRanges");
+  if (version < 6) {
+    REQUIRE(saved["live"].size() <= 1);
+    saved["active"] = saved["live"].empty() ? Json(nullptr) : saved["live"][0];
+    saved.erase("live");
+    saved.erase("retiredRanges");
+  }
   if (version < 5)
     saved.erase("retiredThrough");
   auto strip = [version](Json& job) {
-    job.erase("environmentHash");
+    REQUIRE(job["kind"] == "stage");
+    job.erase("kind");
+    job.erase("interaction");
+    job.erase("interactionDone");
+    if (version < 6)
+      job.erase("environmentHash");
     if (version < 5)
       job.erase("sequenced");
     if (version < 4) {
@@ -215,8 +224,13 @@ Json Legacy(const QuestJobState& state, uint64_t version = 1)
            { "node", "child", "children", "nextOperation" })
         job.erase(field);
   };
-  if (!saved["active"].is_null())
-    strip(saved["active"]);
+  if (version < 6) {
+    if (!saved["active"].is_null())
+      strip(saved["active"]);
+  } else {
+    for (auto& job : saved["live"])
+      strip(job);
+  }
   for (auto& job : saved["completed"])
     strip(job);
   return saved;
@@ -227,14 +241,16 @@ QuestJobState MigratedLegacy(QuestJobState state, uint64_t version = 1)
   if (version < 5)
     state.retiredThrough = 0;
   for (auto& [id, job] : state.live) {
-    job.environmentHash.clear();
+    if (version < 6)
+      job.environmentHash.clear();
     if (version < 5)
       job.sequenced = false;
     if (version < 3)
       job.contentMode = "legacy";
   }
   for (auto& job : state.completed) {
-    job.environmentHash.clear();
+    if (version < 6)
+      job.environmentHash.clear();
     if (version < 5)
       job.sequenced = false;
     if (version < 3)
@@ -407,6 +423,66 @@ void AddPending(QuestJobState& state, bool sequenced)
   state.live.emplace(job.id, job);
 }
 
+QuestJobState InteractionBegin()
+{
+  auto state = Begin();
+  auto& job = *Single(state);
+  static_cast<QuestJobState::Stage&>(job) = QuestJobState::Stage{};
+  job.cursor = "done";
+  job.kind = QuestJobState::Kind::Interaction;
+  job.interactionDone = false;
+  job.environmentHash = std::string(64, 'e');
+  job.interaction = QuestJobState::Interaction{
+    "OnActivate", "10:Skyrim.esm",    "14:Skyrim.esm",   "3001",
+    "3000",       { "7:Skyrim.esm" }, { "8:Skyrim.esm" }
+  };
+  return state;
+}
+
+QuestJobState InteractionHandler(bool waiting = false, bool alias = false)
+{
+  auto state = InteractionBegin();
+  auto& job = *Single(state);
+  job.dispatch = QuestJobState::Dispatch{};
+  auto& dispatch = *job.dispatch;
+  dispatch.recipients = { job.interaction->target };
+  dispatch.captured = true;
+  dispatch.reference = job.interaction->targetReference;
+  dispatch.templates = job.interaction->targetTemplates;
+  dispatch.roots = { "ChildScript" };
+  if (alias) {
+    dispatch.recipients.push_back(Json{
+      { "kind", "alias" }, { "quest", "4e50d:Skyrim.esm" }, { "id", 1 } });
+    dispatch.recipient = 1;
+    dispatch.reference.clear();
+    dispatch.templates.clear();
+  }
+  QuestJobState::Stage handler;
+  handler.handlerIdentity =
+    QuestJobState::HandlerIdentity{ dispatch.recipients[dispatch.recipient],
+                                    "ChildScript",
+                                    "ParentScript",
+                                    "busy",
+                                    job.interaction->name,
+                                    job.nextHandler++ };
+  job.handler = handler;
+  job.segment = job.steps = job.instructions = 3;
+  if (waiting) {
+    auto& current = *job.handler;
+    current.cursor = "waiting";
+    current.accepted = true;
+    current.script = "ParentScript";
+    current.function = job.interaction->name;
+    current.awaitKind = "timer";
+    current.awaitKey = "Utility.Wait";
+    current.timer = QuestJobState::Timer{ 1700000000000, 1700000000100, 100 };
+    current.token = job.NextToken();
+    ++job.nextOperation;
+    HostStep(job, 2);
+  }
+  return state;
+}
+
 QuestJobState::Job Numbered(QuestJobState::Job job, uint64_t id,
                             bool sequenced = true)
 {
@@ -576,7 +652,7 @@ TEST_CASE("Quest jobs reject corrupt exact fields identities and cursor state",
   std::vector<std::function<void(Json&)>> corrupt = {
     [](Json& v) { v["unknown"] = 1; },
     [](Json& v) { v.erase("live"); },
-    [](Json& v) { v["schemaVersion"] = 7; },
+    [](Json& v) { v["schemaVersion"] = 8; },
     [](Json& v) { v["generation"] = 0; },
     [](Json& v) { v["nextJob"] = 1; },
     [](Json& v) { v["nextJob"] = UINT64_MAX; },
@@ -902,7 +978,7 @@ TEST_CASE(
     const auto legacy = Legacy(state);
     const auto migrated = QuestJobState::Read(legacy);
     REQUIRE(migrated.Save() == MigratedLegacy(state).Save());
-    REQUIRE(migrated.Save()["schemaVersion"] == 6);
+    REQUIRE(migrated.Save()["schemaVersion"] == 7);
   }
   auto external = Waiting();
   Single(external)->awaitKey = "quest-stage";
@@ -1276,7 +1352,7 @@ TEST_CASE("Timer jobs round trip UTC deadlines and typed None completions",
   for (const auto& value : { state, Done(state) })
     REQUIRE(QuestJobState::Read(value.Save()).Save() == value.Save());
   const auto saved = state.Save();
-  REQUIRE(saved["schemaVersion"] == 6);
+  REQUIRE(saved["schemaVersion"] == 7);
   REQUIRE(saved["live"][0]["timer"]["policy"] == "utc-deadline-v1");
   const auto done = Done(state);
   const auto& job = done.completed.front();
@@ -1874,7 +1950,7 @@ TEST_CASE(
     auto migrated = QuestJobState::Read(legacy);
     REQUIRE(migrated.Save() == original.Save());
     REQUIRE(migrated.retiredThrough == 0);
-    REQUIRE(migrated.Save()["schemaVersion"] == 6);
+    REQUIRE(migrated.Save()["schemaVersion"] == 7);
     if (Single(migrated)) {
       REQUIRE_FALSE(Single(migrated)->sequenced);
       REQUIRE(Single(migrated)->Scope() == Single(original)->Scope());
@@ -2306,7 +2382,7 @@ TEST_CASE(
   "[Quest][QuestJob]")
 {
   QuestJobState state;
-  for (uint64_t id = 1; id <= QuestJobState::MaxLive; ++id) {
+  for (uint64_t id = 1; id <= QuestJobState::MaxStageLive; ++id) {
     state.live.emplace(id, Numbered(*Single(Begin()), id));
     ++state.nextJob;
   }
@@ -2339,7 +2415,7 @@ TEST_CASE(
   REQUIRE_THROWS(wrongKey.Save());
   auto reserved = state;
   for (size_t index = 0;
-       index < QuestJobState::MaxRecentCompleted - QuestJobState::MaxLive;
+       index < QuestJobState::MaxRecentCompleted - QuestJobState::MaxStageLive;
        ++index)
     reserved.completed.push_back(CompletedRecord(reserved.nextJob++, true));
   REQUIRE_NOTHROW(reserved.Save());
@@ -2574,4 +2650,322 @@ TEST_CASE("Byte retirement preserves several live roots and returns only "
           std::vector<QuestJobState::RetiredRange>{ { 2, 2 } });
   REQUIRE(state.RetainedSequencedBytes() <= QuestJobState::MaxRecentBytes);
   REQUIRE_NOTHROW(state.ValidateHeap(AllLiveHeap(state)));
+}
+
+TEST_CASE("Schema six histories migrate as stages without changing stacks or "
+          "retirement",
+          "[Quest][QuestJob]")
+{
+  auto multiple = Waiting();
+  multiple.live.at(1).environmentHash = std::string(64, 'e');
+  multiple.live.emplace(2, Numbered(*Single(Nested(true)), 2));
+  multiple.nextJob = 5;
+  multiple.retiredRanges = { { 3, 4 } };
+  for (const auto& original : { Begin(), Waiting(), Done(Waiting()),
+                                SelectedHandler(true), multiple }) {
+    const auto migrated = QuestJobState::Read(Legacy(original, 6));
+    REQUIRE(migrated.Save() == original.Save());
+    REQUIRE(migrated.Save()["schemaVersion"] == 7);
+    for (const auto& [id, job] : migrated.live) {
+      REQUIRE(job.kind == QuestJobState::Kind::Stage);
+      REQUIRE_FALSE(job.interaction);
+      REQUIRE(job.interactionDone);
+    }
+    REQUIRE_NOTHROW(migrated.ValidateHeap(AllLiveHeap(migrated)));
+  }
+  auto old = Legacy(Waiting(), 6);
+  old["live"][0]["kind"] = "stage";
+  REQUIRE_THROWS(QuestJobState::Read(old));
+}
+
+TEST_CASE("Interaction roots carry real events and no synthetic quest stage",
+          "[Quest][QuestJob]")
+{
+  for (const auto* name : { "OnActivate", "OnTriggerEnter", "OnTriggerLeave",
+                            "OnTrigger", "SkympOnActivateClose" }) {
+    auto state = InteractionBegin();
+    auto& job = state.live.at(1);
+    job.interaction->name = name;
+    REQUIRE(job.IsPristine());
+    REQUIRE_FALSE(job.IsComplete());
+    REQUIRE(job.quest.empty());
+    REQUIRE(job.contentHash.empty());
+    REQUIRE(job.stage == 0);
+    REQUIRE(job.cursor == "done");
+    REQUIRE_FALSE(job.accepted);
+    const auto saved = state.Save();
+    REQUIRE(saved["live"][0]["kind"] == "interaction");
+    REQUIRE(QuestJobState::Read(saved).Save() == saved);
+    REQUIRE_NOTHROW(state.ValidateHeap(Json::object()));
+    job.interactionDone = true;
+    HostStep(job, 1);
+    REQUIRE(job.IsComplete());
+    REQUIRE_FALSE(job.IsPristine());
+    CompleteLive(state, 1);
+    REQUIRE(QuestJobState::Read(state.Save()).Save() == state.Save());
+  }
+  REQUIRE(Single(Begin())->IsPristine());
+  REQUIRE_FALSE(Single(Waiting())->IsPristine());
+  REQUIRE_FALSE(Single(BodyDone())->IsPristine());
+}
+
+TEST_CASE("Interaction payload codec rejects ambiguous identities provenance "
+          "and unsupported names",
+          "[Quest][QuestJob]")
+{
+  const auto original = InteractionBegin().Save();
+  const std::vector<std::function<void(Json&)>> corrupt = {
+    [](Json& v) { v["live"][0]["kind"] = "event"; },
+    [](Json& v) { v["live"][0]["kind"] = 1; },
+    [](Json& v) { v["live"][0]["interaction"] = nullptr; },
+    [](Json& v) { v["live"][0].erase("interactionDone"); },
+    [](Json& v) { v["live"][0]["interactionDone"] = 0; },
+    [](Json& v) { v["live"][0]["environmentHash"] = ""; },
+    [](Json& v) { v["live"][0]["contentMode"] = "legacy"; },
+    [](Json& v) { v["live"][0]["interaction"]["name"] = "onactivate"; },
+    [](Json& v) { v["live"][0]["interaction"]["name"] = "OnItemAdded"; },
+    [](Json& v) { v["live"][0]["interaction"]["name"] = ""; },
+    [](Json& v) { v["live"][0]["interaction"]["target"] = "3001"; },
+    [](Json& v) { v["live"][0]["interaction"]["target"] = "010:Skyrim.esm"; },
+    [](Json& v) { v["live"][0]["interaction"]["source"] = ""; },
+    [](Json& v) { v["live"][0]["interaction"]["source"] = "3000"; },
+    [](Json& v) { v["live"][0]["interaction"]["source"] = "0:Skyrim.esm"; },
+    [](Json& v) {
+      v["live"][0]["interaction"]["targetReference"] = "10:Skyrim.esm";
+    },
+    [](Json& v) { v["live"][0]["interaction"]["sourceReference"] = "03000"; },
+    [](Json& v) {
+      v["live"][0]["interaction"]["targetTemplates"] =
+        Json::array({ "7:Skyrim.esm", "7:Skyrim.esm" });
+    },
+    [](Json& v) {
+      v["live"][0]["interaction"]["sourceTemplates"] = Json::array({ "3000" });
+    },
+    [](Json& v) {
+      v["live"][0]["interaction"]["targetTemplates"] = Json::object();
+    },
+    [](Json& v) {
+      v["live"][0]["interaction"]["sourceTemplates"] =
+        std::vector<std::string>(129, "7:Skyrim.esm");
+    },
+    [](Json& v) { v["live"][0]["interaction"]["extra"] = true; },
+    [](Json& v) { v["live"][0]["interaction"].erase("sourceReference"); }
+  };
+  for (size_t index = 0; index < corrupt.size(); ++index) {
+    INFO("Interaction payload corruption " << index);
+    auto value = original;
+    corrupt[index](value);
+    REQUIRE_THROWS(QuestJobState::Read(value));
+  }
+  auto stage = Begin();
+  stage.live.at(1).interaction = InteractionBegin().live.at(1).interaction;
+  REQUIRE_THROWS(stage.Save());
+  stage = Begin();
+  stage.live.at(1).interactionDone = false;
+  REQUIRE_THROWS(stage.Save());
+  auto invalidKind = InteractionBegin();
+  invalidKind.live.at(1).kind = static_cast<QuestJobState::Kind>(99);
+  REQUIRE_THROWS(invalidKind.Save());
+  auto tooMany = InteractionBegin();
+  tooMany.live.at(1).interaction->targetTemplates.resize(129);
+  REQUIRE_THROWS(tooMany.Save());
+}
+
+TEST_CASE("Interaction inherited stage is inert and its initial host cursor "
+          "is pristine",
+          "[Quest][QuestJob]")
+{
+  const auto original = InteractionBegin().Save();
+  const std::vector<std::function<void(Json&)>> corrupt = {
+    [](Json& v) { v["live"][0]["quest"] = "4e50d:Skyrim.esm"; },
+    [](Json& v) { v["live"][0]["contentHash"] = std::string(64, 'a'); },
+    [](Json& v) { v["live"][0]["stage"] = 10; },
+    [](Json& v) { v["live"][0]["node"] = 1; },
+    [](Json& v) { v["live"][0]["child"] = 1; },
+    [](Json& v) { v["live"][0]["cursor"] = "begin"; },
+    [](Json& v) { v["live"][0]["accepted"] = true; },
+    [](Json& v) { v["live"][0]["log"] = 1; },
+    [](Json& v) { v["live"][0]["script"] = "QF_Test"; },
+    [](Json& v) { v["live"][0]["function"] = "Fragment_0"; },
+    [](Json& v) { v["live"][0]["token"] = "quest-job:1:1:1"; },
+    [](Json& v) { v["live"][0]["awaitKind"] = "bool"; },
+    [](Json& v) { v["live"][0]["awaitKey"] = "fixture"; },
+    [](Json& v) { v["live"][0]["failure"] = "failed"; },
+    [](Json& v) { v["live"][0]["instructions"] = 1; },
+    [](Json& v) { v["live"][0]["steps"] = 1; },
+    [](Json& v) { v["live"][0]["nextHandler"] = 2; },
+    [](Json& v) { v["live"][0]["interactionDone"] = true; },
+    [](Json& v) {
+      v["live"][0]["events"] = Waiting().Save()["live"][0]["events"];
+    }
+  };
+  for (size_t index = 0; index < corrupt.size(); ++index) {
+    INFO("Interaction root corruption " << index);
+    auto value = original;
+    corrupt[index](value);
+    REQUIRE_THROWS(QuestJobState::Read(value));
+  }
+  auto pending = InteractionBegin();
+  pending.live.at(1).dispatch = QuestJobState::Dispatch{};
+  pending.live.at(1).dispatch->recipients = {
+    pending.live.at(1).interaction->target
+  };
+  REQUIRE_FALSE(pending.live.at(1).IsPristine());
+  REQUIRE_THROWS(pending.Save());
+  HostStep(pending.live.at(1), 1);
+  REQUIRE_NOTHROW(pending.Save());
+  REQUIRE_FALSE(pending.live.at(1).IsComplete());
+}
+
+TEST_CASE("Interaction handlers own exact empty-anchor continuations for "
+          "references and aliases",
+          "[Quest][QuestJob]")
+{
+  for (bool alias : { false, true }) {
+    auto state = InteractionHandler(true, alias);
+    auto& job = state.live.at(1);
+    REQUIRE(job.handler->quest.empty());
+    REQUIRE(job.handler->contentHash.empty());
+    REQUIRE(job.handler->stage == 0);
+    REQUIRE(job.handler->handlerIdentity->function == "OnActivate");
+    REQUIRE(&job.Current() == &*job.handler);
+    REQUIRE(job.Scope(*job.handler) == "quest-job:1:1:handler:1");
+    REQUIRE(QuestJobState::Read(state.Save()).Save() == state.Save());
+    const auto heap = AllLiveHeap(state);
+    REQUIRE_NOTHROW(state.ValidateHeap(heap));
+    auto wrong = heap;
+    wrong["continuations"][job.handler->token]["function"] = "OnItemAdded";
+    REQUIRE_THROWS(state.ValidateHeap(wrong));
+    wrong = heap;
+    wrong["continuations"][job.handler->token]["resultType"] = "Bool";
+    REQUIRE_THROWS(state.ValidateHeap(wrong));
+    auto changed = state;
+    changed.live.at(1).handler->quest = "4e50d:Skyrim.esm";
+    REQUIRE_THROWS(changed.Save());
+    changed = state;
+    changed.live.at(1).handler->contentHash = std::string(64, 'a');
+    REQUIRE_THROWS(changed.Save());
+    changed = state;
+    changed.live.at(1).handler->stage = 1;
+    REQUIRE_THROWS(changed.Save());
+  }
+  auto ordinary = SelectedHandler();
+  ordinary.live.at(1).handler->quest.clear();
+  ordinary.live.at(1).handler->contentHash.clear();
+  ordinary.live.at(1).handler->stage = 0;
+  REQUIRE_THROWS(ordinary.Save());
+  auto captured = InteractionHandler();
+  auto original = captured.Save();
+  for (const auto* field : { "reference", "templates" }) {
+    auto corrupt = original;
+    corrupt["live"][0]["dispatch"][field] = std::string(field) == "reference"
+      ? Json("3002")
+      : Json::array({ "8:Skyrim.esm" });
+    REQUIRE_THROWS(QuestJobState::Read(corrupt));
+  }
+}
+
+TEST_CASE("Interaction handler native children remain real quest stages",
+          "[Quest][QuestJob]")
+{
+  auto state = InteractionHandler(true);
+  auto& job = state.live.at(1);
+  job.handler->awaitKind = "stage";
+  job.handler->awaitKey = "quest-stage";
+  job.handler->timer.reset();
+  job.handler->child = 1;
+  job.children.push_back(Single(Nested(true))->children.front());
+  job.nextOperation = 3;
+  job.instructions = 7;
+  HostStep(job);
+  REQUIRE(QuestJobState::Read(state.Save()).Save() == state.Save());
+  REQUIRE(job.Current().quest == "2aa57:Skyrim.esm");
+  REQUIRE_NOTHROW(state.ValidateHeap(AllLiveHeap(state)));
+  auto corrupt = state;
+  corrupt.live.at(1).children.back().quest.clear();
+  corrupt.live.at(1).children.back().contentHash.clear();
+  corrupt.live.at(1).children.back().stage = 0;
+  REQUIRE_THROWS(corrupt.Save());
+  FinishChild(job);
+  REQUIRE_NOTHROW(state.Save());
+  REQUIRE_NOTHROW(state.ValidateHeap(AllLiveHeap(state)));
+  REQUIRE_FALSE(job.IsComplete());
+}
+
+TEST_CASE("Interaction primary delivery precedes its generated inventory FIFO",
+          "[Quest][QuestJob]")
+{
+  auto state = InteractionHandler(true);
+  auto& job = state.live.at(1);
+  job.events.push_back({ "14:Skyrim.esm", "f:Skyrim.esm", "", 1, true });
+  REQUIRE_NOTHROW(state.Save());
+  auto corrupt = state;
+  corrupt.live.at(1).eventHead = 1;
+  REQUIRE_THROWS(corrupt.Save());
+  corrupt = state;
+  corrupt.live.at(1).interactionDone = true;
+  REQUIRE_THROWS(corrupt.Save());
+  job.completions[job.handler->token] = QuestJobState::Completion::None();
+  job.handler.reset();
+  job.dispatch.reset();
+  job.interactionDone = true;
+  HostStep(job);
+  REQUIRE_FALSE(job.IsComplete());
+  REQUIRE_NOTHROW(state.Save());
+  auto inventory = SelectedHandler();
+  job.dispatch = inventory.live.at(1).dispatch;
+  job.handler = inventory.live.at(1).handler;
+  job.handler->quest.clear();
+  job.handler->contentHash.clear();
+  job.handler->stage = 0;
+  job.handler->handlerIdentity->sequence = job.nextHandler++;
+  HostStep(job, 2);
+  REQUIRE(job.handler->handlerIdentity->function == "OnItemAdded");
+  REQUIRE_NOTHROW(state.Save());
+  job.handler.reset();
+  job.dispatch.reset();
+  job.eventHead = 1;
+  HostStep(job);
+  REQUIRE(job.IsComplete());
+  CompleteLive(state, 1);
+  REQUIRE(QuestJobState::Read(state.Save()).Save() == state.Save());
+}
+
+TEST_CASE(
+  "Interaction roots reserve admission capacity beyond sixteen stage roots",
+  "[Quest][QuestJob]")
+{
+  QuestJobState state;
+  for (uint64_t id = 1; id <= QuestJobState::MaxLive; ++id) {
+    const auto initial =
+      id <= QuestJobState::MaxStageLive ? Begin() : InteractionBegin();
+    state.live.emplace(id, Numbered(*Single(initial), state.nextJob++));
+  }
+  REQUIRE(state.live.size() == 20);
+  REQUIRE_NOTHROW(state.Save());
+  REQUIRE_NOTHROW(state.ValidateHeap(Json::object()));
+  auto tooManyStages = state;
+  tooManyStages.live.at(17) = Numbered(*Single(Begin()), 17);
+  REQUIRE_THROWS(tooManyStages.Save());
+  auto tooManyRoots = state;
+  const auto extra =
+    Numbered(*Single(InteractionBegin()), tooManyRoots.nextJob++);
+  tooManyRoots.live.emplace(extra.id, extra);
+  REQUIRE_THROWS(tooManyRoots.Save());
+  for (auto& [id, job] : state.live)
+    job = Numbered(*Single(InteractionBegin()), id);
+  REQUIRE_NOTHROW(state.Save()); // The reserved slots do not impose an
+                                 // interaction-only ceiling.
+  auto old = Legacy(Begin(), 6);
+  const auto oldJob = old["live"][0];
+  for (uint64_t id = 2; id <= 17; ++id) {
+    auto job = oldJob;
+    job["id"] = id;
+    job["command"] = "legacy-" + std::to_string(id);
+    job["environmentHash"] = std::string(64, 'e');
+    old["live"].push_back(job);
+  }
+  old["live"][0]["environmentHash"] = std::string(64, 'e');
+  old["nextJob"] = 18;
+  REQUIRE_THROWS(QuestJobState::Read(old));
 }
