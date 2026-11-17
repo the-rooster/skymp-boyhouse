@@ -1133,8 +1133,41 @@ serialization and validation during each admitted root remain. A specialized
 Journal-owned builder can assemble validated pristine roots and first recipient
 snapshots before one final serialization, while preserving independent old-state,
 heap, retirement and physical read checks. General SetJobState validation must
-remain strict. That builder, production movement measurements, and multi-campaign
-fairness/load tests are not implemented by this change.
+remain strict. The builder is described below; production movement measurements
+and multi-campaign fairness/load tests remain outstanding.
+
+### Journal-owned admission assembly
+
+Production occurrence and movement batches use AtomicJobAdmissionRoots. The
+Journal copies every pristine root specification, checks the complete future
+identity/capacity envelope before preparation, and computes completed-result
+retirement once. Each runtime callback receives one stable local output. Internal
+guards read immutable pristine or individually validated roots; public job-state
+getters still return owned copies. Generic SetJobState and gameplay mutation APIs
+cannot replace or alter this builder's state.
+
+A private success notification at the end of ExecuteJobSegment freezes the actual
+first recipient snapshot. Merely entering runtime does not acknowledge a capture.
+The returned output must match the successful snapshot, including its original
+identity and roster, with the normal one-segment increment. Fabricating a result,
+catching a failed capture and pretending success, or modifying an earlier output
+through a retained reference cannot publish any part of the batch.
+
+Previously admitted roots, history and continuations are preserved. Each capture
+retains the existing heap immutability check. The assembled state still passes
+independent complete state/heap validation and physical read guards before the
+common save; the optimization removes repeated whole-campaign setter work from
+the per-root loop. Current-schema per-job codec validation does not replace
+campaign-level identity coverage or heap ownership checks. Legacy saved schemas
+and the older synthetic AtomicJobAdmissions API keep their validation contracts.
+
+At the common commit boundary, both APIs also require every staged movement event
+to match one admitted Interaction root in count, order, event name, physical
+source and physical target. An empty batch cannot silently commit a move which
+produces a Leave event. The production builder's successful runtime capture
+additionally validates canonical bindings, templates and recipient membership.
+This is an admission optimization and integrity check; it does not provide the
+remaining spatial lifecycle, quest systems or in-game acceptance.
 
 ## Verification commands
 
@@ -1406,3 +1439,33 @@ Attempt-1 retains the initial base/derived pImpl compile error. Attempt-2 retain
 the successful first build/focused run (29 cases / 4,597 assertions) before the
 additional teleport guard. Attempt-3 retains a test compile error caused by calling
 a private helper; the regression now exercises the public teleporting Kill path.
+
+The journal-owned admission builder passed the Linux build and complete
+verification on 2026-11-17 UTC: 875 native cases / 512,970 assertions,
+368 JavaScript tests, 47 Python tests, addon and both protocol
+smokes, and the existing SQLite recovery suite for 32 characters. The focused
+run passed 38 cases / 5,040 assertions. New tests
+cover preflight of every root, failure after an earlier capture, preserved
+sleeping continuations, forbidden mutations of roots/history/heap, owned getter
+copies, fabricated or altered runtime outputs, second runtime entry, and staged
+movement with missing events through both admission APIs.
+
+The unchanged hidden occurrence benchmark ran 18 samples in each version,
+three per cohort. Median admission milliseconds (previous -> builder) were:
+
+| Existing live roots | New events | Previous | Builder |
+| ---: | ---: | ---: | ---: |
+| 1 | 1 | 5.470 | 4.733 |
+| 1 | 16 | 131.562 | 21.661 |
+| 1 | 64 | 1624.800 | 78.768 |
+| 33 | 1 | 60.836 | 48.551 |
+| 33 | 16 | 554.328 | 119.250 |
+| 33 | 64 | 3304.655 | 349.512 |
+
+These controlled in-memory measurements include fixture manifest/metadata cost;
+they do not establish native movement throughput, production storage latency or
+16-32-player capacity. The existing SQLite smoke does not certify recovery of
+the enrolled movement producer. Restored subscription publication, reconnect,
+spatial transitions, remaining quest systems and in-game acceptance remain
+unfinished. No complete quest is certified. Skyrim, the installed client and
+staging were not launched, changed or deployed by this verification.

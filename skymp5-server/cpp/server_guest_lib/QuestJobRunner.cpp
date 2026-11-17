@@ -532,28 +532,20 @@ QuestJobRunner::AdmitOccurrencesWithContent(
       barrier.admittingLastOccurrence = occurrences.back().id.sequence;
       barrier.admittingGeneration = jobs.generation;
     }
-    result.receipt = QuestJournal::AtomicJobAdmissions(
-      actor, ids,
+    auto committed = QuestJournal::AtomicJobAdmissionRoots(
+      actor, roots,
       [&] {
         if (movement)
           QuestJournal::StageMovement(actor, movement);
       },
-      [&](uint64_t id) {
-        auto retired = jobs.RetireForAdmission();
-        retiredIds.insert(retiredIds.end(), retired.begin(), retired.end());
-        const auto index = static_cast<size_t>(id - ids.front());
-        jobs.ingress.identity = occurrences[index].id.campaignIdentity;
-        ++jobs.ingress.next;
-        ++jobs.nextJob;
-        jobs.live.emplace(id, roots[index]);
-        QuestJournal::SetJobState(actor, jobs);
-        auto& job = jobs.live.at(id);
+      [&](QuestJobState::Job& job) {
         QuestScriptRuntime::ExecuteJobSegment(
           actor, job, {}, sources, {}, fixtureAwait, overrides, hashManifest,
           [this] { return Now(); });
         ++job.segment;
-        QuestJournal::SetJobState(actor, jobs);
       });
+    result.receipt = std::move(committed.receipt);
+    retiredIds = std::move(committed.retiredIds);
     // Everything after commit is nonallocating: all results and scheduler
     // slots were prepared before entering the transaction.
     barrier.receipt = result.receipt;

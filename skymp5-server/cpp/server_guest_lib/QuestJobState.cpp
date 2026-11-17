@@ -952,6 +952,11 @@ QuestJobState QuestJobState::Read(const nlohmann::json& value)
   return Read(value, 0);
 }
 
+QuestJobState::Job QuestJobState::ValidateJob(const Job& job)
+{
+  return ReadJob(SaveJob(job), 10);
+}
+
 QuestJobState QuestJobState::Read(const nlohmann::json& value,
                                   uint64_t completedLive)
 {

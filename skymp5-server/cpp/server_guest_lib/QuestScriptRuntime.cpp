@@ -674,6 +674,7 @@ void QuestScriptRuntime::ExecuteJobSegment(
   Execute(actor, id, current.stage, metadata, scripts, target, name, source,
           &job, completion, fixtureAwait, overrides, contentManifest, clock,
           timerAnchor);
+  QuestJournal::CompleteAdmissionCapture(actor, job);
 }
 
 bool QuestScriptRuntime::Execute(

@@ -17,6 +17,14 @@
 namespace {
 using Json = nlohmann::json;
 constexpr uint64_t kMaxRevision = 9007199254740991ULL;
+struct AdmissionBuilder
+{
+  // Only pristine or individually validated snapshots are visible here.
+  // Mutable runtime outputs never become a source for guards/getters.
+  std::map<uint64_t, std::shared_ptr<const QuestJobState::Job>> roots;
+  std::shared_ptr<const QuestJobState::Job> successfulCapture;
+  std::string identity;
+};
 struct Transaction
 {
   struct InventoryEdit
@@ -41,8 +49,9 @@ struct Transaction
   Json ledger;
   std::map<uint32_t, InventoryEdit> inventories;
   std::map<uint32_t, ReferenceEdit> references;
-  // Immutable, transaction-local decoded jobs. SetJobState publishes this
-  // together with ledger["jobs"]; other journal writers preserve that field.
+  // Immutable, transaction-local decoded jobs. Ordinary SetJobState publishes
+  // this with ledger["jobs"]. The admission builder overlays validated nodes
+  // until its one final assembly; other writers preserve the JSON job field.
   // Borrowed references stay inside their getter/guard call; the snapshot
   // never survives this transaction. External changes still fail read guards.
   std::shared_ptr<const QuestJobState> jobs;
@@ -52,9 +61,41 @@ struct Transaction
   std::optional<uint64_t> jobId;
   bool jobTransitionApplied = false;
   bool admissionOnly = false, admissionRuntimeEntered = false;
+  bool admissionBuilder = false;
+  std::unique_ptr<AdmissionBuilder> builder;
   const Json* initialLedger = nullptr;
 };
 thread_local Transaction* transaction = nullptr;
+
+const QuestJobState::Job* TransactionLive(uint64_t id)
+{
+  if (transaction->builder) {
+    const auto found = transaction->builder->roots.find(id);
+    if (found != transaction->builder->roots.end())
+      return found->second.get();
+  }
+  return transaction->jobs->FindLive(id);
+}
+
+QuestJobState TransactionJobs()
+{
+  auto result = *transaction->jobs;
+  if (transaction->builder) {
+    for (const auto& [id, job] : transaction->builder->roots)
+      result.live.emplace(id, *job);
+    result.nextJob += transaction->builder->roots.size();
+    result.ingress.next += transaction->builder->roots.size();
+    if (!transaction->builder->roots.empty())
+      result.ingress.identity = transaction->builder->identity;
+  }
+  return result;
+}
+
+void RequireGameplayWrites()
+{
+  if (transaction && transaction->admissionBuilder)
+    throw std::runtime_error("Admission builder cannot change gameplay state");
+}
 
 Json SavedHeap(const Json& heap)
 {
@@ -592,6 +633,7 @@ nlohmann::json QuestJournal::Get(MpActor& actor, uint32_t questId)
 
 bool QuestJournal::Apply(MpActor& actor, const nlohmann::json& command)
 {
+  RequireGameplayWrites();
   RequireJobAccess(actor);
   if (!command.is_object())
     throw std::invalid_argument("Expected quest command object");
@@ -702,6 +744,7 @@ bool QuestJournal::Apply(MpActor& actor, const nlohmann::json& command)
 void QuestJournal::RecordRepeatedStage(MpActor& actor, uint32_t questId,
                                        uint16_t stage)
 {
+  RequireGameplayWrites();
   if (!actor.GetParent())
     throw std::runtime_error("Unregistered quest transaction participant");
   auto& owner = Owner(actor);
@@ -805,6 +848,178 @@ std::shared_ptr<const SaveReceipt> QuestJournal::AtomicJobAdmissions(
       }
     },
     true, std::nullopt, &ids);
+}
+
+QuestJournal::AdmissionBatchCommit QuestJournal::AtomicJobAdmissionRoots(
+  MpActor& actor, const std::vector<QuestJobState::Job>& pristineRoots,
+  const std::function<void()>& prepare,
+  const std::function<void(QuestJobState::Job&)>& captureOne)
+{
+  if (pristineRoots.size() > QuestJobState::MaxBatchOccurrences)
+    throw std::runtime_error("Native admission batch exceeds capacity");
+  const auto specs = pristineRoots;
+  auto working = specs;
+  std::vector<uint64_t> ids;
+  ids.reserve(specs.size());
+  for (const auto& root : specs)
+    ids.push_back(root.id);
+  AdmissionBatchCommit result;
+  result.receipt = AtomicImpl(
+    actor,
+    [&] {
+      transaction->admissionBuilder = true;
+      const auto initialJobs = transaction->jobs;
+      auto retained = *initialJobs;
+      if (!specs.empty())
+        result.retiredIds = retained.RetireForAdmission();
+      auto planned = retained;
+      const auto ownerName =
+        transaction->owner->GetChangeForm().formDesc.ToString();
+      const auto actorName = actor.GetChangeForm().formDesc.ToString();
+      const auto identity = specs.empty()
+        ? std::string{}
+        : CampaignReferenceBinding::GetIdentity(*transaction->owner);
+      if (specs.size() > kMaxRevision - retained.ingress.next)
+        throw std::runtime_error("Native occurrence identities exhausted");
+      for (const auto& root : specs) {
+        if (!root.IsPristine() ||
+            root.kind != QuestJobState::Kind::Interaction ||
+            !root.interaction || !root.sequenced || !root.occurrence ||
+            root.id != planned.nextJob ||
+            root.generation != planned.generation ||
+            *root.occurrence != planned.ingress.next ||
+            root.owner != ownerName || root.actor != actorName ||
+            root.instance != actor.GetWorldInstance() ||
+            (!planned.ingress.identity.empty() &&
+             planned.ingress.identity != identity))
+          throw std::runtime_error(
+            "Invalid pristine native admission identity");
+        if (!transaction->initialLedger->contains("referenceInit") ||
+            !transaction->initialLedger->at("referenceInit")
+               .contains(root.interaction->target))
+          throw std::runtime_error(
+            "Native ingress requires prior reference initialization");
+        planned.live.emplace(root.id, root);
+        ++planned.nextJob;
+        planned.ingress.identity = identity;
+        ++planned.ingress.next;
+      }
+      // Validate every spec and the complete future identity/retention
+      // envelope before preparation or runtime entry. No caller supplies
+      // retirement.
+      planned.Save();
+      auto base = std::make_shared<const QuestJobState>(std::move(retained));
+      const auto beforePrepare = transaction->ledger;
+      {
+        struct Guard
+        {
+          bool& active;
+          explicit Guard(bool& flag)
+            : active(flag)
+          {
+            active = true;
+          }
+          ~Guard() { active = false; }
+        } guard(transaction->admissionPreparing);
+        prepare();
+      }
+      if (transaction->ledger != beforePrepare)
+        throw std::runtime_error("Admission preparation changed the journal");
+      if (transaction->movement &&
+          transaction->movement->GetEvents().size() != specs.size())
+        throw std::runtime_error("Movement admission omitted an occurrence");
+      if (specs.empty())
+        return;
+      auto builder = std::make_unique<AdmissionBuilder>();
+      builder->identity = identity;
+      transaction->jobs = base;
+      transaction->builder = std::move(builder);
+      const auto advanceRevision = [&] {
+        const auto revision =
+          transaction->ledger.at("revision").get<uint64_t>();
+        if (revision == kMaxRevision)
+          throw std::overflow_error("Quest revision exhausted");
+        transaction->ledger["revision"] = revision + 1;
+      };
+      for (size_t index = 0; index < specs.size(); ++index) {
+        const auto& pristine = specs[index];
+        auto& output = working[index];
+        transaction->jobId = pristine.id;
+        transaction->admissionRuntimeEntered = false;
+        transaction->builder->successfulCapture.reset();
+        transaction->builder->roots.emplace(
+          pristine.id, std::make_shared<const QuestJobState::Job>(pristine));
+        advanceRevision();
+        const auto beforeHeap =
+          SavedHeap(transaction->ledger.value("vm", Json::object()));
+        captureOne(output);
+        RequireAdmissionHeap(
+          beforeHeap,
+          SavedHeap(transaction->ledger.value("vm", Json::object())));
+        if (!transaction->builder->successfulCapture ||
+            output != *transaction->builder->successfulCapture)
+          throw std::runtime_error(
+            "Admission did not retain its successful runtime capture");
+        transaction->builder->roots.at(pristine.id)
+          .swap(transaction->builder->successfulCapture);
+        advanceRevision();
+      }
+      // A callback can retain an earlier output reference only for this call's
+      // lifetime. Even such a later mutation cannot rewrite accepted
+      // snapshots.
+      for (size_t index = 0; index < working.size(); ++index)
+        if (working[index] != *transaction->builder->roots.at(specs[index].id))
+          throw std::runtime_error(
+            "Admission rewrote an earlier captured root");
+      auto assembled = TransactionJobs();
+      if (assembled.completed != base->completed ||
+          assembled.retiredThrough != base->retiredThrough ||
+          assembled.retiredRanges != base->retiredRanges ||
+          assembled.ingress.retiredThrough != base->ingress.retiredThrough ||
+          assembled.ingress.retiredRanges != base->ingress.retiredRanges)
+        throw std::runtime_error("Admission changed prepared retirement");
+      for (const auto& [id, original] : initialJobs->live)
+        if (!assembled.FindLive(id) || *assembled.FindLive(id) != original)
+          throw std::runtime_error("Admission changed an existing live root");
+      auto saved = assembled.Save();
+      auto ledger = transaction->ledger;
+      ledger["schemaVersion"] = 2;
+      ledger["jobs"] = std::move(saved);
+      Validate(ledger, false);
+      auto snapshot =
+        std::make_shared<const QuestJobState>(std::move(assembled));
+      transaction->ledger.swap(ledger);
+      transaction->jobs.swap(snapshot);
+      transaction->builder.reset();
+    },
+    true, std::nullopt, &ids);
+  return result;
+}
+
+void QuestJournal::CompleteAdmissionCapture(MpActor& actor,
+                                            const QuestJobState::Job& job)
+{
+  if (!transaction || !transaction->admissionBuilder)
+    return;
+  RequireJobExecution(actor, job.id);
+  if (!transaction->builder || !transaction->admissionRuntimeEntered ||
+      transaction->builder->successfulCapture)
+    throw std::runtime_error("Admission runtime capture is unavailable");
+  const auto& pristine = *TransactionLive(job.id);
+  auto captured = job;
+  ++captured.segment;
+  auto expected = pristine;
+  expected.segment = 1;
+  expected.steps = 1;
+  expected.instructions = 1;
+  expected.dispatch = captured.dispatch;
+  if (captured != expected || !IsAdmissionSnapshot(captured) ||
+      !ValidateDispatchTransition(pristine, captured, false))
+    throw std::runtime_error(
+      "Admission runtime did not capture exactly one recipient snapshot");
+  transaction->builder->successfulCapture =
+    std::make_shared<const QuestJobState::Job>(
+      QuestJobState::ValidateJob(captured));
 }
 
 void QuestJournal::StageMovement(
@@ -960,6 +1175,32 @@ std::shared_ptr<const SaveReceipt> QuestJournal::AtomicImpl(
         : QuestJobState{};
       if (finalJobs.nextJob != jobs.nextJob + admissions->size())
         throw std::runtime_error("Admission batch lost its job identities");
+      if (local.movement) {
+        // Both admission APIs must represent every physical occurrence in
+        // order. The plan pins endpoint lifetimes; successful builder runtime
+        // capture separately pins the canonical bindings and templates.
+        const auto& events = local.movement->GetEvents();
+        if (events.size() != admissions->size())
+          throw std::runtime_error("Movement admission omitted an occurrence");
+        const auto sourceReference =
+          local.movement->GetSource().GetChangeForm().formDesc.ToString();
+        for (size_t index = 0; index < events.size(); ++index) {
+          const auto& event = events[index];
+          auto* target =
+            event.target ? event.target->AsObjectReference() : nullptr;
+          const auto* admitted = finalJobs.FindLive((*admissions)[index]);
+          if (!target || !admitted ||
+              admitted->kind != QuestJobState::Kind::Interaction ||
+              !admitted->sequenced || !admitted->occurrence ||
+              !admitted->interaction ||
+              admitted->interaction->name != event.name ||
+              admitted->interaction->targetReference !=
+                target->GetChangeForm().formDesc.ToString() ||
+              admitted->interaction->sourceReference != sourceReference)
+            throw std::runtime_error(
+              "Movement admission changed its occurrence payload or order");
+        }
+      }
       RequireUnchangedContinuations(
         jobs, 0, initialContinuations,
         SavedContinuations(local.ledger.value("vm", Json::object())));
@@ -1030,6 +1271,7 @@ bool QuestJournal::HasActiveTransaction() noexcept
 void QuestJournal::EditInventory(MpActor& actor, MpObjectReference& target,
                                  const std::function<void(Inventory&)>& edit)
 {
+  RequireGameplayWrites();
   auto& staged = InventoryTarget(actor, target);
   auto prepared = staged.current;
   edit(prepared);
@@ -1064,6 +1306,7 @@ void QuestJournal::EditFactions(
   MpActor& actor, MpObjectReference& target,
   const std::function<void(std::vector<Faction>&)>& edit)
 {
+  RequireGameplayWrites();
   auto prepared = ReadFactions(actor, target);
   edit(prepared);
   target.GetParent()->ValidateCampaignFactions(prepared);
@@ -1076,6 +1319,7 @@ void QuestJournal::SetReferenceDisabled(MpActor& actor,
                                         MpObjectReference& target,
                                         bool disabled)
 {
+  RequireGameplayWrites();
   if (&target == &Owner(actor))
     throw std::runtime_error("Campaign visibility cannot disable a player");
   auto& staged = ReferenceTarget(actor, target);
@@ -1112,7 +1356,7 @@ QuestJobState QuestJournal::PersonalJobState(MpActor& owner)
       throw std::runtime_error("Cross-campaign quest transaction");
     // The public result remains an owned copy. A caller cannot mutate the
     // selected lease or a sleeping root through a borrowed cache reference.
-    return *transaction->jobs;
+    return TransactionJobs();
   }
   const auto ledger = Read(owner);
   return ledger.contains("jobs") ? QuestJobState::Read(ledger.at("jobs"))
@@ -1129,13 +1373,13 @@ void QuestJournal::RequirePersonalJobAccess(MpActor& owner)
   if (transaction) {
     if (transaction->owner != &owner)
       throw std::runtime_error("Cross-campaign quest transaction");
-    if (!transaction->ledger.contains("jobs"))
+    if (!transaction->ledger.contains("jobs") && !transaction->builder)
       return;
     const auto& jobs = *transaction->jobs;
     if (transaction->jobId) {
       // The selected root can be terminal by commit-time inventory validation.
       // Its final result still belongs to this transaction's original lease.
-      if (!jobs.FindLive(*transaction->jobId) &&
+      if (!TransactionLive(*transaction->jobId) &&
           !jobs.FindCompleted(*transaction->jobId))
         throw std::runtime_error("Quest job has not installed its root");
       return;
@@ -1154,7 +1398,7 @@ void QuestJournal::RequireJobExecution(MpActor& actor, uint64_t jobId)
   if (!jobId || !transaction || transaction->owner != &owner ||
       transaction->jobId != jobId)
     throw std::runtime_error("Quest runtime does not own this job lease");
-  const auto* selected = transaction->jobs->FindLive(jobId);
+  const auto* selected = TransactionLive(jobId);
   if (!selected ||
       selected->actor != actor.GetChangeForm().formDesc.ToString() ||
       selected->owner != owner.GetChangeForm().formDesc.ToString() ||
@@ -1167,7 +1411,7 @@ void QuestJournal::RequireJobExecution(MpActor& actor,
 {
   RequireJobExecution(actor, job.id);
   if (transaction->admissionOnly) {
-    const auto* selected = transaction->jobs->FindLive(job.id);
+    const auto* selected = TransactionLive(job.id);
     if (transaction->admissionRuntimeEntered || !selected ||
         *selected != job || !job.IsPristine() ||
         job.kind != QuestJobState::Kind::Interaction || !job.occurrence)
@@ -1182,6 +1426,8 @@ void QuestJournal::SetJobState(MpActor& actor, const QuestJobState& state)
   auto& owner = Owner(actor);
   if (!transaction || transaction->owner != &owner || !transaction->jobId)
     throw std::runtime_error("Job state requires an owning job transaction");
+  if (transaction->admissionBuilder)
+    throw std::runtime_error("Admission builder owns its job snapshots");
   const auto saved = state.Save();
   const auto previousSnapshot = transaction->jobs;
   const auto& previous = *previousSnapshot;
@@ -1445,6 +1691,7 @@ bool QuestJournal::ReferenceInitialized(MpActor& actor, uint32_t original)
 
 void QuestJournal::MarkReferenceInitialized(MpActor& actor, uint32_t original)
 {
+  RequireGameplayWrites();
   RequireJobAccess(actor);
   const auto key = ReferenceKey(actor, original);
   auto& owner = Owner(actor);
@@ -1456,7 +1703,7 @@ void QuestJournal::MarkReferenceInitialized(MpActor& actor, uint32_t original)
       ledger.at("referenceInit").contains(key))
     return;
   if (transaction->jobId) {
-    const auto* job = transaction->jobs->FindLive(*transaction->jobId);
+    const auto* job = TransactionLive(*transaction->jobId);
     if (!job || job->kind != QuestJobState::Kind::ReferenceLoad ||
         !job->referenceLoad || job->referenceLoad->target != key ||
         job->loadPhase != QuestJobState::LoadPhase::Init || job->handler ||

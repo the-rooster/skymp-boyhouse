@@ -13,6 +13,7 @@ class MpObjectReference;
 class Inventory;
 class MpChangeFormREFR;
 class CampaignMovementPlan;
+class QuestScriptRuntime;
 
 // Campaign state shared by Papyrus and the trusted gamemode API. Clients may
 // read snapshots but cannot issue mutations. Original stage fragments/alias
@@ -53,6 +54,20 @@ public:
     MpActor& actor, const std::vector<uint64_t>& jobIds,
     const std::function<void()>& prepare,
     const std::function<void(uint64_t)>& initializeOne);
+  struct AdmissionBatchCommit
+  {
+    std::shared_ptr<const SaveReceipt> receipt;
+    std::vector<uint64_t> retiredIds;
+  };
+  // Journal-owned builder for native admission. Specs are copied and validated
+  // before preparation. Each callback receives only its selected local root;
+  // it must run ExecuteJobSegment once and increment segment. Generic
+  // SetJobState is unavailable. Only the successful runtime recipient snapshot
+  // is accepted; the assembled campaign is fully validated before save.
+  static AdmissionBatchCommit AtomicJobAdmissionRoots(
+    MpActor& actor, const std::vector<QuestJobState::Job>& pristineRoots,
+    const std::function<void()>& prepare,
+    const std::function<void(QuestJobState::Job&)>& captureOne);
   // Exactly one physical participant, staged only by the active requester's
   // admission prepare callback. This grants no source inventory or personal
   // journal authority; the world publishes it with the common save receipt.
@@ -103,6 +118,11 @@ public:
   static void MarkReferenceInitialized(MpActor& actor, uint32_t original);
 
 private:
+  friend class QuestScriptRuntime;
+  // Successful runtime return is the only publisher of a builder capture.
+  // Generic execution leases do not use this admission-only handshake.
+  static void CompleteAdmissionCapture(MpActor& actor,
+                                       const QuestJobState::Job& job);
   static std::shared_ptr<const SaveReceipt> AtomicImpl(
     MpActor& actor, const std::function<void()>& execute, bool durable,
     std::optional<uint64_t> jobId = std::nullopt,

@@ -172,6 +172,10 @@ struct QuestJobState
   static constexpr uint64_t MaxSegments = MaxSteps;
 
   static QuestJobState Read(const nlohmann::json& value);
+  // Validate one current-schema node and return an owned canonical copy.
+  // Campaign identity coverage, retention and heap ownership still require
+  // the full-state validators; this does not authorize a state transition.
+  static Job ValidateJob(const Job& job);
   nlohmann::json Save() const;
   // Canonical full-job JSON bytes, excluding permanent legacy completions.
   size_t RetainedSequencedBytes() const;
