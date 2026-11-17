@@ -24,10 +24,23 @@ export class WorldView extends ClientListener {
     this.sp.storage["view"] = this;
     controller.emitter.on('worldModelReset', () => this.destroy());
     controller.on('preLoadGame', () => { this.loading = true; this.destroy(); });
-    controller.emitter.on('gameLoad', () => {
+    controller.on('postLoadGame', (event?: { success: boolean }) => {
+      if (event?.success !== false) return;
+      this.loading = false;
+      if (!this.explicitlyBlocked) {
+        const generation = this.allowUpdateGeneration;
+        controller.once('update', () => this.waitGameTimeAndAllowFormViewUpdate(1, generation));
+      }
+    });
+    controller.emitter.on('gameLoad', event => {
       this.loading = false;
       this.destroy();
-      if (!this.explicitlyBlocked) this.waitGameTimeAndAllowFormViewUpdate(1);
+      if (!this.explicitlyBlocked) {
+        if (event.isNewGame) {
+          const generation = this.allowUpdateGeneration;
+          controller.once('update', () => this.waitGameTimeAndAllowFormViewUpdate(1, generation));
+        } else this.waitGameTimeAndAllowFormViewUpdate(1);
+      }
     });
     controller.emitter.on('connectionAccepted', () => {
       this.destroy();

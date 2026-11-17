@@ -74,6 +74,8 @@ public:
   std::vector<Faction> GetFactions(int minFactionID, int maxFactionID,
                                    bool lazyLoad = true);
   void RemoveFromFaction(FormDesc factionForm, bool lazyLoad = true);
+  // Publish the already committed complete snapshot, never a staged delta.
+  void SendCampaignFactionsUpdate();
 
   void VisitProperties(CreateActorMessage& message,
                        VisitPropertiesMode mode) override;
@@ -225,6 +227,7 @@ private:
   std::map<uint32_t, uint32_t> EvaluateDeathItem();
   void AddDeathItem();
   void LoadFactions();
+  std::string GetCampaignFactionsJson() const;
 
 protected:
   void BeforeDestroy() override;

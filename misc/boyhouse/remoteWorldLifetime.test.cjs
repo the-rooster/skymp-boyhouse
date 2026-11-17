@@ -47,7 +47,7 @@ function fixture(storage = {}) {
       setDisplayName() {}, getFurnitureReference: () => null,
     };
   };
-  class PlayerSpawnService {} class PlayerLoadoutService {} class LoadGameService {} class RagdollService {}
+  class PlayerSpawnService {} class PlayerLoadoutService {} class LoadGameService {} class RagdollService {} class ActorFactionsService {}
   const loadout = { preservesCreationAppearance: false };
   class RespawnNeededError extends Error {}
   const view = { syncFormArray() {}, getFormViews: () => ({ destroyForm: id => calls.push(['destroy-view', id]) }) };
@@ -81,6 +81,8 @@ function fixture(storage = {}) {
     '../../logging': { logTrace() {}, logError() {} }, './playerSpawnService': { PlayerSpawnService },
     './loadGameService': { LoadGameService },
     './playerLoadoutService': { PlayerLoadoutService },
+    './actorFactionsService': { ActorFactionsService },
+    '../../sync/campaignFactions': load('sync/campaignFactions.ts'),
   };
   const { RemoteServer } = load('services/services/remoteServer.ts', dependencies, { Date: { now: () => now } });
   const server = new RemoteServer(sp, { on: (...args) => events.on(...args), once: (...args) => events.once(...args), emitter,
@@ -88,6 +90,7 @@ function fixture(storage = {}) {
       if (type === PlayerSpawnService) return { request: m => calls.push(['spawn', m.idx]), cancel: () => calls.push(['cancel-spawn']) };
       if (type === LoadGameService) return { get isLoadingPlatformSave() { return platformLoad; } };
       if (type === PlayerLoadoutService) return loadout;
+      if (type === ActorFactionsService) return { updateSelf: (...args) => calls.push(['self-factions', ...args]) };
       if (type === RagdollService) return { safeRemoveRagdollFromWorld: (_actor, callback) => ragdolls.push(callback) };
       throw Error('Unexpected service');
     },
@@ -167,6 +170,21 @@ test('generated-world loading suspends initial native effects until its load eve
   f.emitter.emit('gameLoad', { isCausedBySkyrimPlatform: true }); f.update();
   assert.equal(f.calls.filter(c => c[0] === 'appearance').length, 1);
   assert.equal(f.guards[0](), true); f.server.resetWorldModel(); assert.equal(f.guards[0](), false);
+});
+
+test('failed personal load keeps invalidated effects cancelled and releases the loading gate for a new baseline', () => {
+  const f = fixture(); f.create(); f.event('updateAppearanceMessage', { idx: 1, data: { name: 'stale' } });
+  f.native('preLoadGame'); f.native('postLoadGame', { success: false }); f.update();
+  assert.equal(f.calls.some(call => call[0] === 'appearance'), false);
+  f.create(create(2)); f.event('updateAppearanceMessage', { idx: 2, data: { name: 'fresh' } }); f.update();
+  assert.deepEqual(f.calls.filter(call => call[0] === 'appearance'), [['appearance', 'fresh']]);
+});
+
+test('failed generated load cannot resume deferred bootstrap effects in the surviving old world', () => {
+  const f = fixture(); f.create(); f.event('updateAppearanceMessage', { idx: 1, data: { name: 'bootstrap' } });
+  f.platformLoad(true); f.native('preLoadGame'); f.update();
+  f.native('postLoadGame', { success: false }); f.update();
+  assert.equal(f.calls.some(call => call[0] === 'appearance'), false);
 });
 
 test('creation preserves its face and accepted echo without queuing another native rebuild', () => {
@@ -371,4 +389,19 @@ test('container close sends one activation and a reset cancels its old menu poll
   f.menu(false); f.update(100); f.update(100); assert.equal(sent.length, 1);
   f.event('openContainerMessage', { target: 0x100 }); f.update(100); f.menu(true); f.update(100);
   f.server.resetWorldModel(); f.menu(false); f.update(100); assert.equal(sent.length, 1);
+});
+
+test('faction properties target their current actor model and never an authored original', () => {
+  const f = fixture(), message = create();
+  const snapshot = [{ factionId: 0x2bf9b, rank: -1, isMember: false }];
+  message.customPropsJsonDumps.push({ propName: 'campaignFactions', propValueJsonDump: JSON.stringify(snapshot) });
+  f.create(message);
+  assert.deepEqual(JSON.parse(JSON.stringify(f.server.getWorldModel().forms[0].campaignFactions)), snapshot);
+  f.event('updatePropertyMessage', { idx: 1, propName: 'campaignFactions', data: [] });
+  assert.deepEqual(JSON.parse(JSON.stringify(f.calls.filter(call => call[0] === 'self-factions'))), [['self-factions', 1, []]]);
+  assert.throws(() => f.event('updatePropertyMessage', { idx: 1, propName: 'campaignFactions', data: [{ factionId: 1, rank: 0 }] }));
+  assert.deepEqual(JSON.parse(JSON.stringify(f.server.getWorldModel().forms[0].campaignFactions)), []);
+  const original = create(9, 0x100, false);
+  original.customPropsJsonDumps = message.customPropsJsonDumps;
+  assert.throws(() => f.create(original), /authored reference/);
 });

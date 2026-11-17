@@ -3418,7 +3418,7 @@ TEST_CASE("Production quest VM rolls back staged visibility journal rewards "
     ? "UnsupportedWorldReferenceEffect"
     : failure == "alias"   ? "UnsupportedWorldAliasEffect"
     : failure == "barrier" ? "Fixture rejected visibility publication"
-                           : "visibility";
+                           : "available projection barrier";
   REQUIRE_THROWS_WITH(f.RunEvent(),
                       Catch::Matchers::ContainsSubstring(expected));
   REQUIRE(f.owner->GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==

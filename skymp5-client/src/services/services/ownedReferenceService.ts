@@ -3,6 +3,7 @@ import { logError } from '../../logging';
 import { ClientListener, CombinedController, Sp } from './clientListener';
 import { WorldCleanerService } from './worldCleanerService';
 import { NativeReferenceOperationService } from './nativeReferenceOperationService';
+import { ActorFactionsService } from './actorFactionsService';
 
 export class OwnedReferenceService extends ClientListener {
     readonly references: OwnedReferenceLifetime;
@@ -17,7 +18,9 @@ export class OwnedReferenceService extends ClientListener {
         sp.storage[key] = state;
         this.references = new OwnedReferenceLifetime({
             identity: id => sp.getReferenceHandle(id),
-            canStart: id => !controller.lookupListener(NativeReferenceOperationService).operations.isBusy(id),
+            canStart: id => !controller.lookupListener(NativeReferenceOperationService).operations.isBusy(id) &&
+                (!this.references.state.references.get(id)?.retired ||
+                    controller.lookupListener(ActorFactionsService).prepareDisposal(id)),
             dispose: (id, handle) => {
                 if (sp.getReferenceHandle(id) !== handle) throw Error('Owned reference identity changed before disposal');
                 const reference = sp.ObjectReference.from(sp.Game.getFormEx(id));
@@ -39,7 +42,12 @@ export class OwnedReferenceService extends ClientListener {
             });
         });
         let loading = false;
-        controller.on('preLoadGame', () => { loading = true; this.references.forgetWorld(); });
+        // A load attempt can fail with the old world still alive. Keep its
+        // handles and outstanding native calls until replacement is confirmed.
+        controller.on('preLoadGame', () => { loading = true; this.references.retireAll(); });
+        controller.on('postLoadGame', (event?: { success: boolean }) => {
+            if (event?.success === false) loading = false;
+        });
         controller.on('update', () => { if (!loading) this.references.update(); });
         controller.emitter.on('gameLoad', () => { loading = false; this.references.forgetWorld(); });
         for (const event of ['connectionDisconnect', 'connectionDenied', 'connectionFailed'] as const)

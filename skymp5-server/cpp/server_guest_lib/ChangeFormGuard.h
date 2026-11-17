@@ -43,6 +43,8 @@ public:
     static_assert(noexcept(changeForm.inv.entries.swap(prepared.inv.entries)));
     changeForm.inv.entries.swap(prepared.inv.entries);
     changeForm.dynamicFields.Swap(prepared.dynamicFields);
+    static_assert(noexcept(changeForm.factions.swap(prepared.factions)));
+    changeForm.factions.swap(prepared.factions);
     changeForm.baseContainerAdded = prepared.baseContainerAdded;
     changeForm.isDisabled = prepared.isDisabled;
     lastSaveRequest = std::chrono::system_clock::now();

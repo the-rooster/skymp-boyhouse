@@ -18,6 +18,7 @@ const dependencies = {
   './clientListener': { ClientListener: class {} },
   './ownedReferenceService': { OwnedReferenceService: class {} },
   './worldCleanerService': { WorldCleanerService: class {} },
+  './actorFactionsService': { ActorFactionsService: class {} },
   '../../logging': { logError: (...args) => log('service-error', args.map(String)) },
 };
 `;
@@ -46,6 +47,7 @@ function fixture() {
   const controller = { emitter, on: sp.on, once: sp.once, lookupListener(type) {
     if (type === dependencies['./nativeReferenceOperationService'].NativeReferenceOperationService) return native;
     if (type === dependencies['./ownedReferenceService'].OwnedReferenceService) return owned;
+    if (type === dependencies['./actorFactionsService'].ActorFactionsService) return { prepareDisposal: () => true };
     if (type === dependencies['./worldCleanerService'].WorldCleanerService) return {
       modWcProtection(id, amount) { protection.set(id, (protection.get(id) || 0) + amount); },
     };

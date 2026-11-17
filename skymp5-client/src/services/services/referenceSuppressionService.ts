@@ -39,7 +39,10 @@ export class ReferenceSuppressionService extends ClientListener {
             report: (id, error) => logError(this, 'Reference suppression failed', id.toString(16), error),
         }, state);
         let loading = false;
-        controller.on('preLoadGame', () => { loading = true; this.references.forgetWorld(); });
+        controller.on('preLoadGame', () => { loading = true; this.references.releaseAll(); });
+        controller.on('postLoadGame', (event?: { success: boolean }) => {
+            if (event?.success === false) loading = false;
+        });
         controller.on('update', () => { if (!loading) this.references.update(); });
         controller.emitter.on('gameLoad', () => { loading = false; this.references.forgetWorld(); });
         for (const event of ['connectionDisconnect', 'connectionDenied', 'connectionFailed'] as const)

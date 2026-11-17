@@ -1,5 +1,6 @@
 import { ClientListener, CombinedController, Sp } from "./clientListener";
 import { ChangeFormNpc } from "skyrimPlatform";
+import { NetworkingService } from './networkingService';
 
 export class LoadGameService extends ClientListener {
     get isLoadingPlatformSave(): boolean { return this._isCausedBySkyrimPlatform; }
@@ -7,6 +8,24 @@ export class LoadGameService extends ClientListener {
     constructor(private sp: Sp, private controller: CombinedController) {
         super();
         this.controller.on("loadGame", () => this.onLoadGame());
+        this.controller.on('newGame', () => {
+            this._isCausedBySkyrimPlatform = false;
+            this.onLoadGame(true);
+        });
+        this.controller.on('postLoadGame', (event?: { success: boolean }) => {
+            if (event?.success !== false) return;
+            this._isCausedBySkyrimPlatform = false;
+            // Pre-load already invalidated the self/model. A failed attempt
+            // cannot resume that campaign as ready without a fresh baseline.
+            const generation = this.connectionGeneration;
+            this.controller.once('tick', () => {
+                if (generation !== this.connectionGeneration) return;
+                const network = this.controller.lookupListener(NetworkingService);
+                if (network.isConnected()) network.close();
+            });
+        });
+        for (const event of ['connectionAccepted', 'connectionDisconnect', 'connectionFailed', 'connectionDenied'] as const)
+            controller.emitter.on(event, () => { ++this.connectionGeneration; });
     }
 
     public loadGame(pos: number[], rot: number[], worldOrCell: number, changeFormNpc?: ChangeFormNpc, loadOrder?: string[], time?: { seconds: number, minutes: number, hours: number }) {
@@ -21,10 +40,11 @@ export class LoadGameService extends ClientListener {
         this._isCausedBySkyrimPlatform = true;
     }
 
-    private onLoadGame() {
+    private onLoadGame(isNewGame = false) {
         try {
             const gameLoadEvent = {
-                isCausedBySkyrimPlatform: this._isCausedBySkyrimPlatform
+                isCausedBySkyrimPlatform: this._isCausedBySkyrimPlatform,
+                isNewGame,
             };
             this.controller.emitter.emit("gameLoad", gameLoadEvent);
         } catch (e) {
@@ -39,4 +59,5 @@ export class LoadGameService extends ClientListener {
     }
 
     private _isCausedBySkyrimPlatform = false;
+    private connectionGeneration = 0;
 }

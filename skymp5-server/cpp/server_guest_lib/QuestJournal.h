@@ -1,7 +1,9 @@
 #pragma once
+#include "Faction.h"
 #include <cstdint>
 #include <functional>
 #include <nlohmann/json.hpp>
+#include <vector>
 
 class MpActor;
 class MpObjectReference;
@@ -21,7 +23,7 @@ public:
   static nlohmann::json Get(MpActor& actor, uint32_t questId);
   static void RequireAdapter(MpActor& actor, uint32_t questId);
   static bool Apply(MpActor& actor, const nlohmann::json& command);
-  // Synchronous journal/VM, inventory and guarded reference-visibility
+  // Synchronous journal/VM, inventory, actor factions and reference-visibility
   // transaction. Other world effects still require transactional adapters.
   static void Atomic(MpActor& actor, const std::function<void()>& execute);
   static bool HasActiveTransaction() noexcept;
@@ -36,6 +38,14 @@ public:
                                                MpObjectReference& target);
   static void SetReferenceDisabled(MpActor& actor, MpObjectReference& target,
                                    bool disabled);
+  // Effective saved actor factions; absent snapshots are derived from
+  // immutable NPC/template metadata inside the transaction, never lazy-loaded
+  // into live actors. Explicit saved empty snapshots remain empty.
+  static const std::vector<Faction>& ReadFactions(MpActor& actor,
+                                                  MpObjectReference& target);
+  static void EditFactions(
+    MpActor& actor, MpObjectReference& target,
+    const std::function<void(std::vector<Faction>&)>& edit);
   static nlohmann::json ScriptState(MpActor& actor);
   // Trusted allocation/recovery must read this character's own history even
   // while the character is visiting somebody else's campaign.

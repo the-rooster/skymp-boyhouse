@@ -143,10 +143,14 @@ TEST_CASE("Visibility barrier rejects unprepared observers before any gate",
   {
     f.server.serverState.userInfo[1]->campaignVisibilityFailed = true;
   }
-  SECTION("Shared world")
+  SECTION("A different owner's private world")
   {
-    f.owner->SetWorldInstance("");
-    f.guest->SetWorldInstance("");
+    f.owner->SetWorldInstance("campaign:4278206466:barrier");
+  }
+  SECTION("Missing private area")
+  {
+    f.owner->SetWorldInstance(
+      "campaign:" + std::to_string(f.owner->GetFormId()) + ":");
   }
   REQUIRE_THROWS(f.barrier->BeforeCommit(*f.owner));
   f.Abort();
@@ -155,6 +159,80 @@ TEST_CASE("Visibility barrier rejects unprepared observers before any gate",
   REQUIRE(f.closed.empty());
   REQUIRE_FALSE(f.server.serverState.userInfo[0]->gameplayBlocked);
   REQUIRE_FALSE(f.server.serverState.userInfo[1]->gameplayBlocked);
+}
+
+TEST_CASE("Shared faction publication gates the owner and current observers",
+          "[Projection][CampaignVisibilityBarrier][CampaignFaction]")
+{
+  BarrierWorld f;
+  f.owner->SetWorldInstance("");
+  f.guest->SetWorldInstance("");
+  MpObjectReference::Subscribe(f.owner, f.guest);
+  MpObjectReference::Unsubscribe(f.owner, f.outsider);
+  // A distant legacy client cannot prevent an unrelated personal mutation.
+  f.server.serverState.userInfo[2]->packetEpoch.clear();
+  const auto previous = f.server.GetPacketEpoch(1);
+  f.barrier->BeforeCommit(*f.owner);
+  REQUIRE(f.prepared == CampaignVisibilityBarrier::UserIds{ 0, 1 });
+  REQUIRE_FALSE(f.barrier->HoldsGate(2));
+  REQUIRE(f.server.GetPacketEpoch(1) != previous);
+  f.barrier->AfterCommit(*f.owner, true);
+  REQUIRE(f.finishSynchronized);
+  REQUIRE(f.closed.empty());
+  REQUIRE(f.server.serverState.userInfo[0]->gameplayBlocked);
+  REQUIRE(f.server.serverState.userInfo[1]->gameplayBlocked);
+  REQUIRE_FALSE(f.server.serverState.userInfo[2]->gameplayBlocked);
+}
+
+TEST_CASE("Shared faction publication cannot race its observer set",
+          "[Projection][CampaignVisibilityBarrier][CampaignFaction]")
+{
+  BarrierWorld f;
+  f.owner->SetWorldInstance("");
+  f.guest->SetWorldInstance("");
+  MpObjectReference::Subscribe(f.owner, f.guest);
+  MpObjectReference::Unsubscribe(f.owner, f.outsider);
+  SECTION("An observer arrives during preparation")
+  {
+    f.beforeEffect = [&] {
+      MpObjectReference::Subscribe(f.owner, f.outsider);
+    };
+  }
+  SECTION("An observer leaves during preparation")
+  {
+    f.beforeEffect = [&] { MpObjectReference::Unsubscribe(f.owner, f.guest); };
+  }
+  REQUIRE_THROWS(f.barrier->BeforeCommit(*f.owner));
+  f.Abort();
+  f.RequireQuarantined();
+}
+
+TEST_CASE("Hosting an offline observer does not subscribe a shared player",
+          "[Projection][CampaignVisibilityBarrier][CampaignFaction]")
+{
+  BarrierWorld f;
+  f.owner->SetWorldInstance("");
+  f.guest->SetWorldInstance("");
+  constexpr uint32_t hostedId = 0xff004010;
+  f.server.CreateActor(hostedId, { 1, 2, 3 }, 0, 0x3c);
+  auto& hosted = f.server.worldState.GetFormAt<MpActor>(hostedId);
+  REQUIRE(hosted.GetUserId() == Networking::InvalidUserId);
+  MpObjectReference::Subscribe(f.owner, &hosted);
+  MpObjectReference::Subscribe(f.owner, f.guest);
+  MpObjectReference::Unsubscribe(f.owner, f.outsider);
+  f.server.worldState.hosters[hostedId] = f.outsider->GetFormId();
+  f.server.serverState.userInfo[2]->packetEpoch.clear();
+  f.beforeEffect = [&] {
+    f.server.worldState.hosters[hostedId] = f.guest->GetFormId();
+  };
+  f.barrier->BeforeCommit(*f.owner);
+  REQUIRE_FALSE(f.barrier->HoldsGate(2));
+  f.barrier->AfterCommit(*f.owner, true);
+  REQUIRE(f.finishSynchronized);
+  REQUIRE(f.closed.empty());
+  REQUIRE(f.prepared == CampaignVisibilityBarrier::UserIds{ 0, 1 });
+  REQUIRE_FALSE(f.server.serverState.userInfo[2]->gameplayBlocked);
+  REQUIRE_FALSE(f.server.serverState.userInfo[3]->gameplayBlocked);
 }
 
 TEST_CASE(

@@ -18,6 +18,8 @@ import { GamemodeUpdateService } from "../services/services/gamemodeUpdateServic
 import { OwnedReferenceService } from '../services/services/ownedReferenceService';
 import { OwnedReference } from '../campaign/ownedReferenceLifetime';
 import { NativeReferenceOperationService } from '../services/services/nativeReferenceOperationService';
+import { ActorFactionsService } from '../services/services/actorFactionsService';
+import { FactionProgress } from '../sync/actorFactionLease';
 
 export interface FormSpawnReadiness {
   state: 'pending' | 'ready' | 'failed';
@@ -49,6 +51,7 @@ export class FormView {
         getReferenceHandle(this.ownedReference.id) !== this.ownedReference.handle)) {
       // Failed/canceled spawns remain unavailable until the view is replaced.
       this.lifetime.retire(this.ownedReference);
+      this.retireFactions();
       this.ready = false;
       return;
     }
@@ -268,6 +271,8 @@ export class FormView {
       return;
     }
 
+    if (!this.reconcileFactions(model).ready) return;
+
     const refr = ObjectReference.from(Game.getFormEx(this.refrId));
     if (refr) {
       const actor = Actor.from(refr);
@@ -288,11 +293,15 @@ export class FormView {
     ++this.generation;
     this.isOnScreen = false;
     this.spawnMoment = 0;
+    this.retireFactions();
     if (this.ownedReference) this.lifetime.retire(this.ownedReference);
     this.ownedReference = undefined;
     this.refrId = 0;
     this.ready = false;
     this.localImmortal = false;
+    this.factionError = undefined;
+    this.factionSnapshot = undefined;
+    this.factionActorId = 0;
     this.removeNickname();
     this.movState = { lastNumChanges: 0, lastApply: 0, lastRehost: 0, everApplied: false };
     this.lastHarvestedApply = 0; this.lastOpenApply = 0;
@@ -304,11 +313,16 @@ export class FormView {
   }
 
   private ownedReference?: OwnedReference;
+  private factionOwner?: string;
+  private factionError?: string;
+  private factionSnapshot?: FormModel['campaignFactions'];
+  private factionActorId = 0;
   private generation = 0;
   private spawnDead = false;
 
   // Called on native update, after the coordinator has selected this model's
-  // world. This proves spawn/identity only, not inventory or quest projection.
+  // world. Faction readiness additionally requires the native lease's observed
+  // rank and membership to match this model's complete authoritative snapshot.
   getSpawnReadiness(model: FormModel): FormSpawnReadiness {
     const result: FormSpawnReadiness = { state: 'pending', localId: this.refrId };
     if (this.remoteRefrId !== model.refrId) return result;
@@ -323,7 +337,45 @@ export class FormView {
     if (actor && actor.isDead() !== (model.isDead ?? model.movement?.isDead ?? false)) return result;
     const operations = SpApiInteractor.getControllerInstance().lookupListener(NativeReferenceOperationService).operations;
     if (operations.isBusy(this.refrId)) return result;
+    const factions = this.reconcileFactions(model);
+    if (factions.error) return { ...result, state: 'failed', error: factions.error };
+    if (!factions.ready) return result;
     return { ...result, state: 'ready' };
+  }
+
+  private get factionLeases() {
+    return SpApiInteractor.getControllerInstance().lookupListener(ActorFactionsService).leases;
+  }
+
+  private retireFactions(): void {
+    if (this.factionOwner) this.factionLeases.retire(this.factionOwner);
+  }
+
+  private reconcileFactions(model: FormModel): FactionProgress {
+    if (this.factionError) return { ready: false, error: this.factionError };
+    try {
+      if (model.campaignFactions === undefined) {
+        this.retireFactions();
+        this.factionSnapshot = undefined; this.factionActorId = 0;
+        return this.factionOwner ? this.factionLeases.readiness(this.factionOwner) : { ready: true };
+      }
+      if (!this.ownedReference || !this.lifetime.isCurrent(this.ownedReference) ||
+          this.refrId !== this.ownedReference.id || getReferenceHandle(this.refrId) !== this.ownedReference.handle)
+        throw Error('Campaign factions require a live owned actor copy');
+      if (!Actor.from(Game.getFormEx(this.refrId))) throw Error('Campaign factions cannot target a non-actor copy');
+      if (!this.factionOwner) this.factionOwner = this.factionLeases.newOwner();
+      // RemoteServer replaces validated snapshots atomically. Avoid sorting
+      // and serializing every faction row again on each render/update frame.
+      if (this.factionSnapshot !== model.campaignFactions || this.factionActorId !== this.refrId ||
+          !this.factionLeases.hasOwner(this.factionOwner)) {
+        this.factionLeases.request(this.factionOwner, this.refrId, model.campaignFactions);
+        this.factionSnapshot = model.campaignFactions; this.factionActorId = this.refrId;
+      }
+      return this.factionLeases.readiness(this.factionOwner);
+    } catch (error) {
+      this.factionError = String(error);
+      return { ready: false, error: this.factionError };
+    }
   }
 
   private captureLifetime(): () => boolean {

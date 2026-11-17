@@ -13,6 +13,7 @@ import { LoadGameService } from './services/services/loadGameService';
 import { SendInputsService } from './services/services/sendInputsService';
 import { PlayerLoadoutService } from './services/services/playerLoadoutService';
 import { PlayerSpawnService } from './services/services/playerSpawnService';
+import { ActorFactionsService } from './services/services/actorFactionsService';
 import { ReferenceSuppressionService } from './services/services/referenceSuppressionService';
 import { OwnedReferenceService } from './services/services/ownedReferenceService';
 import { NativeReferenceOperationService } from './services/services/nativeReferenceOperationService';
@@ -82,6 +83,7 @@ const main = () => {
       new SinglePlayerService(sp, controller),
       new ReferenceSuppressionService(sp, controller),
       new NativeReferenceOperationService(sp, controller),
+      new ActorFactionsService(sp, controller),
       new OwnedReferenceService(sp, controller),
       new EnforceLimitationsService(sp, controller),
       new SendInputsService(sp, controller),

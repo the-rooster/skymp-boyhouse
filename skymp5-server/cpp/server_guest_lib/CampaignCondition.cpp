@@ -1,4 +1,5 @@
 #include "CampaignCondition.h"
+#include "CampaignFactionApi.h"
 #include "CampaignReferenceBinding.h"
 #include "MpActor.h"
 #include "QuestJournal.h"
@@ -50,7 +51,7 @@ void ValidateReference(MpActor& actor, uint32_t id, bool actorOnly)
       (record.rec->GetType() != "ACHR" &&
        (actorOnly || record.rec->GetType() != "REFR")))
     throw std::runtime_error(
-      actorOnly ? "GetDead requires a placed actor reference"
+      actorOnly ? "Campaign actor condition requires a placed actor reference"
                 : "Campaign condition requires a placed reference");
 }
 }
@@ -69,6 +70,8 @@ CampaignCondition CampaignCondition::Compile(const espm::CTDA& data,
     case 56:
     case 58:
     case 59:
+    case 71:
+    case 73:
     case 74:
     case 543:
     case 629:
@@ -79,7 +82,9 @@ CampaignCondition CampaignCondition::Compile(const espm::CTDA& data,
   }
   const bool physical = result.function == Function::Disabled ||
     result.function == Function::Dead ||
-    result.function == Function::ItemCount;
+    result.function == Function::ItemCount ||
+    result.function == Function::InFaction ||
+    result.function == Function::FactionRank;
   if (physical) {
     if (data.runOnType == espm::CTDA::RunOnTypeFlags::Reference) {
       result.selector = Selector::Reference;
@@ -88,7 +93,10 @@ CampaignCondition CampaignCondition::Compile(const espm::CTDA& data,
         throw std::runtime_error(
           "Condition requires a logical static reference");
     } else if (data.runOnType == espm::CTDA::RunOnTypeFlags::QuestAlias &&
-               result.function == Function::Dead && data.unknown2 >= 0) {
+               (result.function == Function::Dead ||
+                result.function == Function::InFaction ||
+                result.function == Function::FactionRank) &&
+               data.unknown2 >= 0) {
       // TES5 CTDA: reference at byte 24; alias/data ID at byte 28. Alias 0
       // is valid and is never a FormID, even in a master override.
       result.selector = Selector::Alias;
@@ -157,6 +165,18 @@ double CampaignCondition::Read(const Context& context) const
     }
     auto& reference =
       CampaignReferenceBinding::Resolve(context.actor, original);
+    if (function == Function::InFaction || function == Function::FactionRank) {
+      auto* target = reference.AsActor();
+      if (!target)
+        throw std::runtime_error(
+          "Faction conditions require a campaign actor");
+      if (function == Function::InFaction)
+        return CampaignFactionApi::IsMember(context.actor, *target, parameter1)
+          ? 1.0
+          : 0.0;
+      return static_cast<double>(
+        CampaignFactionApi::GetRank(context.actor, *target, parameter1));
+    }
     const auto& snapshot =
       QuestJournal::ReadReference(context.actor, reference);
     if (function == Function::Disabled)
@@ -247,9 +267,14 @@ bool CampaignCondition::Evaluate(
     // private copies and aliases only when their branch actually executes.
     if (condition.selector == Selector::Reference)
       ValidateReference(context.actor, condition.referenceOrAlias,
-                        condition.function == Function::Dead);
+                        condition.function == Function::Dead ||
+                          condition.function == Function::InFaction ||
+                          condition.function == Function::FactionRank);
     if (condition.function == Function::ItemCount)
       ValidateItem(context.actor, condition.parameter1);
+    if (condition.function == Function::InFaction ||
+        condition.function == Function::FactionRank)
+      CampaignFactionApi::ValidateFaction(context.actor, condition.parameter1);
     if (condition.comparisonGlobal) {
       if (!context.readGlobal)
         throw std::runtime_error(

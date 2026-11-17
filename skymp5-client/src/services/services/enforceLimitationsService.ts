@@ -13,6 +13,9 @@ export class EnforceLimitationsService extends ClientListener {
     }
 
     private onGameLoad(event: GameLoadEvent) {
+        // A personal new game is not subject to multiplayer chargen limits,
+        // and its native notification is delivered outside Papyrus update.
+        if (event.isNewGame) return;
         this.sp.Game.setInChargen(true, true, false);
     }
 }

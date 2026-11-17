@@ -1,6 +1,7 @@
 #include "QuestScriptRuntime.h"
 #include "CampaignCondition.h"
 #include "CampaignInventoryApi.h"
+#include "CampaignFactionApi.h"
 #include "CampaignReferenceBinding.h"
 #include "CampaignReferenceQueryApi.h"
 #include "CampaignReferenceScripts.h"
@@ -779,6 +780,7 @@ bool QuestScriptRuntime::Execute(MpActor& actor, uint32_t questId,
     };
     CampaignReferenceQueryApi::Register(vm, actor, formId, resolve);
     CampaignWorldStateApi::Register(vm, actor, formId);
+    CampaignFactionApi::Register(vm, actor, formId);
     vm.RegisterFunction("Form", "GetFormID", FunctionType::Method,
                         [&](VarValue self, std::vector<VarValue> args) {
                           if (!args.empty())

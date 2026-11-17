@@ -154,11 +154,13 @@ function harness(version = '2.1.0') {
   const packets = [], sent = [], errors = [];
   let destroyed = 0, created = 0;
   const model = { forms: [{ idx: 42, refrId: 0xff000001 }], playerCharacterFormIdx: 0 };
-  class RemoteServer {} class PlayerLoadoutService {}
+  class RemoteServer {} class PlayerLoadoutService {} class ActorFactionsService {}
   const loadout = { blocksGameplayInput: false, generation: 1, projectionReadiness: { ready: true } };
+  const factions = { blocksGameplayInput: false };
   const controller = { on: (...args) => native.on(...args), once: (...args) => native.once(...args), emitter,
     lookupListener: type => {
       if (type === PlayerLoadoutService) return loadout;
+      if (type === ActorFactionsService) return factions;
       assert.equal(type, RemoteServer); return { getWorldModel: () => model };
     } };
   const sp = { storage: {}, decodeUtf8: bytes => new TextDecoder().decode(bytes), mpClientPlugin: {
@@ -172,10 +174,11 @@ function harness(version = '2.1.0') {
     '../../lib/errors': { NeverError: Error }, '../../messages': load('messages.ts', {}),
     './clientListener': { ClientListener: class {} }, './remoteServer': { RemoteServer },
     './playerLoadoutService': { PlayerLoadoutService },
+    './actorFactionsService': { ActorFactionsService },
     '../../campaign/campaignPacketChannel': { CampaignPacketChannel },
   });
   const service = new NetworkingService(sp, controller);
-  return { service, emitter, sent, errors, packets, native, loadout,
+  return { service, emitter, sent, errors, packets, native, loadout, factions,
     get destroyed() { return destroyed; }, get created() { return created; },
     message: message => packets.push(['message', new TextEncoder().encode(JSON.stringify(message)).buffer, '']),
     tick: () => native.emit('tick'),
@@ -310,4 +313,19 @@ test('creation failure cleanup is deferred and cannot close a newer loadout', ()
     if (replaced) ++h.loadout.generation;
     h.tick(); assert.equal(h.destroyed, replaced ? 0 : 1);
   }
+});
+
+test('pending actor factions block every gameplay output but allow projection control packets', () => {
+  const h = harness(); h.service.selectPacketEpoch(a); h.service.releasePacketEpoch(a);
+  h.factions.blocksGameplayInput = true;
+  h.emitter.emit('sendMessage', { message: move, reliability: 'unreliable' });
+  h.emitter.emit('sendMessageWithRefrId', { message: { t: 2, _refrId: 0xff000001 }, reliability: 'unreliable' });
+  h.emitter.emit('sendRawMessage', { rawMessage: Uint8Array.from([134, 2, 5]).buffer, reliability: 'unreliable' });
+  assert.equal(h.sent.length, 0);
+  h.emitter.emit('sendMessage', { message: { t: 1,
+    contentJsonDump: JSON.stringify({ customPacketType: 'boyhouse.projection', action: 'ack' }) }, reliability: 'reliable' });
+  assert.equal(h.sent.length, 1);
+  h.factions.blocksGameplayInput = false;
+  h.emitter.emit('sendMessage', { message: move, reliability: 'unreliable' });
+  assert.equal(h.sent.length, 2);
 });

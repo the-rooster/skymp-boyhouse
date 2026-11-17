@@ -7,6 +7,7 @@
 #include "PacketParser.h"
 #include "TestUtils.hpp"
 #include "UpdateMovementMessage.h"
+#include <set>
 #include <slikenet/BitStream.h>
 
 extern espm::Loader& GetEspmLoader();
@@ -337,9 +338,22 @@ TEST_CASE("World baselines contain only the current subscribed world and "
   REQUIRE(messages[4]["t"] == static_cast<int>(MsgType::HostStart));
   REQUIRE(messages[4]["target"] == npc.GetFormId());
   REQUIRE(baseline.dump().find("secret") == std::string::npos);
-  REQUIRE(messages[1]["customPropsJsonDumps"].size() == 2);
-  REQUIRE(messages[2]["customPropsJsonDumps"].size() == 1);
-  REQUIRE(messages[2]["customPropsJsonDumps"][0]["propName"] == "visible");
+  const auto propertyNames = [](const nlohmann::json& message) {
+    std::set<std::string> result;
+    for (const auto& property : message.at("customPropsJsonDumps")) {
+      const auto name = property.at("propName").get<std::string>();
+      REQUIRE(result.insert(name).second);
+      if (name == "campaignFactions")
+        REQUIRE(nlohmann::json::parse(
+                  property.at("propValueJsonDump").get<std::string>())
+                  .is_array());
+    }
+    return result;
+  };
+  REQUIRE(propertyNames(messages[1]) ==
+          std::set<std::string>{ "ownerOnly", "visible", "campaignFactions" });
+  REQUIRE(propertyNames(messages[2]) ==
+          std::set<std::string>{ "visible", "campaignFactions" });
   // Normal stream-in uses exactly the same privacy filter.
   MpObjectReference::Unsubscribe(&peer, &actor);
   server.Messages().clear();

@@ -13,6 +13,20 @@ export class SinglePlayerService extends ClientListener {
     }
 
     private onGameLoad(event: GameLoadEvent) {
+        const generation = ++this.worldGeneration;
+        if (event.isNewGame) {
+            // Invalidate every session, including a reconnect after an earlier
+            // personal world. The native notification runs in tick context.
+            this._isSinglePlayer = true;
+            const network = this.controller.lookupListener(NetworkingService);
+            if (network.isConnected()) network.close();
+            this.controller.once('update', () => {
+                if (generation === this.worldGeneration &&
+                    !this.controller.lookupListener(NetworkingService).isConnected())
+                    this.sp.Game.setInChargen(false, false, false);
+            });
+            return;
+        }
         if (!event.isCausedBySkyrimPlatform && !this._isSinglePlayer) {
             this.sp.Debug.messageBox(
                 'Save has been loaded in multiplayer, switching to the single-player mode',
@@ -24,4 +38,5 @@ export class SinglePlayerService extends ClientListener {
     }
 
     private _isSinglePlayer = false;
+    private worldGeneration = 0;
 }

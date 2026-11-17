@@ -1,6 +1,7 @@
 #include "MpChangeForms.h"
 #include "JsonUtils.h"
 #include <cmath>
+#include <set>
 #include <spdlog/spdlog.h>
 
 namespace {
@@ -119,13 +120,15 @@ nlohmann::json MpChangeForm::ToJson(const MpChangeForm& changeForm)
   }
 
   if (changeForm.factions.has_value()) {
+    if (changeForm.factions->size() > Faction::kMaxEntries)
+      throw std::runtime_error("Too many saved faction entries");
     auto factionsJson = nlohmann::json::array();
-    for (int i = 0; i < static_cast<int>(changeForm.factions.value().size());
-         ++i) {
-      nlohmann::json obj = {
-        { "formDesc", changeForm.factions.value()[i].formDesc.ToString() },
-        { "rank", (uint32_t)changeForm.factions.value()[i].rank }
-      };
+    std::set<FormDesc> unique;
+    for (const auto& faction : *changeForm.factions) {
+      if (!unique.insert(faction.formDesc).second)
+        throw std::runtime_error("Duplicate saved faction entry");
+      nlohmann::json obj = { { "formDesc", faction.formDesc.ToString() },
+                             { "rank", static_cast<int32_t>(faction.rank) } };
       factionsJson.push_back(obj);
     }
     res["factions"] = { { "entries", factionsJson } };
@@ -392,25 +395,35 @@ MpChangeForm MpChangeForm::JsonToChangeForm(simdjson::dom::element& element)
     ReadEx(element, factions, &jTmp);
     static const JsonPointer entries("entries");
 
-    std::vector<simdjson::dom::element> parsedEntries;
-    ReadVector(jTmp, entries, &parsedEntries);
-
-    std::vector<Faction> factions = std::vector<Faction>(parsedEntries.size());
-
-    for (size_t i = 0; i != parsedEntries.size(); ++i) {
-      auto& jEntry = parsedEntries[i];
-
-      static JsonPointer rank("rank");
+    simdjson::dom::element parsedEntries;
+    ReadEx(jTmp, entries, &parsedEntries);
+    const auto array = parsedEntries.get_array().value();
+    if (array.size() > Faction::kMaxEntries)
+      throw std::runtime_error("Too many saved faction entries");
+    std::vector<Faction> factions;
+    factions.reserve(array.size());
+    std::set<FormDesc> unique;
+    static const JsonPointer rank("rank");
+    for (const auto& jEntry : array) {
       Faction fact = Faction();
       const char* tmp;
       ReadEx(jEntry, formDesc, &tmp);
       fact.formDesc = FormDesc::FromString(tmp);
 
-      uint32_t rankTemp = 0;
+      if (!unique.insert(fact.formDesc).second)
+        throw std::runtime_error("Duplicate saved faction entry");
+      int64_t rankTemp = 0;
       ReadEx(jEntry, rank, &rankTemp);
-      fact.rank = rankTemp;
-
-      factions[i] = fact;
+      // Older writers cast int8 ranks directly to uint32, producing values
+      // 2^32-128 through 2^32-1 for negative ranks. Accept exactly that legacy
+      // encoding; arbitrary out-of-range integers must never silently narrow.
+      constexpr int64_t uint32Span = int64_t(1) << 32;
+      if (rankTemp >= uint32Span - 128 && rankTemp < uint32Span)
+        rankTemp -= uint32Span;
+      if (rankTemp < -128 || rankTemp > 127)
+        throw std::runtime_error("Saved faction rank is out of range");
+      fact.rank = static_cast<int8_t>(rankTemp);
+      factions.push_back(std::move(fact));
     }
 
     res.factions = factions;

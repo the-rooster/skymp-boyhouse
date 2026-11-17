@@ -18,6 +18,7 @@ const dependencies = {
   './clientListener': { ClientListener: class {} },
   './worldCleanerService': { WorldCleanerService: class {} },
   './nativeReferenceOperationService': { NativeReferenceOperationService: class {} },
+  './actorFactionsService': { ActorFactionsService: class {} },
   '../services/services/nativeReferenceOperationService': { NativeReferenceOperationService: class {} },
   '../services/spApiInteractor': { SpApiInteractor: {} },
   '../../logging': { logError: (...args) => log('service-error', args.map(String)) },
@@ -47,6 +48,7 @@ function fixture() {
   };
   const controller = { emitter, on: sp.on, once: sp.once, lookupListener: () => ({
     operations: { isBusy: () => false }, // This isolated fixture submits no borrowed mutations.
+    prepareDisposal: () => true, // This fixture does not acquire faction leases.
     modWcProtection(id, amount) { protection.set(id, (protection.get(id) || 0) + amount); },
   }) };
   const service = new dependencies.service.OwnedReferenceService(sp, controller);

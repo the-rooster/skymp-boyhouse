@@ -150,17 +150,21 @@ function servicesFixture() {
       delete: () => operation('delete', () => forms.delete(id)), forceRemoveRagdollFromWorld: () => operation('ragdoll'),
     };
   };
-  class OwnedReferenceServiceToken {} class WorldCleanerService {}
+  class OwnedReferenceServiceToken {} class WorldCleanerService {} class ActorFactionsService {} class NetworkingService {}
+  const factions = { prepareDisposal: () => true };
   const dependencies = {
     './clientListener': { ClientListener: class {} }, '../../logging': { logError: (...args) => errors.push(args) },
     '../../campaign/nativeReferenceOperations': { NativeReferenceOperations },
     '../../campaign/ownedReferenceLifetime': { OwnedReferenceLifetime },
     './ownedReferenceService': { OwnedReferenceService: OwnedReferenceServiceToken }, './worldCleanerService': { WorldCleanerService },
+    './actorFactionsService': { ActorFactionsService },
+    './networkingService': { NetworkingService },
   };
   const { NativeReferenceOperationService } = load('services/services/nativeReferenceOperationService.ts', dependencies);
   dependencies['./nativeReferenceOperationService'] = { NativeReferenceOperationService };
   const { OwnedReferenceService } = load('services/services/ownedReferenceService.ts', dependencies);
   const { RagdollService } = load('services/services/ragdollService.ts', dependencies);
+  const { LoadGameService } = load('services/services/loadGameService.ts', dependencies);
   const sp = { storage: {}, getReferenceHandle: id => forms.get(id)?.handle || 0,
     Game: { getFormEx: reference, getGameSettingFloat: key => values.get(key), setGameSettingFloat: (key, value) => values.set(key, value) },
     ObjectReference: { from: value => value }, Actor: { from: value => value }, TESModPlatform: { setWeaponDrawnMode() {} },
@@ -170,13 +174,16 @@ function servicesFixture() {
     lookupListener(type) {
       if (type === NativeReferenceOperationService) return native;
       if (type === OwnedReferenceServiceToken) return owned;
+      if (type === ActorFactionsService) return factions;
+      if (type === NetworkingService) return { isConnected: () => false };
       if (type === WorldCleanerService) return { modWcProtection: (...args) => changes.push(args) };
       throw Error('Unexpected service lookup');
     },
   };
   native = new NativeReferenceOperationService(sp, controller); owned = new OwnedReferenceService(sp, controller);
   const ragdoll = new RagdollService(sp, controller);
-  return { native, owned, ragdoll, values, calls, forms, changes, errors, emitter, events, pending, reference, sp,
+  new LoadGameService(sp, controller);
+  return { native, owned, ragdoll, values, calls, forms, changes, errors, emitter, events, pending, reference, sp, factions,
     update() { ++frame; events.emit('update'); },
     async finish(name) { const i = name ? pending.findIndex(job => job.name === name) : 0; assert.ok(i >= 0 && pending[i]);
       pending.splice(i, 1)[0].resolve(); await Promise.resolve(); },
@@ -192,6 +199,18 @@ test('owned deletion waits for borrowed native work and borrowed work waits for 
   f.owned.references.retire(lease); f.update(); assert.equal(f.calls.some(c => c[0] === 'delete'), false);
   await f.finish(); f.update(); assert.deepEqual(f.calls.map(c => c[0]), ['enable', 'disable', 'delete']);
   await f.finish(); f.update(); assert.equal(f.forms.has(id), false); assert.equal(f.native.operations.isBusy(), false);
+});
+
+test('owned actor disposal waits for faction restoration even after its view retires', async () => {
+  const f = servicesFixture(), id = 0xff001000, lease = f.owned.references.claim(id);
+  f.factions.prepareDisposal = () => false;
+  f.owned.references.retire(lease); f.update();
+  assert.equal(f.calls.some(call => call[0] === 'delete'), false);
+  assert.equal(f.owned.references.hasRetiringReferences(), true);
+  f.factions.prepareDisposal = () => true; f.update();
+  assert.equal(f.calls.some(call => call[0] === 'delete'), true);
+  await f.finish(); f.update();
+  assert.equal(f.owned.references.hasRetiringReferences(), false);
 });
 
 test('persistent suppression observes native completion across an epoch cancellation', async () => {
@@ -223,6 +242,38 @@ test('new save discards old operations and restores the ragdoll global override 
   const f = servicesFixture(), before = [...f.values.values()];
   const job = f.ragdoll.safeRemoveRagdollFromWorld(f.reference(0xff001000), () => assert.fail('Old callback ran'));
   f.update(); f.events.emit('preLoadGame'); f.update();
+  assert.equal(job.status, 'running'); assert.ok([...f.values.values()].every(value => value === 0));
+  f.emitter.emit('gameLoad', {}); await f.finish(); f.update();
   assert.equal(job.status, 'cancelled'); assert.deepEqual([...f.values.values()], before);
-  f.emitter.emit('gameLoad', {}); await f.finish(); f.update(); assert.equal(f.native.operations.isBusy(), false);
+  assert.equal(f.native.operations.isBusy(), false);
+});
+
+test('failed load retains active native work and owned handles until old-world deletion safely drains', async () => {
+  const f = servicesFixture(), id = 0xff001000;
+  f.owned.references.claim(id);
+  const job = f.native.submit(id, 'old', () => true, [ref => ref.disable(), () => assert.fail('Stale second step ran')],
+    () => assert.fail('Stale completion ran'));
+  f.update(); f.events.emit('preLoadGame'); f.update();
+  assert.equal(f.owned.references.state.references.has(id), true); assert.equal(f.native.operations.isBusy(id), true);
+  f.events.emit('postLoadGame', { success: false }); f.update();
+  assert.deepEqual(f.calls.map(call => call[0]), ['disable'], 'An unsettled old native call still blocks deletion');
+  await f.finish(); f.update();
+  assert.equal(job.status, 'cancelled'); assert.deepEqual(f.calls.map(call => call[0]), ['disable', 'delete']);
+  await f.finish(); f.update();
+  assert.equal(f.owned.references.state.references.size, 0); assert.equal(f.native.operations.isBusy(), false);
+});
+
+for (const replacement of ['gameLoad', 'newGame']) test(`confirmed ${replacement} forgets old ownership without disposing a new actor at the same FormID`, async () => {
+  const f = servicesFixture(), id = 0xff001000;
+  f.owned.references.claim(id);
+  f.native.submit(id, 'old', () => true, ref => ref.disable()); f.update();
+  if (replacement === 'gameLoad') f.events.emit('preLoadGame');
+  f.forms.set(id, { handle: 500, disabled: false });
+  if (replacement === 'newGame') f.events.emit('newGame');
+  else f.emitter.emit('gameLoad', {});
+  assert.equal(f.owned.references.state.references.size, 0, 'Replacement must forget handles before another update');
+  await f.finish(); f.update();
+  assert.equal(f.forms.get(id).handle, 500); assert.equal(f.forms.get(id).disabled, false);
+  assert.equal(f.calls.some(call => call[0] === 'delete'), false);
+  assert.equal(f.owned.references.state.references.size, 0); assert.equal(f.native.operations.isBusy(), false);
 });

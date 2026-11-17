@@ -544,8 +544,12 @@ export declare function once(eventName: 'newGame', callback: () => void): EventH
 export declare function on(eventName: 'preLoadGame', callback: () => void): EventHandle
 export declare function once(eventName: 'preLoadGame', callback: () => void): EventHandle
 
-export declare function on(eventName: 'postLoadGame', callback: () => void): EventHandle
-export declare function once(eventName: 'postLoadGame', callback: () => void): EventHandle
+export interface PostLoadGameEvent {
+  /** False means the prior world survived the failed load attempt. */
+  success: boolean;
+}
+export declare function on(eventName: 'postLoadGame', callback: (event: PostLoadGameEvent) => void): EventHandle
+export declare function once(eventName: 'postLoadGame', callback: (event: PostLoadGameEvent) => void): EventHandle
 
 export declare function on(eventName: 'saveGame', callback: () => void): EventHandle
 export declare function once(eventName: 'saveGame', callback: () => void): EventHandle
@@ -1648,6 +1652,30 @@ export declare function beginPlayerLoadout(): string;
 export declare function requestPlayerLoadout(epoch: string, target: PlayerLoadoutRequest): PlayerLoadoutStatus;
 export declare function getPlayerLoadoutStatus(epoch: string): PlayerLoadoutStatus;
 export declare function cancelPlayerLoadout(epoch: string): void;
+
+export interface ActorFactionEntry {
+  factionId: number;
+  rank: number;
+  isMember: boolean;
+}
+export interface ActorFactionsStatus {
+  token: string;
+  actorId: number;
+  revision?: number;
+  status: "idle" | "queued" | "observing" | "settled" | "restoring" | "restored" | "failed" | "superseded";
+  mutationPending: boolean;
+  uncertain: boolean;
+  error?: string;
+}
+export declare const actorFactionsApiVersion: number;
+// Native leases retain original per-reference overrides across JS reloads.
+// Calls that capture a lease must run in a Papyrus update. Successful results
+// require two later native observations; packet receipt does not imply ready.
+export declare function beginActorFactions(actorId: number): string;
+export declare function applyActorFactions(token: string, revision: number, entries: ActorFactionEntry[]): ActorFactionsStatus;
+export declare function restoreActorFactions(token: string): ActorFactionsStatus;
+export declare function getActorFactionsStatus(token: string): ActorFactionsStatus;
+export declare function releaseActorFactions(token: string): void;
 
 export declare function castSpellImmediate(actorCasterFormId: number, castingSource: SpellType, formIdSpell: number, formIdTarget: number, aimAngle: number, aimHeading: number, animationVariables: ActorAnimationVariables): void;
 export declare function interruptCast(actorCasterFormId: number, castingSource: SpellType, animationVariables: ActorAnimationVariables): void;

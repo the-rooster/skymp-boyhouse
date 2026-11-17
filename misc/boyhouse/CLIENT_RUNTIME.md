@@ -1,6 +1,6 @@
 ﻿# Native client runtime audit
 
-Updated 2026-11-16 UTC. **Experimental port; full multiplayer gameplay is unverified.**
+Updated 2026-11-17 UTC. **Experimental port; full multiplayer gameplay is unverified.**
 The installed Steam runtime is 1.7.104.0. The locally built SKSE 2.3.1 and
 Skyrim Platform implementation now load a generated test world and execute native
 JavaScript/Papyrus bridge calls. A clean restart reproduced this result. No
@@ -877,6 +877,45 @@ Without the flag, the observer uses the scalar UI calls for older plugin builds.
 Both generated modes passed syntax and simulated observer-flow checks; neither
 mode has completed the new engine acceptance run. Real non-null Alias bindings
 are not covered by this observer.
+
+## Campaign faction bridge and load recovery
+
+The isolated server now supplies complete faction snapshots with both signed
+rank and membership. These are separate engine observations: an active base
+membership can survive some negative rank overrides. The native client adapter
+is restricted to the audited 1.7.104 runtime and to the player or owned temporary
+actors. It changes per-reference `ExtraFactionChanges`, never shared NPC base
+records. Unique actors' existing faction removals and other states that cannot
+be represented by an isolated reference override remain unsupported.
+
+Native leases retain the original overrides, actor handle, base identity and
+world generation. Application and restoration require observations on two later
+Papyrus updates. Settled leases are sampled again on status requests after 30
+updates; drift closes readiness without automatically rewriting unexpected
+state. Processing is bounded to eight jobs per update. Restoration preserves
+independent crime overrides and current base metadata. Original state survives
+JavaScript reload, and actor disposal waits for restoration.
+
+Spawn, projection acknowledgement and gameplay input wait for faction
+settlement. A failed save-load attempt retains old-world ownership, original
+visibility, protections and dispatched native operations until cleanup settles.
+The native `postLoadGame` event now supplies its actual success result. Failure
+resumes cleanup and disconnects the invalidated session; confirmed replacement
+discards old identities without operating on reused FormIDs. A new game uses the
+same confirmed-replacement lifecycle.
+
+The Windows native compile-only build and client webpack build passed. Full
+Linux verification passed **569 native cases / 384,806 assertions, 368
+JavaScript tests and 43 Python tests**, plus native-addon, ordinary/projection
+protocol and SQLite restart smokes. The owned catalog scan parsed 14,026 PEX
+objects and 2,274 quest records, with zero parse failures or explicit unresolved
+dependencies. It still certifies zero quests. Evidence is in ignored
+`artifacts/campaign-factions-platform-build-final.log`,
+`artifacts/campaign-factions-client-build-final.log` and
+`artifacts/campaign-factions-verify-final.log`. The new DLL has not been
+installed or exercised in Skyrim. The installed DLL hash remains
+`7ff5d7c82aa2cbed801f22b8fc5aac3a747469d60221be41014d4746e95cec9b`.
+These checks do not establish a playable quest or complete faction semantics.
 
 ## Remaining acceptance
 

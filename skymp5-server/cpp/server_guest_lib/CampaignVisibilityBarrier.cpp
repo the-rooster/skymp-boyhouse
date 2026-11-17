@@ -1,6 +1,7 @@
 #include "CampaignVisibilityBarrier.h"
 #include "MpActor.h"
 #include "PartOne.h"
+#include <algorithm>
 #include <spdlog/spdlog.h>
 #include <stdexcept>
 #include <string>
@@ -10,6 +11,22 @@ bool IsPacketEpoch(const std::string& value)
 {
   return value.size() == 32 &&
     value.find_first_not_of("0123456789abcdef") == std::string::npos;
+}
+
+bool IsObserver(const MpActor& owner, const MpActor* actor)
+{
+  if (!actor || actor->GetWorldInstance() != owner.GetWorldInstance())
+    return false;
+  // Private mutations can change subscriptions, so the entire phase must wait
+  // for its new projection. In shared space only the owner can be mutated;
+  // its connected listeners need a new baseline, not every distant player.
+  if (!owner.GetWorldInstance().empty() || actor == &owner)
+    return true;
+  // Only direct observers have this actor in their replication baseline.
+  // Hosting an offline observer does not itself subscribe a distant player.
+  const auto& listeners = owner.GetActorListeners();
+  return std::find(listeners.begin(), listeners.end(), actor) !=
+    listeners.end();
 }
 }
 
@@ -80,9 +97,11 @@ void CampaignVisibilityBarrier::BeforeCommit(MpActor& owner)
   pending->instance = owner.GetWorldInstance();
   const auto prefix = "campaign:" + std::to_string(owner.GetFormId()) + ":";
   if (pending->owner.get() != &owner || owner.IsDeleted() ||
-      !pending->instance.starts_with(prefix) ||
-      pending->instance.size() == prefix.size())
-    throw std::runtime_error("Campaign visibility requires a private owner");
+      (!pending->instance.empty() &&
+       (!pending->instance.starts_with(prefix) ||
+        pending->instance.size() == prefix.size())))
+    throw std::runtime_error(
+      "Campaign visibility requires the campaign owner");
 
   auto& state = server.serverState;
   for (size_t id = 0; id < state.userInfo.size(); ++id) {
@@ -90,7 +109,7 @@ void CampaignVisibilityBarrier::BeforeCommit(MpActor& owner)
       continue;
     const auto userId = static_cast<Networking::UserId>(id);
     auto* actor = state.ActorByUser(userId);
-    if (!actor || actor->GetWorldInstance() != pending->instance)
+    if (!IsObserver(owner, actor))
       continue;
     auto& user = *state.userInfo[id];
     const auto lifetime =
@@ -138,7 +157,7 @@ void CampaignVisibilityBarrier::Validate(bool advanced)
       continue;
     const auto userId = static_cast<Networking::UserId>(id);
     auto* actor = state.ActorByUser(userId);
-    if (!actor || actor->GetWorldInstance() != context->instance)
+    if (!IsObserver(*owner, actor))
       continue;
     if (next == context->users.size() || context->users[next++] != userId)
       throw std::runtime_error("Campaign visibility participants changed");

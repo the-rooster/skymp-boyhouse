@@ -22,18 +22,19 @@ Generated static analysis. Counts include internal/helper quests and potential d
 | engine.scenes | 1309 |
 | engine.events | 1296 |
 | alias.fill.event | 1180 |
+| forms.asset-bindings | 1108 |
 | condition.run-on:7 | 1062 |
 | alias.properties | 1058 |
-| forms.asset-bindings | 918 |
 | alias.scripts | 699 |
 | engine.packages | 592 |
 | alias.fill.forced-reference | 547 |
 | alias.fill.matching-or-script | 520 |
 | world.campaign-player | 493 |
 | alias.location | 486 |
+| condition.run-on:0:physical | 403 |
 | alias.fill.created-reference | 384 |
+| condition.run-on:2 | 301 |
 | condition.run-on:5 | 277 |
-| condition.run-on:2 | 271 |
 | alias.fill.location-or-alias | 265 |
 | condition.flags | 255 |
 | condition.run-on:1 | 164 |
@@ -41,7 +42,6 @@ Generated static analysis. Counts include internal/helper quests and potential d
 | alias.fill.matching-reference | 138 |
 | quest.log-flags | 72 |
 | alias.fill.external-alias | 63 |
-| condition.run-on:0:physical | 38 |
 | condition.run-on:3 | 31 |
 | condition.run-on:6 | 7 |
 | condition.run-on:4 | 3 |
@@ -52,9 +52,6 @@ Generated static analysis. Counts include internal/helper quests and potential d
 | --- | ---: |
 | quest.stop | 877 |
 | utility.wait | 444 |
-| actor.isinfaction | 386 |
-| actor.setfactionrank | 332 |
-| actor.removefromfaction | 301 |
 | actor.setactorvalue | 283 |
 | actor.getactorvalue | 270 |
 | scene.start | 264 |
@@ -80,6 +77,9 @@ Generated static analysis. Counts include internal/helper quests and potential d
 | keyword.sendstoryevent | 133 |
 | form.unregisterforupdate | 124 |
 | scene.stop | 119 |
+| objectreference.getcurrentlocation | 118 |
+| quest.start | 114 |
+| location.ischild | 98 |
 
 ## Most widely referenced missing condition functions
 
@@ -88,7 +88,6 @@ Generated static analysis. Counts include internal/helper quests and potential d
 | GetIsID (72) | 1467 |
 | GetInCurrentLoc (359) | 1058 |
 | GetIsEditorLocation (565) | 634 |
-| GetInFaction (71) | 475 |
 | GetIsAliasRef (566) | 416 |
 | GetEventData (576) | 393 |
 | GetInCell (67) | 351 |
@@ -105,6 +104,7 @@ Generated static analysis. Counts include internal/helper quests and potential d
 | GetInWorldspace (310) | 100 |
 | IsInInterior (300) | 93 |
 | GetRandomPercent (77) | 92 |
+| HasKeyword (560) | 91 |
 
 ## Limits and next steps
 
@@ -119,7 +119,7 @@ Implement shared capabilities, then rerun this report and the regression suites.
 
 ## Reproducibility
 
-Capability registry SHA-256: e68c07676b9b327fb39db9fbdd1c45ad786ce501707df5e454f05944a7b3e389
+Capability registry SHA-256: 480d4a05a3cd1ac61395e750cb15286fb2eb947c7608a0b088383b6809275479
 
 - Skyrim.esm: e198c3b85e5e48e0c92a6580d8f66e644256b68d812ee32b61735cf9b753df73
 - Update.esm: b298b0f65fa0127fd13c1f5ef6bb30eaf9d21fd19f5e6f8f91f829c9007d3280

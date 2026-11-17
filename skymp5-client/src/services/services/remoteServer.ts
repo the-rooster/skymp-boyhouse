@@ -54,6 +54,8 @@ import { SpellCastMessage } from '../messages/spellCastMessage';
 import { UpdateAnimVariablesMessage } from '../messages/updateAnimVariablesMessage';
 import { PlayerSpawnService } from './playerSpawnService';
 import { PlayerLoadoutService } from './playerLoadoutService';
+import { campaignFactionRanks, campaignFactionsFromBaseline, campaignFactionsProperty } from '../../sync/campaignFactions';
+import { ActorFactionsService } from './actorFactionsService';
 import { LoadGameService } from './loadGameService';
 
 export const getPcInventory = (): Inventory | undefined => {
@@ -81,6 +83,13 @@ export class RemoteServer extends ClientListener {
       // Initial server packets target the generated world being loaded. A
       // personal save must discard them before its first native update.
       if (!controller.lookupListener(LoadGameService).isLoadingPlatformSave) this.resetWorldModel();
+    });
+    controller.on('postLoadGame', (event?: { success: boolean }) => {
+      if (event?.success === false) {
+        this.loading = false;
+        // Drop deferred bootstrap effects before the failed-load disconnect.
+        ++this.lifetime.generation;
+      }
     });
     controller.emitter.on('gameLoad', event => {
       this.loading = false;
@@ -265,6 +274,9 @@ export class RemoteServer extends ClientListener {
 
   private onCreateActorMessage(event: ConnectionMessage<CreateActorMessage>): void {
     const msg = event.message;
+    const campaignFactions = campaignFactionsFromBaseline(msg);
+    if (campaignFactions !== undefined && this.skipFormViewCreation(msg))
+      throw Error('Campaign factions cannot target a shared authored reference');
     this.originals.forEach((entry, id) => {
       if (entry.idx === msg.idx) { this.originals.delete(id); this.originalApplications.delete(id); }
     });
@@ -403,6 +415,7 @@ export class RemoteServer extends ClientListener {
     }
 
     msg.customPropsJsonDumps.forEach(element => {
+      if (element.propName === campaignFactionsProperty) return;
       let parsed: unknown;
       try {
         parsed = JSON.parse(element.propValueJsonDump);
@@ -415,6 +428,7 @@ export class RemoteServer extends ClientListener {
       }
       (form as Record<string, unknown>)[element.propName] = parsed;
     });
+    form.campaignFactions = campaignFactions;
 
     // Reliable death state is authoritative over movement's animation hint.
     // In particular, a dead baseline must not immediately resurrect its copy
@@ -555,7 +569,10 @@ export class RemoteServer extends ClientListener {
 
   private onUpdatePropertyMessage(event: ConnectionMessage<UpdatePropertyMessage>): void {
     const msg = event.message;
-    const msgData = this.extractUpdatePropertyMessageData(msg);
+    const parsed = this.extractUpdatePropertyMessageData(msg);
+    const msgData = msg.propName === campaignFactionsProperty ? campaignFactionRanks(parsed) : parsed;
+    if (msg.propName === campaignFactionsProperty && this.skipFormViewCreation(msg))
+      throw Error('Campaign factions cannot target a shared authored reference');
 
     if (this.skipFormViewCreation(msg)) {
       const refrId = msg.refrId!;
@@ -582,6 +599,8 @@ export class RemoteServer extends ClientListener {
     const form = this.worldModel.forms[i];
     if (form) {
       (form as Record<string, unknown>)[msg.propName] = msgData;
+      if (msg.propName === campaignFactionsProperty && i === this.worldModel.playerCharacterFormIdx)
+        this.controller.lookupListener(ActorFactionsService).updateSelf(msg.idx, msgData);
       if (msg.propName === 'isDead' && typeof msgData === 'boolean' && form.movement) form.movement.isDead = msgData;
     }
   }

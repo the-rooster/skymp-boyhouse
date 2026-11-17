@@ -19,6 +19,7 @@
 #include "MpClientPluginApi.h"
 #include "ObjectReferenceApi.h"
 #include "PlayerLoadoutApi.h"
+#include "ActorFactionsApi.h"
 #include "Sp3Api.h"
 #include "TextApi.h"
 #include "ThreadPoolWrapper.h"
@@ -332,6 +333,7 @@ private:
     jsPromiseTaskQueue.Clear();
     nativeCallRequirements.jsThrQ->Clear();
     PlayerLoadoutApi::ResetRuntime();
+    ActorFactionsApi::ResetRuntime();
     settingsByPluginName.clear();
     settingsByPluginNameCache.reset();
   }

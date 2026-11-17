@@ -155,7 +155,7 @@ def summarize_record(typ, flags, form, values, groups, origins, plugin):
             index = struct.unpack_from("<H", data, 8)[0]
             run_on, reference, alias_id = struct.unpack_from("<IIi", data, 20)
             stage_log = context.startswith("stage:") and typ == "QUST"
-            physical = index in (35, 46, 47)
+            physical = index in (35, 46, 47, 71, 73)
             feature(f"condition:{index}", where)
             if op & 0x1a or op >> 5 > 5:
                 feature("condition.flags", where)
@@ -168,7 +168,7 @@ def summarize_record(typ, flags, form, values, groups, origins, plugin):
             reference_key = ref(reference, where) if run_on == 2 else None
             if stage_log and physical and run_on == 2 and reference_key:
                 feature("condition.stage-run-on:2:private-reference", where)
-            elif stage_log and index == 46 and run_on == 5 and alias_id >= 0:
+            elif stage_log and index in (46, 71, 73) and run_on == 5 and alias_id >= 0:
                 feature("condition.stage-run-on:5:reference-alias", where)
             elif physical and run_on == 0:
                 feature("condition.run-on:0:physical", where)
@@ -176,7 +176,7 @@ def summarize_record(typ, flags, form, values, groups, origins, plugin):
                 feature(f"condition.run-on:{run_on}", where)
             if not stage_log:
                 feature("condition.non-stage-evaluation", where)
-            if index in (47, 56, 58, 59, 74, 543, 629) and not op & 0x0a:
+            if index in (47, 56, 58, 59, 71, 73, 74, 543, 629) and not op & 0x0a:
                 ref(struct.unpack_from("<I", data, 12)[0], where)
         elif tag == b"QSDT" and typ == "QUST":
             if len(data) != 1:

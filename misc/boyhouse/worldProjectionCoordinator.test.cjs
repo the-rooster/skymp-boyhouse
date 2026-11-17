@@ -276,9 +276,10 @@ function engineFixture(options = {}) {
   ['Movement', 'Fighting', 'CamSwitch', 'Looking', 'Sneaking', 'Menu', 'Activate', 'Journal'].forEach((name, i) => {
     sp.Game[`is${name}ControlsEnabled`] = () => flags[i];
   });
-  class OwnedToken {} class WorldCleanerService {} class WorldView {} class RemoteServer {} class PlayerSpawnService {} class NetworkingService {} class PlayerLoadoutService {}
+  class OwnedToken {} class WorldCleanerService {} class WorldView {} class RemoteServer {} class PlayerSpawnService {} class NetworkingService {} class PlayerLoadoutService {} class ActorFactionsService {}
   const loadout = { blocksGameplayInput: false, creationMenuActive: false, projectionReadiness: { ready: true },
     failCreation(error) { this.projectionReadiness = { ready: false, error }; } };
+  const factions = { blocksGameplayInput: false, readiness: { ready: true }, drained: { ready: true }, prepareDisposal: () => true };
   const dependencies = {
     './clientListener': { ClientListener: class {} }, '../../logging': { logError: (...args) => errors.push(args) },
     '../../campaign/nativeReferenceOperations': { NativeReferenceOperations },
@@ -287,6 +288,7 @@ function engineFixture(options = {}) {
     './worldCleanerService': { WorldCleanerService }, '../../view/worldView': { WorldView },
     './remoteServer': { RemoteServer }, './playerSpawnService': { PlayerSpawnService }, './networkingService': { NetworkingService },
     './playerLoadoutService': { PlayerLoadoutService },
+    './actorFactionsService': { ActorFactionsService },
   };
   const { NativeReferenceOperationService } = load('services/services/nativeReferenceOperationService.ts', dependencies);
   dependencies['./nativeReferenceOperationService'] = { NativeReferenceOperationService };
@@ -311,6 +313,7 @@ function engineFixture(options = {}) {
     if (type === RemoteServer) return remote;
     if (type === NetworkingService) return network;
     if (type === PlayerLoadoutService) return loadout;
+    if (type === ActorFactionsService) return factions;
     if (type === PlayerSpawnService) return { get status() { return spawn; }, isReady: generation => playerReady && spawn?.generation === generation };
     if (type === WorldCleanerService) return { modWcProtection() {}, setProjectionMode(value) { calls.push(['cleaner', value]); } };
     throw Error('Unexpected service');
@@ -321,7 +324,7 @@ function engineFixture(options = {}) {
   suppression = new ReferenceSuppressionService(sp, controller);
   const projection = { ...manifest(), instance: `campaign:${actor}:room`, identity: 'a'.repeat(32),
     references: [{ original: 0x100, copy: 0xff001000, baseId: 123, kind: 'actor', disabled: false, deleted: false }] };
-  return { engine, native, owned, suppression, view, projection, pending, forms, flags, errors, calls, sp, loadout,
+  return { engine, native, owned, suppression, view, projection, pending, forms, flags, errors, calls, sp, loadout, factions, events, emitter,
     update() { ++frame; events.emit('update'); },
     async drain(limit = 24) { for (let i = 0; i < limit; ++i) {
       if (pending.length) pending.shift().finish(); await Promise.resolve(); await Promise.resolve(); this.update();
@@ -331,6 +334,17 @@ function engineFixture(options = {}) {
     originalsReady(value) { originalReady = value; }, noOpControls(value) { nativeNoOp = value; },
   };
 }
+
+test('failed load resumes projection cleanup and restores its control lease after native work drains', async () => {
+  const f = engineFixture(), before = [...f.flags]; f.begin(); f.playerReady(); await f.drain();
+  f.events.emit('preLoadGame'); f.engine.disconnect();
+  await f.drain();
+  assert.equal(f.forms.get(0x100).disabled, true, 'Restoration is suspended during the load attempt');
+  assert.equal(f.engine.drained().ready, false);
+  f.events.emit('postLoadGame', { success: false }); await f.drain();
+  assert.equal(f.forms.get(0x100).disabled, false); assert.equal(f.forms.get(0x100).blocked, false);
+  assert.equal(f.engine.drained().ready, true); assert.deepEqual(f.flags, before);
+});
 
 test('native engine waits for self, suppression, original work, and copies while preserving existing control restrictions', async () => {
   const f = engineFixture(), before = [...f.flags]; f.begin(); f.update();
@@ -408,4 +422,19 @@ test('projection waits for loadout application and creation control failures rem
   f.loadout.projectionReadiness = { ready: true }; f.engine.release();
   f.loadout.blocksGameplayInput = true; f.noOpControls(true); f.update();
   assert.match(f.loadout.projectionReadiness.error, /controls did not become blocked/);
+});
+
+test('projection waits for faction settlement and keeps controls until faction cleanup finishes', async () => {
+  const f = engineFixture(); f.begin(); f.playerReady(); f.viewsReady(); await f.drain();
+  f.factions.readiness = { ready: false };
+  assert.equal(f.engine.observe().ready, false);
+  assert.throws(() => f.engine.release(), /no longer ready/);
+  f.factions.readiness = { ready: true }; f.engine.release();
+  f.factions.blocksGameplayInput = true; f.update();
+  assert.equal(f.flags[0], false); assert.equal(f.flags[6], false);
+  f.engine.disconnect(); f.factions.drained = { ready: false };
+  await f.drain(); assert.equal(f.engine.drained().ready, false);
+  assert.equal(f.flags[0], false);
+  f.factions.drained = { ready: true }; f.factions.blocksGameplayInput = false; f.update();
+  assert.equal(f.engine.drained().ready, true); assert.equal(f.flags[0], true);
 });

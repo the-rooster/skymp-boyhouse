@@ -13,6 +13,9 @@ class PartOne;
 // receive exactly one AfterCommit, including failures; false means abort OR
 // postcommit desynchronization. Only the ordinary projection ack may reopen a
 // successful connection after AfterCommit returns.
+// Private phases include all connected phase members. Shared-space owner
+// mutations include the owner and its connected direct actor listeners.
+// Target mutation eligibility remains WorldState's concern.
 class CampaignVisibilityBarrier
 {
 public:

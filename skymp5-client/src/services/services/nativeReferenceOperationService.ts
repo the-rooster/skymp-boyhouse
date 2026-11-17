@@ -22,7 +22,10 @@ export class NativeReferenceOperationService extends ClientListener {
             report: job => logError(this, job.key, job.id.toString(16), job.error),
         }, state);
         this.operations.cancelEpoch();
-        controller.on('preLoadGame', () => { this.loading = true; this.operations.forgetWorld(); });
+        controller.on('preLoadGame', () => { this.loading = true; this.operations.cancelEpoch(); });
+        controller.on('postLoadGame', (event?: { success: boolean }) => {
+            if (event?.success === false) this.loading = false;
+        });
         controller.emitter.on('gameLoad', () => { this.loading = false; this.operations.forgetWorld(); });
         controller.emitter.on('worldModelReset', () => this.operations.cancelEpoch());
         controller.on('update', () => { if (!this.loading) this.operations.update(); });

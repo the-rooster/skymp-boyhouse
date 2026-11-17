@@ -329,9 +329,9 @@ class DependencyTests(unittest.TestCase):
         caps = {c["id"]: c["status"] for c in result["capabilities"]}
         self.assertEqual(caps["condition.flags"], "missing")
 
-    def test_physical_stage_conditions_record_reference_and_item_dependencies(self):
+    def test_physical_stage_conditions_record_reference_and_parameter_dependencies(self):
         origins = ["Skyrim.esm", "Dragonborn.esm"]
-        for function in (35, 46, 47):
+        for function in (35, 46, 47, 71, 73):
             with self.subTest(function=function):
                 condition = bytearray(32)
                 struct.pack_into("<H", condition, 8, function)
@@ -341,13 +341,14 @@ class DependencyTests(unittest.TestCase):
                     [(b"INDX", struct.pack("<H", 10)), (b"QSDT", b"\0"),
                      (b"CTDA", bytes(condition))], (), origins, "Dragonborn.esm")
                 expected = {"Skyrim.esm:000032"}
-                if function == 47:
+                if function in (47, 71, 73):
                     expected.add("Dragonborn.esm:000031")
                 self.assertEqual(quest["refs"], expected)
                 self.assertIn("condition.stage-run-on:2:private-reference", quest["features"])
                 self.assertNotIn("condition.run-on:2", quest["features"])
                 target = summary("ACHR", 0x32)
-                item = summarize_record("MISC", 0, 0x01000031, (), (), origins, "Dragonborn.esm")
+                item = summarize_record("FACT" if function in (71, 73) else "MISC",
+                    0, 0x01000031, (), (), origins, "Dragonborn.esm")
                 registry = {**REGISTRY, "conditionSubsets": [str(function)],
                     "featureSubsets": ["condition.stage-run-on:2:private-reference"]}
                 report = analyze({r["id"]: r for r in (quest, target, item)}, {}, registry)
@@ -358,7 +359,8 @@ class DependencyTests(unittest.TestCase):
                 self.assertEqual(report["summary"]["certifiedPlayable"], 0)
 
     def test_physical_alias_selector_is_signed_offset28_not_a_form(self):
-        for function, alias_id in ((46, 0), (46, 17), (46, -1), (35, 0), (47, 0)):
+        for function, alias_id in ((46, 0), (46, 17), (46, -1), (35, 0), (47, 0),
+                                  (71, 0), (71, 17), (71, -1), (73, 0), (73, 17), (73, -1)):
             with self.subTest(function=function, alias_id=alias_id):
                 condition = bytearray(32)
                 struct.pack_into("<H", condition, 8, function)
@@ -366,12 +368,12 @@ class DependencyTests(unittest.TestCase):
                 quest = summary(values=[(b"INDX", struct.pack("<H", 10)),
                     (b"QSDT", b"\0"), (b"CTDA", bytes(condition))])
                 self.assertEqual(quest["refs"], set())
-                supported = function == 46 and alias_id >= 0
+                supported = function in (46, 71, 73) and alias_id >= 0
                 self.assertEqual("condition.stage-run-on:5:reference-alias" in quest["features"], supported)
                 self.assertEqual("condition.run-on:5" in quest["features"], not supported)
 
     def test_physical_implicit_and_nonstage_selectors_remain_missing(self):
-        for function in (35, 46, 47):
+        for function in (35, 46, 47, 71, 73):
             for stage_log in (False, True):
                 for run_on in (0, 2):
                     with self.subTest(function=function, stage_log=stage_log, run_on=run_on):
@@ -398,16 +400,17 @@ class DependencyTests(unittest.TestCase):
             self.assertNotIn("condition.stage-run-on:2:private-reference", quest["features"])
             self.assertEqual(quest["refs"], {"Skyrim.esm:000014"})
 
-    def test_item_condition_alias_and_package_parameters_are_not_form_ids(self):
-        for flags in (2, 8):
-            condition = bytearray(32)
-            condition[0] = flags
-            struct.pack_into("<H", condition, 8, 47)
-            struct.pack_into("<I", condition, 12, 0xdeadbeef)
-            struct.pack_into("<II", condition, 20, 2, 0x14)
-            quest = summary(values=[(b"CTDA", bytes(condition))])
-            self.assertEqual(quest["refs"], {"Skyrim.esm:000014"})
-            self.assertIn("condition.flags", quest["features"])
+    def test_item_and_faction_condition_alias_and_package_parameters_are_not_form_ids(self):
+        for function in (47, 71, 73):
+            for flags in (2, 8):
+                condition = bytearray(32)
+                condition[0] = flags
+                struct.pack_into("<H", condition, 8, function)
+                struct.pack_into("<I", condition, 12, 0xdeadbeef)
+                struct.pack_into("<II", condition, 20, 2, 0x14)
+                quest = summary(values=[(b"CTDA", bytes(condition))])
+                self.assertEqual(quest["refs"], {"Skyrim.esm:000014"})
+                self.assertIn("condition.flags", quest["features"])
 
     def test_transitive_calls_parent_cycles_and_native_subsets(self):
         objects = {}

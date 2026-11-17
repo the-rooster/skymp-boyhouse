@@ -3,6 +3,8 @@
 #include "QuestJournal.h"
 #include "QuestScriptRuntime.h"
 #include "TestUtils.hpp"
+#include "libespm/NPC_.h"
+#include <algorithm>
 #include <climits>
 #include <cstring>
 #include <limits>
@@ -16,6 +18,8 @@ constexpr uint32_t kMq103 = 0xd0800;
 constexpr uint32_t kClaw = 0xdf202;
 constexpr uint32_t kMs13 = 0x39645;
 constexpr uint32_t kLucan = 0x13487;
+constexpr uint32_t kMq302 = 0x45923;
+constexpr uint32_t kSonsFaction = 0x2bf9b;
 using RunOn = espm::CTDA::RunOnTypeFlags;
 
 espm::CTDA Clause(uint16_t function, RunOn runOn, uint32_t reference,
@@ -60,6 +64,10 @@ struct ConditionFixture
     stranger->SetWorldInstance(
       "campaign:" + std::to_string(stranger->GetFormId()) + ":conditions");
     npc = &AddNpc(*owner, kNpc, 0x13bbd, 0xff005010);
+    // This fixture exercises condition/VM semantics; transport acknowledgement
+    // and observer quarantine are covered by CampaignVisibilityBarrierTest.
+    server.worldState.SetCampaignVisibilityCallbacks([](MpActor&) {},
+                                                     [](MpActor&, bool) {});
   }
 
   MpActor& AddPlayer(uint32_t id)
@@ -68,10 +76,10 @@ struct ConditionFixture
     auto& actor = server.worldState.GetFormAt<MpActor>(id);
     actor.SetInventory(Inventory().AddItem(0xf, 10));
     // Only fixture execution is authorized; this is not quest certification.
-    actor.SetPropertyValueDump(
-      QuestJournal::kEnabled,
-      "[\"4e50d:Skyrim.esm\",\"d0800:Skyrim.esm\",\"39645:Skyrim.esm\"]",
-      false, false);
+    actor.SetPropertyValueDump(QuestJournal::kEnabled,
+                               "[\"4e50d:Skyrim.esm\",\"d0800:Skyrim.esm\","
+                               "\"39645:Skyrim.esm\",\"45923:Skyrim.esm\"]",
+                               false, false);
     return actor;
   }
 
@@ -109,7 +117,265 @@ struct ConditionFixture
     QuestJournal::Apply(
       *guest, { { "quest", kQuest }, { "op", "setStage" }, { "index", 10 } });
   }
+
+  std::vector<Faction> Factions(int rank)
+  {
+    return { { FormDesc::FromFormId(kSonsFaction, server.worldState.espmFiles),
+               static_cast<int8_t>(rank) } };
+  }
+
+  void SetFactions(MpActor& target, int rank)
+  {
+    auto saved = target.GetChangeForm();
+    saved.factions = Factions(rank);
+    target.ApplyChangeForm(saved);
+  }
 };
+}
+
+TEST_CASE("Campaign faction conditions preserve signed ranks and owner scope",
+          "[Quest][CampaignConditions][CampaignFactions]")
+{
+  ConditionFixture f;
+  const auto rank = GENERATE(-128, -2, -1, 0, 1, 127);
+  f.SetFactions(*f.owner, rank);
+  f.SetFactions(*f.guest, rank >= 0 ? -1 : 1);
+  f.SetFactions(*f.npc, 3);
+  auto& other = f.AddNpc(*f.stranger, kNpc, 0x13bbd, 0xff005011);
+  f.SetFactions(other, 9);
+  REQUIRE(f.Evaluate(
+    { Compile(Clause(73, RunOn::Reference, 0x14, static_cast<float>(rank), 0,
+                     kSonsFaction)) }));
+  REQUIRE(f.Evaluate({ Compile(Clause(
+    71, RunOn::Reference, 0x14, rank >= 0 ? 1.f : 0.f, 0, kSonsFaction)) }));
+  REQUIRE(f.Evaluate(
+    { Compile(Clause(73, RunOn::Reference, kNpc, 3, 0, kSonsFaction)) }));
+  REQUIRE_FALSE(f.server.worldState.LookupFormByIdNoLoad(kNpc));
+}
+
+TEST_CASE(
+  "Faction alias selectors map faction forms but never byte28 alias IDs",
+  "[Quest][CampaignConditions][CampaignFactions]")
+{
+  ConditionFixture f;
+  f.SetFactions(*f.npc, 3);
+  const int32_t aliasId = GENERATE(0, 17);
+  const uint16_t function = GENERATE(71, 73);
+  std::vector<uint32_t> mapped;
+  const auto condition = CampaignCondition::Compile(
+    Clause(function, RunOn::QuestAlias, 0xfeabcdef, function == 71 ? 1.f : 3.f,
+           0, 0x0102bf9b, 0, aliasId),
+    [&](uint32_t raw) {
+      mapped.push_back(raw);
+      REQUIRE(raw == 0x0102bf9b);
+      return raw & 0xffffff;
+    });
+  REQUIRE(mapped == std::vector<uint32_t>{ 0x0102bf9b });
+  auto context = f.Context();
+  context.owningQuest = kMq302;
+  context.resolveReferenceAlias = [&](uint32_t quest, uint32_t alias) {
+    REQUIRE(quest == kMq302);
+    REQUIRE(alias == static_cast<uint32_t>(aliasId));
+    return kNpc;
+  };
+  QuestJournal::Atomic(*f.guest, [&] {
+    REQUIRE(CampaignCondition::Evaluate({ condition }, context));
+  });
+  context.resolveReferenceAlias = [](auto, auto) { return 0; };
+  REQUIRE_THROWS(QuestJournal::Atomic(*f.guest, [&] {
+    f.Stage();
+    CampaignCondition::Evaluate({ condition }, context);
+  }));
+  REQUIRE(QuestJournal::Get(*f.owner, kQuest).at("stage") == 0);
+}
+
+TEST_CASE(
+  "Faction predicates observe staged changes and rollback with rewards",
+  "[Quest][CampaignConditions][CampaignFactions]")
+{
+  ConditionFixture f;
+  f.SetFactions(*f.npc, -1);
+  const auto before = QuestJournal::Snapshot(*f.owner);
+  REQUIRE_THROWS_WITH(
+    QuestJournal::Atomic(
+      *f.guest,
+      [&] {
+        REQUIRE(CampaignCondition::Evaluate(
+          { Compile(Clause(71, RunOn::Reference, kNpc, 0, 0, kSonsFaction)) },
+          f.Context()));
+        QuestJournal::EditFactions(
+          *f.guest, *f.npc, [&](auto& factions) { factions = f.Factions(4); });
+        REQUIRE(CampaignCondition::Evaluate(
+          { Compile(Clause(71, RunOn::Reference, kNpc, 1, 0, kSonsFaction)),
+            Compile(Clause(73, RunOn::Reference, kNpc, 4, 0, kSonsFaction)) },
+          f.Context()));
+        REQUIRE(f.npc->GetChangeForm().factions->at(0).rank == -1);
+        f.Stage();
+        QuestJournal::EditInventory(
+          *f.guest, *f.owner, [](Inventory& inv) { inv.AddItem(0xf, 50); });
+        throw std::runtime_error("Fixture faction abort");
+      }),
+    Catch::Matchers::ContainsSubstring("Fixture faction abort"));
+  REQUIRE(QuestJournal::Snapshot(*f.owner) == before);
+  REQUIRE(f.npc->GetChangeForm().factions->at(0).rank == -1);
+  REQUIRE(f.owner->GetInventory().GetItemCount(0xf) == 10);
+}
+
+TEST_CASE(
+  "Faction ranks distinguish an absent entry from stored negative ranks",
+  "[Quest][CampaignConditions][CampaignFactions]")
+{
+  ConditionFixture f;
+  auto empty = f.owner->GetChangeForm();
+  empty.factions = std::vector<Faction>{};
+  f.owner->ApplyChangeForm(empty);
+  REQUIRE(f.Evaluate(
+    { Compile(Clause(73, RunOn::Reference, 0x14, -2, 0, kSonsFaction)),
+      Compile(Clause(71, RunOn::Reference, 0x14, 0, 0, kSonsFaction)) }));
+  f.SetFactions(*f.owner, -1);
+  REQUIRE(f.Evaluate(
+    { Compile(Clause(73, RunOn::Reference, 0x14, -1, 0, kSonsFaction)),
+      Compile(Clause(71, RunOn::Reference, 0x14, 0, 0, kSonsFaction)) }));
+}
+
+TEST_CASE(
+  "Authored active faction membership survives negative overrides except "
+  "the removal rank",
+  "[Quest][CampaignConditions][CampaignFactions]")
+{
+  ConditionFixture f;
+  const auto record =
+    f.server.worldState.GetEspm().GetBrowser().LookupById(f.npc->GetBaseId());
+  const auto base = espm::Convert<espm::NPC_>(record.rec)
+                      ->GetData(f.server.worldState.GetEspmCache());
+  REQUIRE((base.templateDataFlags & espm::NPC_::UseFactions) == 0);
+  const auto authored =
+    std::find_if(base.factions.begin(), base.factions.end(),
+                 [](const auto& faction) { return faction.rank >= 0; });
+  REQUIRE(authored != base.factions.end());
+  const auto faction = record.ToGlobalId(authored->formId);
+  const auto descriptor =
+    FormDesc::FromFormId(faction, f.server.worldState.espmFiles);
+  const int rank = GENERATE(-128, -2, -1, 0, 127);
+  // This actor's real base has an active membership. The actual Skyrim
+  // IsInFaction handler treats only an override of -1 as its removal marker;
+  // other negative overrides still return true while GetFactionRank is
+  // negative.
+  auto saved = f.npc->GetChangeForm();
+  saved.factions =
+    std::vector<Faction>{ { descriptor, static_cast<int8_t>(rank) } };
+  f.npc->ApplyChangeForm(saved);
+  REQUIRE(f.Evaluate({ Compile(Clause(73, RunOn::Reference, kNpc,
+                                      static_cast<float>(rank), 0, faction)),
+                       Compile(Clause(71, RunOn::Reference, kNpc,
+                                      rank == -1 ? 0.f : 1.f, 0, faction)) }));
+  QuestJournal::Atomic(*f.guest, [&] {
+    QuestJournal::EditFactions(*f.guest, *f.npc, [&](auto& factions) {
+      factions = { { descriptor, -1 } };
+    });
+    REQUIRE(CampaignCondition::Evaluate(
+      { Compile(Clause(71, RunOn::Reference, kNpc, 0, 0, faction)) },
+      f.Context()));
+  });
+}
+
+TEST_CASE("Faction conditions preserve mapped global operands and OR groups",
+          "[Quest][CampaignConditions][CampaignFactions]")
+{
+  ConditionFixture f;
+  f.SetFactions(*f.owner, 3);
+  auto context = f.Context();
+  context.readGlobal = [](uint32_t id) {
+    REQUIRE(id == 0x42);
+    return 3.0;
+  };
+  auto clause = Clause(73, RunOn::Reference, 0x01000014, 0, 4, 0x0102bf9b);
+  const uint32_t rawGlobal = 0x01000042;
+  std::memcpy(&clause.comparisonValue, &rawGlobal, 4);
+  std::vector<uint32_t> mapped;
+  const auto global = CampaignCondition::Compile(clause, [&](uint32_t raw) {
+    mapped.push_back(raw);
+    return raw & 0xffffff;
+  });
+  REQUIRE(mapped ==
+          std::vector<uint32_t>({ 0x01000014, 0x0102bf9b, rawGlobal }));
+  const auto no =
+    Compile(Clause(73, RunOn::Reference, 0x14, 9, 1, kSonsFaction));
+  const auto yes =
+    Compile(Clause(71, RunOn::Reference, 0x14, 1, 0, kSonsFaction));
+  QuestJournal::Atomic(*f.guest, [&] {
+    REQUIRE(CampaignCondition::Evaluate({ global, no, yes, yes }, context));
+    REQUIRE_FALSE(CampaignCondition::Evaluate(
+      { global, no, yes,
+        Compile(Clause(73, RunOn::Reference, 0x14, 9, 0, kSonsFaction)) },
+      context));
+  });
+}
+
+TEST_CASE("Stale faction condition reads cannot publish quest progress",
+          "[Quest][CampaignConditions][CampaignFactions]")
+{
+  ConditionFixture f;
+  f.SetFactions(*f.npc, 3);
+  const auto before = QuestJournal::Snapshot(*f.owner);
+  REQUIRE_THROWS(QuestJournal::Atomic(*f.guest, [&] {
+    REQUIRE(CampaignCondition::Evaluate(
+      { Compile(Clause(73, RunOn::Reference, kNpc, 3, 0, kSonsFaction)) },
+      f.Context()));
+    f.Stage();
+    QuestJournal::EditInventory(*f.guest, *f.owner,
+                                [](Inventory& inv) { inv.AddItem(0xf, 50); });
+    f.SetFactions(*f.npc, 4);
+  }));
+  REQUIRE(QuestJournal::Snapshot(*f.owner) == before);
+  REQUIRE(f.owner->GetInventory().GetItemCount(0xf) == 10);
+  REQUIRE(f.npc->GetChangeForm().factions->at(0).rank == 4);
+}
+
+TEST_CASE("Faction conditions validate skipped static targets and parameters",
+          "[Quest][CampaignConditions][CampaignFactions]")
+{
+  ConditionFixture f;
+  const uint16_t function = GENERATE(71, 73);
+  const auto good = Compile(Clause(47, RunOn::Reference, 0x14, 10, 1, 0xf));
+  for (const auto faction : { 0u, 0xfu, kQuest, 0x13bbdu, 0xfeffffffu }) {
+    REQUIRE_THROWS(f.Evaluate(
+      { good,
+        Compile(Clause(function, RunOn::Reference, kNpc, 0, 0, faction)) }));
+  }
+  for (const auto reference :
+       { 0xfu, kQuest, 0x13bbdu, 0x8a986u, 0xfeffffffu }) {
+    REQUIRE_THROWS(
+      f.Evaluate({ good,
+                   Compile(Clause(function, RunOn::Reference, reference, 0, 0,
+                                  kSonsFaction)) }));
+    REQUIRE_FALSE(f.server.worldState.LookupFormByIdNoLoad(reference));
+  }
+  REQUIRE(f.Evaluate({ good,
+                       Compile(Clause(function, RunOn::Reference, kLucan, 0, 0,
+                                      kSonsFaction)) }));
+  REQUIRE_FALSE(f.server.worldState.LookupFormByIdNoLoad(kLucan));
+  REQUIRE_THROWS(CampaignReferenceBinding::Resolve(*f.guest, kLucan));
+  auto context = f.Context();
+  context.resolveReferenceAlias = [](auto, auto) -> uint32_t {
+    throw std::runtime_error("Skipped faction alias must not resolve");
+  };
+  QuestJournal::Atomic(*f.guest, [&] {
+    REQUIRE(CampaignCondition::Evaluate(
+      { good,
+        Compile(Clause(function, RunOn::QuestAlias, 0xfeabcdef, 0, 0,
+                       kSonsFaction, 0, 0)) },
+      context));
+  });
+  for (const auto runOn :
+       { RunOn::Subject, RunOn::Target, RunOn::CombatTarget,
+         RunOn::LinkedReference, RunOn::PackageData, RunOn::EventData })
+    REQUIRE_THROWS(Compile(Clause(function, runOn, 0x14, 0, 0, kSonsFaction)));
+  for (const auto flag : { 2, 8, 16 })
+    REQUIRE_THROWS(Compile(
+      Clause(function, RunOn::Reference, 0x14, 0, flag, kSonsFaction)));
+  REQUIRE_THROWS(Compile(
+    Clause(function, RunOn::QuestAlias, 0, 0, 0, kSonsFaction, 0, -1)));
 }
 
 TEST_CASE("Campaign conditions distinguish owner inventory and private copies",
@@ -459,6 +725,7 @@ struct LogFixture : ConditionFixture
            { "Form", "" },
            { "ObjectReference", "Form" },
            { "Actor", "ObjectReference" },
+           { "Faction", "Form" },
            { "Quest", "Form" },
            { "Alias", "" },
            { "ReferenceAlias", "Alias" },
@@ -591,4 +858,67 @@ TEST_CASE("Owned MS13 death conditions resolve Lucan alias zero in the active "
   REQUIRE(f.Run(kMs13, 10));
   REQUIRE(f.Counter(kMs13) == (dead ? 10 : 1));
   REQUIRE_FALSE(f.server.worldState.LookupFormByIdNoLoad(kLucan));
+}
+
+TEST_CASE(
+  "Owned MQ302 faction logs select the campaign owner through explicit "
+  "PlayerRef and forced alias43",
+  "[Quest][QuestVM][CampaignConditions][CampaignFactions]")
+{
+  LogFixture f;
+  const uint16_t stage = GENERATE(100, 110);
+  const bool member = GENERATE(false, true);
+  f.SetFactions(*f.owner, member ? 0 : -1);
+  f.SetFactions(*f.guest, member ? -1 : 0);
+  // Owned stage100 uses alias43 (forced PlayerRef); stage110 uses explicit
+  // PlayerRef. Both have complementary CWSonsFaction membership conditions.
+  f.Fragment(stage, 0, 1);
+  f.Fragment(stage, 1, 10);
+  REQUIRE(f.Run(kMq302, stage));
+  REQUIRE(f.Counter(kMq302) == (member ? 10 : 1));
+  REQUIRE(f.owner->GetChangeForm().factions->at(0).rank == (member ? 0 : -1));
+  REQUIRE(f.guest->GetChangeForm().factions->at(0).rank == (member ? -1 : 0));
+}
+
+TEST_CASE(
+  "A later owned faction log observes an earlier fragment's staged rank",
+  "[Quest][QuestVM][CampaignConditions][CampaignFactions]")
+{
+  LogFixture f;
+  const bool fail = GENERATE(false, true);
+  f.SetFactions(*f.owner, -1);
+  f.Fragment(110, 0, 1);
+  f.Fragment(110, 1, 10, true, fail);
+  auto& fragment = f.fixture->objectTable[0].states[0].functions[0].function;
+  fragment.locals.push_back({ "faction", "Faction" });
+  // The first real log requires nonmembership. Its fixture fragment joins
+  // the faction; the second real log must then observe the staged membership.
+  fragment.code.instructions.pop_back();
+  fragment.code.instructions.push_back(
+    { FunctionCode::kOp_CallStatic,
+      { VarValue("Game"), VarValue("GetForm"), Identifier("player"),
+        VarValue(1), VarValue(0x14) } });
+  fragment.code.instructions.push_back(
+    { FunctionCode::kOp_CallStatic,
+      { VarValue("Game"), VarValue("GetForm"), Identifier("faction"),
+        VarValue(1), VarValue(static_cast<int32_t>(kSonsFaction)) } });
+  fragment.code.instructions.push_back(
+    { FunctionCode::kOp_CallMethod,
+      { VarValue("SetFactionRank"), Identifier("player"), Identifier("temp"),
+        VarValue(2), Identifier("faction"), VarValue(4) } });
+  fragment.code.instructions.push_back(
+    { FunctionCode::kOp_Return, { VarValue::None() } });
+  const auto before = QuestJournal::Snapshot(*f.owner);
+  if (fail) {
+    REQUIRE_THROWS(f.Run(kMq302, 110));
+    REQUIRE(QuestJournal::Snapshot(*f.owner) == before);
+    REQUIRE(QuestJournal::ScriptState(*f.owner).empty());
+    REQUIRE(f.owner->GetChangeForm().factions->at(0).rank == -1);
+    REQUIRE(f.owner->GetInventory().GetItemCount(kClaw) == 0);
+  } else {
+    REQUIRE(f.Run(kMq302, 110));
+    REQUIRE(f.Counter(kMq302) == 11);
+    REQUIRE(f.owner->GetChangeForm().factions->at(0).rank == 4);
+    REQUIRE(f.owner->GetInventory().GetItemCount(kClaw) == 1);
+  }
 }

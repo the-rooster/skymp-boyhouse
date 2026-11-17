@@ -70,8 +70,9 @@ alias/world feature gates remain missing until filling, effects and lifecycle
 are implemented.
 Quest-variable conditions now contribute their target-quest dependency, and
 global comparisons contribute their GLOB dependency. Explicit Run On Reference
-conditions contribute the placed-reference dependency, and `GetItemCount`
-contributes its base-item dependency unless the parameter uses an unsupported
+conditions contribute the placed-reference dependency. `GetItemCount`
+contributes its base-item dependency; `GetInFaction` and `GetFactionRank`
+contribute their FACT dependency unless the parameter uses an unsupported
 alias/package flag. Run On Quest Alias reads the signed alias ID at byte 28;
 alias zero is valid and the unused byte-24 value is never a FormID.
 Comparison globals have
@@ -83,15 +84,17 @@ when the implementation changes. Condition names are identifiers extracted from
 [xEdit's definitions](https://github.com/TES5Edit/TES5Edit/blob/dev-4.1.6/Core/wbDefinitionsTES5.pas);
 their source hash is recorded in the registry.
 
-The current registry contains **59 partial native methods**, including ten
-physical-reference queries and five private-copy visibility methods. Queries
+The current registry contains **64 partial native methods**, including ten
+physical-reference queries, five private-copy visibility methods and five
+faction methods. Queries
 require tracked owner/private-copy snapshots; visibility additionally requires
 transactional staging and a complete observer projection barrier. The same-named
 condition functions are not enabled by these native registrations. A separate
-typed stage-log evaluator now audits three physical condition subsets:
+typed stage-log evaluator now audits five physical condition subsets:
 `GetDisabled` (35) and `GetItemCount` (47) on explicit references, and `GetDead`
-(46) on explicit references or safely resolved reference aliases. The registry
-has **nine partial condition functions**. Qualified stage-selector features mark
+(46), `GetInFaction` (71) and `GetFactionRank` (73) on explicit references or
+safely resolved reference aliases. The registry has **eleven partial condition
+functions**. Qualified stage-selector features mark
 only these combinations as partial; implicit physical subjects, unsupported
 alias/function combinations and non-stage evaluation retain missing gates.
 Source guards
@@ -99,6 +102,12 @@ include the barrier bridge, projection feed, character-creation gate and binary
 decoder used by this path. These guards detect source changes; they do not prove
 behavior or expand the analyzer's graph coverage. The generated backlog must be
 regenerated against the updated registry before its capability counts are used.
+
+Faction reads use distinct rank and membership semantics. Unique actors' existing
+faction removal and rank writes below -1 still need isolated base-layer modeling;
+raw SKSE `GetFactions` remains unsupported. The client bridge requires observed
+native state and restoration, with explicit rank and membership in its transport.
+Neither source coverage nor these partial methods certify any quest.
 
 The client native-array bridge is guarded separately from campaign capabilities.
 Accepting JavaScript arrays as typed Papyrus native arguments does not implement

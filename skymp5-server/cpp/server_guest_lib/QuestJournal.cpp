@@ -1,4 +1,5 @@
 #include "QuestJournal.h"
+#include "CampaignFactionApi.h"
 #include "CampaignReferenceBinding.h"
 #include "MpActor.h"
 #include "QuestVmState.h"
@@ -30,6 +31,8 @@ struct Transaction
     MpChangeForm initial, current;
     Json serializedInitial;
     uint64_t epoch;
+    std::optional<std::vector<Faction>> factionBaseline;
+    bool factionsEdited = false;
   };
   MpActor* owner;
   Json ledger;
@@ -37,6 +40,16 @@ struct Transaction
   std::map<uint32_t, ReferenceEdit> references;
 };
 thread_local Transaction* transaction = nullptr;
+
+bool EqualFactions(const std::vector<Faction>& lhs,
+                   const std::vector<Faction>& rhs)
+{
+  return lhs.size() == rhs.size() &&
+    std::equal(lhs.begin(), lhs.end(), rhs.begin(),
+               [](const auto& a, const auto& b) {
+                 return a.formDesc == b.formDesc && a.rank == b.rank;
+               });
+}
 
 Transaction::ReferenceEdit& ReferenceTarget(MpActor& actor,
                                             MpObjectReference& target)
@@ -471,9 +484,15 @@ void QuestJournal::Atomic(MpActor& actor, const std::function<void()>& execute)
     for (const auto& [id, edit] : local.references)
       if (edit.initial.isDisabled != edit.current.isDisabled)
         visibility.push_back({ edit.reference, edit.current.isDisabled });
+    std::vector<WorldState::CampaignFactionChange> factions;
+    for (const auto& [id, edit] : local.references)
+      if (edit.factionsEdited &&
+          !EqualFactions(*edit.factionBaseline, *edit.current.factions))
+        factions.push_back(
+          { edit.reference->AsActor(), *edit.current.factions });
     transaction = nullptr;
-    if (!changes.empty() || !visibility.empty())
-      world.CommitCampaignInventory(owner, dump, changes, visibility,
+    if (!changes.empty() || !visibility.empty() || !factions.empty())
+      world.CommitCampaignInventory(owner, dump, changes, visibility, factions,
                                     validateReads);
     else if (local.ledger != initial)
       owner.SetPropertyValueDump(kProperty, dump, false, false);
@@ -510,6 +529,33 @@ const MpChangeFormREFR& QuestJournal::ReadReference(MpActor& actor,
                                                     MpObjectReference& target)
 {
   return ReferenceTarget(actor, target).current;
+}
+
+const std::vector<Faction>& QuestJournal::ReadFactions(
+  MpActor& actor, MpObjectReference& target)
+{
+  if (!target.AsActor())
+    throw std::invalid_argument("Campaign faction target must be an actor");
+  auto& staged = ReferenceTarget(actor, target);
+  if (!staged.factionBaseline) {
+    auto effective = CampaignFactionApi::InitialFactions(
+      *target.AsActor(), staged.initial, &target == &Owner(actor));
+    staged.factionBaseline = effective;
+    staged.current.factions = std::move(effective);
+  }
+  return *staged.current.factions;
+}
+
+void QuestJournal::EditFactions(
+  MpActor& actor, MpObjectReference& target,
+  const std::function<void(std::vector<Faction>&)>& edit)
+{
+  auto prepared = ReadFactions(actor, target);
+  edit(prepared);
+  target.GetParent()->ValidateCampaignFactions(prepared);
+  auto& staged = ReferenceTarget(actor, target);
+  staged.current.factions = std::move(prepared);
+  staged.factionsEdited = true;
 }
 
 void QuestJournal::SetReferenceDisabled(MpActor& actor,

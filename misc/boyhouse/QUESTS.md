@@ -23,7 +23,7 @@ The runner now implements:
 - Bounds-checked QUST VMAD versions 4/5, both object layouts, properties/arrays, stage/log-entry bindings, and alias script metadata. Parsed values own their storage. Alias VM objects and attached scripts now have campaign identities; world filling and lifecycle remain partial (see below).
 - Fresh, campaign-scoped quest objects and a strict VM for each transaction. Identical quest form IDs in different campaigns do not share Papyrus identities or variable maps.
 - Original PEX loading, including BSA decompression. The reader checks headers, bounds, string-table indices and call argument counts, handles absent debug information, and distinguishes parameters from locals.
-- Conditional log-entry selection using the four quest predicates, campaign globals, conditional quest script variables, and the three bounded physical predicates below, in the host's context for guests. Unsupported condition functions, run-on contexts, and log flags are rejected. Matching fragments execute in log-entry order; the complete-quest log flag updates the same transaction.
+- Conditional log-entry selection using the four quest predicates, campaign globals, conditional quest script variables, and the five bounded physical/faction predicates below, in the host's context for guests. Unsupported condition functions, run-on contexts, and log flags are rejected. Matching fragments execute in log-entry order; the complete-quest log flag updates the same transaction.
 - Primitive variables, shared arrays, script state and quest-object references persisted with the journal. Variables are qualified by attached script and declaring class; references use stable plugin/form keys. Private VM state is omitted from client snapshots. Resetting a quest clears its saved script variables and collects arrays only when no other script references them.
 - Campaign-owned GLOB objects and `GlobalVariable.GetValue`, `GetValueInt`, `SetValue`, `SetValueInt`, and `Mod`. Defaults come from owned FLTV records; writes use float32 storage, stable plugin/form keys and the same transaction as stages/variables. A quest reset preserves global effects. The scoped runner's `GetGlobalValue` condition (index 74) sees earlier uncommitted writes, including during nested stages. Global values remain private server state; native client/NPC world projection is not implemented.
 - `GetVMQuestVariable` (index 629) reads the owned CIS2 variable name from the active campaign's conditional quest script. Int/Float/Bool declarations, case-insensitive names, inherited variables, PEX defaults and persisted values are supported. Conditional flags come from each PEX's own user-flag table. The target must be running and adapter-enabled; missing/ambiguous scripts, nonconditional variables, type mismatches and nonfinite values fail the transaction. This does not initialize a quest or run property getters.
@@ -466,6 +466,51 @@ Scene and TopicInfo `GetOwningQuest` now return a quest object in the active cam
 Mutations require the owner's private `private.boyhouse.questAdapters` array to contain the quest's stable key. This is a trusted adapter opt-in, **not automatic evidence that an adapter is correct**. No production vanilla adapter is supplied or enabled. The fixtures explicitly opt in selected quests to validate plumbing, conditional selection, and an original fragment; they do not play or certify Before the Storm.
 
 The persisted field is `private.boyhouse.questJournal`. Unknown save versions are refused rather than reset. The implementation validates before writing and uses the existing character save path. The optional [SQLite driver](STORAGE.md) commits each complete save batch atomically across change forms. Supported inventory and visibility effects stage with journal/VM state, but broader world mutations and acknowledgements after disk commit remain unfinished. The ledger limit is 8 MiB. The diagnostic feed currently sends full snapshots, capped at 1 MiB; exceeding that limit returns unavailable rather than truncating progress. Delta/chunk transport is required before full campaign rollout. VM epochs are process-local guards, not network transition acknowledgements or VM persistence.
+
+### Transactional factions
+
+The isolated runner has partial `Actor.GetFactionRank`, `IsInFaction`,
+`SetFactionRank`, `AddToFaction` and `RemoveFromFaction` implementations. Targets
+are the campaign owner or a bound private actor. Reads use the transaction's
+snapshot; changed factions publish and persist with journal, VM, inventory and
+visibility effects. A failure before publication rolls back that complete set.
+Notification failure after publication quarantines observers without replaying
+already committed quest rewards.
+
+Absent saved factions derive from immutable NPC/template metadata without
+initializing or saving the live actor. A present snapshot, including an empty
+one, is authoritative. Save encoding preserves signed byte ranks and accepts
+the exact wrapped uint32 negative values written by older versions. Malformed
+ranks, duplicate identities and snapshots above 4,096 entries are rejected.
+
+Engine rank and membership are distinct. An absent faction returns rank -2;
+an explicit removal override has rank -1. An active base membership survives
+other negative reference overrides. A player-expelled base faction can therefore
+have rank -2 while still returning true from `IsInFaction`. Network snapshots
+carry `{factionId, rank, isMember}` so a client must prove both observations.
+The raw SKSE `GetFactions` base/override union is not implemented by this API.
+
+Unique actors, including the player, have an additional engine branch: removing
+an existing base faction erases it instead of writing a reference tombstone.
+The current reference-local projection cannot reproduce every resulting pair
+of rank and membership. Existing unique-actor removals and rank writes below -1
+are refused before committing effects. Full support requires isolated base-layer
+state and its lifecycle; treating -1 as equivalent to absence would be wrong.
+These restrictions are outstanding work, not completed faction compatibility.
+
+Stage-log CTDA `GetInFaction` (71) and `GetFactionRank` (73) use the same scoped
+reads. They accept explicit actor references and safely resolved reference
+aliases, including alias zero. Static actor/faction record kinds are checked
+before OR short-circuiting. Implicit physical subjects, unsupported flags and
+non-stage contexts remain unimplemented. Owned MQ302 conditions exercise owner
+selection in fixtures; those fixtures do not certify its campaign playthrough.
+
+Faction publication closes the projection gate for all connected private-phase
+members. In shared space it gates the owner and connected direct observers,
+whose baselines contain the changed actor. Hosting an offline observer does not
+itself subscribe a distant player. Observer identity, connection lifetime and
+packet epochs are rechecked. Even an unchanged shared
+world manifest needs a new baseline and acknowledgement before play resumes.
 
 ## Catalog-wide automation
 

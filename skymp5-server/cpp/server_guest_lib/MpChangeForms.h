@@ -144,7 +144,7 @@ public:
       actorValues.ToTuple(), healthRespawnPercentage, magickaRespawnPercentage,
       staminaRespawnPercentage, spawnPoint, dynamicFields, spawnDelay,
       learnedSpells, templateChain, lastAnimation, setNodeTextureSet,
-      setNodeScale, displayName);
+      setNodeScale, displayName, factions);
   }
 
   static nlohmann::json ToJson(const MpChangeFormREFR& changeForm);

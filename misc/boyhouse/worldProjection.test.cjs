@@ -429,6 +429,40 @@ test("empty shared-space manifests still require engine application and server r
   assert.equal(f.replica.ready, true);
 });
 
+test("shared personal mutations replace baselines even when the world manifest is unchanged", () => {
+  const f = fixture(0);
+  f.data.set(0, { ...manifest(0), instance: "", identity: "" });
+  let rank = 0;
+  const baseline = f.adapter.baseline;
+  f.adapter.baseline = (user, token) => {
+    const result = baseline(user, token);
+    result.messages[1].customPropsJsonDumps.push({
+      propName: "campaignFactions",
+      propValueJsonDump: JSON.stringify([{ factionId: 0x2bf9b, rank, isMember: rank >= 0 }]),
+    });
+    return result;
+  };
+  f.hello(); f.deliver();
+  const oldAck = f.replica.applied(f.replica.version);
+  f.feed.packet(0, oldAck); f.deliver();
+  const unchangedManifest = f.replica.snapshot();
+  assert.equal(f.replica.ready, true);
+  assert.equal(f.feed.prepareVisibility([0]), true); f.deliver();
+  assert.equal(f.replica.ready, false);
+  rank = -1;
+  assert.equal(f.feed.completeVisibility([0], true), true); f.deliver();
+  assert.deepEqual(f.replica.prepared(), unchangedManifest);
+  const properties = f.replica.preparedBaseline().messages[1].customPropsJsonDumps;
+  assert.deepEqual(JSON.parse(properties[0].propValueJsonDump), [{ factionId: 0x2bf9b, rank: -1, isMember: false }]);
+  assert.notEqual(f.replica.packetEpoch, oldAck.token);
+  f.feed.packet(0, oldAck); f.deliver();
+  assert.equal(f.blocked.get(0), true);
+  assert.equal(f.replica.ready, false);
+  f.feed.packet(0, f.replica.applied(f.replica.version)); f.deliver();
+  assert.equal(f.replica.ready, true);
+  assert.equal(f.blocked.get(0), false);
+});
+
 test("missing, malformed and cross-epoch baselines cannot release a projection", () => {
   const f = fixture(); f.hello();
   const [begin, refs, packet] = f.packets.map(p => p.packet);

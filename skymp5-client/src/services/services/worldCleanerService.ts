@@ -11,7 +11,10 @@ export class WorldCleanerService extends ClientListener {
     constructor(private sp: Sp, private controller: CombinedController) {
         super();
         controller.on('update', () => this.onUpdate());
-        controller.on('preLoadGame', () => { this.loading = true; this.protection.clear(); this.active = false; });
+        controller.on('preLoadGame', () => { this.loading = true; });
+        controller.on('postLoadGame', (event?: { success: boolean }) => {
+            if (event?.success === false) this.loading = false;
+        });
         controller.emitter.on('gameLoad', () => { this.loading = false; this.protection.clear(); this.active = false; });
     }
 

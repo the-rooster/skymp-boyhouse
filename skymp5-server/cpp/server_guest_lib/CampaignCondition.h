@@ -44,6 +44,8 @@ private:
     QuestRunning = 56,
     Stage = 58,
     StageDone = 59,
+    InFaction = 71,
+    FactionRank = 73,
     Global = 74,
     QuestCompleted = 543,
     QuestVariable = 629

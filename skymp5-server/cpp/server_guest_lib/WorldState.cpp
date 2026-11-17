@@ -420,10 +420,26 @@ bool WorldState::HasCampaignEnableLinks(uint32_t original)
   return pImpl->campaignEnableLinks->contains(original);
 }
 
+void WorldState::ValidateCampaignFactions(const std::vector<Faction>& factions)
+{
+  if (factions.size() > Faction::kMaxEntries)
+    throw std::runtime_error("Campaign faction limit exceeded");
+  std::set<uint32_t> unique;
+  for (const auto& faction : factions) {
+    const auto id = faction.formDesc.ToFormId(espmFiles);
+    const auto record = GetEspm().GetBrowser().LookupById(id);
+    if (!id || !record.rec || record.rec->IsDeleted() ||
+        record.rec->GetType() != "FACT" || !unique.insert(id).second ||
+        FormDesc::FromFormId(id, espmFiles) != faction.formDesc)
+      throw std::runtime_error("Invalid or duplicate campaign faction");
+  }
+}
+
 void WorldState::CommitCampaignInventory(
   MpActor& owner, const std::string& journal,
   const std::vector<CampaignInventoryChange>& changes,
   const std::vector<CampaignVisibilityChange>& visibility,
+  const std::vector<CampaignFactionChange>& factions,
   const std::function<void()>& validateReads)
 {
   if (pImpl->formLoadingInProgress)
@@ -440,6 +456,7 @@ void WorldState::CommitCampaignInventory(
     MpChangeForm live;
     bool inventoryChanged = false;
     bool visibilityChanged = false;
+    bool factionsChanged = false;
   };
   std::map<uint32_t, Prepared> prepared;
   auto prepare = [&](MpObjectReference& reference) -> Prepared& {
@@ -484,17 +501,30 @@ void WorldState::CommitCampaignInventory(
     entry.visibilityChanged = entry.live.isDisabled != change.disabled;
     entry.live.isDisabled = change.disabled;
   }
+  std::set<uint32_t> factionIds;
+  for (const auto& change : factions) {
+    if (!change.actor ||
+        !factionIds.insert(change.actor->GetFormId()).second ||
+        (change.actor != &owner &&
+         CampaignReferenceBinding::Context(*change.actor).first != &owner))
+      throw std::runtime_error("Invalid campaign faction participant");
+    ValidateCampaignFactions(change.factions);
+    auto& entry = prepare(*change.actor);
+    entry.factionsChanged = true;
+    entry.live.factions = change.factions;
+  }
   const bool changesVisibility =
     std::any_of(prepared.begin(), prepared.end(), [](const auto& item) {
       return item.second.visibilityChanged;
     });
   auto beforeVisibility = pImpl->beforeCampaignVisibility;
   auto afterVisibility = pImpl->afterCampaignVisibility;
-  if (changesVisibility &&
+  const bool requiresBarrier = changesVisibility || !factions.empty();
+  if (requiresBarrier &&
       (!beforeVisibility || !afterVisibility ||
        pImpl->campaignVisibilityCommitting))
     throw std::runtime_error(
-      "Campaign visibility requires an available projection barrier");
+      "Campaign world state requires an available projection barrier");
   struct VisibilityGuard
   {
     bool& active;
@@ -514,9 +544,9 @@ void WorldState::CommitCampaignInventory(
       }
       active = false;
     }
-  } guard{ pImpl->campaignVisibilityCommitting, changesVisibility, owner,
+  } guard{ pImpl->campaignVisibilityCommitting, requiresBarrier, owner,
            afterVisibility };
-  if (changesVisibility) {
+  if (requiresBarrier) {
     pImpl->campaignVisibilityCommitting = true;
     guard.pendingCleanup = true;
     beforeVisibility(owner);
@@ -578,6 +608,8 @@ void WorldState::CommitCampaignInventory(
   static_assert(noexcept(hosters.swap(*nextHosters)));
   for (auto& [id, entry] : prepared) {
     entry.reference->CommitPreparedCampaignChange(entry.live);
+    if (entry.factionsChanged)
+      entry.reference->AsActor()->factionsLoaded = true;
   }
   if (nextGrids) {
     grids.swap(*nextGrids);
@@ -615,7 +647,25 @@ void WorldState::CommitCampaignInventory(
       } // State is already committed, even if logging fails.
     }
   }
-  if (changesVisibility) {
+  for (const auto& [id, entry] : prepared) {
+    if (!entry.factionsChanged)
+      continue;
+    try {
+      if (LookupFormByIdNoLoad(id) != entry.lifetime ||
+          entry.reference->GetWorldInstanceEpoch() != entry.epoch)
+        throw std::runtime_error(
+          "Committed campaign actor is no longer available");
+      entry.reference->AsActor()->SendCampaignFactionsUpdate();
+    } catch (...) {
+      synchronized = false;
+      try {
+        spdlog::error("Campaign faction notification {:x} could not be queued",
+                      id);
+      } catch (...) {
+      }
+    }
+  }
+  if (requiresBarrier) {
     if (LookupFormByIdNoLoad(owner.GetFormId()) != ownerChange.lifetime ||
         owner.GetWorldInstanceEpoch() != ownerChange.epoch)
       synchronized = false;

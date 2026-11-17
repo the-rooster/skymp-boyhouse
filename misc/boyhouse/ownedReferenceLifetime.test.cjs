@@ -398,6 +398,34 @@ test('pre-load invalidates views and suspends rendering before the new world fin
   assert.equal(f.arrays.at(-2).updates.at(-1), 1);
 });
 
+for (const explicitlyBlocked of [false, true]) test(`failed load releases view loading while preserving an explicit gate: ${explicitlyBlocked}`, async () => {
+  const f = worldFixture(), model = { playerCharacterFormIdx: 0, forms: [{ movement: { worldOrCell: 60 } }] };
+  f.tick();
+  if (explicitlyBlocked) f.view.setFormViewUpdateAllowed(false);
+  f.native('preLoadGame'); await f.finishWait(0);
+  f.native('postLoadGame', { success: false });
+  assert.equal(f.waits.length, 1, 'The native tick must not call a Papyrus wait');
+  f.tick(); assert.equal(f.waits.length, explicitlyBlocked ? 1 : 2);
+  if (!explicitlyBlocked) await f.finishWait(1);
+  f.tick(); assert.equal(f.view.getSpawnReadiness(model).ready, !explicitlyBlocked);
+  f.view.setFormViewUpdateAllowed(true);
+  assert.equal(f.view.getSpawnReadiness(model).ready, true, 'The loading flag was cleared independently of the view gate');
+});
+
+test('new-game replacement destroys views immediately but starts its Papyrus wait only on update', async () => {
+  const f = worldFixture(); f.tick();
+  const oldViews = f.arrays.at(-2);
+  f.event('gameLoad', { isCausedBySkyrimPlatform: false, isNewGame: true });
+  assert.equal(oldViews.resizes.at(-1), 0); assert.equal(f.waits.length, 1);
+  await f.finishWait(0); f.tick();
+  assert.equal(f.waits.length, 2);
+  assert.equal(f.arrays.at(-2).updates.at(-1), 0, 'An old world wait cannot reopen replacement views');
+  await f.finishWait(1); f.tick(); assert.equal(f.arrays.at(-2).updates.at(-1), 1);
+  f.event('gameLoad', { isCausedBySkyrimPlatform: false, isNewGame: true });
+  f.view.setFormViewUpdateAllowed(false); f.tick();
+  assert.equal(f.waits.length, 2, 'A newer explicit gate invalidates the deferred new-game wait');
+});
+
 test('a replacement view and single-player/disconnected sessions cannot be changed by stale timers', async () => {
   const f = worldFixture(); f.tick(); f.sp.storage.view = {};
   await f.finishWait(); f.tick(); assert.equal(f.arrays[0].updates.at(-1), 0);
@@ -422,12 +450,17 @@ function formViewFixture() {
   } });
   Object.assign(f.sp, { getReferenceHandle: f.adapter.identity, ActorBase: { from: () => null },
     FormType: { NPC: 43 }, printConsole() {}, storage: {} });
-  class OwnedReferenceService {} class WorldCleanerService {} class GamemodeUpdateService {} class NativeReferenceOperationService {}
+  class OwnedReferenceService {} class WorldCleanerService {} class GamemodeUpdateService {} class NativeReferenceOperationService {} class ActorFactionsService {}
   let nativeBusy = false;
+  const factions = { progress: { ready: false }, requests: [], retired: [],
+    newOwner: () => 'view-factions', request(...args) { this.requests.push(args); },
+    hasOwner() { return this.requests.length > 0; },
+    readiness() { return this.progress; }, retire(owner) { this.retired.push(owner); } };
   const protections = [], visible = [];
   const controller = { emitter: new EventEmitter(), lookupListener(type) {
     if (type === OwnedReferenceService) return { references: f.lifetime };
     if (type === NativeReferenceOperationService) return { operations: { isBusy: () => nativeBusy } };
+    if (type === ActorFactionsService) return { leases: factions };
     if (type === WorldCleanerService) return { modWcProtection: (...args) => protections.push(args) };
     if (type === GamemodeUpdateService) return { updateNeighbor: ref => visible.push(ref.getFormID()) };
     throw Error('Unexpected lookup');
@@ -446,12 +479,13 @@ function formViewFixture() {
     '../services/services/gamemodeUpdateService': { GamemodeUpdateService },
     '../services/services/ownedReferenceService': { OwnedReferenceService },
     '../services/services/nativeReferenceOperationService': { NativeReferenceOperationService },
+    '../services/services/actorFactionsService': { ActorFactionsService },
   });
   const view = new FormView(id + 123);
   // This fixture targets lifecycle, not combat/rendering or model application.
   view.applyAll = () => {};
   const model = { baseId: 123, refrId: id + 123, movement: { worldOrCell: 60, pos: [1, 2, 3], rot: [0, 0, 0] } };
-  return { ...f, view, model, protections, visible, update: () => view.update(model),
+  return { ...f, view, model, protections, visible, factions, update: () => view.update(model),
     setNativeBusy(value) { nativeBusy = value; }, setNullSpawn(value) { nullSpawn = value; } };
 }
 
@@ -476,6 +510,23 @@ test('FormView handles a native null spawn without dereferencing it or creating 
   const f = formViewFixture(); f.setNullSpawn(true); f.update(); f.tick();
   assert.equal(f.view.getLocalRefrId(), 0); assert.equal(f.lifetime.state.references.size, 0);
   assert.equal(f.calls.length, 0);
+});
+
+test('FormView cannot publish readiness or gameplay before managed factions settle', async () => {
+  const f = formViewFixture();
+  f.model.campaignFactions = [{ factionId: 0x2bf9b, rank: -1, isMember: false }];
+  f.update(); f.tick(); await f.drain(); f.update();
+  assert.equal(f.view.getSpawnReadiness(f.model).state, 'pending');
+  assert.deepEqual(f.visible, []);
+  assert.equal(f.factions.requests[0][1], id);
+  f.factions.progress = { ready: true }; f.update();
+  assert.equal(f.view.getSpawnReadiness(f.model).state, 'ready');
+  assert.deepEqual(f.visible, [id]);
+  for (let i = 0; i < 100; ++i) assert.equal(f.view.getSpawnReadiness(f.model).state, 'ready');
+  assert.equal(f.factions.requests.length, 1, 'Stable frames must not resubmit or recanonicalize full faction snapshots');
+  f.factions.progress = { ready: false, error: 'native rank mismatch' };
+  assert.equal(f.view.getSpawnReadiness(f.model).state, 'failed');
+  f.view.destroy(); assert.deepEqual(f.factions.retired, ['view-factions']);
 });
 
 test('FormView spawns an initially dead model and never applies the live-actor immortality override', async () => {
@@ -541,26 +592,34 @@ test('a reused model array slot retires the previous remote identity', () => {
   assert.deepEqual(created, [id, id + 1]); assert.deepEqual(destroyed, [id]);
 });
 
-for (const loadNewWorld of [false, 'gameLoad', 'preLoadGame']) test(`service recovery ${loadNewWorld ? `discards an old world on ${loadNewWorld} before first update` : 'restores protection until pending cleanup completes'}`, async () => {
+for (const loadNewWorld of [false, 'gameLoad', 'failedLoad']) test(`service recovery ${loadNewWorld === 'gameLoad' ? 'discards a confirmed replacement world before first update' : `restores protection until pending cleanup completes (${loadNewWorld || 'reload'})`}`, async () => {
   const f = fixture(), reference = f.lifetime.claim(id);
   f.lifetime.enqueue(reference, () => f.work('pending')); f.tick();
   const events = new EventEmitter(), emitter = new EventEmitter(), changes = [];
   const controller = { on: (...args) => events.on(...args), once: (...args) => events.once(...args), emitter,
-    lookupListener: () => ({ modWcProtection: (...args) => changes.push(args), operations: { isBusy: () => false } }) };
+    lookupListener: () => ({ modWcProtection: (...args) => changes.push(args), operations: { isBusy: () => false }, prepareDisposal: () => true }) };
   const { OwnedReferenceService } = load('services/services/ownedReferenceService.ts', {
     '../../campaign/ownedReferenceLifetime': { OwnedReferenceLifetime }, '../../logging': { logError() {} },
     './clientListener': { ClientListener: class {} }, './worldCleanerService': {},
     './nativeReferenceOperationService': {},
+    './actorFactionsService': {},
   });
   const service = new OwnedReferenceService({
     storage: { boyhouseOwnedReferences: f.lifetime.state }, getReferenceHandle: f.adapter.identity,
     Game: { getFormEx: formId => ({ delete: () => f.work('delete', formId, () => { f.forms.get(formId).deleted = true; }) }) },
     Actor: { from: () => null }, ObjectReference: { from: value => value },
   }, controller);
-  if (loadNewWorld === 'preLoadGame') events.emit('preLoadGame');
+  if (loadNewWorld === 'failedLoad') events.emit('preLoadGame');
   else if (loadNewWorld) emitter.emit('gameLoad', {});
   events.emit('update'); await f.complete(); events.emit('update');
-  if (loadNewWorld) {
+  if (loadNewWorld === 'failedLoad') {
+    assert.equal(service.references.state.references.size, 1, 'The old handle must remain owned during the attempt');
+    assert.equal(f.jobs.length, 0, 'No deletion may start while loading');
+    events.emit('postLoadGame'); events.emit('update');
+    assert.equal(f.jobs.length, 0, 'A missing result cannot resume native work');
+    events.emit('postLoadGame', { success: false }); events.emit('update');
+  }
+  if (loadNewWorld === 'gameLoad') {
     assert.deepEqual(changes, []); assert.equal(f.jobs.length, 0);
   } else {
     assert.deepEqual(changes, [[id, 1]]); assert.equal(f.jobs[0].name, 'delete');

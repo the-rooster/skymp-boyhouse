@@ -58,12 +58,13 @@ function serviceFixture(options = {}) {
   const { ReferenceSuppressionService } = loadService('referenceSuppressionService.ts', dependencies);
   dependencies['./referenceSuppressionService'] = { ReferenceSuppressionService };
   const { WorldCleanerService } = loadService('worldCleanerService.ts', dependencies);
+  const { LoadGameService } = loadService('loadGameService.ts', dependencies);
   const sp = { storage: {}, Game: {
     getPlayer: () => player, getFormEx: id => forms.get(id),
     findRandomActor: () => { ++searches; return candidate; },
   }, ObjectReference: { from: form => form }, Actor: { from: form => form } };
   let suppression;
-  const controller = { emitter, on: (...args) => events.on(...args), lookupListener(type) {
+  const controller = { emitter, on: (...args) => events.on(...args), once: (...args) => events.once(...args), lookupListener(type) {
     if (type === ReferenceSuppressionService) return suppression;
     if (type === NetworkingService) return { isConnected: () => connected };
     if (type === SinglePlayerService) return { isSinglePlayer: singlePlayer };
@@ -74,6 +75,7 @@ function serviceFixture(options = {}) {
   } };
   suppression = new ReferenceSuppressionService(sp, controller);
   const cleaner = new WorldCleanerService(sp, controller);
+  new LoadGameService(sp, controller);
   return { actor, player, calls, errors, jobs, forms, suppression, cleaner, makeActor,
     tick: () => events.emit('update'), event: (...args) => emitter.emit(...args), native: (...args) => events.emit(...args),
     get searches() { return searches; }, setCandidate(value) { candidate = value; },
@@ -146,15 +148,35 @@ test('a quest suppression claim retains an actor after the world cleaner release
   assert.equal(f.actor.state.disabled, false); assert.equal(f.actor.state.blocked, false);
 });
 
-for (const event of ['gameLoad', 'preLoadGame']) test(`${event} discards old suppression and pending completions`, async () => {
+for (const replacement of ['gameLoad', 'newGame']) test(`confirmed ${replacement} discards old suppression and pending completions`, async () => {
   const f = serviceFixture(); f.tick(); f.tick();
-  if (event === 'preLoadGame') f.native(event);
-  else { f.event(event, { isCausedBySkyrimPlatform: false }); f.setSinglePlayer(true); }
+  if (replacement === 'gameLoad') f.native('preLoadGame');
+  assert.equal(f.suppression.references.state.entries.size, 1);
+  f.cleaner.modWcProtection(200, 1);
+  if (replacement === 'newGame') f.native('newGame');
+  else f.event('gameLoad', { isCausedBySkyrimPlatform: false });
+  assert.equal(f.cleaner.getWcProtection(200), 0);
+  assert.equal(f.suppression.references.state.entries.size, 0);
+  f.setSinglePlayer(true);
   const newActor = f.makeActor(100, { blocked: true }), original = structuredClone(newActor.state);
   await f.complete(); f.tick(); f.tick();
   assert.deepEqual(newActor.state, original);
   assert.equal(f.suppression.references.state.entries.size, 0);
   assert.equal(f.calls.length, 2);
+});
+
+test('failed load retains suppression originals and protections until restoration completes in the old world', async () => {
+  const f = serviceFixture(), original = structuredClone(f.actor.state);
+  f.tick(); f.tick();
+  f.cleaner.modWcProtection(100, 1); f.native('preLoadGame');
+  await f.complete(); f.tick();
+  assert.equal(f.suppression.references.state.entries.size, 1); assert.equal(f.jobs.length, 0);
+  assert.equal(f.cleaner.getWcProtection(100), 1);
+  f.native('postLoadGame', { success: false }); f.tick();
+  assert.equal(f.jobs.length, 1); await f.complete(); f.tick();
+  assert.deepEqual(f.actor.state, original); assert.equal(f.suppression.references.state.entries.size, 0);
+  assert.equal(f.cleaner.getWcProtection(100), 1);
+  f.event('gameLoad', {}); assert.equal(f.cleaner.getWcProtection(100), 0);
 });
 
 test('native adapter waits for dialogue and refuses a replaced base identity', async () => {

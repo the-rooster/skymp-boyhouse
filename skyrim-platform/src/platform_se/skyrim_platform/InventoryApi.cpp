@@ -3,6 +3,7 @@
 #include "NativeInventoryMetadata.h"
 #include "NullPointerException.h"
 #include "PlayerLoadoutApi.h"
+#include "ActorFactionsApi.h"
 
 extern CallNativeApi::NativeCallRequirements g_nativeCallRequirements;
 
@@ -345,6 +346,7 @@ Napi::Value InventoryApi::SetInventory(const Napi::CallbackInfo& info)
 void InventoryApi::Register(Napi::Env env, Napi::Object& exports)
 {
   PlayerLoadoutApi::Register(env, exports);
+  ActorFactionsApi::Register(env, exports);
   exports.Set("getExtraContainerChanges",
               Napi::Function::New(
                 env, NapiHelper::WrapCppExceptions(GetExtraContainerChanges)));

@@ -1,6 +1,7 @@
 #include "MpActor.h"
 #include "ActiveMagicEffectsMap.h"
 #include "ActorValues.h"
+#include "CampaignFactionApi.h"
 #include "ChangeFormGuard.h"
 #include "ClientEffectContext.h"
 #include "CropRegeneration.h"
@@ -37,6 +38,7 @@
 #include "ChangeValuesMessage.h"
 #include "TeleportMessage.h"
 #include "UpdateEquipmentMessage.h"
+#include "UpdatePropertyMessage.h"
 
 // for PlaceAtMe used in MpActor::DropItem
 #include "script_classes/PapyrusObjectReference.h"
@@ -393,6 +395,82 @@ void MpActor::VisitProperties(CreateActorMessage& message,
 
     message.props.templateChain = std::move(templateChain);
   }
+
+  if (changeForm.factions || (worldState && worldState->HasEspm())) {
+    // Reserved authoritative property. Reuse the existing custom-property
+    // wire encoding so this does not change the binary CreateActor layout.
+    auto& properties = message.customPropsJsonDumps;
+    properties.erase(std::remove_if(properties.begin(), properties.end(),
+                                    [](const auto& property) {
+                                      return property.propName ==
+                                        "campaignFactions";
+                                    }),
+                     properties.end());
+    properties.push_back({ "campaignFactions", GetCampaignFactionsJson() });
+  }
+}
+
+std::string MpActor::GetCampaignFactionsJson() const
+{
+  auto saved = GetChangeForm().factions;
+  const auto world = GetParent();
+  if (!world)
+    throw std::runtime_error("Campaign factions have no registered actor");
+  if (!saved)
+    saved = CampaignFactionApi::InitialFactions(*this, IsCreatedAsPlayer());
+  if (saved->size() > Faction::kMaxEntries)
+    throw std::runtime_error("Campaign faction snapshot exceeds bridge limit");
+  std::map<uint32_t, int> ranks;
+  if (world->HasEspm())
+    world->ValidateCampaignFactions(*saved);
+  const auto base = world->HasEspm()
+    ? CampaignFactionApi::ReadBaseFactions(*this)
+    : std::vector<Faction>{};
+  std::set<uint32_t> activeBaseFactions;
+  for (const auto& faction : base)
+    if (faction.rank >= 0)
+      activeBaseFactions.insert(faction.formDesc.ToFormId(world->espmFiles));
+  for (const auto& faction : *saved) {
+    const auto id = faction.formDesc.ToFormId(world->espmFiles);
+    if (!id || !ranks.emplace(id, static_cast<int>(faction.rank)).second)
+      throw std::runtime_error("Invalid or duplicate campaign faction form");
+  }
+  auto result = nlohmann::json::array();
+  for (const auto& [id, rank] : ranks)
+    result.push_back(
+      { { "factionId", id },
+        { "rank", rank },
+        { "isMember",
+          CampaignFactionApi::IsMember(static_cast<int8_t>(rank),
+                                       activeBaseFactions.contains(id)) } });
+  return result.dump();
+}
+
+void MpActor::SendCampaignFactionsUpdate()
+{
+  UpdatePropertyMessage message;
+  message.idx = GetIdx();
+  message.propName = "campaignFactions";
+  message.dataDump = GetCampaignFactionsJson();
+  // Actor baselines can use virtual64-bit IDs for authored NPC copies, while
+  // this legacy property field is uint32. Route by idx rather than
+  // accidentally sending an authored actor update down the client's
+  // original-reference path.
+  message.refrId = 0;
+  std::set<MpActor*> recipients;
+  const auto include = [&](MpActor* listener) {
+    // Full replacement baselines contain the recipient's own actor and its
+    // direct subscriptions. An offline observer's host may have no model for
+    // this actor, so forwarding through that NPC would not synchronize it.
+    if (listener && SharesWorldInstance(*listener) &&
+        listener->GetUserId() != Networking::InvalidUserId)
+      recipients.insert(listener);
+  };
+  include(this);
+  for (auto listener : GetActorListeners())
+    include(listener);
+  for (auto recipient : recipients)
+    recipient->SendToUser(message, true);
 }
 
 void MpActor::Disable()
@@ -1243,23 +1321,17 @@ void MpActor::AddDeathItem()
 
 void MpActor::LoadFactions()
 {
-  std::vector<Faction> factions = EvaluateTemplate<espm::NPC_::UseFactions>(
-    GetParent(), GetBaseId(), GetTemplateChain(),
-    [&](const auto& npcLookupResult, const auto& npcData) {
-      std::vector<Faction> factions = std::vector<Faction>();
-      for (auto npcFaction : npcData.factions) {
-        Faction faction = Faction();
-        faction.formDesc =
-          FormDesc::FromFormId(npcLookupResult.ToGlobalId(npcFaction.formId),
-                               GetParent()->espmFiles);
-        faction.rank = npcFaction.rank;
-        factions.push_back(faction);
-      }
-      return factions;
-    });
-  for (Faction faction : factions) {
-    AddToFaction(faction, false);
+  // Persisted full snapshots, including empty and negative-rank entries,
+  // override the NPC/template defaults. Reloading must not re-add removals.
+  if (GetChangeForm().factions) {
+    factionsLoaded = true;
+    return;
   }
+  auto factions =
+    CampaignFactionApi::InitialFactions(*this, IsCreatedAsPlayer());
+  EditChangeForm([&](MpChangeForm& changeForm) {
+    changeForm.factions = std::move(factions);
+  });
   factionsLoaded = true;
 }
 

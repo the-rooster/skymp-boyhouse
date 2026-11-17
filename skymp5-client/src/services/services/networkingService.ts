@@ -11,6 +11,7 @@ import { SendRawMessageEvent } from "../events/sendRawMessageEvent";
 import { CampaignPacketChannel } from "../../campaign/campaignPacketChannel";
 import { WorldBaseline } from '../../campaign/worldProjection';
 import { PlayerLoadoutService } from './playerLoadoutService';
+import { ActorFactionsService } from './actorFactionsService';
 
 export class NetworkingService extends ClientListener {
   private campaignPackets = new CampaignPacketChannel();
@@ -88,10 +89,11 @@ export class NetworkingService extends ClientListener {
 
   private creationAllows(message: any): boolean {
     const loadout = this.controller.lookupListener(PlayerLoadoutService);
-    if (!loadout.blocksGameplayInput) return true;
+    const factionsBlocked = this.controller.lookupListener(ActorFactionsService).blocksGameplayInput;
+    if (!loadout.blocksGameplayInput && !factionsBlocked) return true;
     const pending = loadout.pendingAppearance;
     if (message?.t === MsgType.UpdateAppearance)
-      return !!pending && message.idx === pending.actorIdx && message.data === pending.data;
+      return !factionsBlocked && !!pending && message.idx === pending.actorIdx && message.data === pending.data;
     if (message?.t !== MsgType.CustomPacket || typeof message.contentJsonDump !== 'string') return false;
     try {
       const type = JSON.parse(message.contentJsonDump)?.customPacketType;
@@ -108,7 +110,8 @@ export class NetworkingService extends ClientListener {
   }
 
   private onSendRawMessage(e: SendRawMessageEvent) {
-    if (this.controller.lookupListener(PlayerLoadoutService).blocksGameplayInput) return;
+    if (this.controller.lookupListener(PlayerLoadoutService).blocksGameplayInput ||
+        this.controller.lookupListener(ActorFactionsService).blocksGameplayInput) return;
     if (!this.campaignPackets.enabled) {
       // @ts-expect-error
       this.sp.mpClientPlugin.sendRaw(e.rawMessage, e.rawMessage.byteLength, this.isReliable(e.reliability));

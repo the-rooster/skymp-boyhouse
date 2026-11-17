@@ -27,10 +27,13 @@ function fixture(storage = {}) {
       is3DLoaded() { valid(); return loaded3D; }, setActorValue(name, value) { valid(); calls.push(['value', name, value]); },
     };
   };
-  class LoadGameService {} class PlayerLoadoutService {} class TimeService {} class NetworkingService {}
+  class LoadGameService {} class PlayerLoadoutService {} class TimeService {} class NetworkingService {} class ActorFactionsService {}
+  const factions = { generation: 0, progress: { ready: true }, beginSpawn() { return ++this.generation; },
+    cancelSpawn() {}, markSpawnAvailable() {}, spawnReadiness() { return this.progress; } };
   const dependencies = {
     './clientListener': { ClientListener: class {} }, './loadGameService': { LoadGameService },
     './playerLoadoutService': { PlayerLoadoutService }, './timeService': { TimeService }, './networkingService': { NetworkingService },
+    './actorFactionsService': { ActorFactionsService },
     '../../logging': { logError: (...args) => errors.push(args), logTrace() {} },
     '../../sync/appearance': { applyAppearanceToPlayer(appearance, guard) {
       calls.push(['appearance', appearance.name]); guards.push(guard); appearanceHook();
@@ -66,12 +69,13 @@ function fixture(storage = {}) {
     on: (...args) => events.on(...args), emitter, lookupListener(type) {
       if (type === LoadGameService) return { loadGame: (...args) => loads.push(args) };
       if (type === PlayerLoadoutService) return loadout;
+      if (type === ActorFactionsService) return factions;
       if (type === TimeService) return { getTime: () => ({ newGameHourValue: 12.5 }) };
       if (type === NetworkingService) return { isConnected: () => connected };
       throw Error('Unexpected service lookup');
     },
   });
-  return { service, calls, loads, errors, ready, guards, storage, emitter, loadout,
+  return { service, calls, loads, errors, ready, guards, storage, emitter, loadout, factions,
     update(ms = 0) { now += ms; ++frame; events.emit('update'); },
     tick(ms = 0) { now += ms; inTick = true; try { events.emit('tick'); } finally { inTick = false; } },
     native: (...args) => events.emit(...args), message: (...args) => emitter.emit(...args),
@@ -160,6 +164,34 @@ test('a replacement arriving during generated loading positions the new snapshot
   assert.deepEqual(f.calls.filter(c => c[0] === 'appearance'), [['appearance', 'Player 2']]);
 });
 
+test('failed bootstrap stops immediately, releases its loading lifetime, and never retries the failed snapshot', () => {
+  const f = fixture(); f.present(false); const generation = f.service.request(spawn()); f.tick(500);
+  f.native('preLoadGame'); f.native('postLoadGame', { success: false });
+  assert.equal(f.storage.boyhousePlayerSpawnLifetime.loading, false);
+  assert.equal(f.service.status.phase, 'failed');
+  assert.match(f.service.status.error, /save failed to load/);
+  assert.equal(f.calls.filter(call => call[0] === 'cancel').length, 1);
+  f.tick(5000); f.present(true); f.arrive();
+  assert.equal(f.loads.length, 1); assert.equal(f.ready.length, 0);
+  assert.equal(f.service.isReady(generation), false);
+  const replacement = f.service.request(spawn(2)); f.arrive(spawn(2));
+  assert.equal(f.service.isReady(replacement), true, 'A later authoritative spawn is not stuck loading');
+});
+
+test('a failed personal load keeps the cancelled self cancelled and releases the loading gate', () => {
+  const f = fixture(); f.service.request(spawn()); f.update();
+  f.native('preLoadGame'); f.native('postLoadGame', { success: false }); f.arrive();
+  assert.equal(f.service.status, undefined); assert.equal(f.ready.length, 0);
+  const next = f.service.request(spawn(2)); f.arrive(spawn(2));
+  assert.equal(f.service.isReady(next), true);
+});
+
+test('a post-load callback without a result cannot release a bootstrap loading gate', () => {
+  const f = fixture(); f.present(false); f.service.request(spawn()); f.tick(500);
+  f.native('preLoadGame'); f.native('postLoadGame'); f.present(true); f.arrive();
+  assert.equal(f.storage.boyhousePlayerSpawnLifetime.loading, true); assert.equal(f.ready.length, 0);
+});
+
 test('personal-save pre-load cancels old player work before the loaded event', () => {
   const f = fixture(); const generation = f.service.request(spawn()); f.update();
   f.native('preLoadGame'); f.move([9000, 9000, 9000]); f.update(5000);
@@ -215,4 +247,18 @@ test('invalid transforms leave the current valid spawn intact', () => {
   assert.throws(() => f.service.request(spawn(2, [NaN, 0, 0])), /transform/);
   assert.throws(() => f.service.request(spawn(2, [0, 0, 0], 0x100000000)), /transform/);
   f.arrive(); assert.equal(f.service.isReady(generation), true);
+});
+
+test('player spawn waits for native faction observations and fails if they cannot settle', () => {
+  const f = fixture(); f.factions.progress = { ready: false };
+  const generation = f.service.request(spawn()); f.arrive();
+  assert.equal(f.service.isReady(generation), false);
+  assert.equal(f.ready.length, 0);
+  f.factions.progress = { ready: true }; f.update();
+  assert.equal(f.service.isReady(generation), true);
+  const failure = fixture(); failure.factions.progress = { ready: false, error: 'actor faction mismatch' };
+  failure.service.request(spawn()); failure.arrive();
+  assert.equal(failure.service.status.phase, 'failed');
+  assert.match(failure.service.status.error, /actor faction mismatch/);
+  assert.equal(failure.ready.length, 0);
 });

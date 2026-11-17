@@ -8,12 +8,14 @@ import { LoadGameService } from './loadGameService';
 import { PlayerLoadoutService } from './playerLoadoutService';
 import { TimeService } from './timeService';
 import { NetworkingService } from './networkingService';
+import { ActorFactionsService } from './actorFactionsService';
 
 type SpawnPhase = 'pending' | 'positioning' | 'applying' | 'ready' | 'failed';
 interface SpawnState {
     generation: number;
     message: CreateActorMessage;
     loadoutGeneration: number;
+    factionGeneration: number;
     phase: SpawnPhase;
     started: number;
     lastMove: number;
@@ -55,6 +57,13 @@ export class PlayerSpawnService extends ClientListener {
             this.loading = true;
             if (!this.lifetime.loading) this.cancel();
         });
+        controller.on('postLoadGame', (event?: { success: boolean }) => {
+            if (event?.success !== false) return;
+            const ownLoad = this.lifetime.loading;
+            this.loading = false;
+            this.lifetime.loading = false;
+            if (ownLoad && this.state) this.fail(this.state, 'Generated multiplayer save failed to load');
+        });
         controller.emitter.on('gameLoad', event => {
             const ownLoad = this.lifetime.loading;
             this.loading = false;
@@ -83,7 +92,8 @@ export class PlayerSpawnService extends ClientListener {
         const snapshot: CreateActorMessage = JSON.parse(JSON.stringify(message));
         const generation = ++this.lifetime.generation;
         const loadoutGeneration = this.controller.lookupListener(PlayerLoadoutService).beginSpawn(snapshot);
-        this.state = { generation, message: snapshot, loadoutGeneration, phase: 'pending', started: Date.now(),
+        const factionGeneration = this.controller.lookupListener(ActorFactionsService).beginSpawn(snapshot);
+        this.state = { generation, message: snapshot, loadoutGeneration, factionGeneration, phase: 'pending', started: Date.now(),
             lastMove: 0, moves: 0, stableSamples: 0, sawWorld: false, presentationApplied: false };
         return generation;
     }
@@ -92,7 +102,10 @@ export class PlayerSpawnService extends ClientListener {
         ++this.lifetime.generation;
         const previous = this.state;
         this.state = undefined;
-        if (previous) this.controller.lookupListener(PlayerLoadoutService).cancelSpawn(previous.loadoutGeneration);
+        if (previous) {
+            this.controller.lookupListener(PlayerLoadoutService).cancelSpawn(previous.loadoutGeneration);
+            this.controller.lookupListener(ActorFactionsService).cancelSpawn(previous.factionGeneration);
+        }
     }
 
     isReady(generation: number): boolean {
@@ -112,6 +125,7 @@ export class PlayerSpawnService extends ClientListener {
         if (!this.current(state)) return;
         state.error = String(error); state.phase = 'failed';
         this.controller.lookupListener(PlayerLoadoutService).cancelSpawn(state.loadoutGeneration);
+        this.controller.lookupListener(ActorFactionsService).cancelSpawn(state.factionGeneration);
         logError(this, 'Player spawn failed', state.error);
     }
 
@@ -194,6 +208,11 @@ export class PlayerSpawnService extends ClientListener {
                 if (this.current(state)) { state.phase = 'applying'; state.presentationApplied = true; }
                 return; // Observe the current player again on a later update.
             }
+            const factions = this.controller.lookupListener(ActorFactionsService);
+            factions.markSpawnAvailable(state.factionGeneration);
+            const factionProgress = factions.spawnReadiness(state.factionGeneration);
+            if (factionProgress.error) throw Error(factionProgress.error);
+            if (!factionProgress.ready) return;
             this.controller.lookupListener(PlayerLoadoutService).markSpawnReady(state.loadoutGeneration);
             if (this.current(state)) {
                 state.phase = 'ready';

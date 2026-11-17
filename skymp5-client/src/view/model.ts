@@ -3,10 +3,12 @@ import { Animation } from "../sync/animation";
 import { Appearance } from "../sync/appearance";
 import { Equipment } from "../sync/equipment";
 import { Inventory } from "../sync/inventory";
+import { CampaignFactionRank } from '../sync/campaignFactions';
 import { CreateActorMessageMainProps, CreateActorMessageAdditionalProps } from "src/services/messages/createActorMessage";
 
 // Own properties (not inherited) are being assigned locally
 export interface FormModel extends CreateActorMessageAdditionalProps, CreateActorMessageMainProps{
+  campaignFactions?: CampaignFactionRank[];
   idx?: number;
   movement?: Movement;
   numMovementChanges?: number;

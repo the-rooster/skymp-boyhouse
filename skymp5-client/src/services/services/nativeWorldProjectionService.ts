@@ -11,6 +11,7 @@ import { RemoteServer } from './remoteServer';
 import { PlayerSpawnService } from './playerSpawnService';
 import { PlayerLoadoutService } from './playerLoadoutService';
 import { NetworkingService } from './networkingService';
+import { ActorFactionsService } from './actorFactionsService';
 
 interface ControlLease { version: 1; enabled?: boolean[]; }
 
@@ -35,6 +36,9 @@ export class NativeWorldProjectionService extends ClientListener implements Proj
         this.controls = stored?.version === 1 ? stored : { version: 1 };
         sp.storage[key] = this.controls;
         controller.on('preLoadGame', () => { this.loading = true; });
+        controller.on('postLoadGame', (event?: { success: boolean }) => {
+            if (event?.success === false) this.loading = false;
+        });
         controller.emitter.on('gameLoad', () => { this.loading = false; });
         controller.on('update', () => this.update());
     }
@@ -44,6 +48,7 @@ export class NativeWorldProjectionService extends ClientListener implements Proj
     private get owned() { return this.controller.lookupListener(OwnedReferenceService).references; }
     private get operations() { return this.controller.lookupListener(NativeReferenceOperationService).operations; }
     private get loadout() { return this.controller.lookupListener(PlayerLoadoutService); }
+    private get factions() { return this.controller.lookupListener(ActorFactionsService); }
 
     cancel(): void {
         this.blocked = true; this.target = undefined; this.references = []; this.acquired = 0; this.installed = false;
@@ -60,9 +65,10 @@ export class NativeWorldProjectionService extends ClientListener implements Proj
         const ownedError = Array.from(this.owned.state.references.values()).find(reference => reference.error)?.error;
         const nativeError = this.operations.state.errors[0]?.error;
         const suppressionError = this.restoreIds.map(id => this.suppression.error(id)).find(Boolean);
-        const error = this.error || ownedError || nativeError || suppressionError;
+        const factions = this.factions.drained;
+        const error = this.error || ownedError || nativeError || suppressionError || factions.error;
         return { ready: !error && !this.owned.hasRetiringReferences() && !this.operations.isBusy() &&
-            this.suppression.isSettled(this.restoreIds), error };
+            this.suppression.isSettled(this.restoreIds) && factions.ready, error };
     }
 
     apply(projection: WorldProjection, baseline: WorldBaseline): void {
@@ -104,6 +110,8 @@ export class NativeWorldProjectionService extends ClientListener implements Proj
         if (!player.isReady(this.spawnGeneration)) return { ready: false };
         const loadout = this.loadout.projectionReadiness;
         if (!loadout.ready) return loadout;
+        const factions = this.factions.readiness;
+        if (!factions.ready) return factions;
         const originals = this.controller.lookupListener(RemoteServer).getOriginalApplicationProgress();
         if (!originals.ready) return originals;
         const ids = this.references.map(reference => reference.original);
@@ -127,7 +135,8 @@ export class NativeWorldProjectionService extends ClientListener implements Proj
     }
 
     private update(): void {
-        if (this.loading || (!this.blocked && !this.controls.enabled && !this.target && !this.loadout.blocksGameplayInput)) return;
+        if (this.loading || (!this.blocked && !this.controls.enabled && !this.target &&
+            !this.loadout.blocksGameplayInput && !this.factions.blocksGameplayInput)) return;
         try {
             this.reconcileControls();
             const target = this.target;
@@ -171,7 +180,7 @@ export class NativeWorldProjectionService extends ClientListener implements Proj
     private reconcileControls(): void {
         if (!this.sp.Game.getPlayer()) return;
         const creationBlocked = this.loadout.blocksGameplayInput;
-        const blocking = this.blocked || creationBlocked;
+        const blocking = this.blocked || creationBlocked || this.factions.blocksGameplayInput;
         if (blocking && !this.controls.enabled) {
             const flags = this.controlFlags();
             // Camera/looking remain available. Only flags changed by this lease
