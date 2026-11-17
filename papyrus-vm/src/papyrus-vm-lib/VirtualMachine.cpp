@@ -9,12 +9,34 @@
 
 namespace {
 constexpr uint32_t g_maxStackId = 100'000;
+thread_local size_t g_nativeInvocationDepth = 0;
+struct NativeInvocationGuard
+{
+  NativeInvocationGuard() { ++g_nativeInvocationDepth; }
+  ~NativeInvocationGuard() { --g_nativeInvocationDepth; }
+};
 }
 
 void VirtualMachine::CheckExecutionBudget()
 {
   if (strictExecution && ++executedInstructions > 100000)
     throw std::runtime_error("Papyrus transaction instruction quota exceeded");
+}
+
+void VirtualMachine::RequestSuspension(const std::string& token,
+                                       const std::string& resultType)
+{
+  if (!strictExecution || !checkpointFrame)
+    throw std::runtime_error(
+      "Papyrus suspension requires an explicit host entry");
+  if (activeFrames != 1 || g_nativeInvocationDepth != 1)
+    throw std::runtime_error(
+      "Nested Papyrus suspension requires a caller chain");
+  if (token.empty() || token.size() > 256 ||
+      token.find('\0') != std::string::npos || resultType.empty() ||
+      resultType.size() > 1024 || resultType.find('\0') != std::string::npos)
+    throw std::invalid_argument("Invalid Papyrus suspension operation");
+  throw SuspensionRequest(token, resultType);
 }
 
 VirtualMachine::VirtualMachine(
@@ -446,6 +468,7 @@ VarValue VirtualMachine::CallMethod(
       auto self = VarValue(selfObj);
       self.SetMetaStackIdHolder(stackData->stackIdHolder);
       try {
+        NativeInvocationGuard invocation;
         return f(self, arguments);
       } catch (std::exception& e) {
         if (strictExecution)
@@ -510,6 +533,7 @@ VarValue VirtualMachine::CallStatic(const std::string& className,
     auto self = VarValue::None();
     self.SetMetaStackIdHolder(stackData->stackIdHolder);
     try {
+      NativeInvocationGuard invocation;
       return f(self, arguments);
     } catch (std::exception& e) {
       if (strictExecution)

@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "FunctionCode.h"
+#include "Continuation.h"
 #include "FunctionInfo.h"
 #include "IVariablesHolder.h"
 #include "PexScript.h"
@@ -42,6 +43,16 @@ public:
   VarValue StartFunction(const FunctionInfo& function,
                          std::vector<VarValue>& arguments,
                          std::shared_ptr<StackData> stackData);
+
+  // Explicit host entry points for a single attached leaf function. They do
+  // not enable latent quest stages/events or persist the surrounding job.
+  PapyrusExecutionResult StartResumableFunction(
+    const std::string& scope, const std::string& state,
+    const std::string& function, std::vector<VarValue> arguments,
+    std::shared_ptr<StackData> stackData);
+  PapyrusExecutionResult ResumeFunction(
+    const std::string& scope, const PapyrusContinuation& continuation,
+    const VarValue& completion, std::shared_ptr<StackData> stackData);
 
   static uint8_t GetTypeByName(std::string typeRef);
   std::string GetActiveStateName() const;
@@ -82,6 +93,11 @@ private:
                              const std::vector<VarValue*>& arguments);
 
   std::shared_ptr<ActivePexInstance> GetAttachedRoot() const;
+  PapyrusContinuation DescribeContinuation(const std::string& scope,
+                                           const std::string& state,
+                                           const std::string& function) const;
+  void ValidateFrameValue(const VarValue& value, const std::string& type,
+                          bool discard = false) const;
 
   bool EnsureCallResultIsSynchronous(const VarValue& callResult,
                                      ExecutionContext* ctx);

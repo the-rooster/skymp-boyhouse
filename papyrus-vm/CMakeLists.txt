@@ -13,6 +13,9 @@ target_link_libraries(papyrus-vm-lib PUBLIC viet)
 find_package(spdlog CONFIG REQUIRED)
 target_link_libraries(papyrus-vm-lib PUBLIC spdlog::spdlog)
 
+find_package(unofficial-sodium CONFIG REQUIRED)
+target_link_libraries(papyrus-vm-lib PRIVATE unofficial-sodium::sodium)
+
 file(GLOB src "${CMAKE_CURRENT_SOURCE_DIR}/src/papyrus-vm/*.h" "${CMAKE_CURRENT_SOURCE_DIR}/src/papyrus-vm/*.cpp")
 add_executable(papyrus-vm ${src})
 target_link_libraries(papyrus-vm PUBLIC papyrus-vm-lib)

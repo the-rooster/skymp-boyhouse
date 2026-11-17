@@ -17,6 +17,11 @@ struct PexScript
   PexScript(const PexScript&) = delete;
   PexScript& operator=(const PexScript&) = delete;
 
+  // Canonical SHA-256 of current executable metadata, recalculated each call.
+  // Excludes timestamps, debug data, docstrings, build user/machine and unused
+  // string-table layout. Rejects runtime operands and data outside PEX bounds.
+  std::string ExecutionHash() const;
+
   struct Lazy
   {
     std::string source;

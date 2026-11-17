@@ -35,7 +35,46 @@ The runner now implements:
 
 Original MQ102 stage 100 and DA04 stage 5 are execution fixtures. The DA04 fragment displays objective 5; a guest's execution changes only the host's journal. MQ102 stage 100 has no visible objective effect from a fresh journal. Other stages reach cross-quest adapter gates, map-marker effects, alias operations and nested lifecycle execution. Their first failure can move as earlier dependencies are implemented. Those operations fail rather than being omitted. These fixtures do not start or play the quests: no initialization events, complete alias filling/effects, dialogue, scene execution, rewards, or world overlays are supplied.
 
-VM save schema 4 separates script roots, a campaign-local array heap, campaign globals, and resolved alias bindings. Schema 2/3 saves and legacy inline saves migrate on a successful transaction. Multiple variables/scripts retain one allocation across fragments and character reloads, including mutations through a script whose other sharers are unloaded. Equal-valued allocations remain separate; null and empty arrays remain distinct. Unreachable allocations are collected. Papyrus equality compares array identities and recognizes typed null arrays as None. The runner remains an experimental subset; latent stacks, timers and object lifecycle persistence are unfinished.
+VM save schema 5 separates script roots, a campaign-local array heap, campaign globals, resolved alias bindings, and explicitly captured leaf frames. Schema 2/3/4 saves and legacy inline saves migrate on a successful transaction. Multiple variables/scripts retain one allocation across fragments and character reloads, including mutations through a script whose other sharers are unloaded. Equal-valued allocations remain separate; null and empty arrays remain distinct. Unreachable allocations are collected. Papyrus equality compares array identities and recognizes typed null arrays as None. The runner remains an experimental subset; full latent stacks, timers and object lifecycle persistence are unfinished.
+
+### Saved leaf frames
+
+The interpreter exposes explicit `StartResumableFunction` and `ResumeFunction`
+host entry points for an attached script function. An admitted native can request
+a terminal suspension with an operation token and result type. The frame records
+its campaign scope, stable receiver identity, script attachment and implementation,
+function/state, call instruction, instruction budget, and typed locals/parameters.
+Resumption supplies the native result and continues after the saved call; it
+does not rerun the instructions before that call.
+
+Every script in the attachment's inheritance chain has a streamed SHA-256 of
+its current executable metadata. Restore verifies those hashes, the receiver
+and campaign scope, local layout/types, call destination and remaining budget.
+The hash includes code, declarations, defaults, properties and flags; it omits
+nonexecuting build timestamps, debug information and documentation. It is an
+execution identity check, not a content migration or a complete mod manifest.
+
+Schema 5 stores frames with a versioned, bounded codec. Local-only arrays remain
+heap roots; a local and script field sharing an array retain one allocation
+after reload. Taking a frame checks its scope and consumes its pending token;
+a second take fails. Put/take validate a candidate before changing the heap.
+Reset refuses outstanding frames until cancellation and dependency semantics
+exist, including frames whose scope alone does not reveal every referenced quest.
+
+This entry path currently supports one leaf Papyrus frame. A suspension inside
+another script function, property handler, or nested VM native call is rejected.
+The admitted native itself must use the request as terminal control flow; it must
+not suppress the request or expect C++ code after the await to run on resume.
+Ordinary strict-mode promises remain rejected. The host is responsible for
+rebinding stack policy and committing token consumption, resumed effects and any
+replacement frame in one campaign transaction.
+
+The production quest runner does not yet use these entry points. No Utility.Wait,
+Start/Stop/Reset, latent fragment or event is enabled by this change. Full caller
+chains, stage/log completion cursors, event delivery, lifecycle ordering and
+disk-commit acknowledgements are still required. Destroying and rebuilding a VM
+from saved JSON proves frame recovery; it does not prove crash-durable quest
+execution or exactly-once external delivery. See [STORAGE.md](STORAGE.md).
 
 ### Repeatable stages and lifecycle metadata
 
@@ -563,7 +602,7 @@ The [dependency analyzer](DEPENDENCIES.md) discovers shared work across the full
 | Gate | Required work and evidence |
 | --- | --- |
 | Original quest execution | Extend the implemented scoped fragment runner with startup/shutdown scheduling, alias filling and alias scripts, nested quest lifecycle transitions, asynchronous stage completion, and the remaining condition/native semantics. The existing global VM must not become an alternate campaign-effect path. |
-| VM persistence | Shared arrays, variables, globals and alias bindings now persist; add alias lifecycle, timers, latent continuations, content hashes and content migrations. Restart during a stage/reward must neither lose nor duplicate effects. |
+| VM persistence | Shared arrays, variables, globals, alias bindings and explicit leaf checkpoints persist. Add full caller stacks, runner cursors, alias lifecycle, timers, content migrations and durable completion delivery. Restart during a stage/reward must neither lose nor duplicate effects. |
 | World overlays | Explicit entry/recovery prepares private references and experimental projection replaces originals. Extend the transactional visibility subset with enable-parent propagation and lifecycle, plus death, inventory, globals, factions, locations, doors and encounters with their complete mutation/event semantics. Add automatic area entry and broader native acceptance. |
 | Dialogue and story | Implement topic/response selection, conditions, aliases, scenes, packages, story-manager events, radiants, followers, and quest item/reward behavior. Every mutating effect must carry campaign context. |
 | Client engine | Expand the experimental Skyrim Platform 1.7.104 port and the single-client projection round-trip evidence to new-character completion, general world restoration, multiple real clients and journal/objective markers without rerunning client fragments. See [the native runtime audit](CLIENT_RUNTIME.md). |
@@ -602,3 +641,15 @@ capabilities, no parse failures or explicit unresolved static dependencies, and
 zero certified playable quests. Runtime-dependent dispatch remains on 1,146
 quest records. The registry guards 127 source files. No Skyrim launch, client
 installation update or staging deployment was part of this batch.
+
+The subsequent leaf-checkpoint batch passed the Linux build and complete suite
+on 2026-11-17 UTC: 610 native cases / 451,607 assertions, 368 JavaScript tests,
+47 Python tests, addon and both protocol smokes, and the 32-character SQLite
+restart check. Recovery tests destroy and reconstruct the VM twice, preserve
+local-only/shared arrays and object declarations, route method/static/parent
+results correctly, preserve budgets, and discard a failing resumed candidate
+before retrying the original checkpoint. Ordinary promises and unsupported
+nested suspension remain rejected. Owned archive scripts also pass executable
+fingerprinting. The source registry now guards 131 files; catalog capability
+counts and zero certified playable quests are unchanged. No game launch,
+installation update or deployment was performed.

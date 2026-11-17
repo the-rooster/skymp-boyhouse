@@ -35,6 +35,36 @@ uint64_t HeapId(const std::string& text)
     throw std::runtime_error("Invalid saved Papyrus array identity");
   return id;
 }
+void BoundedString(const std::string& value, size_t limit,
+                   bool allowEmpty = false)
+{
+  if ((!allowEmpty && value.empty()) || value.size() > limit ||
+      value.find('\0') != std::string::npos)
+    throw std::runtime_error("Invalid continuation string");
+}
+void BoundedString(const Json& value, size_t limit, bool allowEmpty = false)
+{
+  if (!value.is_string())
+    throw std::runtime_error("Invalid continuation string");
+  BoundedString(value.get_ref<const std::string&>(), limit, allowEmpty);
+}
+void Fields(const Json& value, std::initializer_list<const char*> names)
+{
+  if (!value.is_object() || value.size() != names.size())
+    throw std::runtime_error("Invalid continuation fields");
+  for (const auto* name : names)
+    if (!value.contains(name))
+      throw std::runtime_error("Missing continuation field");
+}
+void InstructionCount(const Json& value, bool executed)
+{
+  if (!value.is_number_integer() ||
+      (value.is_number_unsigned() && value.get<uint64_t>() > 100000))
+    throw std::runtime_error("Invalid continuation instruction count");
+  const auto number = value.get<int64_t>();
+  if (number < (executed ? 1 : 0) || number > (executed ? 100000 : 99999))
+    throw std::runtime_error("Invalid continuation instruction count");
+}
 }
 
 void QuestVmState::ValidateScalar(const Json& value)
@@ -77,6 +107,12 @@ QuestVmState::Json QuestVmState::Normalize(Json saved)
   if (!saved.is_object())
     throw std::runtime_error("Invalid saved quest VM");
   if (saved.contains("schemaVersion")) {
+    if (!saved.at("schemaVersion").is_number_integer())
+      throw std::runtime_error("Invalid saved quest VM version");
+    if (saved.at("schemaVersion") != 5 && saved.contains("continuations") &&
+        (!saved.at("continuations").is_object() ||
+         !saved.at("continuations").empty()))
+      throw std::runtime_error("Continuations require quest VM version five");
     if (saved.at("schemaVersion") == 2) {
       saved["schemaVersion"] = 3;
       if (!saved.contains("globals"))
@@ -85,7 +121,11 @@ QuestVmState::Json QuestVmState::Normalize(Json saved)
     if (saved.at("schemaVersion") == 3) {
       saved["schemaVersion"] = 4;
       saved["aliases"] = Json::object();
-    } else if (saved.at("schemaVersion") != 4) {
+    }
+    if (saved.at("schemaVersion") == 4) {
+      saved["schemaVersion"] = 5;
+      saved["continuations"] = Json::object();
+    } else if (saved.at("schemaVersion") != 5) {
       throw std::runtime_error("Unsupported saved quest VM version");
     }
     Validate(saved);
@@ -94,11 +134,12 @@ QuestVmState::Json QuestVmState::Normalize(Json saved)
   // Legacy scripts stored inline, non-shared arrays. Assign a distinct heap
   // identity to each of those allocations; never deduplicate by array
   // contents.
-  Json result = { { "schemaVersion", 4 },
+  Json result = { { "schemaVersion", 5 },
                   { "scripts", saved },
                   { "arrays", Json::object() },
                   { "globals", Json::object() },
-                  { "aliases", Json::object() } };
+                  { "aliases", Json::object() },
+                  { "continuations", Json::object() } };
   uint64_t id = 1;
   for (auto& [key, script] : result["scripts"].items()) {
     if (!script.is_object() || script.at("schemaVersion") != 1 ||
@@ -128,7 +169,8 @@ QuestVmState::Json QuestVmState::Normalize(Json saved)
 
 void QuestVmState::Validate(const Json& saved)
 {
-  if (saved.at("schemaVersion") != 4 || !saved.at("scripts").is_object() ||
+  if (!saved.at("schemaVersion").is_number_integer() ||
+      saved.at("schemaVersion") != 5 || !saved.at("scripts").is_object() ||
       !saved.at("arrays").is_object() || saved["arrays"].size() > 100000)
     throw std::runtime_error("Invalid saved quest heap");
   {
@@ -165,19 +207,79 @@ void QuestVmState::Validate(const Json& saved)
     if (key.empty() || key.size() > 1024 || !script.is_object() ||
         script.at("schemaVersion") != 1 || !script.at("values").is_object())
       throw std::runtime_error("Invalid saved quest script");
-    for (const auto& value : script["values"]) {
-      const auto type = Type(value);
-      if (!IsArray(type)) {
-        ValidateScalar(value);
-        continue;
-      }
-      const auto& ref = value.at("array");
-      if (ref.is_null())
-        continue;
-      if (!ref.is_string() || !arrays.contains(ref.get<std::string>()) ||
-          arrays.at(ref.get<std::string>()).at("type") != type)
-        throw std::runtime_error("Dangling or mistyped quest array reference");
-    }
+    for (const auto& value : script["values"])
+      ValidateValue(value, arrays);
+  }
+  if (!saved.at("continuations").is_object() ||
+      saved.at("continuations").size() > 256)
+    throw std::runtime_error("Invalid saved quest continuations");
+  for (const auto& [token, continuation] : saved["continuations"].items())
+    ValidateContinuation(token, continuation, arrays);
+}
+
+void QuestVmState::ValidateValue(const Json& value, const Json& arrays)
+{
+  const auto type = Type(value);
+  if (!IsArray(type)) {
+    ValidateScalar(value);
+    return;
+  }
+  const auto& ref = value.at("array");
+  if (ref.is_null())
+    return;
+  if (!ref.is_string() || !arrays.contains(ref.get<std::string>()) ||
+      arrays.at(ref.get<std::string>()).at("type") != type)
+    throw std::runtime_error("Dangling or mistyped quest array reference");
+}
+
+void QuestVmState::ValidateContinuation(const std::string& token,
+                                       const Json& value, const Json& arrays)
+{
+  BoundedString(token, 256);
+  Fields(value, { "schemaVersion", "scope", "receiver", "rootScript",
+                  "script", "state", "function", "contentHashes",
+                  "resultType", "instruction", "executedInstructions",
+                  "locals" });
+  if (!value.at("schemaVersion").is_number_integer() ||
+      value.at("schemaVersion") != 1)
+    throw std::runtime_error("Unsupported quest continuation version");
+  BoundedString(value.at("scope"), 300);
+  for (const auto* field : { "rootScript", "script", "function", "resultType" })
+    BoundedString(value.at(field), 1024);
+  BoundedString(value.at("state"), 1024, true);
+  InstructionCount(value.at("instruction"), false);
+  InstructionCount(value.at("executedInstructions"), true);
+  const auto& receiver = value.at("receiver");
+  if (Type(receiver) != VarValue::kType_Object ||
+      receiver.at("value").is_null())
+    throw std::runtime_error("Continuation requires a nonnull receiver");
+  ValidateScalar(receiver);
+  const auto& hashes = value.at("contentHashes");
+  if (!hashes.is_array() || hashes.size() > 128)
+    throw std::runtime_error("Invalid continuation content hashes");
+  std::set<std::string> scripts;
+  for (const auto& hash : hashes) {
+    Fields(hash, { "script", "hash" });
+    BoundedString(hash.at("script"), 1024);
+    if (!scripts.insert(hash.at("script").get<std::string>()).second)
+      throw std::runtime_error("Duplicate continuation content hash");
+    BoundedString(hash.at("hash"), 64);
+    const auto& digest = hash.at("hash").get_ref<const std::string&>();
+    if (digest.size() != 64 ||
+        digest.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos)
+      throw std::runtime_error("Invalid continuation content digest");
+  }
+  const auto& locals = value.at("locals");
+  if (!locals.is_array() || locals.size() > 65535)
+    throw std::runtime_error("Invalid continuation locals");
+  std::set<std::string> names;
+  for (const auto& local : locals) {
+    Fields(local, { "name", "declaredType", "value" });
+    BoundedString(local.at("name"), 1024);
+    BoundedString(local.at("declaredType"), 1024);
+    if (!names.insert(local.at("name").get<std::string>()).second)
+      throw std::runtime_error("Duplicate continuation local");
+    ValidateValue(local.at("value"), arrays);
   }
 }
 
@@ -188,6 +290,12 @@ void QuestVmState::Collect(Json& saved)
     for (const auto& value : script["values"])
       if (IsArray(Type(value)) && !value.at("array").is_null())
         reachable.insert(value.at("array").get<std::string>());
+  for (const auto& continuation : saved["continuations"])
+    for (const auto& local : continuation["locals"]) {
+      const auto& value = local.at("value");
+      if (IsArray(Type(value)) && !value.at("array").is_null())
+        reachable.insert(value.at("array").get<std::string>());
+    }
   auto& arrays = saved["arrays"];
   for (auto it = arrays.begin(); it != arrays.end();)
     if (!reachable.count(it.key()))
@@ -327,25 +435,111 @@ QuestVmState::Json QuestVmState::Save()
 
 void QuestVmState::ResetQuest(Json& saved, const std::string& prefix)
 {
-  if (saved.empty())
+  if (saved.is_object() && saved.empty())
     return;
-  saved = Normalize(std::move(saved));
-  auto& scripts = saved["scripts"];
+  auto updated = Normalize(saved);
+  // A suspended frame may refer to this quest through locals, aliases, or
+  // another script. Scope alone is not a complete dependency/cancellation map.
+  if (!updated["continuations"].empty())
+    throw std::runtime_error("Cannot reset quests with pending continuations");
+  auto& scripts = updated["scripts"];
   for (auto it = scripts.begin(); it != scripts.end();)
     if (it.key().compare(0, prefix.size(), prefix) == 0)
       it = scripts.erase(it);
     else
       ++it;
-  auto& aliases = saved["aliases"];
+  auto& aliases = updated["aliases"];
   for (auto it = aliases.begin(); it != aliases.end();)
     if (it.key().compare(0, prefix.size(), prefix) == 0)
       it = aliases.erase(it);
     else
       ++it;
-  Collect(saved);
+  Collect(updated);
   if (scripts.empty() && aliases.empty() &&
-      saved.value("globals", Json::object()).empty())
-    saved = Json::object();
+      updated.value("globals", Json::object()).empty())
+    updated = Json::object();
+  saved = std::move(updated);
+}
+
+void QuestVmState::PutContinuation(const PapyrusContinuation& continuation)
+{
+  BoundedString(continuation.token, 256);
+  if (state["continuations"].contains(continuation.token))
+    throw std::runtime_error("Duplicate quest continuation token");
+  if (state["continuations"].size() >= 256 ||
+      continuation.locals.size() > 65535 ||
+      continuation.contentHashes.size() > 128)
+    throw std::runtime_error("Quest continuation limit exceeded");
+  if (continuation.receiver.GetType() != VarValue::kType_Object ||
+      !static_cast<IGameObject*>(continuation.receiver))
+    throw std::runtime_error("Continuation requires a nonnull receiver");
+
+  // Encoding can allocate heap identities, and saving checks all live arrays.
+  // Publish those changes only after the entire candidate has been validated.
+  auto updated = *this;
+  Json value = { { "schemaVersion", 1 },
+                 { "scope", continuation.scope },
+                 { "receiver", updated.Encode(continuation.receiver) },
+                 { "rootScript", continuation.rootScript },
+                 { "script", continuation.script },
+                 { "state", continuation.state },
+                 { "function", continuation.function },
+                 { "contentHashes", Json::array() },
+                 { "resultType", continuation.resultType },
+                 { "instruction", continuation.instruction },
+                 { "executedInstructions", continuation.executedInstructions },
+                 { "locals", Json::array() } };
+  for (const auto& [script, hash] : continuation.contentHashes)
+    value["contentHashes"].push_back({ { "script", script }, { "hash", hash } });
+  for (const auto& [name, local] : continuation.locals)
+    value["locals"].push_back({ { "name", name },
+                                { "declaredType", local.objectType },
+                                { "value", updated.Encode(local) } });
+  updated.state["continuations"][continuation.token] = std::move(value);
+  updated.Save();
+  *this = std::move(updated);
+}
+
+PapyrusContinuation QuestVmState::TakeContinuation(const std::string& scope,
+                                                  const std::string& token)
+{
+  BoundedString(scope, 300);
+  BoundedString(token, 256);
+  auto updated = *this;
+  updated.Save();
+  const auto& pending = updated.state["continuations"];
+  if (!pending.contains(token) || pending.at(token).at("scope") != scope)
+    throw std::runtime_error("Quest continuation scope or token mismatch");
+  const auto& value = pending.at(token);
+  PapyrusContinuation result;
+  result.scope = scope;
+  result.token = token;
+  result.receiver = updated.Decode(value.at("receiver"));
+  if (result.receiver.promise ||
+      result.receiver.GetType() != VarValue::kType_Object ||
+      !static_cast<IGameObject*>(result.receiver))
+    throw std::runtime_error("Continuation receiver could not be resolved");
+  result.rootScript = value.at("rootScript").get<std::string>();
+  result.script = value.at("script").get<std::string>();
+  result.state = value.at("state").get<std::string>();
+  result.function = value.at("function").get<std::string>();
+  result.resultType = value.at("resultType").get<std::string>();
+  result.instruction = value.at("instruction").get<uint32_t>();
+  result.executedInstructions = value.at("executedInstructions").get<uint32_t>();
+  for (const auto& hash : value.at("contentHashes"))
+    result.contentHashes.emplace_back(hash.at("script").get<std::string>(),
+                                      hash.at("hash").get<std::string>());
+  for (const auto& local : value.at("locals")) {
+    auto decoded = updated.Decode(local.at("value"));
+    if (decoded.promise || decoded.GetType() != Type(local.at("value")))
+      throw std::runtime_error("Continuation local could not be resolved");
+    decoded.objectType = local.at("declaredType").get<std::string>();
+    result.locals.emplace_back(local.at("name").get<std::string>(), decoded);
+  }
+  updated.state["continuations"].erase(token);
+  Collect(updated.state);
+  *this = std::move(updated);
+  return result;
 }
 
 std::optional<float> QuestVmState::GetGlobal(const std::string& key) const

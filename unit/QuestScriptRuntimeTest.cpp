@@ -538,6 +538,9 @@ TEST_CASE("Owned vanilla PEX files parse after archive decompression",
       Reader(std::vector<std::vector<uint8_t>>{ bytes }).GetSourceStructures();
     REQUIRE(parsed.size() == 1);
     REQUIRE(parsed.front()->objectTable.size() == 1);
+    const auto hash = parsed.front()->ExecutionHash();
+    REQUIRE(hash.size() == 64);
+    REQUIRE(hash.find_first_not_of("0123456789abcdef") == std::string::npos);
   }
 }
 
@@ -1038,7 +1041,7 @@ TEST_CASE(
   AliasProperty(restart);
   REQUIRE(restart.Run(restored, 20));
   REQUIRE(Counter(restored) == 0x1a677);
-  REQUIRE(QuestJournal::ScriptState(restored)["schemaVersion"] == 4);
+  REQUIRE(QuestJournal::ScriptState(restored)["schemaVersion"] == 5);
 }
 
 TEST_CASE("Alias binding failures roll back and unsupported optional fills "

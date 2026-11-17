@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cctype> // tolower
+#include <cmath>
 #include <fmt/ranges.h>
 #include <functional>
 #include <spdlog/spdlog.h>
@@ -331,6 +332,11 @@ void ActivePexInstance::ExecuteOpCode(ExecutionContext* ctx, uint8_t op,
           static_cast<uint32_t>(static_cast<int32_t>(index)) >=
             array.pArray->size())
         throw std::runtime_error("Invalid Papyrus array access");
+      if (array.GetType() < VarValue::kType_ObjectArray ||
+          array.GetType() > VarValue::kType_BoolArray ||
+          (!get &&
+           args.at(2)->GetType() != GetArrayElementType(array.GetType())))
+        throw std::runtime_error("Invalid Papyrus array element type");
     }
     if (op == OpcodesImplementation::Opcodes::op_iDiv ||
         op == OpcodesImplementation::Opcodes::op_iMod) {
@@ -965,7 +971,39 @@ VarValue ActivePexInstance::ExecuteAll(
     }
 
     auto& [op, args] = opCode[ctx.line];
-    ExecuteOpCode(&ctx, op, args);
+    try {
+      ExecuteOpCode(&ctx, op, args);
+    } catch (const VirtualMachine::SuspensionRequest& request) {
+      if (!parentVM->checkpointFrame || parentVM->activeFrames != 1 ||
+          (op != FunctionCode::kOp_CallMethod &&
+           op != FunctionCode::kOp_CallStatic &&
+           op != FunctionCode::kOp_CallParent))
+        throw std::runtime_error("Unsupported Papyrus suspension boundary");
+      const size_t resultIndex = op == FunctionCode::kOp_CallParent ? 1 : 2;
+      const auto& destination =
+        ctx.instructions.at(ctx.line).args.at(resultIndex);
+      if (destination.GetType() != VarValue::kType_Identifier ||
+          !static_cast<const char*>(destination) ||
+          !Utils::stricmp(static_cast<const char*>(destination), "self") ||
+          !Utils::stricmp(static_cast<const char*>(destination), "::State") ||
+          !Utils::stricmp(request.resultType.c_str(), "identifier"))
+        throw std::runtime_error(
+          "Invalid Papyrus suspension result declaration");
+      const VarValue prototype(GetTypeByName(request.resultType));
+      ValidateFrameValue(prototype, request.resultType);
+      ValidateFrameValue(prototype, args.at(resultIndex)->objectType, true);
+      for (const auto& local : *ctx.locals)
+        ValidateFrameValue(local.second, local.second.objectType, true);
+      auto& frame = *parentVM->checkpointFrame;
+      frame.token = request.token;
+      frame.resultType = request.resultType;
+      frame.instruction = static_cast<uint32_t>(ctx.line);
+      frame.executedInstructions =
+        static_cast<uint32_t>(parentVM->executedInstructions);
+      frame.locals = *ctx.locals;
+      parentVM->checkpointSuspended = true;
+      return VarValue::None();
+    }
 
     ++opCodeExecutions;
 
@@ -986,6 +1024,236 @@ VarValue ActivePexInstance::ExecuteAll(
   return ctx.returnValue;
 }
 
+PapyrusContinuation ActivePexInstance::DescribeContinuation(
+  const std::string& scope, const std::string& state,
+  const std::string& function) const
+{
+  auto validName = [](const std::string& text, size_t limit, bool empty) {
+    return (empty || !text.empty()) && text.size() <= limit &&
+      text.find('\0') == std::string::npos;
+  };
+  if (!parentVM || !parentVM->IsStrictExecution() || parentVM->activeFrames ||
+      parentVM->checkpointFrame || !IsValid() ||
+      !validName(scope, 300, false) || !validName(state, 1024, true) ||
+      !validName(function, 1024, false))
+    throw std::runtime_error("Invalid Papyrus checkpoint entry");
+  if (activeInstanceOwner.GetType() != VarValue::kType_Object ||
+      !static_cast<IGameObject*>(activeInstanceOwner))
+    throw std::runtime_error(
+      "Papyrus checkpoint requires an attached receiver");
+  PapyrusContinuation frame;
+  frame.scope = scope;
+  frame.receiver = activeInstanceOwner;
+  const auto root = GetAttachedRoot();
+  size_t matchingRoots = 0;
+  for (const auto& attachment : static_cast<IGameObject*>(activeInstanceOwner)
+                                  ->ListActivePexInstances())
+    if (attachment && attachment->IsValid() &&
+        !Utils::stricmp(attachment->GetSourcePexName().c_str(),
+                        root->GetSourcePexName().c_str()))
+      ++matchingRoots;
+  if (matchingRoots != 1)
+    throw std::runtime_error("Ambiguous Papyrus checkpoint attachment");
+  frame.rootScript = root->GetSourcePexName();
+  frame.script = GetSourcePexName();
+  frame.state = state;
+  frame.function = function;
+  for (auto entry = root; entry && entry->IsValid();
+       entry = entry->GetParentInstance()) {
+    if (frame.contentHashes.size() >= 128)
+      throw std::runtime_error(
+        "Papyrus checkpoint inheritance limit exceeded");
+    frame.contentHashes.emplace_back(entry->GetSourcePexName(),
+                                     entry->sourcePex.fn()->ExecutionHash());
+  }
+  return frame;
+}
+
+void ActivePexInstance::ValidateFrameValue(const VarValue& value,
+                                           const std::string& type,
+                                           bool discard) const
+{
+  if (type.empty() || type.size() > 1024 ||
+      type.find('\0') != std::string::npos ||
+      !Utils::stricmp(type.c_str(), "identifier") || value.promise)
+    throw std::runtime_error("Invalid Papyrus checkpoint value type");
+  const auto actual = value.GetType();
+  if (actual == VarValue::kType_Identifier ||
+      (actual > VarValue::kType_Bool &&
+       (actual < VarValue::kType_ObjectArray ||
+        actual > VarValue::kType_BoolArray)) ||
+      (actual == VarValue::kType_Float &&
+       !std::isfinite(static_cast<double>(value))) ||
+      (actual == VarValue::kType_String && !static_cast<const char*>(value)))
+    throw std::runtime_error("Invalid Papyrus checkpoint value");
+  const bool none = !Utils::stricmp(type.c_str(), "None");
+  const auto expected = GetTypeByName(type);
+  const bool null =
+    actual == VarValue::kType_Object && !static_cast<IGameObject*>(value);
+  // The compiler's None temporary may discard a native's nonvoid result.
+  if (!(discard && none) && actual != expected &&
+      !(null && expected >= VarValue::kType_ObjectArray))
+    throw std::runtime_error(
+      "Papyrus checkpoint value does not match declaration");
+  if (none && !discard && !null)
+    throw std::runtime_error("Papyrus completion must be None");
+  if (actual == VarValue::kType_Object && !null && !none &&
+      !parentVM->DynamicCast(value, CIString{ type.begin(), type.end() }))
+    throw std::runtime_error("Papyrus checkpoint object has the wrong type");
+  if (actual >= VarValue::kType_ObjectArray && value.pArray) {
+    if (value.pArray->size() > 1000000)
+      throw std::runtime_error("Papyrus checkpoint array exceeds limits");
+    auto element = type.size() > 2 && type.substr(type.size() - 2) == "[]"
+      ? type.substr(0, type.size() - 2)
+      : std::string{};
+    if (discard && none) {
+      static const char* elementTypes[] = { "None", "String", "Int", "Float",
+                                            "Bool" };
+      element = elementTypes[actual - VarValue::kType_ObjectArray];
+    }
+    if (element.empty() || element.find("[]") != std::string::npos)
+      throw std::runtime_error("Invalid Papyrus checkpoint array declaration");
+    for (const auto& entry : *value.pArray) {
+      // Papyrus arrays cannot contain arrays. Check the physical element tag
+      // even for a compiler discard local, before any recursive validation.
+      if (entry.GetType() != GetArrayElementType(actual))
+        throw std::runtime_error(
+          "Invalid Papyrus checkpoint array element type");
+      ValidateFrameValue(entry, element, discard && none);
+    }
+  }
+}
+
+PapyrusExecutionResult ActivePexInstance::StartResumableFunction(
+  const std::string& scope, const std::string& state,
+  const std::string& functionName, std::vector<VarValue> arguments,
+  std::shared_ptr<StackData> stackData)
+{
+  auto frame = DescribeContinuation(scope, state, functionName);
+  const auto function = GetFunctionByName(functionName.c_str(), state);
+  if (!stackData || !function.valid || function.IsGlobal() ||
+      function.IsNative() || function.params.size() != arguments.size() ||
+      function.params.size() + function.locals.size() > 65535 ||
+      function.code.instructions.size() > 100000)
+    throw std::runtime_error("Invalid resumable Papyrus function");
+  std::set<CIString> names;
+  for (const auto* declarations : { &function.locals, &function.params })
+    for (const auto& declaration : *declarations) {
+      if (declaration.name.empty() || declaration.name.size() > 1024 ||
+          declaration.name.find('\0') != std::string::npos ||
+          !Utils::stricmp(declaration.name.c_str(), "self") ||
+          !Utils::stricmp(declaration.name.c_str(), "::State") ||
+          !names
+             .insert(
+               CIString{ declaration.name.begin(), declaration.name.end() })
+             .second ||
+          declaration.type.empty() || declaration.type.size() > 1024 ||
+          declaration.type.find('\0') != std::string::npos ||
+          !Utils::stricmp(declaration.type.c_str(), "identifier"))
+        throw std::runtime_error(
+          "Invalid resumable Papyrus local declaration");
+    }
+  for (size_t i = 0; i < arguments.size(); ++i)
+    ValidateFrameValue(arguments[i], function.params[i].type);
+  parentVM->checkpointFrame = std::move(frame);
+  parentVM->checkpointSuspended = false;
+  Viet::ScopedTask<VirtualMachine*> checkpointGuard(
+    [](VirtualMachine*& vm) {
+      vm->checkpointFrame.reset();
+      vm->checkpointSuspended = false;
+    },
+    parentVM);
+  PapyrusExecutionResult result;
+  result.value = StartFunction(function, arguments, std::move(stackData));
+  if (parentVM->checkpointSuspended)
+    result.continuation = std::move(parentVM->checkpointFrame);
+  return result;
+}
+
+PapyrusExecutionResult ActivePexInstance::ResumeFunction(
+  const std::string& scope, const PapyrusContinuation& frame,
+  const VarValue& completion, std::shared_ptr<StackData> stackData)
+{
+  const auto current =
+    DescribeContinuation(scope, frame.state, frame.function);
+  if (!stackData || frame.scope != scope ||
+      frame.receiver.GetType() != VarValue::kType_Object ||
+      !(frame.receiver == activeInstanceOwner) ||
+      !(activeInstanceOwner == frame.receiver) ||
+      frame.rootScript != current.rootScript ||
+      frame.script != current.script ||
+      frame.contentHashes != current.contentHashes || frame.token.empty() ||
+      frame.token.size() > 256 ||
+      frame.token.find('\0') != std::string::npos ||
+      !frame.executedInstructions || frame.executedInstructions > 100000)
+    throw std::runtime_error("Papyrus continuation identity/content mismatch");
+  const auto function = GetFunctionByName(frame.function.c_str(), frame.state);
+  if (!function.valid || function.IsGlobal() || function.IsNative() ||
+      function.code.instructions.size() > 100000 ||
+      frame.instruction >= function.code.instructions.size() ||
+      function.locals.size() + function.params.size() > 65535 ||
+      frame.locals.size() != function.locals.size() + function.params.size())
+    throw std::runtime_error("Invalid Papyrus continuation function/frame");
+  if (std::max<size_t>(parentVM->executedInstructions,
+                       frame.executedInstructions) >= 100000 &&
+      size_t(frame.instruction) + 1 < function.code.instructions.size())
+    throw std::runtime_error("Papyrus transaction instruction quota exceeded");
+  const auto& call = function.code.instructions[frame.instruction];
+  if (call.op != FunctionCode::kOp_CallMethod &&
+      call.op != FunctionCode::kOp_CallStatic &&
+      call.op != FunctionCode::kOp_CallParent)
+    throw std::runtime_error(
+      "Papyrus continuation is not at a call instruction");
+  const size_t destination = call.op == FunctionCode::kOp_CallParent ? 1 : 2;
+  if (call.args.size() <= destination ||
+      call.args[destination].GetType() != VarValue::kType_Identifier ||
+      !static_cast<const char*>(call.args[destination]))
+    throw std::runtime_error(
+      "Invalid Papyrus continuation result destination");
+  ValidateFrameValue(completion, frame.resultType);
+  std::set<CIString> names;
+  auto locals = std::make_shared<std::vector<Local>>();
+  for (size_t i = 0; i < frame.locals.size(); ++i) {
+    const auto& declaration = i < function.locals.size()
+      ? function.locals[i]
+      : function.params[i - function.locals.size()];
+    const auto& [name, value] = frame.locals[i];
+    if (name != declaration.name || name.empty() || name.size() > 1024 ||
+        name.find('\0') != std::string::npos ||
+        !names.insert(CIString{ name.begin(), name.end() }).second ||
+        value.objectType != declaration.type)
+      throw std::runtime_error("Papyrus continuation local layout mismatch");
+    ValidateFrameValue(value, declaration.type, true);
+    locals->emplace_back(name, value);
+  }
+  const auto* resultName = static_cast<const char*>(call.args[destination]);
+  if (!Utils::stricmp(resultName, "self") ||
+      !Utils::stricmp(resultName, "::State"))
+    throw std::runtime_error("Invalid Papyrus continuation result target");
+  const auto& resultSlot = GetVariableValueByName(locals.get(), resultName);
+  ValidateFrameValue(completion, resultSlot.objectType, true);
+  parentVM->checkpointFrame = current;
+  parentVM->checkpointSuspended = false;
+  parentVM->executedInstructions = std::max<size_t>(
+    parentVM->executedInstructions, frame.executedInstructions);
+  ++parentVM->activeFrames;
+  Viet::ScopedTask<VirtualMachine*> checkpointGuard(
+    [](VirtualMachine*& vm) {
+      --vm->activeFrames;
+      vm->checkpointFrame.reset();
+      vm->checkpointSuspended = false;
+    },
+    parentVM);
+  ExecutionContext context{ std::move(stackData), function.code.instructions,
+                            std::move(locals) };
+  context.line = size_t(frame.instruction) + 1;
+  PapyrusExecutionResult result;
+  result.value = ExecuteAll(context, completion);
+  if (parentVM->checkpointSuspended)
+    result.continuation = std::move(parentVM->checkpointFrame);
+  return result;
+}
+
 VarValue ActivePexInstance::StartFunction(const FunctionInfo& function,
                                           std::vector<VarValue>& arguments,
                                           std::shared_ptr<StackData> stackData)
@@ -1001,6 +1269,12 @@ VarValue ActivePexInstance::StartFunction(const FunctionInfo& function,
   if (parentVM->IsStrictExecution() && function.IsNative())
     throw std::runtime_error(
       "Native Papyrus function requires a registered implementation");
+
+  if (parentVM->IsStrictExecution() && parentVM->activeFrames >= 128)
+    throw std::runtime_error("Papyrus frame depth exceeded");
+  ++parentVM->activeFrames;
+  Viet::ScopedTask<VirtualMachine*> frameDepthGuard(
+    [](VirtualMachine*& vm) { --vm->activeFrames; }, parentVM);
 
   thread_local StackDepthHolder g_stackDepthHolder;
   if (parentVM->IsStrictExecution() &&

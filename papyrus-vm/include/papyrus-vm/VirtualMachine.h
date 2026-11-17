@@ -1,10 +1,12 @@
 #pragma once
 #include "CIString.h"
 #include "Structures.h"
+#include "Continuation.h"
 #include <MakeID.h>
 #include <functional>
 #include <map>
 #include <set>
+#include <stdexcept>
 
 using NativeFunction =
   std::function<VarValue(VarValue self, std::vector<VarValue> arguments)>;
@@ -56,6 +58,7 @@ struct VmExceptionInfo
 class VirtualMachine
 {
   friend class StackIdHolder;
+  friend class ActivePexInstance;
 
 public:
   using OnEnter = std::function<void(const StackData&)>;
@@ -79,6 +82,12 @@ public:
   }
   bool IsStrictExecution() const { return strictExecution; }
   void CheckExecutionBudget();
+
+  // Only an explicitly registered host native may request a checkpoint, and
+  // only inside StartResumableFunction/ResumeFunction. Ordinary promises keep
+  // their existing strict-execution rejection. No timer is registered here.
+  [[noreturn]] void RequestSuspension(const std::string& token,
+                                    const std::string& resultType);
 
   void AddObject(std::shared_ptr<IGameObject> self,
                  const std::vector<ScriptInfo>& scripts);
@@ -134,6 +143,19 @@ public:
   bool DynamicCast(const VarValue& object, const CIString& className) const;
 
 private:
+  struct SuspensionRequest : std::runtime_error
+  {
+    std::string token, resultType;
+    SuspensionRequest(std::string token_, std::string resultType_)
+      : std::runtime_error("Explicit Papyrus suspension")
+      , token(std::move(token_))
+      , resultType(std::move(resultType_))
+    {
+    }
+  };
+  size_t activeFrames = 0;
+  std::optional<PapyrusContinuation> checkpointFrame;
+  bool checkpointSuspended = false;
   bool strictExecution = false;
   size_t executedInstructions = 0;
   CIMap<PexScript::Lazy> allLoadedScripts;
