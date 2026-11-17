@@ -3,7 +3,9 @@ const scampNativeNode = require(process.cwd() + "/scam_native.node");
 export declare interface Bot {
   destroy(): void;
   send(msg: Record<string, unknown>): void;
-  pollCustomPackets(): string[];
+  // Prime the epoch before sending when inspecting framed replies. Omitting
+  // the epoch drains unframed custom packets and ends framed capture.
+  pollCustomPackets(epoch?: string): string[];
 }
 
 export type SendChatMessageFn = (
@@ -14,7 +16,8 @@ export type SendChatMessageFn = (
 export interface CampaignResumeState {
   attempt: string;
   status: "Pending" | "ProjectionReady" | "Failed";
-  actor?: number;
+  actor: number;
+  phase: string;
   error?: string;
 }
 
@@ -23,6 +26,7 @@ export interface CampaignResumeArea {
   worldOrCell: number;
   center: number[];
   radius: number;
+  encounterLevel?: number;
 }
 
 export interface WorldBaseline {

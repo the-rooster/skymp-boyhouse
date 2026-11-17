@@ -5,6 +5,7 @@
 #include "SaveReceipt.h"
 #include "libespm/QuestScriptData.h"
 #include "papyrus-vm/PexScript.h"
+#include <functional>
 #include <map>
 #include <memory>
 
@@ -210,6 +211,7 @@ public:
                                   const std::vector<PexScript::Lazy>& scripts);
 
 private:
+  friend class PartOne;
   friend class WorldState;
   friend class QuestJournal;
   explicit QuestJobRunner(WorldState& world);
@@ -217,9 +219,23 @@ private:
   void Pump() noexcept;
   void OnActorLoaded(MpActor& actor) noexcept;
   void HoldRestoredOwner(MpActor& owner);
+  void RememberRestoredVisitor(MpActor& actor);
+  void RequireVisitorReturned(MpActor& actor) const;
+  ResumeLease AcquireVisitorResumeLease(
+    MpActor& visitor,
+    const std::function<std::shared_ptr<const SaveReceipt>()>& sealPersonal);
   ResumeLease RequireJournalAccess(MpActor& actor, bool emptyAdmission);
   void ValidateJournalAccess(MpActor& actor, const ResumeLease& lease);
   void RequireSaveReady(MpActor& actor);
+  struct ColdVisitor
+  {
+    std::weak_ptr<MpForm> actor;
+    uint64_t epoch;
+    int32_t profile;
+    std::string phase, baseline;
+  };
+  std::map<uint32_t, ColdVisitor> coldVisitors;
+  bool IsColdVisitor(MpActor& actor) const;
   struct ResumeHold
   {
     std::weak_ptr<MpForm> owner;

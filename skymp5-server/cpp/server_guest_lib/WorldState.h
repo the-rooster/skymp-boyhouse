@@ -149,8 +149,11 @@ private:
   friend class QuestJournal;
   friend class QuestJobRunner;
   friend class CampaignReferenceFactory;
-  void CommitCampaignReferences(MpActor& owner, MpChangeForm ownerState,
-                                const std::vector<MpChangeForm>& copies);
+  std::shared_ptr<const SaveReceipt> CommitCampaignReferences(
+    MpActor& owner, MpChangeForm ownerState,
+    const std::vector<MpChangeForm>& copies,
+    const FormCallbacks* rebaseCallbacks = nullptr,
+    const std::function<bool()>& stillCurrent = {});
   // Internal campaign commit: prepare every live/save copy before publishing
   // any of them. Visibility and faction changes require a projection barrier.
   std::shared_ptr<const SaveReceipt> CommitCampaignInventory(
@@ -160,9 +163,11 @@ private:
     const std::vector<CampaignFactionChange>& factions,
     const std::function<void()>& validateReads, bool durable = false,
     const std::shared_ptr<CampaignMovementPlan>& movement = {});
-  void RequireDurableSaveStorage() const;
 
 public:
+  // Storage capabilities can be supplied by the host. Call this before
+  // acquiring visitor recovery state and revalidate the connection afterward.
+  void RequireDurableSaveStorage() const;
   bool HasEspmFile(std::string_view filename) const noexcept;
 
   template <typename T>

@@ -14,7 +14,15 @@ bool Enrolled(const MpActor& actor)
            CampaignMovementPlan::kProperty) != "null";
 }
 
-void ValidateArea(MpActor& owner, const std::string& phase, const Json& area)
+struct ResumeArea
+{
+  std::string id;
+  uint32_t cell;
+  NiPoint3 center;
+  float radius;
+};
+
+ResumeArea ReadArea(MpActor& owner, const std::string& phase, const Json& area)
 {
   const auto& center = area.at("center");
   const auto& cell = area.at("worldOrCell");
@@ -31,8 +39,14 @@ void ValidateArea(MpActor& owner, const std::string& phase, const Json& area)
       distance > radius ||
       owner.GetCellOrWorld().ToFormId(owner.GetParent()->espmFiles) != cellId)
     throw std::runtime_error("Campaign resume is outside its configured area");
+  return { area.at("id").get<std::string>(), cellId, point, radius };
+}
+
+void ValidateArea(MpActor& owner, const std::string& phase, const Json& area)
+{
+  const auto location = ReadArea(owner, phase, area);
   CampaignReferenceFactory::ValidateExistingArea(
-    owner, area.at("id").get<std::string>(), cellId, point, radius);
+    owner, location.id, location.cell, location.center, location.radius);
 }
 }
 
@@ -43,7 +57,8 @@ struct PartOne::ResumeAttempt
   std::shared_ptr<MpForm> lifetime;
   QuestJobRunner::ResumeLease lease;
   std::shared_ptr<CampaignMovementPlan> plan;
-  std::string phase, token, status = "Pending", error, epoch, proof;
+  std::string phase, savedPhase, token, status = "Pending", error, epoch,
+                                        proof;
   struct Delivery
   {
     CampaignMovementPlan::SubscriptionChange edge;
@@ -95,6 +110,7 @@ Json PartOne::GetCampaignResume(Networking::UserId user)
     return nullptr;
   return { { "attempt", a->token },
            { "actor", a->lifetime->GetFormId() },
+           { "phase", a->phase },
            { "status", a->status },
            { "error", a->error } };
 }
@@ -117,30 +133,81 @@ Json PartOne::ResumeCampaignActor(Networking::UserId user, uint32_t id,
       (serverState.ActorByUser(user) &&
        serverState.ActorByUser(user) != actor))
     throw std::runtime_error("Campaign resume connection is unavailable");
-  ValidateArea(*actor, phase, area);
-  if (!IsConnected(user) ||
-      serverState.userInfo[user]->connectionIdentity != incarnation ||
-      worldState.LookupFormByIdNoLoad(id) != pin)
-    throw std::runtime_error(
-      "Campaign owner or connection changed during validation");
+  const auto currentConnection = [&] {
+    return worldState.IsStorageRestoreReady() && !worldState.IsRestoring() &&
+      IsConnected(user) &&
+      serverState.userInfo[user]->connectionIdentity == incarnation &&
+      serverState.userInfo[user]->gameplayBlocked &&
+      !serverState.userInfo[user]->campaignVisibilityFailed &&
+      worldState.LookupFormByIdNoLoad(id) == pin;
+  };
   if (auto previous = CurrentResume(user); previous &&
-      previous->phase == phase && previous->area == area &&
-      previous->lifetime == pin)
+      (previous->phase == phase || previous->savedPhase == phase) &&
+      previous->area == area && previous->lifetime == pin) {
+    ValidateArea(*actor, previous->phase, area);
+    if (!currentConnection() || !IsCurrentResume(*previous))
+      throw std::runtime_error("Campaign resume changed during validation");
     return GetCampaignResume(user);
+  }
+  const auto location = ReadArea(*actor, phase, area);
+  const bool visitor = QuestJournal::ParseCampaignOwnerId(phase, true) != id;
   auto a = std::make_shared<ResumeAttempt>();
   a->user = user;
   a->connection = incarnation;
   a->lifetime = pin;
-  a->phase = phase;
+  a->phase =
+    visitor ? "campaign:" + std::to_string(id) + ":" + location.id : phase;
+  a->savedPhase = phase;
   a->area = area;
   a->token = NewCampaignToken();
+
+  if (visitor) {
+    const auto& level = area.at("encounterLevel");
+    if (!level.is_number_integer() || level.get<double>() < 1 ||
+        level.get<double>() > UINT16_MAX)
+      throw std::runtime_error("Invalid visitor recovery encounter level");
+    const auto available = [&] {
+      return currentConnection() && !serverState.ActorByUser(user) &&
+        serverState.UserByActor(actor) == Networking::InvalidUserId &&
+        actor->IsDisabled() && actor->GetWorldInstance() == phase;
+    };
+    if (!available())
+      throw std::runtime_error(
+        "Visitor recovery requires an unassigned restored actor");
+    // Capability checks call into the configured storage backend. Complete
+    // those calls before pinning a lease, a barrier or any prepared world
+    // state.
+    worldState.RequireDurableSaveStorage();
+    if (!available())
+      throw std::runtime_error(
+        "Visitor or connection changed during storage preflight");
+    // Seal the disabled personal row before binding any connection. Even a
+    // gamemode feed that reads its actor immediately can only see personal
+    // data.
+    a->lease =
+      worldState.GetQuestJobs().AcquireVisitorResumeLease(*actor, [&] {
+        return CampaignReferenceFactory::RecoverVisitor(
+          *actor, phase, location.id, location.cell, location.center,
+          location.radius, level.get<uint32_t>(), available);
+      });
+  } else {
+    CampaignReferenceFactory::ValidateExistingArea(
+      *actor, location.id, location.cell, location.center, location.radius);
+  }
+  if (!currentConnection() || actor->GetWorldInstance() != a->phase ||
+      (serverState.ActorByUser(user) &&
+       serverState.ActorByUser(user) != actor) ||
+      (visitor && serverState.UserByActor(actor) != Networking::InvalidUserId))
+    throw std::runtime_error(
+      "Campaign owner or connection changed during validation");
   auto mapping = serverState.actorsMap;
   mapping.Set(user, actor);
   auto next = resumes;
   if (auto it = next.find(id); it != next.end() && it->second->lifetime == pin)
     a->deliveries = it->second->deliveries;
   next[id] = a;
-  a->lease = worldState.GetQuestJobs().AcquireResumeLease(*actor);
+  if (!visitor)
+    a->lease = worldState.GetQuestJobs().AcquireResumeLease(*actor);
   const auto old = serverState.UserByActor(actor);
   if (IsConnected(old))
     serverState.userInfo[old]->gameplayBlocked = true;

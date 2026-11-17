@@ -27,6 +27,12 @@ public:
     }
   }
 
+  bool Contains(const T& id) const
+  {
+    const auto it = objects.find(id);
+    return it != objects.end() && it->second.active;
+  }
+
   std::pair<int16_t, int16_t> GetPos(const T& id) const
   {
     if (objects[id].active)

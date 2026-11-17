@@ -93,6 +93,68 @@ struct WorldState::Impl
   std::function<void(MpActor&, bool)> afterCampaignVisibility;
   bool campaignVisibilityCommitting = false;
   std::optional<std::unordered_set<uint32_t>> campaignEnableLinks;
+  struct PreparedSave
+  {
+    std::list<std::shared_ptr<SaveBatch>> batches;
+    std::vector<std::optional<MpChangeForm>> nextPending;
+    std::shared_ptr<SaveReceipt> receipt;
+  };
+
+  void RequireSaveCapacity() const
+  {
+    if (sealedSaves.size() >= maxSaveBatches ||
+        queuedReceiptBytes >= maxReceiptBytes ||
+        nextSaveSequence == std::numeric_limits<uint64_t>::max())
+      throw std::runtime_error("Durable campaign save queue limit exceeded");
+  }
+
+  PreparedSave PrepareSeal(std::vector<std::optional<MpChangeForm>>& saveBatch,
+                           const FormDesc& campaign, uint64_t journalRevision)
+  {
+    RequireSaveCapacity();
+    PreparedSave result;
+    // Indexed save buffers can be very sparse. Charge their slots as well as
+    // serialized values so many owner-only receipts cannot retain unbounded
+    // empty change-form allocations.
+    if (saveBatch.capacity() >
+        Impl::maxReceiptBytes / sizeof(std::optional<MpChangeForm>))
+      throw std::runtime_error("Durable campaign save batch is too large");
+    auto receiptBytes =
+      saveBatch.capacity() * sizeof(std::optional<MpChangeForm>);
+    for (const auto& form : saveBatch) {
+      if (!form)
+        continue;
+      const auto bytes = MpChangeForm::ToJson(*form).dump().size();
+      if (bytes > Impl::maxReceiptBytes - receiptBytes)
+        throw std::runtime_error("Durable campaign save batch is too large");
+      receiptBytes += bytes;
+    }
+    if (receiptBytes > Impl::maxReceiptBytes - queuedReceiptBytes)
+      throw std::runtime_error(
+        "Durable campaign save queue byte limit exceeded");
+    auto receipt = std::make_shared<SaveReceipt>();
+    receipt->sequence = nextSaveSequence + 1;
+    receipt->campaign = campaign;
+    receipt->journalRevision = journalRevision;
+    auto batch = std::make_shared<Impl::SaveBatch>();
+    result.nextPending.resize(saveBatch.size());
+    batch->forms.swap(saveBatch);
+    batch->receipt = receipt;
+    batch->receiptBytes = receiptBytes;
+    result.batches.push_back(std::move(batch));
+
+    result.receipt = std::move(receipt);
+    return result;
+  }
+
+  void PublishSeal(PreparedSave& prepared) noexcept
+  {
+    changesByIdx.swap(prepared.nextPending);
+    changesByIdxEmpty = true;
+    queuedReceiptBytes += prepared.batches.front()->receiptBytes;
+    nextSaveSequence = prepared.receipt->sequence;
+    sealedSaves.splice(sealedSaves.end(), prepared.batches);
+  }
 };
 
 WorldState::WorldState()
@@ -617,15 +679,14 @@ void WorldState::ValidateCampaignFactions(const std::vector<Faction>& factions)
 
 void WorldState::RequireDurableSaveStorage() const
 {
-  if (pImpl->clearing || IsRestoring() || !pImpl->saveStorage ||
-      !pImpl->saveStorage->SupportsAtomicBatches() ||
-      !pImpl->saveStorage->SupportsUpsertResults())
+  const auto storage = pImpl->saveStorage;
+  if (pImpl->clearing || IsRestoring() || !IsStorageRestoreReady() ||
+      !storage || !storage->SupportsAtomicBatches() ||
+      !storage->SupportsUpsertResults() || pImpl->saveStorage != storage ||
+      pImpl->clearing || IsRestoring() || !IsStorageRestoreReady())
     throw std::runtime_error(
       "Durable campaign commit requires atomic save storage with results");
-  if (pImpl->sealedSaves.size() >= Impl::maxSaveBatches ||
-      pImpl->queuedReceiptBytes >= Impl::maxReceiptBytes ||
-      pImpl->nextSaveSequence == std::numeric_limits<uint64_t>::max())
-    throw std::runtime_error("Durable campaign save queue limit exceeded");
+  pImpl->RequireSaveCapacity();
 }
 
 std::shared_ptr<const SaveReceipt> WorldState::CommitCampaignInventory(
@@ -636,13 +697,15 @@ std::shared_ptr<const SaveReceipt> WorldState::CommitCampaignInventory(
   const std::function<void()>& validateReads, bool durable,
   const std::shared_ptr<CampaignMovementPlan>& movement)
 {
+  const auto storage = pImpl->saveStorage;
   if (durable)
     RequireDurableSaveStorage();
-  if (IsRestoring() || !IsStorageRestoreReady())
-    throw std::runtime_error("Campaign commit during world loading");
-  if (pImpl->saveStorage && !pImpl->saveStorage->SupportsAtomicBatches())
+  else if (storage && !storage->SupportsAtomicBatches())
     throw std::runtime_error(
       "Campaign inventory requires atomic save storage");
+  if (IsRestoring() || !IsStorageRestoreReady() ||
+      pImpl->saveStorage != storage)
+    throw std::runtime_error("Campaign commit lost its storage context");
   struct Prepared
   {
     MpObjectReference* reference;
@@ -763,7 +826,14 @@ std::shared_ptr<const SaveReceipt> WorldState::CommitCampaignInventory(
     guard.pendingCleanup = true;
     beforeVisibility(owner);
   }
+  // Capabilities are supplied by the backend and may reenter the server.
+  // Check them before revalidating authority or freezing grids and save rows.
+  if (durable)
+    RequireDurableSaveStorage();
   validateReads();
+  if (IsRestoring() || !IsStorageRestoreReady() ||
+      pImpl->saveStorage != storage)
+    throw std::runtime_error("Campaign commit lost its storage context");
   for (const auto& [id, entry] : prepared) {
     if (LookupFormByIdNoLoad(id) != entry.lifetime ||
         entry.reference->GetWorldInstanceEpoch() != entry.epoch ||
@@ -842,43 +912,13 @@ std::shared_ptr<const SaveReceipt> WorldState::CommitCampaignInventory(
   saveBatch.resize(size);
   for (const auto& [id, entry] : prepared)
     saveBatch[entry.reference->GetIdx()] = entry.live;
-  std::shared_ptr<SaveReceipt> receipt;
-  std::list<std::shared_ptr<Impl::SaveBatch>> sealed;
-  std::vector<std::optional<MpChangeForm>> nextPending;
-  size_t receiptBytes = 0;
+  Impl::PreparedSave seal;
   if (durable) {
-    // The barrier may have performed unrelated work or replaced storage.
-    RequireDurableSaveStorage();
-    // Indexed save buffers can be very sparse. Charge their slots as well as
-    // serialized values so many owner-only receipts cannot retain unbounded
-    // empty change-form allocations.
-    if (saveBatch.capacity() >
-        Impl::maxReceiptBytes / sizeof(std::optional<MpChangeForm>))
-      throw std::runtime_error("Durable campaign save batch is too large");
-    receiptBytes = saveBatch.capacity() * sizeof(std::optional<MpChangeForm>);
-    for (const auto& form : saveBatch) {
-      if (!form)
-        continue;
-      const auto bytes = MpChangeForm::ToJson(*form).dump().size();
-      if (bytes > Impl::maxReceiptBytes - receiptBytes)
-        throw std::runtime_error("Durable campaign save batch is too large");
-      receiptBytes += bytes;
-    }
-    if (receiptBytes > Impl::maxReceiptBytes - pImpl->queuedReceiptBytes)
-      throw std::runtime_error(
-        "Durable campaign save queue byte limit exceeded");
-    receipt = std::make_shared<SaveReceipt>();
-    receipt->sequence = pImpl->nextSaveSequence + 1;
-    receipt->campaign = ownerChange.live.formDesc;
-    receipt->journalRevision =
-      nlohmann::json::parse(journal).at("revision").get<uint64_t>();
-    auto batch = std::make_shared<Impl::SaveBatch>();
-    batch->forms.swap(saveBatch);
-    batch->receipt = receipt;
-    batch->receiptBytes = receiptBytes;
-    sealed.push_back(std::move(batch));
-    nextPending.resize(size);
+    seal = pImpl->PrepareSeal(
+      saveBatch, ownerChange.live.formDesc,
+      nlohmann::json::parse(journal).at("revision").get<uint64_t>());
   }
+  const auto receipt = seal.receipt;
   static_assert(noexcept(pImpl->changesByIdx.swap(saveBatch)));
   static_assert(noexcept(grids.swap(*nextGrids)));
   static_assert(noexcept(hosters.swap(*nextHosters)));
@@ -894,11 +934,7 @@ std::shared_ptr<const SaveReceipt> WorldState::CommitCampaignInventory(
     hosters.swap(*nextHosters);
   }
   if (durable) {
-    pImpl->changesByIdx.swap(nextPending);
-    pImpl->changesByIdxEmpty = true;
-    pImpl->sealedSaves.splice(pImpl->sealedSaves.end(), sealed);
-    pImpl->queuedReceiptBytes += receiptBytes;
-    pImpl->nextSaveSequence = receipt->sequence;
+    pImpl->PublishSeal(seal);
   } else {
     pImpl->changesByIdx.swap(saveBatch);
     pImpl->changesByIdxEmpty = false;
@@ -969,17 +1005,23 @@ std::shared_ptr<const SaveReceipt> WorldState::CommitCampaignInventory(
   return receipt;
 }
 
-void WorldState::CommitCampaignReferences(
+std::shared_ptr<const SaveReceipt> WorldState::CommitCampaignReferences(
   MpActor& owner, MpChangeForm ownerState,
-  const std::vector<MpChangeForm>& copies)
+  const std::vector<MpChangeForm>& copies,
+  const FormCallbacks* rebaseCallbacks,
+  const std::function<bool()>& stillCurrent)
 {
-  QuestJournal::RequirePersonalJobAccess(owner);
+  if (!rebaseCallbacks)
+    QuestJournal::RequirePersonalJobAccess(owner);
+  else
+    owner.RequireIsolatedVisitor();
   if (IsRestoring() || QuestJournal::HasActiveTransaction() ||
       owner.GetParent() != this ||
       LookupFormByIdNoLoad(owner.GetFormId()).get() != &owner ||
       !formIdxManager || owner.GetIdx() == FormIndex::g_invalidIdx)
     throw std::runtime_error("Invalid campaign allocation context");
-  if (pImpl->saveStorage && !pImpl->saveStorage->SupportsAtomicBatches())
+  if (!rebaseCallbacks && pImpl->saveStorage &&
+      !pImpl->saveStorage->SupportsAtomicBatches())
     throw std::runtime_error("Campaign allocation requires atomic storage");
 
   // Build replacement indexes off to the side. Existing objects retain their
@@ -991,6 +1033,7 @@ void WorldState::CommitCampaignReferences(
   auto nextByIdx = refrByIdxUnreliable;
   auto saves = pImpl->changesByIdx;
   std::set<uint32_t> clonedGrids;
+  Impl::PreparedSave seal;
   std::vector<uint32_t> reserved;
   reserved.reserve(copies.size());
   try {
@@ -1006,13 +1049,14 @@ void WorldState::CommitCampaignReferences(
       const auto baseRecord = GetEspm().GetBrowser().LookupById(base);
       if (!baseRecord.rec || baseRecord.rec->IsDeleted())
         throw std::runtime_error("Missing campaign copy base");
+      const auto callbacks =
+        rebaseCallbacks ? *rebaseCallbacks : formCallbacksFactory();
       std::shared_ptr<MpObjectReference> copy;
       if (saved.recType == MpChangeForm::ACHR)
-        copy = std::make_shared<MpActor>(LocationalData(),
-                                         formCallbacksFactory(), base);
+        copy = std::make_shared<MpActor>(LocationalData(), callbacks, base);
       else
         copy = std::make_shared<MpObjectReference>(
-          LocationalData(), formCallbacksFactory(), base,
+          LocationalData(), callbacks, base,
           baseRecord.rec->GetType().ToString().c_str());
       uint32_t idx;
       if (!formIdxManager->CreateID(idx))
@@ -1052,6 +1096,16 @@ void WorldState::CommitCampaignReferences(
     MpChangeForm::ToJson(ownerState).dump();
     saves.resize(std::max(saves.size(), size_t(owner.GetIdx()) + 1));
     saves[owner.GetIdx()] = ownerState;
+    if (rebaseCallbacks) {
+      const auto& journal =
+        ownerState.dynamicFields.GetValueDump(QuestJournal::kProperty);
+      const auto revision = journal == "null"
+        ? uint64_t(0)
+        : nlohmann::json::parse(journal).at("revision").get<uint64_t>();
+      seal = pImpl->PrepareSeal(saves, ownerState.formDesc, revision);
+      if (!stillCurrent())
+        throw std::runtime_error("Visitor recovery authority changed");
+    }
   } catch (...) {
     for (auto it = reserved.rbegin(); it != reserved.rend(); ++it)
       formIdxManager->DestroyID(*it);
@@ -1064,10 +1118,16 @@ void WorldState::CommitCampaignReferences(
   actorIdByPrivateIndexedProperty.swap(nextIndex);
   grids.swap(nextGrids);
   refrByIdxUnreliable.swap(nextByIdx);
-  owner.CommitPreparedCampaignChange(ownerState);
-  pImpl->changesByIdx.swap(saves);
-  pImpl->changesByIdxEmpty = false;
+  if (rebaseCallbacks) {
+    owner.CommitVisitorPhase(ownerState, seal.receipt);
+    pImpl->PublishSeal(seal);
+  } else {
+    owner.CommitPreparedCampaignChange(ownerState);
+    pImpl->changesByIdx.swap(saves);
+    pImpl->changesByIdxEmpty = false;
+  }
   pImpl->allFormsByModIndexCache[0xff].reset();
+  return seal.receipt;
 }
 
 const std::shared_ptr<MpForm>& WorldState::LookupFormById(
@@ -1574,9 +1634,14 @@ void WorldState::TickSaveStorage(const std::chrono::system_clock::time_point&)
   if (batch->submitted)
     return;
   try {
-    if (batch->receipt &&
-        (!storage->SupportsAtomicBatches() ||
-         !storage->SupportsUpsertResults()))
+    const bool atomic = !batch->receipt || storage->SupportsAtomicBatches();
+    const bool tracked = storage->SupportsUpsertResults();
+    // Clear() can abandon even this batch during either capability query.
+    // Claim it for submission only while this writer still owns its queue.
+    if (pImpl->saveStorage != storage || pImpl->sealedSaves.empty() ||
+        pImpl->sealedSaves.front() != batch || batch->abandoned)
+      return;
+    if (batch->receipt && (!atomic || !tracked))
       throw std::runtime_error(
         "Queued durable save requires atomic storage with results");
     // The storage interface takes ownership of its argument even on a throw.
@@ -1586,7 +1651,7 @@ void WorldState::TickSaveStorage(const std::chrono::system_clock::time_point&)
       throw std::overflow_error("Save batch attempt counter exhausted");
     const auto attempt = ++batch->attempt;
     batch->submitted = true;
-    batch->tracked = storage->SupportsUpsertResults();
+    batch->tracked = tracked;
     if (batch->receipt)
       batch->receipt->attempts = attempt;
     std::weak_ptr<Impl> weak = pImpl;

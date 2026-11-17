@@ -50,6 +50,11 @@ public:
     lastSaveRequest = std::chrono::system_clock::now();
   }
 
+  void SwapPreparedCampaignPhase(std::string& next) noexcept
+  {
+    changeForm.worldInstance.swap(next);
+  }
+
   // The movement transaction already owns its save snapshot and occupancy.
   // Do not call SetPos: its subscription and trigger tails are not atomic.
   void CommitPreparedMovementTransform(const NiPoint3& position,

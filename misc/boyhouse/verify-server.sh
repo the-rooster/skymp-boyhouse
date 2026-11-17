@@ -14,3 +14,4 @@ node misc/boyhouse/native-smoke.cjs
 node misc/boyhouse/protocol-smoke.cjs
 node misc/boyhouse/protocol-smoke.cjs --projection
 node misc/boyhouse/storage-smoke.cjs
+node misc/boyhouse/guest-restart-smoke.cjs

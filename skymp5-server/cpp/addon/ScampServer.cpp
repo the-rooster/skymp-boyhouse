@@ -751,7 +751,13 @@ Napi::Value ScampServer::CreateBot(const Napi::CallbackInfo& info)
     "pollCustomPackets",
     Napi::Function::New(info.Env(), [bot](const Napi::CallbackInfo& info) {
       try {
-        const auto packets = bot->PollCustomPackets();
+        std::optional<std::string> epoch;
+        if (info.Length() && !info[0].IsUndefined()) {
+          if (!info[0].IsString())
+            throw std::invalid_argument("Bot capture epoch must be a string");
+          epoch = info[0].As<Napi::String>().Utf8Value();
+        }
+        const auto packets = bot->PollCustomPackets(epoch);
         auto result = Napi::Array::New(info.Env(), packets.size());
         for (uint32_t i = 0; i < packets.size(); ++i)
           result.Set(i, Napi::String::New(info.Env(), packets[i]));

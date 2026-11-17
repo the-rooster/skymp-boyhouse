@@ -832,35 +832,14 @@ std::shared_ptr<CampaignMovementPlan> MpObjectReference::PrepareCampaignResume(
       continue;
     if (primitives.size() >= 64)
       throw std::runtime_error("Recovery primitive limit exceeded");
-    const auto& bounds = ref->pImpl->primitive->boundsDiv2;
-    if (!finite(ref->GetPos()) || !finite(ref->GetAngle()) ||
-        !finite(bounds) || bounds.x <= 0 || bounds.y <= 0 || bounds.z <= 0 ||
-        ref->GetAngle().x != 0 || ref->GetAngle().y != 0)
-      throw std::runtime_error("Invalid recovery primitive geometry");
-    const auto vertices =
-      Primitive::GetVertices(ref->GetPos(), ref->GetAngle(), bounds);
-    const auto cached = ref->pImpl->primitive->polygonProc.GetPolygon().GetV();
-    if (vertices.size() != cached.size())
-      throw std::runtime_error("Stale recovery primitive");
-    for (size_t i = 0; i < vertices.size(); ++i)
-      if (!finite(vertices[i]) || vertices[i].x != cached[i].x ||
-          vertices[i].y != cached[i].y || vertices[i].z != cached[i].z)
-        throw std::runtime_error("Stale recovery primitive");
     const auto event = capture
       ? QuestScriptRuntime::CaptureInteraction(requester, *ref, "OnTrigger",
                                                requester, *capture)
       : QuestScriptRuntime::CaptureInteraction(requester, *ref, "OnTrigger",
                                                requester);
     if (!primitives
-           .emplace(
-             event.target,
-             Json{ { "target", event.target },
-                   { "reference", event.targetReference },
-                   { "templates", event.targetTemplates },
-                   { "position", point(ref->GetPos()) },
-                   { "angle", point(ref->GetAngle()) },
-                   { "bounds", point(bounds) },
-                   { "inside", ref->IsPointInsidePrimitive(GetPos()) } })
+           .emplace(event.target,
+                    ref->PersonalRecoveryPrimitive(event.target, GetPos()))
            .second)
       throw std::runtime_error("Duplicate recovery primitive");
     prepared->targets.push_back(world->LookupFormByIdNoLoad(ref->GetFormId()));
@@ -2319,6 +2298,70 @@ MpChangeForm MpObjectReference::GetChangeForm() const
   }
 
   return res;
+}
+
+void MpObjectReference::RequireIsolatedVisitor() const
+{
+  if (!IsDisabled() || IsDeleted() || !AsActor() ||
+      GetChangeForm().profileId < 0 || GetFormId() < 0xff000000 ||
+      HasPrimitive() || HasPendingCampaignMovement() ||
+      !GetListeners().empty() || !GetEmitters().empty() ||
+      !actorListenerArray.empty() ||
+      (primitivesWeAreInside && !primitivesWeAreInside->empty()) ||
+      (emittersWithPrimitives && !emittersWithPrimitives->empty()) ||
+      !pImpl->pendingListeners.empty() ||
+      !pImpl->publishingListeners.empty() ||
+      !pImpl->listenerOccurrences.empty() || occupant ||
+      worldInstanceEpoch == std::numeric_limits<uint64_t>::max())
+    throw std::runtime_error("Campaign visitor is not isolated");
+}
+
+nlohmann::json MpObjectReference::PersonalRecoveryPrimitive(
+  const std::string& original, const NiPoint3& sourcePosition) const
+{
+  const auto finite = [](const NiPoint3& value) {
+    return std::isfinite(value.x) && std::isfinite(value.y) &&
+      std::isfinite(value.z);
+  };
+  const auto point = [](const NiPoint3& value) {
+    return nlohmann::json::array({ value.x, value.y, value.z });
+  };
+  const auto& bounds = pImpl->primitive->boundsDiv2;
+  if (!finite(GetPos()) || !finite(GetAngle()) || !finite(bounds) ||
+      bounds.x <= 0 || bounds.y <= 0 || bounds.z <= 0 || GetAngle().x != 0 ||
+      GetAngle().y != 0)
+    throw std::runtime_error("Invalid recovery primitive geometry");
+  const auto vertices = Primitive::GetVertices(GetPos(), GetAngle(), bounds);
+  const auto cached = pImpl->primitive->polygonProc.GetPolygon().GetV();
+  if (vertices.size() != cached.size())
+    throw std::runtime_error("Stale recovery primitive");
+  for (size_t i = 0; i < vertices.size(); ++i)
+    if (!finite(vertices[i]) || vertices[i].x != cached[i].x ||
+        vertices[i].y != cached[i].y || vertices[i].z != cached[i].z)
+      throw std::runtime_error("Stale recovery primitive");
+  const auto saved = GetChangeForm();
+  if (saved.templateChain.size() > 128)
+    throw std::runtime_error("Recovery reference template limit exceeded");
+  std::vector<std::string> templates;
+  for (const auto& desc : saved.templateChain)
+    templates.push_back(desc.ToString());
+  return { { "target", original },
+           { "reference", saved.formDesc.ToString() },
+           { "templates", templates },
+           { "position", point(GetPos()) },
+           { "angle", point(GetAngle()) },
+           { "bounds", point(bounds) },
+           { "inside", IsPointInsidePrimitive(sourcePosition) } };
+}
+
+void MpObjectReference::CommitVisitorPhase(
+  MpChangeForm& prepared,
+  const std::shared_ptr<const SaveReceipt>& receipt) noexcept
+{
+  SwapPreparedCampaignPhase(prepared.worldInstance);
+  ++worldInstanceEpoch;
+  CommitPreparedCampaignChange(prepared);
+  pImpl->movementReceipt = receipt;
 }
 
 void MpObjectReference::CommitPreparedCampaignChange(

@@ -711,6 +711,7 @@ void QuestJobRunner::Stop() noexcept
   // recover jobs, after its previous writer has shut down.
   stopped = true;
   scheduled.clear();
+  coldVisitors.clear();
   resumeHolds.clear();
 }
 
@@ -972,7 +973,8 @@ void QuestJobRunner::Pump() noexcept
           continue;
         if (work.owner.lock().get() != owner)
           throw std::runtime_error("Scheduled quest owner was replaced");
-        if (actor->GetWorldInstance() != work.instance)
+        if (IsColdVisitor(*actor) ||
+            actor->GetWorldInstance() != work.instance)
           continue;
         const auto jobs = QuestJournal::PersonalJobState(*owner);
         const auto* job = jobs.FindLive(work.job);
@@ -1045,6 +1047,95 @@ void QuestJobRunner::HoldRestoredOwner(MpActor& owner)
     return;
   if (!resumeHolds.contains(owner.GetFormId()))
     AcquireResumeLease(owner);
+}
+
+void QuestJobRunner::RememberRestoredVisitor(MpActor& actor)
+{
+  if (world.IsStorageRestoreReady() || !world.IsRestoring() ||
+      actor.GetParent() != &world)
+    throw std::logic_error(
+      "Visitor recovery registration requires storage restoration");
+  const auto& baseline =
+    actor.GetDynamicFields().GetValueDump(CampaignMovementPlan::kProperty);
+  if (!actor.IsDisabled() || actor.IsDeleted() || actor.GetProfileId() < 0 ||
+      baseline == "null" ||
+      QuestJournal::ParseCampaignOwnerId(actor.GetWorldInstance(), true) ==
+        actor.GetFormId())
+    return;
+  coldVisitors.insert_or_assign(
+    actor.GetFormId(),
+    ColdVisitor{ world.LookupFormByIdNoLoad(actor.GetFormId()),
+                 actor.GetWorldInstanceEpoch(), actor.GetProfileId(),
+                 actor.GetWorldInstance(), baseline });
+}
+
+bool QuestJobRunner::IsColdVisitor(MpActor& actor) const
+{
+  const auto it = coldVisitors.find(actor.GetFormId());
+  return it != coldVisitors.end() && it->second.actor.lock().get() == &actor;
+}
+
+void QuestJobRunner::RequireVisitorReturned(MpActor& actor) const
+{
+  if (IsColdVisitor(actor))
+    throw std::runtime_error(
+      "Restored visitor must return to its personal campaign");
+}
+
+QuestJobRunner::ResumeLease QuestJobRunner::AcquireVisitorResumeLease(
+  MpActor& visitor,
+  const std::function<std::shared_ptr<const SaveReceipt>()>& sealPersonal)
+{
+  const auto id = visitor.GetFormId();
+  const auto cold = coldVisitors.find(id);
+  if (stopped || !world.IsStorageRestoreReady() || world.IsRestoring() ||
+      world.IsClearing() || !visitor.IsDisabled() || visitor.IsDeleted() ||
+      cold == coldVisitors.end() ||
+      cold->second.actor.lock().get() != &visitor ||
+      cold->second.profile != visitor.GetProfileId() ||
+      cold->second.epoch != visitor.GetWorldInstanceEpoch() ||
+      cold->second.phase != visitor.GetWorldInstance() ||
+      cold->second.baseline !=
+        visitor.GetDynamicFields().GetValueDump(
+          CampaignMovementPlan::kProperty) ||
+      world.LookupFormByIdNoLoad(id).get() != &visitor)
+    throw std::runtime_error(
+      "Visitor requires its original restored character");
+  if (resumeHolds.size() >= 4096 || resumeHolds.contains(id))
+    throw std::runtime_error("Visitor recovery hold is unavailable");
+
+  Barrier initial;
+  initial.owner = cold->second.actor;
+  auto& barrier = barriers.try_emplace(id, std::move(initial)).first->second;
+  if (barrier.owner.lock().get() != &visitor || barrier.busy ||
+      (barrier.receipt &&
+       barrier.receipt->GetState() != SaveReceipt::State::Durable))
+    throw std::runtime_error("Visitor has an outstanding personal save");
+
+  auto hold = std::make_shared<ResumeHold>();
+  hold->owner = cold->second.actor;
+  hold->lease = std::make_shared<const uint8_t>(0);
+  resumeHolds.emplace(id, hold);
+  BusyGuard busy(barrier.busy);
+  try {
+    // Reserve both the hold and barrier before publishing the personal row.
+    // Reconnecting again must wait for this exact save, even if allocation
+    // of the subsequent online attempt or its lease fails.
+    auto receipt = sealPersonal();
+    if (!receipt)
+      throw std::logic_error("Visitor return did not seal its personal row");
+    barrier.receipt = std::move(receipt);
+  } catch (...) {
+    if (const auto it = resumeHolds.find(id);
+        it != resumeHolds.end() && it->second == hold)
+      resumeHolds.erase(it);
+    throw;
+  }
+  coldVisitors.erase(id);
+  hold->epoch = visitor.GetWorldInstanceEpoch();
+  hold->instance = visitor.GetWorldInstance();
+  hold->identity = CampaignReferenceBinding::GetIdentity(visitor);
+  return hold->lease;
 }
 
 QuestJobRunner::ResumeLease QuestJobRunner::AcquireResumeLease(MpActor& owner)
@@ -1170,6 +1261,7 @@ void QuestJobRunner::CompleteResumeLease(MpActor& owner,
 QuestJobRunner::ResumeLease QuestJobRunner::RequireJournalAccess(
   MpActor& actor, bool emptyAdmission)
 {
+  RequireVisitorReturned(actor);
   auto& owner = QuestJournal::Owner(actor);
   const auto found = resumeHolds.find(owner.GetFormId());
   if (found == resumeHolds.end()) {
@@ -1188,7 +1280,7 @@ void QuestJobRunner::ValidateJournalAccess(MpActor& actor,
                                            const ResumeLease& lease)
 {
   if (stopped || world.IsClearing() || !world.IsStorageRestoreReady() ||
-      world.IsRestoring())
+      world.IsRestoring() || IsColdVisitor(actor))
     throw std::runtime_error("Campaign execution lost its world");
   auto& owner = QuestJournal::Owner(actor);
   if (lease)
@@ -1206,6 +1298,7 @@ void QuestJobRunner::RequireReady(MpActor& actor)
 
 void QuestJobRunner::RequireSaveReady(MpActor& actor)
 {
+  RequireVisitorReturned(actor);
   if (stopped || actor.GetParent() != &world)
     throw std::runtime_error("Quest job coordinator has stopped");
   if (!world.IsStorageRestoreReady() || world.IsRestoring())

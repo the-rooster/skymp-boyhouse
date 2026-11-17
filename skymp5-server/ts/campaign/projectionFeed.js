@@ -23,6 +23,12 @@ class ProjectionFeed {
 
   disconnect(user) { this.users.delete(user); }
 
+  captureConnection(user) {
+    const state = this.users.get(user);
+    // The state belongs to the socket and survives ordinary epoch rotations.
+    return () => this.adapter.connected(user) && this.users.get(user) === state;
+  }
+
   send(user, state, body) {
     this.adapter.send(user, { customPacketType: TYPE, protocolVersion: 2, sessionId: state.session,
       sequence: state.sequence, ...body });

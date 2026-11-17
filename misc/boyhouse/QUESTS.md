@@ -1546,6 +1546,21 @@ reconnect, spatial transitions and remaining quest/client systems are unfinished
 No complete quest is certified. Skyrim stayed closed; installed client and
 staging deployment were unchanged.
 
+## Location aliases in quest stage conditions
+
+The stage runner can compare a bound quest location alias with a location
+record (`LocAliasIsLocation`, 605) and check for a keyword on that location
+(`LocAliasHasKeyword`, 610). It resolves the alias from the current campaign.
+A city and a location inside that city have different record identities.
+The keyword check reads the bound location's own keywords.
+
+The owned records contain eight such clauses in the Civil War siege objective
+quest (`CWSiegeObj`) and nine in the Companions quest `CR05`. Tests supply a
+location binding and exercise the original conditions, including the case
+where one location selects two stage logs. A radiant quest still needs its
+alias filled by the engine, and both quest lines need complete multiplayer
+playthroughs.
+
 ## Reconnecting inside an altered location
 
 A returning owner with a saved movement baseline can rejoin the same configured
@@ -1560,11 +1575,39 @@ inside a trigger with a sleeping script. After the owner rejoins and moves
 out, the script resumes once and receives one Leave event. Separate cases
 exercise a failed save and retry, connection replacement during acknowledgement,
 deleted reference copies, and observer visibility when disconnect and reconnect
-overlap. On restart a saved visitor whose host moved or is missing stays
-disabled. Other owners can still resume their own campaigns. A malformed
-enrolled phase keeps storage restoration closed for investigation. Broader cell
-transitions, recovery of the visitor's own movement baseline and playthroughs
-on actual Skyrim clients still need coverage.
+overlap. A malformed enrolled phase keeps storage restoration closed for
+investigation.
+
+### Returning a visitor after a server restart
+
+A visitor saved inside another player's campaign returns to their own version
+of the same configured area when they log in. The former host may have moved,
+may be offline, or may be absent from storage. The server checks the
+character's saved position, orientation, movement sequence and old trigger
+occupancy. It keeps the visitor's inventory and personal quest journal and
+rebuilds the trigger list from their own copies. Old host quest jobs stay with
+the host.
+
+The first SQLite transaction records the personal phase with the character
+still disabled. Once that save completes, ordinary owner recovery restores
+subscriptions, transfers the personal world snapshot and waits for the client
+acknowledgement. A later restart reads the personal phase directly from SQLite.
+A guest with an unprepared personal area can return when the nearby
+references need no first-time load events. An area requiring new script
+initialization keeps the character offline until that lifecycle is supported.
+Live transfers for enrolled guests and automatic cell crossings remain open.
+
+The verification suite runs the two-process login check. To run it on its own,
+use a built checkout with the owned game data and disposable state directories configured.
+
+```sh
+docker compose -p skymp-guest-check -f misc/boyhouse/compose.yaml run --rm --no-deps verify node misc/boyhouse/guest-restart-smoke.cjs
+```
+
+The fixture writes a host and guest to SQLite after real movement. The test
+boots the server twice on that database and logs in with a native bot. It
+checks the personal quest stage, gold, saved position and sequence, the host's
+journal, and rejection of the acknowledgement from the first boot.
 
 ## Optional 32-connection protocol probe
 

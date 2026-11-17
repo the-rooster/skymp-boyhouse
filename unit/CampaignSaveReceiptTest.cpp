@@ -2,9 +2,11 @@
 #include "SaveReceipt.h"
 #include "TestUtils.hpp"
 #include "save_storages/ISaveStorage.h"
+#include <algorithm>
 #include <catch2/catch_all.hpp>
 #include <chrono>
 #include <exception>
+#include <functional>
 #include <utility>
 
 extern espm::Loader& GetEspmLoader();
@@ -24,11 +26,17 @@ struct ControlledStorage
   };
   bool atomic = true, results = true, automatic = true;
   bool successBeforeSubmitError = false;
+  mutable std::function<void()> onResultsCapability;
   std::vector<Submission> submissions;
   std::exception_ptr tickError, submitError;
   uint32_t finished = 0;
   bool SupportsAtomicBatches() const noexcept override { return atomic; }
-  bool SupportsUpsertResults() const noexcept override { return results; }
+  bool SupportsUpsertResults() const noexcept override
+  {
+    if (auto callback = std::exchange(onResultsCapability, {}))
+      callback();
+    return results;
+  }
   void IterateSync(const IterateSyncCallback&) override {}
   void Iterate(const IterateCallback& callback,
                const std::optional<std::vector<FormDesc>>&) override
@@ -211,6 +219,58 @@ TEST_CASE("Durable campaign receipts identify immutable ordered save batches",
     Find(f.storage->submissions[2].forms, ownerId).inv.GetItemCount(0xf) ==
     23);
   f.storage->Complete(2);
+}
+
+TEST_CASE("Durable campaign saves retain writes from the storage preflight",
+          "[Quest][CampaignInventory][SaveReceipt]")
+{
+  ReceiptWorld f;
+  const bool editsParticipant = GENERATE(false, true);
+  auto& target = editsParticipant ? *f.owner : *f.guest;
+  bool called = false;
+  std::exception_ptr callbackError;
+  // Arm the storage callback after staged rows reach the projection barrier.
+  f.server.worldState.SetCampaignVisibilityCallbacks(
+    [&](MpActor&) {
+      f.storage->onResultsCapability = [&] {
+        called = true;
+        try {
+          target.SetInventory(Inventory().AddItem(0xf, 27));
+        } catch (...) {
+          callbackError = std::current_exception();
+        }
+      };
+    },
+    [](MpActor&, bool) {});
+  const auto initialJournal =
+    f.owner->GetDynamicFields().GetValueDump(QuestJournal::kProperty);
+  auto commit = [&] {
+    return QuestJournal::AtomicDurable(*f.guest, [&] {
+      f.Stage();
+      f.Transfer(1);
+      QuestJournal::EditFactions(*f.guest, *f.owner, [&](auto& factions) {
+        factions = {
+          { FormDesc::FromFormId(0x5c84d, f.server.worldState.espmFiles), 4 }
+        };
+      });
+    });
+  };
+  if (editsParticipant) {
+    REQUIRE_THROWS(commit());
+    REQUIRE(f.owner->GetDynamicFields().GetValueDump(
+              QuestJournal::kProperty) == initialJournal);
+    REQUIRE(f.chest->GetInventory().GetItemCount(0xf) == 10);
+  } else {
+    REQUIRE(commit()->GetState() == SaveReceipt::State::Pending);
+    REQUIRE(f.chest->GetInventory().GetItemCount(0xf) == 9);
+  }
+  REQUIRE(called);
+  REQUIRE_FALSE(callbackError);
+  f.Tick();
+  REQUIRE(f.storage->submissions.size() == 1);
+  const auto& row = Find(f.storage->submissions.front().forms,
+                         target.GetChangeForm().formDesc);
+  REQUIRE(row.inv.GetItemCount(0xf) == 27);
 }
 
 TEST_CASE("Failed receipt attempts retry exact snapshots before later commits",
@@ -467,6 +527,58 @@ TEST_CASE("A throwing durable transaction does not seal a partial reward",
   REQUIRE(f.chest->GetInventory().GetItemCount(0xf) == 10);
   f.Tick();
   REQUIRE(f.storage->submissions.empty());
+}
+
+TEST_CASE("Storage preflight pins the guest and host before executing a quest",
+          "[Quest][CampaignInventory][SaveReceipt]")
+{
+  ReceiptWorld f;
+  const auto id =
+    GENERATE(false, true) ? f.owner->GetFormId() : f.guest->GetFormId();
+  bool executed = false, pinned = false;
+  std::shared_ptr<MpActor> removed;
+  std::exception_ptr callbackError;
+  f.storage->onResultsCapability = [&] {
+    try {
+      f.server.worldState.DestroyForm(id, &removed);
+      pinned = removed.use_count() > 1;
+      f.server.CreateActor(id, { 7, 8, 9 }, 0, 0x3c);
+    } catch (...) {
+      callbackError = std::current_exception();
+    }
+  };
+  REQUIRE_THROWS(
+    QuestJournal::AtomicDurable(*f.guest, [&] { executed = true; }));
+  REQUIRE_FALSE(callbackError);
+  REQUIRE(pinned);
+  REQUIRE_FALSE(executed);
+  REQUIRE(f.server.worldState.LookupFormByIdNoLoad(id) != removed);
+  REQUIRE(f.storage->submissions.empty());
+}
+
+TEST_CASE(
+  "Clear during save capability checks never submits the abandoned batch",
+  "[Quest][CampaignInventory][SaveReceipt][Clear]")
+{
+  ReceiptWorld f;
+  const auto receipt = f.Commit(1, 1);
+  const auto queued = f.Commit(1, 2);
+  f.storage->onResultsCapability = [&] { f.server.worldState.Clear(); };
+  f.Tick();
+  REQUIRE(receipt->GetState() == SaveReceipt::State::Abandoned);
+  REQUIRE(queued->GetState() == SaveReceipt::State::Abandoned);
+  REQUIRE(receipt->GetAttempts() == 0);
+  REQUIRE(f.storage->submissions.empty());
+  const uint32_t id = 0xff003100;
+  f.server.CreateActor(id, { 3, 4, 5 }, 0, 0x3c);
+  f.Tick();
+  REQUIRE(f.storage->submissions.size() == 1);
+  const auto& forms = f.storage->submissions.front().forms;
+  REQUIRE(std::count_if(forms.begin(), forms.end(), [](const auto& form) {
+            return form.has_value();
+          }) == 1);
+  REQUIRE(Find(forms, FormDesc::FromFormId(id, f.server.worldState.espmFiles))
+            .position == NiPoint3(3, 4, 5));
 }
 
 TEST_CASE(

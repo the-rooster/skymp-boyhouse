@@ -5,7 +5,8 @@ const assert = require("node:assert/strict");
 const { WorldProjectionReplica } = require("../../skymp5-client/src/campaign/worldProjection.ts");
 const server = globalThis.mp;
 const community = process.env.BOYHOUSE_PROTOCOL_COMMUNITY === "1";
-const polls = community ? 400 : 80;
+const guestRestart = process.env.BOYHOUSE_GUEST_RESTART;
+const polls = community || guestRestart ? 400 : 80;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const packet = (bot, content) => bot.send({ t: 1, contentJsonDump: JSON.stringify(content) });
 const scope = p => server.get(p.actor, "worldInstance");
@@ -79,6 +80,12 @@ async function finishCreation(p) {
 }
 
 (async () => {
+  if (guestRestart) {
+    await require("./guest-restart-smoke.cjs").loginGuest({
+      server, sleep, packet, prepared, acknowledge, login, boot: guestRestart,
+    });
+    process.exit(0);
+  }
   if (community) {
     await require("./community-smoke-gamemode.cjs")({ server, sleep, packet, scope,
       prepared, acknowledge, login, command, finishCreation });

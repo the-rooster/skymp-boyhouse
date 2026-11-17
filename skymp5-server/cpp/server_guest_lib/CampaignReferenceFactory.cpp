@@ -1,16 +1,20 @@
 #include "CampaignReferenceFactory.h"
+#include "CampaignMovement.h"
 #include "CampaignReferenceBinding.h"
 #include "EvaluateTemplate.h"
+#include "FormCallbacks.h"
 #include "GetBaseActorValues.h"
 #include "InventoryDefaults.h"
 #include "LeveledListUtils.h"
 #include "LocationalDataUtils.h"
 #include "MpActor.h"
+#include "Primitive.h"
 #include "QuestJournal.h"
 #include "QuestVmState.h"
 #include "WorldState.h"
 #include "libespm/GroupUtils.h"
 #include "libespm/RecordHeaderAccess.h"
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <iomanip>
@@ -349,6 +353,45 @@ struct Allocation
                                       Binding(original));
     return result;
   }
+  std::vector<uint32_t> Prepare(const std::vector<uint32_t>& originals,
+                                MpChangeForm& state,
+                                std::vector<MpChangeForm>& copies)
+  {
+    std::map<uint32_t, uint32_t> ids;
+
+    for (const auto original : originals) {
+      if (ids.contains(original))
+        continue;
+      uint32_t id;
+      if (auto* existing = Existing(original)) {
+        id = existing->GetFormId();
+      } else {
+        auto saved = Defaults(original);
+        preparedDisabled.emplace(original, saved.isDisabled);
+        id = world.GenerateFormId();
+        if (id < 0xff000000)
+          throw std::runtime_error("Campaign dynamic ID space exhausted");
+        saved.formDesc = FormDesc::FromFormId(id, world.espmFiles);
+        copies.push_back(std::move(saved));
+      }
+      ids.emplace(original, id);
+      ledger["copies"][OriginalKey(original)] =
+        FormDesc::FromFormId(id, world.espmFiles).ToString();
+    }
+    const auto dump = ledger.dump();
+    if (dump.size() > 8 * 1024 * 1024 || ledger["copies"].size() > 100000)
+      throw std::runtime_error("Campaign allocation ledger exceeds limit");
+
+    state.dynamicFields.SetValueDump(kIdentity, Json(identity).dump());
+    state.dynamicFields.SetValueDump(CampaignReferenceFactory::kAllocations,
+                                     dump);
+    // Prepare the return value too: no allocation is allowed to make a
+    // successful commit appear to have failed to its caller.
+    std::vector<uint32_t> result;
+    for (const auto original : originals)
+      result.push_back(ids.at(original));
+    return result;
+  }
 };
 }
 
@@ -437,40 +480,9 @@ std::vector<uint32_t> CampaignReferenceFactory::EnsureForInstance(
   if (originals.empty())
     return {};
   Allocation allocation(owner, instance, encounterLevel);
-  std::map<uint32_t, uint32_t> ids;
   std::vector<MpChangeForm> copies;
-  for (const auto original : originals) {
-    if (ids.contains(original))
-      continue;
-    uint32_t id;
-    if (auto* existing = allocation.Existing(original)) {
-      id = existing->GetFormId();
-    } else {
-      auto saved = allocation.Defaults(original);
-      allocation.preparedDisabled.emplace(original, saved.isDisabled);
-      id = allocation.world.GenerateFormId();
-      if (id < 0xff000000)
-        throw std::runtime_error("Campaign dynamic ID space exhausted");
-      saved.formDesc = FormDesc::FromFormId(id, allocation.world.espmFiles);
-      copies.push_back(std::move(saved));
-    }
-    ids.emplace(original, id);
-    allocation.ledger["copies"][allocation.OriginalKey(original)] =
-      FormDesc::FromFormId(id, allocation.world.espmFiles).ToString();
-  }
-  const auto dump = allocation.ledger.dump();
-  if (dump.size() > 8 * 1024 * 1024 ||
-      allocation.ledger["copies"].size() > 100000)
-    throw std::runtime_error("Campaign allocation ledger exceeds limit");
   auto state = owner.GetChangeForm();
-  state.dynamicFields.SetValueDump(kIdentity,
-                                   Json(allocation.identity).dump());
-  state.dynamicFields.SetValueDump(kAllocations, dump);
-  // Prepare the return value too: no allocation is allowed to make a
-  // successful commit appear to have failed to its caller.
-  std::vector<uint32_t> result;
-  for (const auto original : originals)
-    result.push_back(ids.at(original));
+  auto result = allocation.Prepare(originals, state, copies);
   if (!copies.empty() || state.dynamicFields != owner.GetDynamicFields())
     allocation.world.CommitCampaignReferences(owner, std::move(state), copies);
   return result;
@@ -594,4 +606,218 @@ void CampaignReferenceFactory::ValidateExistingArea(MpActor& owner,
       throw std::runtime_error(
         "Existing campaign area allocation is incomplete");
   }
+}
+
+namespace {
+NiPoint3 SavedPoint(const Json& values)
+{
+  if (!values.is_array() || values.size() != 3 ||
+      !std::all_of(values.begin(), values.end(),
+                   [](const Json& v) { return v.is_number(); }))
+    throw std::runtime_error("Malformed visitor baseline point");
+  NiPoint3 point{ values.at(0).get<float>(), values.at(1).get<float>(),
+                  values.at(2).get<float>() };
+  if (!std::isfinite(point.x) || !std::isfinite(point.y) ||
+      !std::isfinite(point.z))
+    throw std::runtime_error("Nonfinite visitor baseline point");
+  return point;
+}
+
+Json VisitorBaseline(MpActor& visitor, uint32_t host, const std::string& phase)
+{
+  const auto& bytes =
+    visitor.GetDynamicFields().GetValueDump(CampaignMovementPlan::kProperty);
+  if (bytes.size() > 1024 * 1024)
+    throw std::runtime_error("Visitor baseline exceeds limit");
+  auto value = Json::parse(bytes);
+  const auto& files = visitor.GetParent()->espmFiles;
+  const auto& sequence = value.at("sequence");
+  const auto& identity =
+    value.at("campaignIdentity").get_ref<const std::string&>();
+  const auto& primitives = value.at("primitives");
+  if (value.size() != 10 || !value.at("schemaVersion").is_number_integer() ||
+      value.at("schemaVersion") != 1 ||
+      value.at("source") != visitor.GetChangeForm().formDesc.ToString() ||
+      value.at("owner") != FormDesc::FromFormId(host, files).ToString() ||
+      value.at("instance") != phase ||
+      value.at("cell") != visitor.GetCellOrWorld().ToString() ||
+      !sequence.is_number_unsigned() || sequence == 0 ||
+      sequence.get<uint64_t>() >= 9007199254740991ULL ||
+      identity.size() != 32 ||
+      identity.find_first_not_of("0123456789abcdef") != std::string::npos ||
+      !primitives.is_array() || primitives.size() > 64)
+    throw std::runtime_error("Invalid saved visitor identity or sequence");
+  const auto samePoint = [](const Json& values, const NiPoint3& actual) {
+    return values == Json::array({ actual.x, actual.y, actual.z });
+  };
+  SavedPoint(value.at("position"));
+  SavedPoint(value.at("angle"));
+  if (!samePoint(value.at("position"), visitor.GetPos()) ||
+      !samePoint(value.at("angle"), visitor.GetAngle()))
+    throw std::runtime_error("Saved visitor pose changed");
+  auto canonicalForm = [&](const Json& v, bool dynamic) {
+    const auto& text = v.get_ref<const std::string&>();
+    const auto desc = FormDesc::FromString(text);
+    const auto id = desc.ToFormId(files);
+    if ((id >= 0xff000000) != dynamic || !id ||
+        FormDesc::FromFormId(id, files).ToString() != text)
+      throw std::runtime_error("Malformed visitor reference identity");
+    return id;
+  };
+  std::string previous;
+  std::set<uint32_t> physical;
+  for (const auto& target : primitives) {
+    const auto& original = target.at("target").get_ref<const std::string&>();
+    const auto id = canonicalForm(original, false);
+    const auto copy = canonicalForm(target.at("reference"), true);
+    const auto position = SavedPoint(target.at("position"));
+    const auto angle = SavedPoint(target.at("angle"));
+    const auto bounds = SavedPoint(target.at("bounds"));
+    const auto& templates = target.at("templates");
+    if (target.size() != 7 || id == 0x14 || original <= previous ||
+        copy == host || copy == visitor.GetFormId() ||
+        !physical.insert(copy).second || !templates.is_array() ||
+        templates.size() > 128 || !target.at("inside").is_boolean() ||
+        angle.x || angle.y || bounds.x <= 0 || bounds.y <= 0 || bounds.z <= 0)
+      throw std::runtime_error("Invalid saved visitor primitive roster");
+    for (const auto& entry : templates)
+      canonicalForm(entry, false);
+    const auto vertices = Primitive::GetVertices(position, angle, bounds);
+    const bool inside = Primitive::IsInside(
+      visitor.GetPos(), Primitive::CreateGeoPolygonProc(vertices));
+    if (inside != target.at("inside").get<bool>())
+      throw std::runtime_error("Inconsistent saved visitor occupancy");
+    previous = original;
+  }
+  return value;
+}
+}
+
+std::shared_ptr<const SaveReceipt> CampaignReferenceFactory::RecoverVisitor(
+  MpActor& visitor, const std::string& expectedForeignPhase,
+  const std::string& areaId, uint32_t worldOrCell, const NiPoint3& center,
+  float radius, uint32_t encounterLevel,
+  const std::function<bool()>& stillCurrent)
+{
+  auto* world = visitor.GetParent();
+  if (!world || !world->IsStorageRestoreReady() || world->IsRestoring() ||
+      world->IsClearing() || QuestJournal::HasActiveTransaction() ||
+      !stillCurrent || !stillCurrent() || !encounterLevel ||
+      encounterLevel > 65535)
+    throw std::runtime_error("Cold visitor recovery is unavailable");
+  const auto pin = world->LookupFormByIdNoLoad(visitor.GetFormId());
+  if (pin.get() != &visitor)
+    throw std::runtime_error("Unregistered visitor");
+  // Restored forms already carry this server's network callbacks. Copy them
+  // without invoking a user-defined factory while the resume lease is held.
+  const auto callbacks = visitor.GetCallbacks();
+  if (!stillCurrent() ||
+      world->LookupFormByIdNoLoad(visitor.GetFormId()) != pin ||
+      !world->IsStorageRestoreReady() || world->IsRestoring() ||
+      world->IsClearing())
+    throw std::runtime_error("Visitor recovery context changed");
+  visitor.RequireIsolatedVisitor();
+  for (const auto& [cell, space] : world->grids)
+    if (space.grid && space.grid->Contains(&visitor))
+      throw std::runtime_error(
+        "Visitor still participates in a physical grid");
+  for (const auto& [ref, host] : world->hosters)
+    if (ref == visitor.GetFormId() || host == visitor.GetFormId())
+      throw std::runtime_error("Visitor has outstanding hosting authority");
+  const auto destination = Destination(visitor, areaId);
+  const auto formerHost =
+    QuestJournal::ParseCampaignOwnerId(expectedForeignPhase, true);
+  if (formerHost < 0xff000000 || formerHost == visitor.GetFormId() ||
+      expectedForeignPhase !=
+        "campaign:" + std::to_string(formerHost) + ":" + areaId ||
+      visitor.GetWorldInstance() != expectedForeignPhase ||
+      visitor.GetCellOrWorld().ToFormId(world->espmFiles) != worldOrCell)
+    throw std::runtime_error("Visitor belongs to another saved area");
+  const auto position = visitor.GetPos();
+  const float distance = (position - center).Length();
+  if (!std::isfinite(distance) || distance > radius)
+    throw std::runtime_error("Visitor is outside the configured area");
+
+  auto baseline = VisitorBaseline(visitor, formerHost, expectedForeignPhase);
+  const auto originals = AreaOriginals(visitor, worldOrCell, center, radius);
+  if (visitor.GetDynamicFields().GetValueDump(kAllocations) != "null" &&
+      visitor.GetDynamicFields().GetValueDump(kIdentity) == "null")
+    throw std::runtime_error(
+      "Visitor has lost its personal allocation identity");
+  Allocation allocation(visitor, destination, encounterLevel);
+  if (baseline.at("campaignIdentity") == allocation.identity)
+    throw std::runtime_error(
+      "Personal and visited campaign identities coincide");
+  std::set<uint32_t> destinationRefs(originals.begin(), originals.end());
+  for (const auto& [key, target] : allocation.ledger.at("copies").items()) {
+    const auto id = FormDesc::FromString(key).ToFormId(world->espmFiles);
+    auto* copy = allocation.Existing(id, false);
+    if (!copy)
+      throw std::runtime_error("Missing personal reference copy");
+    if (copy->GetWorldInstance() == destination)
+      destinationRefs.insert(id);
+  }
+  if (destinationRefs.size() > 4096)
+    throw std::runtime_error(
+      "Personal recovery projection exceeds its area limit");
+  auto state = visitor.GetChangeForm();
+  std::vector<MpChangeForm> copies;
+  allocation.Prepare(originals, state, copies);
+  const auto x = static_cast<int>(position.x / 4096),
+             y = static_cast<int>(position.y / 4096);
+  // A first-time entry needs genuine load events. A reconnect may only
+  // restore reference relationships whose initialization already ran.
+  for (const auto& copy : copies)
+    if (!copy.isDisabled && !copy.isDeleted &&
+        copy.worldOrCellDesc == visitor.GetCellOrWorld() &&
+        std::abs(static_cast<int>(copy.position.x / 4096) - x) <= 1 &&
+        std::abs(static_cast<int>(copy.position.y / 4096) - y) <= 1)
+      throw std::runtime_error(
+        "Personal destination requires first-time reference initialization");
+
+  const auto& journalDump =
+    state.dynamicFields.GetValueDump(QuestJournal::kProperty);
+  // Allocation validated this personal journal while reading its VM state.
+  const Json journal =
+    journalDump == "null" ? Json::object() : Json::parse(journalDump);
+  std::map<std::string, Json> roster;
+  if (const auto grid = world->grids.find(worldOrCell);
+      grid != world->grids.end()) {
+    auto snapshot = *grid->second.grid;
+    for (auto* ref :
+         snapshot.GetNeighboursByPosition(int16_t(x), int16_t(y))) {
+      if (ref->IsDisabled() || ref->IsDeleted() ||
+          ref->GetWorldInstance() != destination)
+        continue;
+      const auto saved = ref->GetChangeForm();
+      const auto id = CampaignReferenceBinding::SavedOriginal(*world, saved);
+      const auto key = allocation.OriginalKey(id);
+      if (!allocation.ledger.at("copies").contains(key) ||
+          allocation.Existing(id) != ref ||
+          !journal.contains("referenceInit") ||
+          !journal.at("referenceInit").contains(key) ||
+          ref->HasPendingCampaignMovement())
+        throw std::runtime_error(
+          "Personal reference is not ready for visitor recovery");
+      if (ref->HasPrimitive() &&
+          (!roster.emplace(key, ref->PersonalRecoveryPrimitive(key, position))
+              .second ||
+           roster.size() > 64))
+        throw std::runtime_error("Invalid personal recovery primitive roster");
+    }
+  }
+  baseline["owner"] = state.formDesc.ToString();
+  baseline["instance"] = destination;
+  baseline["campaignIdentity"] = allocation.identity;
+  baseline["primitives"] = Json::array();
+  for (auto& [key, entry] : roster)
+    baseline["primitives"].push_back(std::move(entry));
+  const auto dump = baseline.dump();
+  if (dump.size() > 1024 * 1024)
+    throw std::runtime_error(
+      "Personal recovery movement baseline exceeds limit");
+  state.dynamicFields.SetValueDump(CampaignMovementPlan::kProperty, dump);
+  state.worldInstance = destination;
+  return world->CommitCampaignReferences(visitor, std::move(state), copies,
+                                         &callbacks, stillCurrent);
 }

@@ -17,9 +17,11 @@
 #include "save_storages/ISaveStorage.h"
 #include "script_storages/IScriptStorage.h"
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <random>
 #include <set>
@@ -32,6 +34,14 @@ using Json = nlohmann::json;
 using Forms = std::vector<std::optional<MpChangeForm>>;
 constexpr uint32_t kOwner = 0xff009b00, kTrigger = 0x6debb;
 constexpr uint32_t kObserver = kOwner + 1;
+// NarzulburFreeFormWifeQuest has real stages 10 and 20 and no attached
+// alias scripts. Its journal can run alongside the deliberately small PEX
+// fixture used to observe private trigger dispatch.
+constexpr uint32_t kGuestQuest = 0xe316e;
+constexpr uint32_t kGuestStage = 10, kHostStage = 20;
+constexpr auto kQuestKey = "e316e:Skyrim.esm";
+const std::string kGuestPhase =
+  "campaign:" + std::to_string(kObserver) + ":resume";
 constexpr ProfileId kProfile = 42;
 constexpr Networking::UserId kUser = 0;
 
@@ -267,7 +277,13 @@ struct ResumeStorage
     , ownerFirst(first)
   {
   }
-  bool SupportsAtomicBatches() const noexcept override { return true; }
+  mutable std::function<void()> onAtomicCapability;
+  bool SupportsAtomicBatches() const noexcept override
+  {
+    if (onAtomicCapability)
+      onAtomicCapability();
+    return true;
+  }
   bool SupportsUpsertResults() const noexcept override { return true; }
   void IterateSync(const IterateSyncCallback& callback) override
   {
@@ -332,6 +348,13 @@ Json Serialized(const Forms& forms)
     output.push_back(form ? MpChangeForm::ToJson(*form) : Json(nullptr));
   return output;
 }
+
+enum class PersonalArea
+{
+  Unused,
+  Fresh,
+  Initialized
+};
 
 struct ResumeWorld
 {
@@ -466,7 +489,8 @@ struct ResumeWorld
     INFO("Last movement: " << lastMovement.dump());
     FAIL("Campaign resume did not reach its expected durable boundary");
   }
-  void Seed(bool tombstone = false, bool observer = false)
+  void Seed(bool tombstone = false, bool observer = false,
+            PersonalArea personalArea = PersonalArea::Unused)
   {
     DoConnect(server, kUser);
     server.CreateActor(kOwner, outside, 0, cell, kProfile);
@@ -485,7 +509,32 @@ struct ResumeWorld
     if (observer) {
       DoConnect(server, 1);
       server.CreateActor(kObserver, outside, 0, cell, kProfile + 1);
-      server.worldState.GetFormAt<MpActor>(kObserver).SetWorldInstance(phase);
+      auto& visitor = server.worldState.GetFormAt<MpActor>(kObserver);
+      if (personalArea != PersonalArea::Unused) {
+        // Establish both personal histories before party admission.
+        if (personalArea == PersonalArea::Initialized) {
+          visitor.SetWorldInstance(kGuestPhase);
+          CampaignReferenceFactory::Ensure(visitor, { kTrigger }, 1);
+          QuestScriptRuntime::ExecuteReferenceLoad(visitor, kTrigger);
+        }
+        const auto stage = [&](MpActor& actor, uint32_t index) {
+          actor.SetPropertyValueDump(QuestJournal::kEnabled,
+                                     Json::array({ kQuestKey }).dump(), false,
+                                     false);
+          REQUIRE(QuestJournal::Apply(actor,
+                                      { { "quest", kGuestQuest },
+                                        { "op", "setStage" },
+                                        { "index", index } }));
+        };
+        stage(visitor, kGuestStage);
+        stage(Owner(), kHostStage);
+        Inventory guestInventory, hostInventory;
+        guestInventory.AddItem(0xf, 17);
+        hostInventory.AddItem(0xf, 37);
+        visitor.SetInventory(guestInventory);
+        Owner().SetInventory(hostInventory);
+      }
+      visitor.SetWorldInstance(phase);
       server.SetUserActor(1, kObserver);
     }
     const auto originals = tombstone
@@ -589,6 +638,190 @@ struct ResumeWorld
       publish);
   }
 };
+
+Json SeedFreshVisitor(const ResumeFiles& files)
+{
+  ResumeWorld initial(files);
+  initial.Seed(false, true, PersonalArea::Fresh);
+  initial.EnrollVisitor();
+  initial.Move(initial.outside, kObserver, 1);
+  for (size_t i = 0; i < 16; ++i)
+    initial.Tick();
+  REQUIRE(initial.server.worldState.GetFormAt<MpActor>(kObserver).GetPos() ==
+          initial.outside);
+  auto area = initial.Area();
+  area["center"] = { initial.outside.x, initial.outside.y, initial.outside.z };
+  area["encounterLevel"] = 1;
+  return area;
+}
+
+void ExportVisitorSeed(const ResumeFiles& files, const Json& area)
+{
+  const char* requested = std::getenv("BOYHOUSE_VISITOR_SEED_DIR");
+  if (!requested)
+    return;
+  // The normal server smoke consumes a copy of the exact SQLite input,
+  // after all writers have closed and before the recovery test opens it.
+  const std::filesystem::path directory(requested);
+  REQUIRE(std::filesystem::create_directory(directory));
+  const auto copy = directory / "world.sqlite3";
+  REQUIRE(std::filesystem::copy_file(files.File(), copy));
+  Json seed = { { "profile", kProfile + 1 },
+                { "actor", kObserver },
+                { "host", kOwner },
+                { "hostProfile", kProfile },
+                { "personalPhase", kGuestPhase },
+                { "area", area },
+                { "quest", kGuestQuest },
+                { "questKey", kQuestKey } };
+  {
+    SqliteDatabase exported(copy.string());
+    exported.Iterate(
+      [&](const MpChangeForm& row) {
+        if (row.profileId != kProfile && row.profileId != kProfile + 1)
+          return;
+        const bool guest = row.profileId == kProfile + 1;
+        const auto ledger =
+          Json::parse(row.dynamicFields.GetValueDump(QuestJournal::kProperty));
+        seed[guest ? "guestStage" : "hostStage"] =
+          ledger.at("quests").at(kQuestKey).at("stage");
+        seed[guest ? "guestGold" : "hostGold"] = row.inv.GetItemCount(0xf);
+        if (guest) {
+          seed["oldPhase"] = row.worldInstance;
+          const auto baseline = Json::parse(
+            row.dynamicFields.GetValueDump(CampaignMovementPlan::kProperty));
+          REQUIRE(baseline.at("instance") == row.worldInstance);
+          REQUIRE(baseline.at("position") == area.at("center"));
+          seed["sequence"] = baseline.at("sequence");
+        }
+      },
+      {});
+  }
+  REQUIRE(seed.at("guestStage") == kGuestStage);
+  REQUIRE(seed.at("hostStage") == kHostStage);
+  REQUIRE(seed.at("guestGold") == 17);
+  REQUIRE(seed.at("hostGold") == 37);
+  REQUIRE(seed.at("oldPhase") ==
+          "campaign:" + std::to_string(kOwner) + ":resume");
+  std::ofstream metadata(directory / "visitor-seed.json");
+  metadata << seed.dump(2) << '\n';
+  metadata.close();
+  REQUIRE(metadata.good());
+}
+
+void CheckVisitorRecovery(ResumeWorld& f, MpActor& guest, const Json& area,
+                          const ResumeFiles& savedFiles, bool ownerFirst)
+{
+  // Recovery must preserve the guest's own quest/VM data and inventory,
+  // even while the former host has a sleeping handler for the guest.
+  const auto journal = [](const MpActor& actor) {
+    return actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty);
+  };
+  const auto guestJournal = journal(guest);
+  auto hostActor = f.server.worldState.LookupFormByIdNoLoad(kOwner);
+  const auto hostJournal = hostActor ? journal(*hostActor->AsActor()) : "null";
+  const auto oldBaseline = Json::parse(
+    guest.GetDynamicFields().GetValueDump(CampaignMovementPlan::kProperty));
+  REQUIRE(oldBaseline.at("instance") == f.phase);
+  const auto savedPhase = guest.GetWorldInstance();
+  const auto oldEpoch = f.server.GetPacketEpoch(1);
+  f.storage->automatic = false;
+  const auto initialWrites = f.storage->submissions.size();
+  const auto attempt =
+    f.server.ResumeCampaignActor(1, kObserver, savedPhase, area);
+  REQUIRE(attempt.at("status") == "Pending");
+  REQUIRE(attempt.at("phase") == kGuestPhase);
+  REQUIRE(guest.IsDisabled());
+  REQUIRE(guest.GetWorldInstance() == kGuestPhase);
+  REQUIRE(guest.GetPos() == f.center);
+  REQUIRE(f.server.GetUserActor(1) == kObserver);
+  for (size_t i = 0; i < 16 && f.storage->submissions.size() == initialWrites;
+       ++i)
+    f.Tick();
+  REQUIRE(f.storage->submissions.size() == initialWrites + 1);
+  const auto sealedRows = Serialized(f.storage->submissions.back().forms);
+  f.storage->Complete(initialWrites,
+                      std::make_exception_ptr(
+                        std::runtime_error("visitor rebase write failed")));
+  for (size_t i = 0;
+       i < 16 && f.storage->submissions.size() == initialWrites + 1; ++i)
+    f.Tick();
+  REQUIRE(f.storage->submissions.size() == initialWrites + 2);
+  REQUIRE(Serialized(f.storage->submissions.back().forms) == sealedRows);
+  REQUIRE(f.server.GetCampaignResume(1).at("status") == "Pending");
+  REQUIRE(f.server.serverState.userInfo[1]->gameplayBlocked);
+  REQUIRE_THROWS(f.server.CaptureCampaignResumeProjection(1, oldEpoch));
+  f.storage->automatic = true;
+  f.storage->Complete(initialWrites + 1);
+  for (size_t i = 0;
+       i < 32 && f.server.GetCampaignResume(1).at("status") == "Pending"; ++i)
+    f.Tick();
+  INFO(f.server.GetCampaignResume(1).dump());
+  REQUIRE(f.server.GetCampaignResume(1).at("status") == "ProjectionReady");
+  REQUIRE(journal(guest) == guestJournal);
+  REQUIRE(guest.GetInventory().GetItemCount(0xf) == 17);
+  REQUIRE(QuestJournal::Get(guest, kGuestQuest).at("stage") == kGuestStage);
+  const auto baseline = Json::parse(
+    guest.GetDynamicFields().GetValueDump(CampaignMovementPlan::kProperty));
+  REQUIRE(baseline.at("owner") == guest.GetChangeForm().formDesc.ToString());
+  REQUIRE(baseline.at("source") == oldBaseline.at("source"));
+  REQUIRE(baseline.at("instance") == kGuestPhase);
+  REQUIRE(baseline.at("position") == oldBaseline.at("position"));
+  REQUIRE(baseline.at("angle") == oldBaseline.at("angle"));
+  REQUIRE(baseline.at("sequence") == oldBaseline.at("sequence"));
+  REQUIRE(baseline.at("campaignIdentity") !=
+          oldBaseline.at("campaignIdentity"));
+  REQUIRE(baseline.at("primitives").size() == 1);
+  REQUIRE(baseline.at("primitives")[0].at("inside") == true);
+
+  const auto personalEpoch = f.server.BeginPacketEpoch(1);
+  const auto projectionForGuest =
+    f.server.CaptureCampaignResumeProjection(1, personalEpoch);
+  const auto& manifest = projectionForGuest.at("manifest");
+  REQUIRE(manifest.at("campaignOwner") == kObserver);
+  REQUIRE(manifest.at("instance") == kGuestPhase);
+  REQUIRE(manifest.at("identity") == baseline.at("campaignIdentity"));
+  REQUIRE(manifest.at("references").size() == 1);
+  REQUIRE(manifest.at("references")[0].at("copy") ==
+          CampaignReferenceBinding::Resolve(guest, kTrigger).GetFormId());
+  const auto token = attempt.at("attempt").get<std::string>();
+  const auto proof = projectionForGuest.at("proof").get<std::string>();
+  REQUIRE_FALSE(f.server.CompleteCampaignResume(
+    1, token, oldEpoch, proof, [] { FAIL("stale epoch published ready"); }));
+  REQUIRE(f.server.serverState.userInfo[1]->gameplayBlocked);
+  f.Move(f.outside, kObserver, 1);
+  REQUIRE(guest.GetPos() == f.center);
+  REQUIRE(
+    f.server.CompleteCampaignResume(1, token, personalEpoch, proof, [] {}));
+  REQUIRE_FALSE(f.server.serverState.userInfo[1]->gameplayBlocked);
+  f.Move(f.outside, kObserver, 1);
+  REQUIRE(guest.GetPos() == f.outside);
+  for (size_t i = 0; i < 16; ++i)
+    f.Tick();
+  REQUIRE_FALSE(guest.HasPendingCampaignMovement());
+  REQUIRE(QuestJournal::Get(guest, kGuestQuest).at("stage") == kGuestStage);
+  REQUIRE(guest.GetInventory().GetItemCount(0xf) == 17);
+  if (hostActor) {
+    REQUIRE(journal(*hostActor->AsActor()) == hostJournal);
+    REQUIRE(hostActor->AsActor()->GetInventory().GetItemCount(0xf) == 37);
+  }
+  const auto movedBaseline = Json::parse(
+    guest.GetDynamicFields().GetValueDump(CampaignMovementPlan::kProperty));
+  REQUIRE(movedBaseline.at("sequence").get<uint64_t>() ==
+          baseline.at("sequence").get<uint64_t>() + 1);
+
+  ResumeWorld restarted(savedFiles, !ownerFirst);
+  const auto& savedGuest =
+    restarted.server.worldState.GetFormAt<MpActor>(kObserver);
+  REQUIRE(savedGuest.GetWorldInstance() == kGuestPhase);
+  REQUIRE(savedGuest.GetPos() == f.outside);
+  REQUIRE(journal(savedGuest) == journal(guest));
+  REQUIRE(
+    savedGuest.GetDynamicFields().GetValueDump(
+      CampaignMovementPlan::kProperty) ==
+    guest.GetDynamicFields().GetValueDump(CampaignMovementPlan::kProperty));
+}
+
 }
 
 TEST_CASE(
@@ -1001,10 +1234,17 @@ TEST_CASE(
 }
 
 TEST_CASE(
-  "Stale saved visitors do not prevent unrelated owners from recovering",
+  "Cold visitors recover their own history and unrelated owners can resume",
   "[CampaignResume][SQLite][GuestRestore]")
 {
-  const bool missingHost = GENERATE(false, true);
+  enum class HostState
+  {
+    Present,
+    Moved,
+    Missing
+  };
+  const auto host =
+    GENERATE(HostState::Present, HostState::Moved, HostState::Missing);
   const bool ownerFirst = GENERATE(false, true);
   constexpr uint32_t otherId = kOwner + 2;
   const std::string otherPhase =
@@ -1013,8 +1253,14 @@ TEST_CASE(
   Json otherArea;
   {
     ResumeWorld initial(original);
-    initial.Seed(false, true);
+    initial.Seed(false, true, PersonalArea::Initialized);
     initial.EnrollVisitor();
+    REQUIRE(QuestJournal::Get(initial.Owner(), kGuestQuest).at("stage") ==
+            kHostStage);
+    REQUIRE(
+      QuestJournal::Get(
+        initial.server.worldState.GetFormAt<MpActor>(kObserver), kGuestQuest)
+        .at("stage") == kHostStage);
     DoConnect(initial.server, 2);
     initial.server.CreateActor(otherId, initial.outside, 0, initial.cell,
                                kProfile + 2);
@@ -1051,8 +1297,8 @@ TEST_CASE(
     source.Iterate(
       [&](const MpChangeForm& saved) {
         auto row = saved;
-        if (row.profileId == kProfile) {
-          if (missingHost)
+        if (row.profileId == kProfile && host != HostState::Present) {
+          if (host == HostState::Missing)
             return;
           // Its visitor still refers to the old phase. Recovery must classify
           // the visitor without requiring the host to remain in that phase.
@@ -1083,8 +1329,11 @@ TEST_CASE(
   DoConnect(f.server, 1);
   f.server.serverState.userInfo[1]->gameplayBlocked = true;
   f.server.BeginPacketEpoch(1);
-  REQUIRE_THROWS(f.server.ResumeCampaignActor(
-    1, kObserver, guest.GetWorldInstance(), f.Area()));
+  auto area = f.Area();
+  area["encounterLevel"] = 1;
+  // Supplying the destination phase as the source cannot authorize recovery.
+  REQUIRE_THROWS(
+    f.server.ResumeCampaignActor(1, kObserver, kGuestPhase, area));
   REQUIRE(f.server.GetUserActor(1) == 0);
   REQUIRE(f.server.serverState.userInfo[1]->gameplayBlocked);
   REQUIRE(MpChangeForm::ToJson(guest.GetChangeForm()) == guestState);
@@ -1114,6 +1363,255 @@ TEST_CASE(
   REQUIRE_FALSE(other.HasPendingCampaignMovement());
   REQUIRE(guest.IsDisabled());
   REQUIRE(MpChangeForm::ToJson(guest.GetChangeForm()) == guestState);
+  if (host == HostState::Present) {
+    REQUIRE(f.Begin().at("status") == "Pending");
+    f.ProjectionReady();
+    REQUIRE(f.Complete(f.Capture()));
+    f.time->unixMs += 60000;
+    f.time->steadyMs += 60000;
+    f.Until([&] { return f.Counter("suffixes") == 1; },
+            "host's own restored sleeper completes");
+    for (size_t step = 0; step < 16; ++step)
+      f.Tick();
+    const auto live = QuestJournal::PersonalJobState(f.Owner()).live;
+    REQUIRE(live.size() == 1);
+    REQUIRE(live.begin()->second.actor ==
+            guest.GetChangeForm().formDesc.ToString());
+    REQUIRE(f.Counter("suffixes") == 1);
+  }
+  CheckVisitorRecovery(f, guest, area, changed, ownerFirst);
+}
+
+TEST_CASE(
+  "An enrolled visitor can start a personal area with no local references",
+  "[CampaignResume][SQLite][GuestRestore][GuestRestartSeed]")
+{
+  ResumeFiles files;
+  const auto area = SeedFreshVisitor(files);
+  ExportVisitorSeed(files, area);
+  ResumeWorld f(files);
+  auto& guest = f.server.worldState.GetFormAt<MpActor>(kObserver);
+  REQUIRE(guest.GetDynamicFields().GetValueDump(
+            CampaignReferenceFactory::kAllocations) == "null");
+  DoConnect(f.server, 1);
+  f.server.serverState.userInfo[1]->gameplayBlocked = true;
+  f.server.BeginPacketEpoch(1);
+  // A storage callback can replace the connection before the save. The
+  // superseded request must leave the visitor in its original cold state.
+  const auto oldConnection =
+    f.server.serverState.userInfo[1]->connectionIdentity;
+  const auto coldState = MpChangeForm::ToJson(guest.GetChangeForm());
+  f.storage->onAtomicCapability = [&] {
+    if (f.server.serverState.userInfo[1]->connectionIdentity == oldConnection)
+      DoConnect(f.server, 1);
+  };
+  REQUIRE_THROWS(f.server.ResumeCampaignActor(1, kObserver, f.phase, area));
+  f.storage->onAtomicCapability = {};
+  REQUIRE(f.server.serverState.userInfo[1]->connectionIdentity !=
+          oldConnection);
+  REQUIRE(f.server.GetUserActor(1) == 0);
+  REQUIRE(MpChangeForm::ToJson(guest.GetChangeForm()) == coldState);
+  REQUIRE(f.storage->submissions.empty());
+  f.server.serverState.userInfo[1]->gameplayBlocked = true;
+  f.server.BeginPacketEpoch(1);
+  f.storage->automatic = false;
+  const auto original =
+    f.server.ResumeCampaignActor(1, kObserver, f.phase, area);
+  REQUIRE(original.at("status") == "Pending");
+  for (size_t i = 0; i < 16 && f.storage->submissions.empty(); ++i)
+    f.Tick();
+  REQUIRE(f.storage->submissions.size() == 1);
+  REQUIRE(guest.GetWorldInstance() == kGuestPhase);
+  REQUIRE(guest.IsDisabled());
+
+  // A replacement connection must wait for the same pending personal row.
+  DoDisconnect(f.server, 1);
+  DoConnect(f.server, 1);
+  f.server.serverState.userInfo[1]->gameplayBlocked = true;
+  const auto replacementEpoch = f.server.BeginPacketEpoch(1);
+  const auto attempt =
+    f.server.ResumeCampaignActor(1, kObserver, kGuestPhase, area);
+  REQUIRE(attempt.at("status") == "Pending");
+  REQUIRE(attempt.at("attempt") != original.at("attempt"));
+  for (size_t i = 0; i < 4; ++i)
+    f.Tick();
+  REQUIRE(f.storage->submissions.size() == 1);
+  REQUIRE_THROWS(
+    f.server.CaptureCampaignResumeProjection(1, replacementEpoch));
+  f.storage->Complete(0);
+
+  // Inspect independent SQLite rows at the crash boundary before enable.
+  {
+    SqliteDatabase disk(files.File());
+    size_t players = 0;
+    disk.Iterate(
+      [&](const MpChangeForm& row) {
+        if (row.profileId != kProfile && row.profileId != kProfile + 1)
+          return;
+        ++players;
+        const auto visiting = row.profileId == kProfile + 1;
+        REQUIRE(row.worldInstance == (visiting ? kGuestPhase : f.phase));
+        REQUIRE(row.inv.GetItemCount(0xf) == (visiting ? 17 : 37));
+        const auto ledger =
+          Json::parse(row.dynamicFields.GetValueDump(QuestJournal::kProperty));
+        REQUIRE(ledger.at("quests").at(kQuestKey).at("stage") ==
+                (visiting ? kGuestStage : kHostStage));
+        if (visiting) {
+          REQUIRE(row.isDisabled);
+          const auto baseline = Json::parse(
+            row.dynamicFields.GetValueDump(CampaignMovementPlan::kProperty));
+          REQUIRE(baseline.at("owner") == row.formDesc.ToString());
+          REQUIRE(baseline.at("instance") == kGuestPhase);
+        }
+      },
+      {});
+    REQUIRE(players == 2);
+  }
+  f.storage->automatic = true;
+  for (size_t i = 0;
+       i < 32 && f.server.GetCampaignResume(1).at("status") == "Pending"; ++i)
+    f.Tick();
+  INFO(f.server.GetCampaignResume(1).dump());
+  REQUIRE(f.server.GetCampaignResume(1).at("status") == "ProjectionReady");
+  const auto epoch = f.server.BeginPacketEpoch(1);
+  const auto projection = f.server.CaptureCampaignResumeProjection(1, epoch);
+  const auto& manifest = projection.at("manifest");
+  REQUIRE(manifest.at("campaignOwner") == kObserver);
+  REQUIRE(manifest.at("instance") == kGuestPhase);
+  REQUIRE(manifest.at("references").empty());
+  REQUIRE_FALSE(manifest.at("identity").get<std::string>().empty());
+  REQUIRE_FALSE(f.server.CompleteCampaignResume(
+    1, original.at("attempt").get<std::string>(), epoch,
+    projection.at("proof").get<std::string>(),
+    [] { FAIL("replaced visitor attempt published ready"); }));
+  REQUIRE(f.server.serverState.userInfo[1]->gameplayBlocked);
+  REQUIRE(f.server.CompleteCampaignResume(
+    1, attempt.at("attempt").get<std::string>(), epoch,
+    projection.at("proof").get<std::string>(), [] {}));
+  const auto next = f.outside + NiPoint3{ 1, 0, 0 };
+  f.Move(next, kObserver, 1);
+  REQUIRE(guest.GetPos() == next);
+}
+
+TEST_CASE("Late connection replacement cannot enable a returning visitor",
+          "[CampaignResume][SQLite][GuestRestore][Lifetime]")
+{
+  // Observe the final backend capability query while admitting the online
+  // topology in a control run, then replace the connection at that exact
+  // query in an independent server. Earlier validation alone cannot catch it.
+  const auto exercise = [](size_t replaceAt) {
+    ResumeFiles files;
+    const auto area = SeedFreshVisitor(files);
+    ResumeWorld f(files);
+    auto& guest = f.server.worldState.GetFormAt<MpActor>(kObserver);
+    DoConnect(f.server, 1);
+    f.server.serverState.userInfo[1]->gameplayBlocked = true;
+    f.server.BeginPacketEpoch(1);
+    f.storage->automatic = false;
+    REQUIRE(
+      f.server.ResumeCampaignActor(1, kObserver, f.phase, area).at("status") ==
+      "Pending");
+    for (size_t i = 0; i < 16 && f.storage->submissions.empty(); ++i)
+      f.Tick();
+    REQUIRE(f.storage->submissions.size() == 1);
+    f.storage->Complete(0);
+    REQUIRE(guest.IsDisabled());
+    size_t checks = 0;
+    bool replaced = false;
+    f.storage->onAtomicCapability = [&] {
+      if (guest.IsDisabled() && !replaced && ++checks == replaceAt) {
+        replaced = true;
+        DoConnect(f.server, 1);
+      }
+    };
+    for (size_t i = 0; i < 16 && guest.IsDisabled() && !replaced; ++i)
+      f.Tick();
+    f.storage->onAtomicCapability = {};
+    REQUIRE(checks > 0);
+    if (replaceAt) {
+      REQUIRE(replaced);
+      REQUIRE(guest.IsDisabled());
+      REQUIRE(f.server.GetUserActor(1) == 0);
+      REQUIRE(f.server.GetCampaignResume(1).is_null());
+      // A superseding detach can submit a disabled row on subsequent ticks.
+      // No enabled row may escape from the stale online plan.
+      for (size_t i = 0; i < 4; ++i)
+        f.Tick();
+      for (const auto& batch : f.storage->submissions)
+        for (const auto& row : batch.forms)
+          if (row && row->profileId == kProfile + 1)
+            REQUIRE(row->isDisabled);
+    } else {
+      REQUIRE_FALSE(guest.IsDisabled());
+      REQUIRE(f.server.GetUserActor(1) == kObserver);
+    }
+    return checks;
+  };
+  const auto finalCheck = exercise(0);
+  REQUIRE(exercise(finalCheck) == finalCheck);
+}
+
+TEST_CASE("Visitor recovery refuses inconsistent saved geometry or missing "
+          "personal initialization",
+          "[CampaignResume][SQLite][GuestRestore]")
+{
+  enum class Damage
+  {
+    Position,
+    Owner,
+    NewTrigger
+  };
+  const auto damage =
+    GENERATE(Damage::Position, Damage::Owner, Damage::NewTrigger);
+  ResumeFiles files;
+  {
+    ResumeWorld initial(files);
+    initial.Seed(false, true,
+                 damage == Damage::NewTrigger ? PersonalArea::Fresh
+                                              : PersonalArea::Initialized);
+    initial.EnrollVisitor();
+  }
+  if (damage != Damage::NewTrigger) {
+    SqliteDatabase database(files.File());
+    Forms rows;
+    database.Iterate(
+      [&](const MpChangeForm& saved) {
+        if (saved.profileId != kProfile + 1)
+          return;
+        auto row = saved;
+        auto baseline = Json::parse(
+          row.dynamicFields.GetValueDump(CampaignMovementPlan::kProperty));
+        if (damage == Damage::Position)
+          baseline.at("position")[0] = row.position.x + 2;
+        else
+          baseline.at("owner") = row.formDesc.ToString();
+        row.dynamicFields.SetValueDump(CampaignMovementPlan::kProperty,
+                                       baseline.dump());
+        rows.push_back(std::move(row));
+      },
+      {});
+    REQUIRE(rows.size() == 1);
+    database.Upsert(std::move(rows));
+  }
+  ResumeWorld f(files);
+  auto& guest = f.server.worldState.GetFormAt<MpActor>(kObserver);
+  const auto saved = MpChangeForm::ToJson(guest.GetChangeForm());
+  const auto hostHistory = f.History();
+  auto area = f.Area();
+  area["encounterLevel"] = 1;
+  DoConnect(f.server, 1);
+  f.server.serverState.userInfo[1]->gameplayBlocked = true;
+  const auto epoch = f.server.BeginPacketEpoch(1);
+  REQUIRE_THROWS(f.server.ResumeCampaignActor(1, kObserver, f.phase, area));
+  for (size_t i = 0; i < 3; ++i)
+    f.Tick();
+  REQUIRE(guest.IsDisabled());
+  REQUIRE(f.server.GetUserActor(1) == 0);
+  REQUIRE(f.server.serverState.userInfo[1]->gameplayBlocked);
+  REQUIRE_THROWS(f.server.CaptureCampaignResumeProjection(1, epoch));
+  REQUIRE(MpChangeForm::ToJson(guest.GetChangeForm()) == saved);
+  REQUIRE(f.History() == hostHistory);
+  REQUIRE(f.storage->submissions.empty());
 }
 
 TEST_CASE("Malformed enrolled visitor phases still fail storage restoration",

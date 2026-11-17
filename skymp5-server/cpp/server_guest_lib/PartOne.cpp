@@ -2,6 +2,7 @@
 #include "CampaignFrameMessage.h"
 #include "CampaignMovement.h"
 #include "CampaignReferenceBinding.h"
+#include "QuestJobRunner.h"
 #include <array>
 #include <cassert>
 #include <chrono>
@@ -573,6 +574,15 @@ void PartOne::AttachSaveStorage(
       worldState.LoadChangeForm(changeForm, CreateFormCallbacks());
       if (changeForm.profileId >= 0) {
         ++numPlayerCharacters;
+        if (changeForm.recType == MpChangeForm::ACHR && isFF &&
+            changeForm.dynamicFields.GetValueDump(
+              CampaignMovementPlan::kProperty) != "null") {
+          const auto id = changeForm.formDesc.ToFormId(worldState.espmFiles);
+          const auto loaded = worldState.LookupFormByIdNoLoad(id);
+          if (loaded && loaded->AsActor())
+            worldState.GetQuestJobs().RememberRestoredVisitor(
+              *loaded->AsActor());
+        }
       }
 
       if (n % 25 == 0) {

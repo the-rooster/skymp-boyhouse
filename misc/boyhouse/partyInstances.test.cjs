@@ -27,7 +27,7 @@ test("owner recovery adopts only native-accepted exact-phase visits without prep
   f.adapter.resumeOwner = (actor, area, user) => {
     assert.equal(actor, 1); assert.equal(area.id, "town"); assert.equal(user, 7);
     assert.equal(f.authority.snapshot(actor).visit, null, "visit must follow native acceptance");
-    return { attempt: "resume-1", status: "Pending" };
+    return { attempt: "resume-1", status: "Pending", actor: 1, phase: "campaign:1:town" };
   };
   f.adapter.setInstance = () => assert.fail("Resume cannot rebind the existing phase");
   f.authority.recover(1, request);
@@ -62,8 +62,10 @@ test("invalid enrolled recovery and enrolled guest refusal never prepare a repla
 });
 
 test("malformed native resume acceptance cannot publish a visit or mark spawn handled", () => {
-  for (const resumed of [undefined, {}, { attempt: "", status: "Pending" },
-    { attempt: "x", status: "Failed" }, { attempt: "x", status: "unknown" }]) {
+  const accepted = { actor: 1, phase: "campaign:1:town", attempt: "x", status: "Pending" };
+  for (const resumed of [undefined, {}, { ...accepted, attempt: "" },
+    { ...accepted, status: "Failed" }, { ...accepted, status: "unknown" },
+    { ...accepted, actor: 2 }, { ...accepted, phase: "campaign:2:town" }]) {
     const f = fixture(); f.scopes.set(1, "campaign:1:town");
     const request = { userId: 7, handled: false };
     f.adapter.resumeOwner = () => resumed;
@@ -330,4 +332,26 @@ test("an invitation expires when its recipient leaves before accepting", () => {
   authority.accept(2, 1);
   authority.enter(2, 1, "town");
   assert.deepEqual(authority.snapshot(2).visit, { owner: 1, area: "town" });
+});
+
+test("a refused duplicate guest login leaves the active party visit intact", () => {
+  const { authority, adapter, scopes, disabled } = fixture();
+  authority.enter(1, 1, "town");
+  authority.invite(1, 2); authority.accept(2, 1);
+  authority.enter(2, 1, "town");
+  adapter.assignedElsewhere = (actor, user) => actor === 2 && user === 8;
+  adapter.resumeOwner = () => { throw Error("guest already assigned"); };
+  assert.throws(() => authority.recover(2, { userId: 8, handled: false }), /already assigned/);
+  assert.deepEqual(authority.snapshot(2).visit, { owner: 1, area: "town" });
+  assert.equal(scopes.get(2), "campaign:1:town");
+  assert.ok(authority.sameParty(1, 2));
+  assert.equal(disabled.size, 0);
+});
+
+test("a guest cannot adopt a host snapshot as a personal recovery", () => {
+  const { authority, scopes } = fixture();
+  scopes.set(2, "campaign:1:town");
+  assert.throws(() => authority.confirmPersonalResume(2, "campaign:1:town"));
+  assert.throws(() => authority.confirmPersonalResume(2, "campaign:2:town"));
+  assert.equal(authority.snapshot(2).visit, null);
 });

@@ -1203,14 +1203,20 @@ bool QuestScriptRuntime::Execute(
 
     std::optional<std::map<uint32_t, std::vector<uint32_t>>> actorReferences;
     std::set<std::pair<uint32_t, uint32_t>> resolvingAliases;
-    std::function<VarValue(CampaignAliasObject&)> aliasTarget;
-    aliasTarget = [&](CampaignAliasObject& object) -> VarValue {
+    std::function<VarValue(CampaignAliasObject&, bool)> readAliasTarget;
+    readAliasTarget = [&](CampaignAliasObject& object,
+                          bool staticLocation) -> VarValue {
       const auto& def = object.Definition();
       const auto id = object.QuestId();
       // A stopped/unstarted quest has no active alias instance.
       if (QuestJournal::Get(actor, id).at("running") != true)
         return VarValue::None();
       QuestJournal::RequireAdapter(actor, id);
+      if (staticLocation &&
+          (def.kind != espm::QuestAliasDefinition::Kind::Location ||
+           def.Unsigned("KSIZ").value_or(0)))
+        throw std::runtime_error("Location conditions require a location "
+                                 "alias without keyword effects");
       const auto stateKey = questKey(id) + "/alias:" + std::to_string(def.id);
       auto validateTarget = [&](uint32_t target) {
         auto resolved = resolve(target);
@@ -1302,7 +1308,7 @@ bool QuestScriptRuntime::Execute(
         const auto other =
           std::dynamic_pointer_cast<CampaignAliasObject>(resolveAlias(
             record.ToGlobalId(*external), static_cast<uint32_t>(*aliasId)));
-        const auto value = aliasTarget(*other);
+        const auto value = readAliasTarget(*other, staticLocation);
         if (static_cast<IGameObject*>(value))
           target = formId(value);
       }
@@ -1315,6 +1321,9 @@ bool QuestScriptRuntime::Execute(
       const auto result = validateTarget(*target);
       state.SetAliasBinding(stateKey, questKey(*target));
       return result;
+    };
+    auto aliasTarget = [&](CampaignAliasObject& object) {
+      return readAliasTarget(object, false);
     };
     for (const auto* method :
          { "GetReference", "GetRef", "GetActorReference", "GetActorRef" }) {
@@ -1472,19 +1481,21 @@ bool QuestScriptRuntime::Execute(
       throw std::runtime_error("Conditional quest variable does not exist: " +
                                name);
     };
-    auto conditionAlias = [&](uint32_t id, uint32_t aliasId) {
-      const auto object = std::dynamic_pointer_cast<CampaignAliasObject>(
-        resolveAlias(id, aliasId));
-      if (!object ||
-          object->Definition().kind !=
-            espm::QuestAliasDefinition::Kind::Reference)
-        throw std::runtime_error("Condition requires a reference alias");
-      const auto value = aliasTarget(*object);
-      // GetIsAliasRef treats a proven empty alias as a nonmatch. Other
-      // physical predicates still reject zero in CampaignCondition::Read.
-      if (!static_cast<IGameObject*>(value))
-        return uint32_t{ 0 };
-      return formId(value);
+    using AliasKind = espm::QuestAliasDefinition::Kind;
+    auto conditionAlias = [&](AliasKind kind) {
+      return [&, kind](uint32_t id, uint32_t aliasId) {
+        const auto object = std::dynamic_pointer_cast<CampaignAliasObject>(
+          resolveAlias(id, aliasId));
+        if (!object || object->Definition().kind != kind)
+          throw std::runtime_error(kind == AliasKind::Location
+                                     ? "Condition requires a location alias"
+                                     : "Condition requires a reference alias");
+        const auto value =
+          readAliasTarget(*object, kind == AliasKind::Location);
+        if (!static_cast<IGameObject*>(value))
+          return uint32_t{ 0 };
+        return formId(value);
+      };
     };
     size_t depth = 0;
     std::set<std::pair<uint32_t, uint16_t>> activeStages;
@@ -1709,10 +1720,11 @@ bool QuestScriptRuntime::Execute(
           throw std::runtime_error("Quest job work limit exceeded");
         const bool resuming = managed && work->cursor == "waiting";
         if (!resuming) {
-          const bool passes =
-            CampaignCondition::Evaluate(logs[logIndex].conditions,
-                                        { actor, targetId, readGlobalId,
-                                          readQuestVariable, conditionAlias });
+          const bool passes = CampaignCondition::Evaluate(
+            logs[logIndex].conditions,
+            { actor, targetId, readGlobalId, readQuestVariable,
+              conditionAlias(AliasKind::Reference),
+              conditionAlias(AliasKind::Location) });
           if (!passes) {
             if (managed)
               work->log = static_cast<uint32_t>(logIndex + 1);

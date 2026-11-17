@@ -523,6 +523,48 @@ class DependencyTests(unittest.TestCase):
             self.assertIn("condition.flags", quest["features"])
             self.assertEqual(capability_status("condition.flags", registry), "missing")
 
+    def test_stage_location_alias_conditions_map_the_second_operand_only(self):
+        origins = ["Skyrim.esm", "Dragonborn.esm"]
+        registry = json.loads(Path(__file__).with_name("quest_capabilities.json").read_text())
+        stage = [(b"INDX", struct.pack("<HBB", 10, 0, 0)), (b"QSDT", b"\0")]
+        for function, kind in ((605, "LCTN"), (610, "KYWD")):
+            with self.subTest(function=function):
+                condition = bytearray(32)
+                struct.pack_into("<H", condition, 8, function)
+                struct.pack_into("<IIIii", condition, 12, 0, 0x01000031, 0, -1, -1)
+                values = stage + [(b"CTDA", bytes(condition)), (b"ANAM", b""),
+                    (b"ALLS", struct.pack("<I", 0)), (b"ALED", b"")]
+                quest = summarize_record("QUST", 0, 0x0100002a, values, (), origins, origins[1])
+                target = summarize_record(kind, 0, 0x01000031, (), (), origins, origins[1])
+                row = analyze({r["id"]: r for r in (quest, target)}, {}, registry)["quests"][0]
+                caps = {c["id"]: c["status"] for c in row["capabilities"]}
+                self.assertEqual(quest["refs"], {target["id"]})
+                self.assertEqual(caps[f"condition:{function}"], "implemented-subset")
+                self.assertEqual(caps["alias.location"], "missing")
+                self.assertEqual(caps["alias.fill.matching-or-script"], "missing")
+                self.assertEqual(row["status"], "untested")
+                self.assertNotIn("condition.alias-parameter", caps)
+
+                for flags in (2, 8):
+                    condition[0] = flags
+                    marked = summary(values=stage + [(b"CTDA", bytes(condition))])
+                    self.assertEqual(marked["refs"], set())
+                    self.assertIn("condition.flags", marked["features"])
+                condition[0] = 0
+                for run_on in (0, 1, 2, 5):
+                    struct.pack_into("<iII", condition, 12, -1, 0, run_on)
+                    struct.pack_into("<I", condition, 24, 0x14)
+                    marked = summary(values=[(b"CTDA", bytes(condition))])
+                    self.assertIn("condition.alias-parameter", marked["features"])
+                    self.assertIn("condition.static-operand", marked["features"])
+                    self.assertIn("condition.non-stage-evaluation", marked["features"])
+                    if run_on:
+                        self.assertIn(f"condition.run-on:{run_on}", marked["features"])
+                struct.pack_into("<iII", condition, 12, 0x12, 0xff000031, 0)
+                marked = summary(values=stage + [(b"CTDA", bytes(condition))])
+                self.assertEqual(marked["refs"], set())
+                self.assertIn("condition.static-operand", marked["features"])
+
     def test_alias_reference_comparison_does_not_erase_fill_dependencies(self):
         condition = bytearray(32)
         struct.pack_into("<H", condition, 8, 566)

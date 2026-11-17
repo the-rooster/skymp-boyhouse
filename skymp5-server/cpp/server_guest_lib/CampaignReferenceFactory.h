@@ -1,10 +1,13 @@
 #pragma once
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <nlohmann/json_fwd.hpp>
 #include <string>
 #include <vector>
 
 class MpActor;
+class SaveReceipt;
 class NiPoint3;
 
 // Trusted server allocation. Defaults are selected once, then saved with the
@@ -39,6 +42,16 @@ public:
                                    const NiPoint3& center, float radius);
 
 private:
+  friend class PartOne;
+  // Return a cold-restored visitor to their own disabled personal row. The
+  // caller holds network and scheduler authority until the exact receipt and
+  // a subsequent owner projection complete. stillCurrent only reads that
+  // authority, and must never publish, allocate, or dispatch callbacks.
+  static std::shared_ptr<const SaveReceipt> RecoverVisitor(
+    MpActor& actor, const std::string& expectedForeignPhase,
+    const std::string& areaId, uint32_t worldOrCell, const NiPoint3& center,
+    float radius, uint32_t encounterLevel,
+    const std::function<bool()>& stillCurrent);
   static std::vector<uint32_t> EnsureForInstance(
     MpActor& owner, const std::string& instance,
     const std::vector<uint32_t>& originals, uint32_t encounterLevel);

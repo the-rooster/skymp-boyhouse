@@ -190,9 +190,9 @@ function loadSystem(name, dependencies) {
   return module.exports;
 }
 
-async function systemsFixture(resumeResult = { attempt: "attempt-1", status: "Pending" }) {
+async function systemsFixture(resumeResult = { attempt: "attempt-1", actor, phase, status: "Pending" }, savedPhase = phase) {
   const calls = [], gm = new EventEmitter();
-  let assigned = 0, connected = true;
+  let assigned = 0, connected = true, currentPhase = savedPhase;
   const settings = { allSettings: { boyhouseInstances: { experimental: true, projection: true, areas: [area] } },
     startPoints: [{ pos: [0, 0, 0], angleZ: 0, worldOrCell: 60 }] };
   const dependencies = { "../settings": { Settings: { get: async () => settings } },
@@ -200,7 +200,7 @@ async function systemsFixture(resumeResult = { attempt: "attempt-1", status: "Pe
   const { CampaignInstances } = loadSystem("campaignInstances.ts", dependencies);
   const { Spawn } = loadSystem("spawn.ts", dependencies);
   const svr = {
-    get: (_id, key) => ({ type: "MpActor", worldInstance: phase, campaignReferences: manifest() })[key],
+    get: (_id, key) => ({ type: "MpActor", worldInstance: currentPhase, campaignReferences: manifest() })[key],
     set: (_id, key, value) => calls.push(["set", key, value]),
     getActorsByProfileId: () => [actor],
     getUserActor: () => assigned,
@@ -213,8 +213,14 @@ async function systemsFixture(resumeResult = { attempt: "attempt-1", status: "Pe
     resumeCampaignActor: (user, id, expected, definition) => {
       calls.push(["resume", user, id, expected, structuredClone(definition)]);
       if (resumeResult instanceof Error) throw resumeResult;
-      if (resumeResult) assigned = id;
+      if (resumeResult) { assigned = id; currentPhase = resumeResult.phase; }
       return resumeResult;
+    },
+    getCampaignResume: () => resumeResult,
+    completeCampaignResume: (_user, attempt, _epoch, proof, publishReady) => {
+      if (attempt !== resumeResult.attempt || proof !== "current-proof") return false;
+      publishReady();
+      return true;
     },
     detachCampaignActor: () => { calls.push(["detach"]); return resumeResult !== null; },
     setCampaignVisibilityCallbacks() {},
@@ -230,7 +236,7 @@ async function systemsFixture(resumeResult = { attempt: "attempt-1", status: "Pe
 test("real spawn hook adopts the native resume without enable, rebind, or allocation", async () => {
   const f = await systemsFixture(); f.fire();
   assert.deepEqual(f.calls, [
-    ["resume", 0, actor, phase, { id: "town", worldOrCell: 60, center: [0, 0, 0], radius: 50 }],
+    ["resume", 0, actor, phase, { id: "town", worldOrCell: 60, center: [0, 0, 0], radius: 50, encounterLevel: area.encounterLevel }],
     ["set", "private.discordRoles", ["role"]],
   ]);
   assert.deepEqual(f.instances.authority.snapshot(actor).visit, { owner: actor, area: "town" });
@@ -261,4 +267,36 @@ test("disconnect preserves party cleanup order and routes enrolled actors throug
   f.instances.disconnect(0, f.ctx);
   f.spawn.disconnect(0, f.ctx);
   assert.deepEqual(f.calls, [["party-leave"], ["detach"]]);
+});
+
+test("a cold visitor becomes a personal host only after the matching native acknowledgement", async () => {
+  const result = { attempt: "guest-return", actor, phase, status: "Pending" };
+  const f = await systemsFixture(result, `campaign:${actor + 1}:town`);
+  f.fire();
+  const authority = f.instances.authority;
+  const complete = f.instances.projection.adapter.completeResume;
+  assert.equal(authority.snapshot(actor).visit, null);
+  assert.equal(complete(0, "stale-attempt", "epoch", "current-proof", assert.fail), false);
+  assert.equal(complete(0, result.attempt, "epoch", "stale-proof", assert.fail), false);
+  assert.equal(authority.snapshot(actor).visit, null);
+  assert.equal(complete(0, result.attempt, "epoch", "current-proof", () => {
+    assert.equal(authority.snapshot(actor).visit, null);
+  }), true);
+  assert.deepEqual(authority.snapshot(actor).visit, { owner: actor, area: "town" });
+});
+
+test("a failed spawn cannot quarantine a replacement in the same numeric slot", async () => {
+  const f = await systemsFixture();
+  const feed = f.instances.projection;
+  f.ctx.svr.setGameplayBlocked = () => {};
+  f.ctx.svr.beginPacketEpoch = () => "a".repeat(32);
+  feed.connect(0);
+  f.ctx.svr.resumeCampaignActor = () => {
+    feed.disconnect(0);
+    feed.connect(0);
+    throw Error("connection changed during storage preflight");
+  };
+  assert.throws(f.fire, /connection changed/);
+  assert.deepEqual(f.calls, []);
+  assert.equal(f.ctx.svr.isConnected(0), true);
 });

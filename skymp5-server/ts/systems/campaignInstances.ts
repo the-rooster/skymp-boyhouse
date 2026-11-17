@@ -25,11 +25,15 @@ export class CampaignInstances implements System {
           instanceArea: area.id, encounterLevel: area.encounterLevel,
           area: { worldOrCell: area.worldOrCell, center: area.center, radius: area.radius },
         }),
-      resumeOwner: config.projection === true ? (actor: number, area: { id: string; worldOrCell: number; center: number[]; radius: number }, user: number) => {
+      resumeOwner: config.projection === true ? (actor: number, area: { id: string; worldOrCell: number; center: number[]; radius: number; encounterLevel: number }, user: number) => {
         return ctx.svr.resumeCampaignActor(user, actor, api.get(actor, "worldInstance"), {
-          id: area.id, worldOrCell: area.worldOrCell, center: [...area.center], radius: area.radius,
+          id: area.id, worldOrCell: area.worldOrCell, center: [...area.center], radius: area.radius, encounterLevel: area.encounterLevel,
         });
       } : undefined,
+      assignedElsewhere: (actor: number, requester: number) => {
+        const assigned = ctx.svr.getUserByActor(actor);
+        return assigned !== requester && ctx.svr.isConnected(assigned);
+      },
       setInstance: (id: number, key: string) => {
         this.projection?.pauseActor(id);
         api.set(id, "worldInstance", key);
@@ -44,13 +48,14 @@ export class CampaignInstances implements System {
         // an assigned actor. Remove that authority before closing the socket.
         const user = ctx.svr.getUserByActor(id);
         const connected = ctx.svr.isConnected(user);
+        const current = this.projection?.captureConnection(user);
         try {
           if (!connected || !ctx.svr.detachCampaignActor(user)) {
             if (connected) ctx.svr.setUserActor(user, 0);
             api.setEnabled(id, false);
           }
         }
-        finally { if (connected) ctx.svr.kick(user); }
+        finally { if (connected && (!current || current())) ctx.svr.kick(user); }
       },
       isInside: (id: number, area: { worldOrCell: number; center: number[]; radius: number }) => {
         const pos = ctx.svr.getActorPos(id);
@@ -68,8 +73,13 @@ export class CampaignInstances implements System {
       baseline: (user: number, epoch: string) => ctx.svr.getWorldBaseline(user, epoch),
       resume: (user: number) => ctx.svr.getCampaignResume(user),
       captureResume: (user: number, epoch: string) => ctx.svr.captureCampaignResumeProjection(user, epoch),
-      completeResume: (user: number, attempt: string, epoch: string, proof: string, publishReady: () => void) =>
-        ctx.svr.completeCampaignResume(user, attempt, epoch, proof, publishReady),
+      completeResume: (user: number, attempt: string, epoch: string, proof: string, publishReady: () => void) => {
+        const resume = ctx.svr.getCampaignResume(user);
+        if (!resume || resume.attempt !== attempt) return false;
+        const accepted = ctx.svr.completeCampaignResume(user, attempt, epoch, proof, publishReady);
+        if (accepted) this.authority!.confirmPersonalResume(resume.actor, resume.phase);
+        return accepted;
+      },
       block: (user: number, blocked: boolean) => ctx.svr.setGameplayBlocked(user, blocked),
       send: (user: number, packet: unknown) => ctx.svr.sendCustomPacket(user, JSON.stringify(packet)),
       close: (user: number, error: unknown) => {
@@ -90,11 +100,12 @@ export class CampaignInstances implements System {
     }
     // Spawn emits this before enabling or subscribing a saved character.
     ctx.gm.on("beforeSpawn", (actor: number, request?: { userId: number; handled: boolean }) => {
-      try { this.authority?.recover(actor, request); }
+      const current = request && this.projection?.captureConnection(request.userId);
+      try { this.authority?.recover(actor, request, current); }
       catch (error) {
         // Resume validation can fail before native actor assignment. Close the
         // requesting connection even when quarantine cannot find it by actor.
-        if (request && ctx.svr.isConnected(request.userId)) ctx.svr.kick(request.userId);
+        if (request && ctx.svr.isConnected(request.userId) && (!current || current())) ctx.svr.kick(request.userId);
         throw error;
       }
     });

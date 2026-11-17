@@ -172,6 +172,7 @@ def summarize_record(typ, flags, form, values, groups, origins, plugin):
             run_on, reference, alias_id = struct.unpack_from("<IIi", data, 20)
             stage_log = context.startswith("stage:") and typ == "QUST" and has_stage_log
             physical = index in (35, 46, 47, 71, 73, 566)
+            location_alias = index in (605, 610)
             feature(f"condition:{index}", where)
             if op & 0x1a or op >> 5 > 5:
                 feature("condition.flags", where)
@@ -188,18 +189,22 @@ def summarize_record(typ, flags, form, values, groups, origins, plugin):
                 feature("condition.stage-run-on:5:reference-alias", where)
             elif physical and run_on == 0:
                 feature("condition.run-on:0:physical", where)
-            elif run_on != 0 and not (not physical and run_on == 2 and reference_key == "Skyrim.esm:000014"):
+            elif run_on != 0 and not (not physical and not location_alias and run_on == 2 and reference_key == "Skyrim.esm:000014"):
                 feature(f"condition.run-on:{run_on}", where)
             if not stage_log:
                 feature("condition.non-stage-evaluation", where)
-            if index == 566:
-                # GetIsAliasRef's first argument is a quest-local signed alias
-                # ID even without UseAliases. Never remap it as a FormID, and
-                # retain alias lifecycle/fill dependencies despite the narrow
-                # condition implementation.
-                feature("alias.reference", where)
+            if index == 566 or location_alias:
+                # Byte 12 holds a signed owning-quest alias ID. The location
+                # predicates separately encode a LCTN/KYWD FormID at byte 16.
+                feature("alias.location" if location_alias else "alias.reference", where)
                 if struct.unpack_from("<i", data, 12)[0] < 0:
                     feature("condition.alias-parameter", where)
+                if location_alias and not op & 0x0a:
+                    operand = struct.unpack_from("<I", data, 16)[0]
+                    if not operand or operand >= 0xff000000:
+                        feature("condition.static-operand", where)
+                    else:
+                        ref(operand, where)
             if index in (47, 56, 58, 59, 71, 73, 74, 543, 629) and not op & 0x0a:
                 ref(struct.unpack_from("<I", data, 12)[0], where)
         elif tag == b"QSDT" and typ == "QUST":

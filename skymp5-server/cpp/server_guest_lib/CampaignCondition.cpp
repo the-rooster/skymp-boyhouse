@@ -5,6 +5,7 @@
 #include "QuestJournal.h"
 #include "WorldState.h"
 #include "libespm/LIGH.h"
+#include "libespm/RecordHeaderAccess.h"
 #include "libespm/Utils.h"
 #include <algorithm>
 #include <climits>
@@ -54,6 +55,50 @@ void ValidateReference(MpActor& actor, uint32_t id, bool actorOnly)
       actorOnly ? "Campaign actor condition requires a placed actor reference"
                 : "Campaign condition requires a placed reference");
 }
+
+espm::LookupResult StaticOperand(MpActor& actor, uint32_t id, const char* type)
+{
+  auto* world = actor.GetParent();
+  if (!world || !id || id >= 0xff000000)
+    throw std::runtime_error("Expected a static location condition operand");
+  const auto record = world->GetEspm().GetBrowser().LookupById(id);
+  if (!record.rec || record.rec->IsDeleted() || record.rec->GetType() != type)
+    throw std::runtime_error(std::string("Location condition requires ") +
+                             type);
+  return record;
+}
+
+bool LocationHasKeyword(WorldState& world, const espm::LookupResult& location,
+                        uint32_t keyword)
+{
+  std::optional<uint32_t> count, entries;
+  bool found = false;
+  espm::RecordHeaderAccess::IterateFields(
+    location.rec,
+    [&](const char* tag, uint32_t size, const char* bytes) {
+      if (!std::memcmp(tag, "KSIZ", 4)) {
+        if (count || size != sizeof(uint32_t))
+          throw std::runtime_error("Invalid location keyword count");
+        uint32_t value;
+        std::memcpy(&value, bytes, sizeof(value));
+        count = value;
+      } else if (!std::memcmp(tag, "KWDA", 4)) {
+        if (entries || size % sizeof(uint32_t))
+          throw std::runtime_error("Invalid location keywords");
+        entries = size / sizeof(uint32_t);
+        for (uint32_t i = 0; i < *entries; ++i) {
+          uint32_t raw;
+          std::memcpy(&raw, bytes + i * sizeof(raw), sizeof(raw));
+          if (raw && location.ToGlobalId(raw) == keyword)
+            found = true;
+        }
+      }
+    },
+    world.GetEspmCache());
+  if (count.value_or(0) != entries.value_or(0) || (entries && !count))
+    throw std::runtime_error("Location keyword count mismatch");
+  return found;
+}
 }
 
 CampaignCondition CampaignCondition::Compile(const espm::CTDA& data,
@@ -75,6 +120,8 @@ CampaignCondition CampaignCondition::Compile(const espm::CTDA& data,
     case 74:
     case 543:
     case 566:
+    case 605:
+    case 610:
     case 629:
       result.function = static_cast<Function>(data.functionIndex);
       break;
@@ -87,6 +134,8 @@ CampaignCondition CampaignCondition::Compile(const espm::CTDA& data,
     result.function == Function::InFaction ||
     result.function == Function::FactionRank ||
     result.function == Function::IsAliasRef;
+  const bool locationAlias = result.function == Function::LocAliasIsLocation ||
+    result.function == Function::LocAliasHasKeyword;
   if (physical) {
     if (data.runOnType == espm::CTDA::RunOnTypeFlags::Reference) {
       result.selector = Selector::Reference;
@@ -109,7 +158,8 @@ CampaignCondition CampaignCondition::Compile(const espm::CTDA& data,
         "Unsupported physical quest condition run-on context");
     }
   } else if (data.runOnType != espm::CTDA::RunOnTypeFlags::Subject &&
-             !(data.runOnType == espm::CTDA::RunOnTypeFlags::Reference &&
+             !(!locationAlias &&
+               data.runOnType == espm::CTDA::RunOnTypeFlags::Reference &&
                mapForm(static_cast<uint32_t>(data.reference)) == 0x14)) {
     // Preserve the existing context acceptance for predicates whose receiver
     // is the campaign journal/global/conditional script, not a physical actor.
@@ -117,17 +167,27 @@ CampaignCondition CampaignCondition::Compile(const espm::CTDA& data,
   }
   espm::CTDA::DefaultData parameters{};
   std::memcpy(&parameters, data.functionData, sizeof(parameters));
-  if (result.function == Function::IsAliasRef) {
+  result.parameter2 = parameters.secondParameter;
+  if (locationAlias || result.function == Function::IsAliasRef) {
     // The operand at byte 12 is another owning-quest alias ID, independent
     // of the run-on alias at byte 28. Neither is a plugin-relative FormID.
     if (parameters.firstParameter > INT_MAX)
       throw std::runtime_error(
-        "GetIsAliasRef requires a nonnegative alias ID");
+        "Quest condition requires a nonnegative alias ID");
     result.parameter1 = parameters.firstParameter;
+    if (locationAlias) {
+      if (!parameters.secondParameter ||
+          parameters.secondParameter >= 0xff000000)
+        throw std::runtime_error(
+          "Location condition requires a static operand");
+      result.parameter2 = mapForm(parameters.secondParameter);
+      if (!result.parameter2 || result.parameter2 >= 0xff000000)
+        throw std::runtime_error(
+          "Location condition requires a static operand");
+    }
   } else if (result.function != Function::Disabled &&
              result.function != Function::Dead)
     result.parameter1 = mapForm(parameters.firstParameter);
-  result.parameter2 = parameters.secondParameter;
   result.comparison = data.GetOperator();
   result.orNext = (data.operatorFlag & 1) != 0;
   if (data.operatorFlag & 4) {
@@ -161,6 +221,23 @@ void CampaignCondition::Validate() const
 
 double CampaignCondition::Read(const Context& context) const
 {
+  if (function == Function::LocAliasIsLocation ||
+      function == Function::LocAliasHasKeyword) {
+    if (!context.resolveLocationAlias)
+      throw std::runtime_error(
+        "Quest condition requires a location alias resolver");
+    const auto id =
+      context.resolveLocationAlias(context.owningQuest, parameter1);
+    if (!id)
+      return 0;
+    const auto location = StaticOperand(context.actor, id, "LCTN");
+    // Both predicates inspect the aliased location itself. Parent locations
+    // do not supply an identity match or inherited keywords.
+    if (function == Function::LocAliasIsLocation)
+      return id == parameter2;
+    return LocationHasKeyword(*context.actor.GetParent(), location,
+                              parameter2);
+  }
   if (function == Function::IsAliasRef) {
     if (!context.resolveReferenceAlias)
       throw std::runtime_error(
@@ -310,6 +387,10 @@ bool CampaignCondition::Evaluate(
                           condition.function == Function::FactionRank);
     if (condition.function == Function::ItemCount)
       ValidateItem(context.actor, condition.parameter1);
+    if (condition.function == Function::LocAliasIsLocation)
+      StaticOperand(context.actor, condition.parameter2, "LCTN");
+    if (condition.function == Function::LocAliasHasKeyword)
+      StaticOperand(context.actor, condition.parameter2, "KYWD");
     if (condition.function == Function::InFaction ||
         condition.function == Function::FactionRank)
       CampaignFactionApi::ValidateFaction(context.actor, condition.parameter1);

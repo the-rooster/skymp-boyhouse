@@ -182,7 +182,7 @@ class PartyInstances {
     return changed;
   }
 
-  recover(actor, request) {
+  recover(actor, request, current = () => true) {
     this.actor(actor);
     const saved = this.adapter.getInstance(actor);
     if (!saved) { this.visits.delete(actor); return; }
@@ -190,8 +190,10 @@ class PartyInstances {
     const owner = match ? Number(match[1]) : 0;
     if (!match || !this.areas.has(match[2]) || !Number.isInteger(owner) ||
         owner <= 0 || owner > 0xffffffff || String(owner) !== match[1]) {
-      this.quarantine(actor);
-      this.reconcile();
+      if (current() && (!request || !this.adapter.assignedElsewhere?.(actor, request.userId))) {
+        this.quarantine(actor);
+        this.reconcile();
+      }
       throw new Error("Saved instance needs administrator recovery");
     }
     const areaId = match[2];
@@ -205,11 +207,21 @@ class PartyInstances {
         // Only native admission can distinguish an unenrolled character from
         // an invalid enrolled context. The latter must never be rebound here.
         const resumed = this.adapter.resumeOwner(actor, this.areas.get(areaId), request.userId);
+        if (!current()) throw new Error("Campaign spawn connection was replaced");
         if (resumed !== null) {
-          if (owner !== actor || !resumed || typeof resumed.attempt !== "string" ||
+          const personal = this.key(actor, areaId);
+          if (!resumed || resumed.actor !== actor || resumed.phase !== personal ||
+              this.adapter.getInstance(actor) !== personal || typeof resumed.attempt !== "string" ||
               !resumed.attempt || !["Pending", "ProjectionReady"].includes(resumed.status))
             throw new Error("Campaign resume was not accepted");
-          this.visits.set(actor, { owner, area: areaId });
+          if (owner === actor) {
+            this.visits.set(actor, { owner, area: areaId });
+          } else {
+            // Cold visitors return to their own campaign. Their visit becomes
+            // visible to party commands after the native projection completes.
+            this.visits.delete(actor);
+            this.removeMembership(actor);
+          }
           request.handled = true;
           return;
         }
@@ -218,9 +230,20 @@ class PartyInstances {
         this.transition(actor, authorizedOwner, areaId);
       } else this.transition(actor, null);
     } catch (error) {
-      this.quarantine(actor);
+      // The requesting socket can lose a race to the character's existing
+      // connection. Only the requester should be closed in that case.
+      if (current() && (!request || !this.adapter.assignedElsewhere?.(actor, request.userId)))
+        this.quarantine(actor);
       throw error;
-    } finally { this.reconcile(); }
+    } finally { if (current()) this.reconcile(); }
+  }
+
+  confirmPersonalResume(actor, phase) {
+    const area = phase.slice(phase.lastIndexOf(":") + 1);
+    if (!this.areas.has(area) || phase !== this.key(actor, area) ||
+        this.adapter.getInstance(actor) !== phase)
+      throw new Error("Completed recovery disagrees with the personal campaign");
+    this.visits.set(actor, { owner: actor, area });
   }
 
   snapshot(actor) {

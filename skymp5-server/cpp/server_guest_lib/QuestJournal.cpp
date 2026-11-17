@@ -1169,19 +1169,29 @@ std::shared_ptr<const SaveReceipt> QuestJournal::AtomicImpl(
     throw std::runtime_error("Unregistered quest transaction participant");
   auto& owner = Owner(actor);
   auto& world = *actor.GetParent();
-  const auto resumeLease = world.GetQuestJobs().RequireJournalAccess(
-    actor, admissions && admissions->empty());
-  if (durable)
-    world.RequireDurableSaveStorage();
   const auto actorId = actor.GetFormId(), ownerId = owner.GetFormId();
-  // Keep both objects alive and require the same registered identities at
-  // commit.
+  // A backend capability callback may remove or replace either participant.
   const auto actorLifetime = world.LookupFormByIdNoLoad(actorId);
   const auto ownerLifetime = world.LookupFormByIdNoLoad(ownerId);
   if (actorLifetime.get() != &actor || ownerLifetime.get() != &owner)
     throw std::runtime_error("Unregistered quest transaction participant");
   const auto actorEpoch = actor.GetWorldInstanceEpoch();
   const auto ownerEpoch = owner.GetWorldInstanceEpoch();
+  const auto validateContext = [&] {
+    if (world.LookupFormByIdNoLoad(actorId) != actorLifetime ||
+        world.LookupFormByIdNoLoad(ownerId) != ownerLifetime ||
+        &Owner(actor) != &owner ||
+        actor.GetWorldInstanceEpoch() != actorEpoch ||
+        owner.GetWorldInstanceEpoch() != ownerEpoch)
+      throw std::runtime_error("Quest context changed during execution");
+  };
+  const auto resumeLease = world.GetQuestJobs().RequireJournalAccess(
+    actor, admissions && admissions->empty());
+  if (durable) {
+    world.RequireDurableSaveStorage();
+    validateContext();
+    world.GetQuestJobs().ValidateJournalAccess(actor, resumeLease);
+  }
   const auto initial = Read(owner);
   const auto initialJobs = std::make_shared<const QuestJobState>(
     initial.contains("jobs") ? QuestJobState::Read(initial.at("jobs"))
@@ -1243,12 +1253,7 @@ std::shared_ptr<const SaveReceipt> QuestJournal::AtomicImpl(
   try {
     execute();
     const auto validateReads = [&] {
-      if (world.LookupFormByIdNoLoad(actorId) != actorLifetime ||
-          world.LookupFormByIdNoLoad(ownerId) != ownerLifetime ||
-          &Owner(actor) != &owner ||
-          actor.GetWorldInstanceEpoch() != actorEpoch ||
-          owner.GetWorldInstanceEpoch() != ownerEpoch)
-        throw std::runtime_error("Quest context changed during execution");
+      validateContext();
       if (owner.GetDynamicFields().GetValueDump(kProperty) != initialJournal)
         throw std::runtime_error(
           "Campaign journal changed outside its transaction");
@@ -1482,6 +1487,8 @@ QuestJobState QuestJournal::PersonalJobState(MpActor& owner)
 
 void QuestJournal::RequireJobAccess(MpActor& actor)
 {
+  if (auto* world = actor.GetParent())
+    world->GetQuestJobs().RequireVisitorReturned(actor);
   RequirePersonalJobAccess(Owner(actor));
 }
 

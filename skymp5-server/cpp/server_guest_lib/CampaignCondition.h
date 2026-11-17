@@ -25,6 +25,9 @@ public:
     // Return a logical original, never a physical copy ID. Zero means a proven
     // empty alias; missing definitions and unsupported fill modes must throw.
     std::function<uint32_t(uint32_t, uint32_t)> resolveReferenceAlias;
+    // Returns a static LCTN for the owning quest's location alias, or zero
+    // for a proven empty binding.
+    std::function<uint32_t(uint32_t, uint32_t)> resolveLocationAlias{};
   };
 
   // Compile every CTDA before evaluating any branch. Unsupported functions,
@@ -50,6 +53,8 @@ private:
     Global = 74,
     QuestCompleted = 543,
     IsAliasRef = 566,
+    LocAliasIsLocation = 605,
+    LocAliasHasKeyword = 610,
     QuestVariable = 629
   };
   enum class Selector

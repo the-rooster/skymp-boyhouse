@@ -40,6 +40,7 @@ struct GridPosInfo
 class MpActor;
 class WorldState;
 class CampaignMovementPlan;
+class SaveReceipt;
 class OccupantDestroyEventSink;
 class OccupantDisableEventSink;
 
@@ -85,6 +86,7 @@ class MpObjectReference
   friend class OccupantDisableEventSink;
   friend class WorldState;
   friend class CampaignMovementPlan;
+  friend class CampaignReferenceFactory;
 
 public:
   static const char* Type() { return "ObjectReference"; }
@@ -239,6 +241,12 @@ protected:
                                    bool reliable) const;
 
 private:
+  void CommitVisitorPhase(
+    MpChangeForm& prepared,
+    const std::shared_ptr<const SaveReceipt>& receipt) noexcept;
+  nlohmann::json PersonalRecoveryPrimitive(
+    const std::string& original, const NiPoint3& sourcePosition) const;
+  void RequireIsolatedVisitor() const;
   void CommitPreparedCampaignChange(MpChangeForm& prepared) noexcept;
   void AddContainerObject(const espm::CONT::ContainerObject& containerObject,
                           std::map<uint32_t, uint32_t>* itemsToAdd);

@@ -5,6 +5,7 @@
 #include "QuestScriptRuntime.h"
 #include "QuestVmState.h"
 #include "TestUtils.hpp"
+#include "libespm/RecordHeaderAccess.h"
 #include "papyrus-vm/Reader.h"
 #include "script_storages/BsaArchiveScriptStorage.h"
 #include <climits>
@@ -19,6 +20,8 @@ constexpr uint32_t kAlchemy = 0x10557c;
 constexpr uint32_t kSmithing = 0x105385;
 constexpr uint32_t kQuest = 0x4e50d;
 constexpr uint32_t kNpc = 0x1a677;
+constexpr uint32_t kCr05 = 0x2522f;
+constexpr uint32_t kSiege = 0x96e71;
 using RunOn = espm::CTDA::RunOnTypeFlags;
 
 espm::CTDA Clause(RunOn runOn, uint32_t reference, uint32_t operand,
@@ -41,6 +44,14 @@ espm::CTDA Clause(RunOn runOn, uint32_t reference, uint32_t operand,
 CampaignCondition Compile(const espm::CTDA& condition)
 {
   return CampaignCondition::Compile(condition, [](uint32_t id) { return id; });
+}
+
+espm::CTDA LocationCondition(uint16_t function, uint32_t alias, uint32_t form)
+{
+  auto condition = Clause(RunOn::Subject, 0, alias);
+  condition.functionIndex = function;
+  std::memcpy(condition.functionData + sizeof(alias), &form, sizeof(form));
+  return condition;
 }
 
 struct Fixture
@@ -71,7 +82,8 @@ struct Fixture
     actor.SetInventory(Inventory().AddItem(0xf, 10));
     actor.SetPropertyValueDump(
       QuestJournal::kEnabled,
-      "[\"4e50d:Skyrim.esm\",\"10557c:Skyrim.esm\",\"105385:Skyrim.esm\"]",
+      "[\"4e50d:Skyrim.esm\",\"10557c:Skyrim.esm\",\"105385:Skyrim.esm\","
+      "\"2522f:Skyrim.esm\"]",
       false, false);
     return actor;
   }
@@ -151,6 +163,7 @@ struct AuthoredFixture : Fixture
            { "Quest", "Form" },
            { "Alias", "" },
            { "ReferenceAlias", "Alias" },
+           { "LocationAlias", "Alias" },
            { "AliasIdentityFixture", "Quest" } }) {
       auto script = std::make_shared<PexScript>();
       script->source = name;
@@ -226,18 +239,17 @@ struct AuthoredFixture : Fixture
     metadata.fragments.push_back({ 10, log, 1, fragment->source, name });
   }
 
-  void BindGiver(uint32_t quest, uint32_t alias,
-                 std::optional<uint32_t> reference)
+  void BindAlias(uint32_t quest, uint32_t alias, std::optional<uint32_t> form)
   {
     QuestJournal::Atomic(*guest, [&] {
       QuestVmState state(QuestJournal::ScriptState(*guest), {}, {});
       state.SetAliasBinding(
         FormDesc::FromFormId(quest, server.worldState.espmFiles).ToString() +
           "/alias:" + std::to_string(alias),
-        reference ? nlohmann::json(FormDesc::FromFormId(
-                                     *reference, server.worldState.espmFiles)
-                                     .ToString())
-                  : nlohmann::json(nullptr));
+        form ? nlohmann::json(
+                 FormDesc::FromFormId(*form, server.worldState.espmFiles)
+                   .ToString())
+             : nlohmann::json(nullptr));
       QuestJournal::SetScriptState(*guest, state.Save());
     });
   }
@@ -419,7 +431,7 @@ TEST_CASE("Owned tutorial stage logs select the current quest-giver alias",
                                                   { 0x3a19f, 0x13650 } };
   for (size_t i = 0; i < targets.size(); ++i)
     f.AddAuthoredNpc(targets[i].first, targets[i].second, 0xff006030 + i);
-  f.BindGiver(quest, alchemy ? 0 : 5,
+  f.BindAlias(quest, alchemy ? 0 : 5,
               selected < 0 ? std::nullopt
                            : std::optional<uint32_t>(targets[selected].first));
   f.Fragment(0, 1);
@@ -450,7 +462,7 @@ TEST_CASE("Failure in an owned alias-selected log rolls back prior fragments",
 {
   AuthoredFixture f;
   f.AddAuthoredNpc(0x3a19b, 0x3a19a, 0xff006030);
-  f.BindGiver(kAlchemy, 0, 0x3a19b);
+  f.BindAlias(kAlchemy, 0, 0x3a19b);
   f.Fragment(0, 1);
   f.Fragment(1, 10, true);
   f.Fragment(2, 100);
@@ -460,4 +472,162 @@ TEST_CASE("Failure in an owned alias-selected log rolls back prior fragments",
                                      f.scripts),
     Catch::Matchers::ContainsSubstring("script is missing - 'Unknown'"));
   REQUIRE(QuestJournal::Snapshot(*f.owner) == before);
+}
+
+TEST_CASE("Civil War siege stage logs compare the exact city location",
+          "[Quest][CampaignConditions][CampaignLocationAlias]")
+{
+  Fixture f;
+  auto context = f.Context();
+  context.owningQuest = kSiege;
+  const uint32_t city = GENERATE(0u, 0x18a56u, 0x18a5au, 0x18a57u, 0x1706du);
+  context.resolveLocationAlias = [=](uint32_t quest, uint32_t alias) {
+    REQUIRE(quest == kSiege);
+    REQUIRE(alias == 1);
+    return city;
+  };
+  auto& world = f.server.worldState;
+  const auto record = world.GetEspm().GetBrowser().LookupById(kSiege);
+  REQUIRE(record.rec);
+  // Select just the owned city CTDAs. The other clause in each log concerns
+  // the Civil War controller and is independent of the location predicate.
+  std::vector<uint16_t> stages;
+  std::vector<bool> matches;
+  QuestJournal::Atomic(*f.guest, [&] {
+    uint16_t stage = 0;
+    espm::RecordHeaderAccess::IterateFields(
+      record.rec,
+      [&](const char* tag, uint32_t size, const char* bytes) {
+        if (!std::memcmp(tag, "INDX", 4)) {
+          REQUIRE(size >= sizeof(stage));
+          std::memcpy(&stage, bytes, sizeof(stage));
+        } else if (!std::memcmp(tag, "QOBJ", 4) ||
+                   !std::memcmp(tag, "ANAM", 4)) {
+          stage = 0;
+        } else if (stage && !std::memcmp(tag, "CTDA", 4)) {
+          espm::CTDA clause{};
+          REQUIRE(size == sizeof(clause));
+          std::memcpy(&clause, bytes, sizeof(clause));
+          if (clause.functionIndex == 605) {
+            stages.push_back(stage);
+            matches.push_back(CampaignCondition::Evaluate(
+              { CampaignCondition::Compile(
+                clause, [&](auto raw) { return record.ToGlobalId(raw); }) },
+              context));
+          }
+        }
+      },
+      world.GetEspmCache());
+  });
+  REQUIRE(stages ==
+          std::vector<uint16_t>{ 1, 1, 1, 1, 9000, 9000, 9000, 9000 });
+  const bool whiterun = city == 0x18a56, solitude = city == 0x18a5a,
+             windhelm = city == 0x18a57;
+  // Whiterun Underforge (1706d) is a child of Whiterun and matches none.
+  REQUIRE(matches ==
+          std::vector<bool>{ whiterun, whiterun, solitude, windhelm, whiterun,
+                             whiterun, solitude, windhelm });
+}
+
+TEST_CASE("CR05 stage ten selects logs by the bound location's own keywords",
+          "[Quest][QuestVM][CampaignConditions][CampaignLocationAlias]")
+{
+  AuthoredFixture f;
+  const uint32_t location = GENERATE(0x18a56u, 0x18ee9u, 0x192c4u);
+  f.BindAlias(kCr05, 4, location);
+  // Original CR05 owns all nine CTDAs and the location alias. Each fixture
+  // fragment sets a distinct bit by adding a power of two to the counter.
+  for (uint16_t log = 0; log < 9; ++log)
+    f.Fragment(log, 1 << log);
+  REQUIRE(QuestScriptRuntime::ExecuteStage(*f.guest, kCr05, 10, f.metadata,
+                                           f.scripts));
+  // Whiterun matches none, Bleak Falls Barrow matches one, and Serpent's
+  // Bluff Redoubt matches both the Forsworn and Hagraven categories.
+  REQUIRE(f.Counter(kCr05) ==
+          (location == 0x18a56     ? 0
+             : location == 0x18ee9 ? 2
+                                   : 40));
+  REQUIRE(QuestJournal::Get(*f.owner, kCr05).at("stage") == 10);
+  REQUIRE(QuestJournal::Get(*f.stranger, kCr05).at("stage") == 0);
+}
+
+TEST_CASE("CR05 location fill and fragment failures roll back its stage",
+          "[Quest][QuestVM][CampaignConditions][CampaignLocationAlias]")
+{
+  AuthoredFixture f;
+  const int scenario = GENERATE(0, 1, 2, 3);
+  std::string reason;
+  if (scenario == 0) {
+    reason = "Alias fill requires lifecycle";
+  } else if (scenario == 1) {
+    f.BindAlias(kCr05, 4, std::nullopt);
+    reason = "Required alias has an empty saved binding";
+  } else if (scenario == 2) {
+    f.BindAlias(kCr05, 4, 0x14);
+    reason = "Alias target type mismatch";
+  } else {
+    f.BindAlias(kCr05, 4, 0x192c4);
+    f.Fragment(3, 8);
+    f.Fragment(5, 32, true);
+    reason = "script is missing - 'Unknown'";
+  }
+  const auto before = QuestJournal::Snapshot(*f.owner);
+  REQUIRE_THROWS_WITH(QuestScriptRuntime::ExecuteStage(*f.guest, kCr05, 10,
+                                                       f.metadata, f.scripts),
+                      Catch::Matchers::ContainsSubstring(reason));
+  REQUIRE(QuestJournal::Snapshot(*f.owner) == before);
+}
+
+TEST_CASE("Location alias conditions guard both operands and OR evaluation",
+          "[Quest][CampaignConditions][CampaignLocationAlias]")
+{
+  Fixture f;
+  const uint16_t function = GENERATE(605, 610);
+  const uint32_t operand = function == 605 ? 0x18a56 : 0x39793;
+  auto raw = LocationCondition(function, 0, 0x01000000 | operand);
+  raw.operatorFlag = 1;
+  std::vector<uint32_t> mapped;
+  const auto condition = CampaignCondition::Compile(raw, [&](uint32_t id) {
+    mapped.push_back(id);
+    return id & 0xffffff;
+  });
+  REQUIRE(mapped == std::vector<uint32_t>{ 0x01000000 | operand });
+  auto context = f.Context();
+  uint32_t location = 0x18a56;
+  context.resolveLocationAlias = [&](uint32_t quest, uint32_t alias) {
+    REQUIRE(quest == kQuest);
+    if (alias)
+      throw std::runtime_error("Skipped alias should not resolve");
+    return location;
+  };
+  const auto skipped = Compile(LocationCondition(function, 1, operand));
+  const auto wrongType = Compile(LocationCondition(function, 1, 0xf));
+  QuestJournal::Atomic(*f.guest, [&] {
+    REQUIRE(CampaignCondition::Evaluate({ condition, skipped }, context));
+    REQUIRE_THROWS(
+      CampaignCondition::Evaluate({ condition, wrongType }, context));
+    location =
+      0x1706d; // Underforge inherits neither identity nor city keyword.
+    REQUIRE_FALSE(CampaignCondition::Evaluate({ condition }, context));
+    location = 0;
+    REQUIRE_FALSE(CampaignCondition::Evaluate({ condition }, context));
+    location = 0x14;
+    REQUIRE_THROWS(CampaignCondition::Evaluate({ condition }, context));
+    context.resolveLocationAlias = {};
+    REQUIRE_THROWS(CampaignCondition::Evaluate({ condition }, context));
+  });
+  for (const auto selector :
+       { RunOn::Reference, RunOn::QuestAlias, RunOn::Target }) {
+    raw.runOnType = selector;
+    raw.reference = 0x14;
+    REQUIRE_THROWS(Compile(raw));
+  }
+  REQUIRE_THROWS(Compile(LocationCondition(function, UINT32_MAX, operand)));
+  REQUIRE_THROWS(Compile(LocationCondition(function, 0, 0)));
+  REQUIRE_THROWS(Compile(LocationCondition(function, 0, 0xff000010)));
+  for (const auto flag : { 2, 8, 16 }) {
+    raw = LocationCondition(function, 0, operand);
+    raw.operatorFlag = flag;
+    REQUIRE_THROWS(Compile(raw));
+  }
 }
