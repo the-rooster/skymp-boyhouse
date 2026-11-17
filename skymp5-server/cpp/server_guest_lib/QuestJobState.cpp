@@ -452,6 +452,8 @@ QuestJobState::Job ReadJob(const Json& saved, uint64_t version)
         "children" });
   else {
     auto fields = value;
+    if (version >= 9)
+      fields.erase("occurrence");
     if (version >= 8)
       for (const auto* field : { "referenceLoad", "loadPhase" })
         fields.erase(field);
@@ -535,6 +537,13 @@ QuestJobState::Job ReadJob(const Json& saved, uint64_t version)
       "Host event root contains executable quest stage state");
   job.automatic = version >= 3 ? Boolean(value.at("automatic")) : false;
   job.sequenced = version >= 5 ? Boolean(value.at("sequenced")) : false;
+  if (version >= 9 && !value.at("occurrence").is_null())
+    job.occurrence = Number(value.at("occurrence"), MaxIdentity, true);
+  if (job.occurrence &&
+      (!job.sequenced || !interaction ||
+       (job.interaction->name != "OnTriggerEnter" &&
+        job.interaction->name != "OnTriggerLeave")))
+    throw std::runtime_error("Invalid native quest occurrence job");
   job.contentMode = version >= 3 ? Text(value.at("contentMode"), 7) : "legacy";
   job.environmentHash =
     version >= 6 ? Text(value.at("environmentHash"), 64, true) : "";
@@ -834,6 +843,7 @@ Json SaveJob(const QuestJobState::Job& job)
       { "completions", std::move(completions) },
       { "automatic", job.automatic },
       { "sequenced", job.sequenced },
+      { "occurrence", job.occurrence ? Json(*job.occurrence) : Json(nullptr) },
       { "contentMode", job.contentMode },
       { "environmentHash", job.environmentHash },
       { "children", std::move(children) },
@@ -933,8 +943,12 @@ std::string QuestJobState::Job::NextToken() const
 
 QuestJobState QuestJobState::Read(const nlohmann::json& value)
 {
-  const auto version = Number(value.at("schemaVersion"), 8, true);
-  if (version >= 6)
+  const auto version = Number(value.at("schemaVersion"), 9, true);
+  if (version >= 9)
+    Fields(value,
+           { "schemaVersion", "generation", "nextJob", "retiredThrough",
+             "retiredRanges", "live", "completed", "ingress" });
+  else if (version >= 6)
     Fields(value,
            { "schemaVersion", "generation", "nextJob", "retiredThrough",
              "retiredRanges", "live", "completed" });
@@ -1050,6 +1064,82 @@ QuestJobState QuestJobState::Read(const nlohmann::json& value)
   }
   if (expected != result.nextJob)
     throw std::runtime_error("Quest job history has missing identities");
+  if (version >= 9) {
+    const auto& saved = value.at("ingress");
+    Fields(saved, { "identity", "next", "retiredThrough", "retiredRanges" });
+    auto& ingress = result.ingress;
+    ingress.identity = Text(saved.at("identity"), 32, true);
+    ingress.next = Number(saved.at("next"), MaxIdentity, true);
+    ingress.retiredThrough = Number(saved.at("retiredThrough"), MaxIdentity);
+    const auto& ranges = saved.at("retiredRanges");
+    if (!ranges.is_array() || ranges.size() > MaxIngressRetiredRanges ||
+        ingress.retiredThrough >= ingress.next ||
+        ingress.next > result.nextJob ||
+        (ingress.identity.empty()
+           ? (ingress.next != 1 || ingress.retiredThrough || !ranges.empty())
+           : (ingress.identity.size() != 32 || ingress.next < 2 ||
+              ingress.identity.find_first_not_of("0123456789abcdef") !=
+                std::string::npos)))
+      throw std::runtime_error("Invalid native quest ingress identity");
+    std::vector<RetiredRange> nativeCoverage;
+    uint64_t last = ingress.retiredThrough;
+    uint64_t nativeRetired = ingress.retiredThrough;
+    for (const auto& range : ranges) {
+      Fields(range, { "first", "last" });
+      RetiredRange parsed{ Number(range.at("first"), MaxIdentity, true),
+                           Number(range.at("last"), MaxIdentity, true) };
+      if (parsed.first > parsed.last ||
+          parsed.first <= ingress.retiredThrough + 1 ||
+          parsed.last >= ingress.next ||
+          (!ingress.retiredRanges.empty() && parsed.first <= last + 1))
+        throw std::runtime_error("Invalid native quest retirement range");
+      last = parsed.last;
+      nativeRetired += parsed.last - parsed.first + 1;
+      ingress.retiredRanges.push_back(parsed);
+      nativeCoverage.push_back(parsed);
+    }
+    std::map<uint64_t, uint64_t> occurrences;
+    const auto occurrence = [&](const Job& job) {
+      if (!job.occurrence)
+        return;
+      const auto sequence = *job.occurrence;
+      if (sequence <= ingress.retiredThrough || sequence >= ingress.next ||
+          sequence > job.id)
+        throw std::runtime_error("Invalid native quest occurrence sequence");
+      occurrences.emplace(job.id, sequence);
+      nativeCoverage.push_back({ sequence, sequence });
+    };
+    for (const auto& job : result.completed)
+      occurrence(job);
+    for (const auto& [id, job] : result.live)
+      occurrence(job);
+    uint64_t previous = 0;
+    for (const auto& [id, sequence] : occurrences) {
+      if (sequence <= previous)
+        throw std::runtime_error("Unordered native quest occurrences");
+      previous = sequence;
+    }
+    std::sort(nativeCoverage.begin(), nativeCoverage.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    auto expected = ingress.retiredThrough + 1;
+    for (const auto& range : nativeCoverage) {
+      if (range.first != expected)
+        throw std::runtime_error(
+          "Native quest ingress has missing or overlapping occurrences");
+      expected = range.last + 1;
+    }
+    if (expected != ingress.next)
+      throw std::runtime_error("Native quest ingress has missing occurrences");
+    uint64_t retired = result.retiredThrough;
+    for (const auto& job : result.completed)
+      if (!job.sequenced && job.id < result.retiredThrough)
+        --retired;
+    for (const auto& range : result.retiredRanges)
+      retired += range.last - range.first + 1;
+    if (nativeRetired > retired)
+      throw std::runtime_error(
+        "Native quest retirement exceeds retired numbered jobs");
+  }
   if (version == 5 && !result.live.empty() &&
       result.live.begin()->second.sequenced) {
     // Schema 5 admitted exactly one root and enforced this bound throughout
@@ -1099,6 +1189,7 @@ std::vector<uint64_t> QuestJobState::RetireForAdmission()
   // stacks remain unchanged even if validation or allocation fails.
   auto retained = completed;
   auto ranges = retiredRanges;
+  auto nativeRanges = ingress.retiredRanges;
   std::vector<uint64_t> retired;
   for (auto current = retained.begin(); current != retained.end() &&
        (count >= MaxRecentCompleted || bytes > MaxRecentBytes);) {
@@ -1110,6 +1201,8 @@ std::vector<uint64_t> QuestJobState::RetireForAdmission()
     --count;
     retired.push_back(current->id);
     ranges.push_back({ current->id, current->id });
+    if (current->occurrence)
+      nativeRanges.push_back({ *current->occurrence, *current->occurrence });
     current = retained.erase(current);
   }
   std::sort(ranges.begin(), ranges.end(),
@@ -1147,9 +1240,26 @@ std::vector<uint64_t> QuestJobState::RetireForAdmission()
                                 return range.last <= frontier;
                               }),
                merged.end());
+  std::sort(nativeRanges.begin(), nativeRanges.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
+  std::vector<RetiredRange> nativeMerged;
+  auto nativeFrontier = ingress.retiredThrough;
+  for (const auto& range : nativeRanges) {
+    if (range.first == nativeFrontier + 1) {
+      nativeFrontier = range.last;
+    } else if (!nativeMerged.empty() &&
+               range.first <= nativeMerged.back().last + 1) {
+      nativeMerged.back().last =
+        std::max(nativeMerged.back().last, range.last);
+    } else {
+      nativeMerged.push_back(range);
+    }
+  }
   completed.swap(retained);
   retiredRanges.swap(merged);
   retiredThrough = frontier;
+  ingress.retiredRanges.swap(nativeMerged);
+  ingress.retiredThrough = nativeFrontier;
   return retired;
 }
 
@@ -1173,6 +1283,20 @@ const QuestJobState::Job* QuestJobState::FindCompleted(uint64_t id) const
   return found == completed.end() || found->id != id ? nullptr : &*found;
 }
 
+const QuestJobState::Job* QuestJobState::FindOccurrence(
+  uint64_t occurrence) const
+{
+  if (!occurrence)
+    return nullptr;
+  for (const auto& [id, job] : live)
+    if (job.occurrence == occurrence)
+      return &job;
+  for (const auto& job : completed)
+    if (job.occurrence == occurrence)
+      return &job;
+  return nullptr;
+}
+
 bool QuestJobState::HasLive() const
 {
   return !live.empty();
@@ -1194,11 +1318,27 @@ bool QuestJobState::IsRetired(uint64_t id) const
   return found != retiredRanges.end() && found->first <= id;
 }
 
+bool QuestJobState::IsOccurrenceRetired(uint64_t occurrence) const
+{
+  if (!occurrence || occurrence >= ingress.next || FindOccurrence(occurrence))
+    return false;
+  if (occurrence <= ingress.retiredThrough)
+    return true;
+  const auto found = std::lower_bound(
+    ingress.retiredRanges.begin(), ingress.retiredRanges.end(), occurrence,
+    [](const RetiredRange& range, uint64_t value) {
+      return range.last < value;
+    });
+  return found != ingress.retiredRanges.end() && found->first <= occurrence;
+}
+
 nlohmann::json QuestJobState::Save() const
 {
   if (completed.size() > MaxCompleted + MaxRecentCompleted ||
-      live.size() > MaxLive || retiredRanges.size() > MaxRetiredRanges)
+      live.size() > MaxLive || retiredRanges.size() > MaxRetiredRanges ||
+      ingress.retiredRanges.size() > MaxIngressRetiredRanges)
     throw std::runtime_error("Quest job collection limit exceeded");
+  Bounded(ingress.identity, 32);
   auto history = Json::array();
   for (const auto& job : completed)
     history.push_back(SaveJob(job));
@@ -1211,11 +1351,20 @@ nlohmann::json QuestJobState::Save() const
   auto ranges = Json::array();
   for (const auto& range : retiredRanges)
     ranges.push_back({ { "first", range.first }, { "last", range.last } });
-  Json result = { { "schemaVersion", 8 },
+  auto nativeRanges = Json::array();
+  for (const auto& range : ingress.retiredRanges)
+    nativeRanges.push_back(
+      { { "first", range.first }, { "last", range.last } });
+  Json result = { { "schemaVersion", 9 },
                   { "generation", generation },
                   { "nextJob", nextJob },
                   { "retiredThrough", retiredThrough },
                   { "retiredRanges", std::move(ranges) },
+                  { "ingress",
+                    { { "identity", ingress.identity },
+                      { "next", ingress.next },
+                      { "retiredThrough", ingress.retiredThrough },
+                      { "retiredRanges", std::move(nativeRanges) } } },
                   { "live", std::move(current) },
                   { "completed", std::move(history) } };
   Read(
@@ -1239,7 +1388,7 @@ void QuestJobState::ValidateHeap(const nlohmann::json& heap) const
   // Before the runner has ever allocated a job, preserve schema-1 journals'
   // standalone VM fixtures. Once used, the runner owns every saved stack.
   if (generation == 1 && nextJob == 1 && retiredThrough == 0 && live.empty() &&
-      retiredRanges.empty() && completed.empty())
+      retiredRanges.empty() && completed.empty() && ingress == Ingress{})
     return;
   std::vector<std::pair<const Job*, const Stage*>> waiting;
   for (const auto& [id, job] : live) {

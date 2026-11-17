@@ -138,6 +138,7 @@ public:
 
 private:
   friend class QuestJournal;
+  friend class QuestJobRunner;
   friend class CampaignReferenceFactory;
   void CommitCampaignReferences(MpActor& owner, MpChangeForm ownerState,
                                 const std::vector<MpChangeForm>& copies);

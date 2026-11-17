@@ -360,6 +360,9 @@ void Validate(const Json& ledger, bool validateHeap = true)
       jobs.ValidateHeap(ledger.value("vm", Json::object()));
       const auto initialized = ledger.value("referenceInit", Json::object());
       const auto checkLoad = [&](const QuestJobState::Job& job) {
+        if (job.occurrence && !initialized.contains(job.interaction->target))
+          throw std::runtime_error(
+            "Native ingress requires an initialized reference");
         if (!job.referenceLoad)
           return;
         const bool marked = initialized.contains(job.referenceLoad->target);
@@ -1028,6 +1031,26 @@ void QuestJournal::SetJobState(MpActor& actor, const QuestJobState& state)
       state.retiredRanges != retained.retiredRanges)
     throw std::runtime_error(
       "Job transaction changed its retirement frontier");
+  auto expectedIngress = retained.ingress;
+  if (!priorJob && candidate->occurrence) {
+    if (*candidate->occurrence != expectedIngress.next)
+      throw std::runtime_error("Native ingress skipped its next occurrence");
+    const auto identity = CampaignReferenceBinding::GetIdentity(owner);
+    if (!expectedIngress.identity.empty() &&
+        expectedIngress.identity != identity)
+      throw std::runtime_error("Native ingress campaign identity changed");
+    expectedIngress.identity = identity;
+    ++expectedIngress.next;
+    // A marker created during this transaction is not an admission lease.
+    // The runner also gates the exact earlier receipt before entering here.
+    if (!transaction->initialLedger->contains("referenceInit") ||
+        !transaction->initialLedger->at("referenceInit")
+           .contains(candidate->interaction->target))
+      throw std::runtime_error(
+        "Native ingress requires prior reference initialization");
+  }
+  if (state.ingress != expectedIngress)
+    throw std::runtime_error("Job transaction rewrote native ingress history");
   if (priorJob) {
     const auto& prior = *priorJob;
     if (candidate->id != prior.id ||
@@ -1040,6 +1063,7 @@ void QuestJournal::SetJobState(MpActor& actor, const QuestJobState& state)
         candidate->kind != prior.kind ||
         candidate->interaction != prior.interaction ||
         candidate->referenceLoad != prior.referenceLoad ||
+        candidate->occurrence != prior.occurrence ||
         candidate->actor != prior.actor || candidate->owner != prior.owner ||
         candidate->quest != prior.quest ||
         candidate->instance != prior.instance ||

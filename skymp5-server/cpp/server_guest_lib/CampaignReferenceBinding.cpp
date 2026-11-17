@@ -126,6 +126,13 @@ MpObjectReference* Find(MpActor& owner, uint32_t original,
 }
 }
 
+std::string CampaignReferenceBinding::GetIdentity(MpActor& owner)
+{
+  if (&QuestJournal::Owner(owner) != &owner)
+    throw std::runtime_error("Expected the personal campaign owner");
+  return Identity(owner, false);
+}
+
 void CampaignReferenceBinding::Bind(MpActor& owner, uint32_t original,
                                     MpObjectReference& copy)
 {

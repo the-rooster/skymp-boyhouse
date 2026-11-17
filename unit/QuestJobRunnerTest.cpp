@@ -5271,3 +5271,740 @@ TEST_CASE("Automatic reference loads recover initialization without replay",
     REQUIRE(LoadAliasField(owner, "loads") == 1);
   }
 }
+
+namespace {
+using OccurrenceId = QuestJobRunner::OccurrenceId;
+using CapturedOccurrence = QuestJobRunner::CapturedOccurrence;
+using AdmissionStatus = QuestJobRunner::AdmissionStatus;
+
+struct OccurrenceProgram
+{
+  InteractionProgram interaction{ false, false };
+  OccurrenceProgram()
+  {
+    // These are actual reference event roots. Both handlers stay selected in
+    // the same state so replay cannot hide behind a later ignored handler.
+    auto& object = interaction.handlerBase->objectTable[0];
+    object.variables = { { "enters", "Int", 0, VarValue(0) },
+                         { "leaves", "Int", 0, VarValue(0) },
+                         { "suffixes", "Int", 0, VarValue(0) },
+                         { "sourceId", "Int", 0, VarValue(0) } };
+    auto handler = [&](int reward, const char* counter, bool wait) {
+      auto function = Reward(reward);
+      function.params = { { "source", "ObjectReference" } };
+      function.code.instructions.pop_back();
+      function.code.instructions.insert(
+        function.code.instructions.end(),
+        { { FunctionCode::kOp_IAdd,
+            { Name(counter), Name(counter), VarValue(1) } },
+          { FunctionCode::kOp_CallMethod,
+            { VarValue("GetFormID"), Name("source"), Name("sourceId"),
+              VarValue(0) } } });
+      if (wait) {
+        function.code.instructions.insert(
+          function.code.instructions.end(),
+          { { FunctionCode::kOp_CallStatic,
+              { VarValue("Utility"), VarValue("Wait"), Name("temp"),
+                VarValue(1), VarValue(2.0) } },
+            { FunctionCode::kOp_IAdd,
+              { Name("suffixes"), Name("suffixes"), VarValue(1) } },
+            { FunctionCode::kOp_CallMethod,
+              { VarValue("AddItem"), Name("target"), Name("temp"), VarValue(3),
+                Name("gold"), VarValue(5), VarValue(true) } } });
+      }
+      function.code.instructions.push_back(
+        { FunctionCode::kOp_Return, { VarValue::None() } });
+      return function;
+    };
+    object.states = {
+      { "busy",
+        { { "OnTriggerEnter", handler(3, "enters", true) },
+          { "OnTriggerLeave", handler(2, "leaves", false) } } }
+    };
+    // The long retention test observes actual inventory rewards without an
+    // unrelated decimal-order observer overflowing after hundreds of events.
+    interaction.concurrent.metadata.at(kParentQuest).aliases.clear();
+  }
+  auto Scripts() const { return interaction.Scripts(); }
+  const auto& Metadata() const { return interaction.Metadata(); }
+  void Enable(MpActor& owner) const { interaction.Enable(owner); }
+};
+
+RequestId RequireAdmission(const QuestJobRunner::AdmissionResult& result,
+                           AdmissionStatus expected)
+{
+  REQUIRE(result.status == expected);
+  REQUIRE(result.error.empty());
+  REQUIRE(result.request);
+  return *result.request;
+}
+
+void RequireConsumed(const QuestJobRunner::AdmissionResult& result)
+{
+  REQUIRE(result.status == AdmissionStatus::Durable);
+  REQUIRE_FALSE(result.request);
+  REQUIRE(result.error.empty());
+}
+
+struct OccurrenceFixture : Fixture
+{
+  OccurrenceProgram content;
+  std::shared_ptr<QuestJobTime> time =
+    std::make_shared<QuestJobTime>(QuestJobTime{ 1000000, 5000 });
+  OccurrenceFixture()
+  {
+    content.Enable(Owner());
+    BindInteractionTarget(server, Owner());
+    QuestScriptRuntime::ExecuteReferenceLoad(Owner(), kInteractionOriginal,
+                                             content.Scripts());
+    storage->automatic = true;
+    Tick();
+    storage->submissions.clear();
+    storage->automatic = false;
+    Jobs().SetClock([time = time] { return *time; });
+  }
+  MpObjectReference& Target()
+  {
+    return server.worldState.GetFormAt<MpObjectReference>(kInteractionCopy);
+  }
+  CapturedOccurrence Capture(const std::string& name = "OnTriggerEnter")
+  {
+    return Jobs().CaptureOccurrence(Owner(), Jobs().NextOccurrence(Owner()),
+                                    Target(), name, Owner());
+  }
+  QuestJobRunner::AdmissionResult Admit(const CapturedOccurrence& captured)
+  {
+    return Jobs().AdmitOccurrence(Owner(), captured, content.Metadata(),
+                                  content.Scripts());
+  }
+  QuestJobRunner::AdmissionResult Admission(const OccurrenceId& id)
+  {
+    return Jobs().InspectOccurrence(Owner(), id);
+  }
+  QuestJobRunner::Result Advance(const RequestId& request)
+  {
+    return Jobs().Advance(Owner(), request, content.Metadata(),
+                          content.Scripts());
+  }
+  QuestJobRunner::Result DrainOccurrence(const RequestId& request)
+  {
+    return Drain(*this, request, content.Metadata(), content.Scripts());
+  }
+  void AckLatest()
+  {
+    Tick();
+    REQUIRE_FALSE(storage->submissions.empty());
+    storage->Complete(storage->submissions.size() - 1);
+    Tick();
+  }
+  void SelectHandler(const RequestId& request)
+  {
+    for (size_t boundary = 0; boundary < 32; ++boundary) {
+      const auto result = Jobs().Inspect(Owner(), request);
+      if (result.status == Status::Pending)
+        AckLatest();
+      const auto jobs = QuestJournal::JobState(Owner());
+      const auto* job = jobs.FindLive(request.sequence);
+      REQUIRE(job);
+      if (job->handler)
+        return;
+      RequirePending(Advance(request));
+    }
+    FAIL("Occurrence did not select its reference handler");
+  }
+};
+}
+
+TEST_CASE(
+  "Occurrence admission keeps one identity through exact receipts and waits",
+  "[Quest][QuestJobs][Occurrences][QuestIngress][SaveReceipt]")
+{
+  OccurrenceFixture f;
+  const auto before = QuestJournal::JobState(f.Owner()).Save();
+  const auto heapBefore = QuestJournal::ScriptState(f.Owner());
+  const auto physical = f.Owner().GetChangeForm();
+  const auto enter = f.Capture();
+  const auto same = f.Capture();
+  REQUIRE(enter.id == same.id);
+  REQUIRE(enter.interaction == same.interaction);
+  REQUIRE(QuestJournal::JobState(f.Owner()).Save() == before);
+  REQUIRE(QuestJournal::ScriptState(f.Owner()) == heapBefore);
+  REQUIRE(f.Owner().GetChangeForm() == physical);
+  REQUIRE(f.storage->submissions.empty());
+  const auto request =
+    RequireAdmission(f.Admit(enter), AdmissionStatus::Pending);
+  RequireSameRequest(
+    request, RequireAdmission(f.Admit(same), AdmissionStatus::Pending));
+  const auto admitted = QuestJournal::JobState(f.Owner()).Save();
+  const auto admittedHeap = QuestJournal::ScriptState(f.Owner());
+  RequirePending(f.Advance(request));
+  REQUIRE(QuestJournal::JobState(f.Owner()).Save() == admitted);
+  REQUIRE(QuestJournal::ScriptState(f.Owner()) == admittedHeap);
+  REQUIRE(f.storage->submissions.empty());
+  RequireAdmission(f.Admission(enter.id), AdmissionStatus::Pending);
+  REQUIRE(f.Gold() == 10);
+  f.Tick();
+  const auto failed = f.storage->submissions.size() - 1;
+  const auto bytes = Serialized(f.storage->submissions[failed].forms);
+  f.storage->Complete(
+    failed,
+    std::make_exception_ptr(std::runtime_error("occurrence admission")));
+  f.Tick();
+  REQUIRE(Serialized(f.storage->submissions.back().forms) == bytes);
+  RequireAdmission(f.Admission(enter.id), AdmissionStatus::Pending);
+  f.storage->Complete(
+    failed); // An old successful callback cannot acknowledge the retry.
+  f.Tick();
+  RequireAdmission(f.Admit(enter), AdmissionStatus::Pending);
+  f.AckLatest();
+  RequireSameRequest(
+    request,
+    RequireAdmission(f.Admission(enter.id), AdmissionStatus::Durable));
+
+  f.SelectHandler(request);
+  RequirePending(f.Advance(request));
+  REQUIRE(f.Gold() == 13);
+  REQUIRE(InteractionField(f.Owner(), "enters") == 1);
+  RequirePending(f.Jobs().Inspect(f.Owner(), request));
+  // Admission is already durable even while a later handler segment is not.
+  RequireSameRequest(
+    request, RequireAdmission(f.Admit(enter), AdmissionStatus::Durable));
+  f.AckLatest();
+  RequireSleeping(f.Jobs().Inspect(f.Owner(), request));
+  const auto leave = f.Capture("OnTriggerLeave");
+  const auto leaveRequest =
+    RequireAdmission(f.Admit(leave), AdmissionStatus::Pending);
+  RequireAdmission(f.Admission(enter.id), AdmissionStatus::Durable);
+  f.time->steadyMs += 2000;
+  RequireReady(f.Jobs().Inspect(f.Owner(), request));
+  const auto blocked = QuestJournal::JobState(f.Owner()).Save();
+  const auto blockedHeap = QuestJournal::ScriptState(f.Owner());
+  REQUIRE_THROWS(f.Advance(request));
+  REQUIRE(QuestJournal::JobState(f.Owner()).Save() == blocked);
+  REQUIRE(QuestJournal::ScriptState(f.Owner()) == blockedHeap);
+  REQUIRE(f.Gold() == 13);
+  REQUIRE(f.DrainOccurrence(leaveRequest).status == Status::Completed);
+  REQUIRE(f.Gold() == 15);
+  REQUIRE(InteractionField(f.Owner(), "leaves") == 1);
+  RequireReady(f.Jobs().Inspect(f.Owner(), request));
+  REQUIRE(f.DrainOccurrence(request).status == Status::Completed);
+  REQUIRE(f.Gold() == 20);
+  REQUIRE(InteractionField(f.Owner(), "enters") == 1);
+  REQUIRE(InteractionField(f.Owner(), "suffixes") == 1);
+  const auto complete = QuestJournal::JobState(f.Owner()).Save();
+  RequireSameRequest(
+    request, RequireAdmission(f.Admit(enter), AdmissionStatus::Durable));
+  auto conflict = enter;
+  conflict.interaction.name = "OnTriggerLeave";
+  REQUIRE_THROWS(f.Admit(conflict));
+  REQUIRE(QuestJournal::JobState(f.Owner()).Save() == complete);
+  REQUIRE(f.Gold() == 20);
+  const auto publicState = QuestJournal::Snapshot(f.Owner());
+  REQUIRE_FALSE(publicState.contains("ingress"));
+  REQUIRE_FALSE(publicState.contains("jobs"));
+  REQUIRE(publicState.dump().find(enter.id.campaignIdentity) ==
+          std::string::npos);
+}
+
+TEST_CASE(
+  "Occurrence retirement remains bounded around a sleeping earlier event",
+  "[Quest][QuestJobs][Occurrences][QuestIngress][Retention]")
+{
+  OccurrenceFixture f;
+  const auto sleeping = f.Capture();
+  const auto sleepingRequest =
+    RequireAdmission(f.Admit(sleeping), AdmissionStatus::Pending);
+  RequireSleeping(f.DrainOccurrence(sleepingRequest));
+  const auto stack = QuestJournal::ScriptState(f.Owner()).at("continuations");
+  // Ordinary numbered stages share job IDs, but never consume producer IDs.
+  const auto beforeStage = f.Jobs().NextOccurrence(f.Owner());
+  const auto stage = f.Jobs().NextRequest(f.Owner());
+  f.Jobs().Submit(f.Owner(), stage, kRetentionQuest, 10, f.content.Metadata(),
+                  f.content.Scripts());
+  REQUIRE(f.DrainOccurrence(stage).status == Status::Completed);
+  REQUIRE(f.Jobs().NextOccurrence(f.Owner()) == beforeStage);
+  CapturedOccurrence oldest, newest;
+  RequestId newestRequest;
+  for (size_t index = 0; index < 300; ++index) {
+    const auto event = f.Capture("OnTriggerLeave");
+    const auto request =
+      RequireAdmission(f.Admit(event), AdmissionStatus::Pending);
+    REQUIRE(request.sequence != event.id.sequence);
+    if (index == 0)
+      oldest = event;
+    newest = event;
+    newestRequest = request;
+    REQUIRE(f.DrainOccurrence(request).status == Status::Completed);
+    const auto state = QuestJournal::JobState(f.Owner());
+    REQUIRE(state.FindOccurrence(sleeping.id.sequence));
+    REQUIRE(state.FindOccurrence(sleeping.id.sequence)->id ==
+            sleepingRequest.sequence);
+    REQUIRE(state.ingress.retiredThrough == 0);
+    REQUIRE(state.ingress.retiredRanges.size() <= 1);
+    REQUIRE(state.live.size() + state.completed.size() <=
+            QuestJobState::MaxRecentCompleted);
+    REQUIRE(state.Save().dump().size() < 2 * 1024 * 1024);
+    f.storage->submissions.clear();
+  }
+  const auto state = QuestJournal::JobState(f.Owner());
+  REQUIRE(state.IsOccurrenceRetired(oldest.id.sequence));
+  REQUIRE(QuestJournal::ScriptState(f.Owner()).at("continuations") == stack);
+  REQUIRE(f.Gold() == 614);
+  RequireConsumed(f.Admit(oldest));
+  RequireSameRequest(
+    newestRequest,
+    RequireAdmission(f.Admit(newest), AdmissionStatus::Durable));
+  f.time->steadyMs += 2000;
+  REQUIRE(f.DrainOccurrence(sleepingRequest).status == Status::Completed);
+  REQUIRE(f.Gold() == 619);
+  const auto next = f.Capture("OnTriggerLeave");
+  const auto nextRequest =
+    RequireAdmission(f.Admit(next), AdmissionStatus::Pending);
+  // Admission A remains acknowledged when B retires A's detailed result.
+  RequireConsumed(f.Admission(sleeping.id));
+  RequireConsumed(f.Admission(oldest.id));
+  REQUIRE(f.DrainOccurrence(nextRequest).status == Status::Completed);
+  const auto retained = QuestJournal::JobState(f.Owner()).Save();
+  const auto gold = f.Gold();
+  f.server.worldState.DestroyForm(kInteractionCopy);
+  auto opaque = oldest;
+  opaque.interaction.name = "OnDeath";
+  opaque.interaction.targetReference = "not a reference";
+  // No target or owned PEX storage is needed to report an opaque consumption.
+  RequireConsumed(f.Jobs().AdmitOccurrence(f.Owner(), opaque));
+  REQUIRE(QuestJournal::JobState(f.Owner()).Save() == retained);
+  REQUIRE(f.Gold() == gold);
+}
+
+TEST_CASE("Occurrence envelopes reject mismatched identity and physical "
+          "context atomically",
+          "[Quest][QuestJobs][Occurrences][QuestIngress][Rollback]")
+{
+  OccurrenceFixture f;
+  const auto captured = f.Capture("OnTriggerLeave");
+  const auto before = QuestJournal::JobState(f.Owner()).Save();
+  const auto heap = QuestJournal::ScriptState(f.Owner());
+  const std::vector<std::function<void(CapturedOccurrence&)>> corrupt = {
+    [](auto& v) { ++v.id.generation; },
+    [](auto& v) { v.id.owner = "ff006199"; },
+    [](auto& v) {
+      v.id.campaignIdentity[0] = v.id.campaignIdentity[0] == 'a' ? 'b' : 'a';
+    },
+    [](auto& v) { ++v.id.sequence; },
+    [](auto& v) { v.actor = "ff006199"; },
+    [](auto& v) { v.instance += ":different"; },
+    [](auto& v) { v.interaction.name = "OnActivate"; },
+    [](auto& v) {
+      v.interaction.targetTemplates.push_back("13bbd:Skyrim.esm");
+    },
+    [](auto& v) {
+      v.interaction.sourceReference = v.interaction.targetReference;
+    }
+  };
+  for (size_t index = 0; index < corrupt.size(); ++index) {
+    INFO("Occurrence envelope corruption " << index);
+    auto invalid = captured;
+    corrupt[index](invalid);
+    REQUIRE_THROWS(f.Admit(invalid));
+    REQUIRE(QuestJournal::JobState(f.Owner()).Save() == before);
+    REQUIRE(QuestJournal::ScriptState(f.Owner()) == heap);
+    REQUIRE(f.Gold() == 10);
+    REQUIRE(f.storage->submissions.empty());
+  }
+  auto unknown = captured.id;
+  ++unknown.sequence;
+  REQUIRE_THROWS(f.Admission(unknown));
+  REQUIRE_THROWS(f.Jobs().CaptureOccurrence(f.Owner(), captured.id, f.Target(),
+                                            "OnTrigger", f.Owner()));
+  const auto originalPhase = f.Target().GetWorldInstance();
+  f.Target().SetWorldInstance("campaign:" + std::to_string(kOwner) +
+                              ":elsewhere");
+  REQUIRE_THROWS(f.Admit(captured));
+  f.Target().SetWorldInstance(originalPhase);
+  REQUIRE(QuestJournal::JobState(f.Owner()).Save() == before);
+  const auto request =
+    RequireAdmission(f.Admit(captured), AdmissionStatus::Pending);
+  REQUIRE(f.DrainOccurrence(request).status == Status::Completed);
+  REQUIRE(f.Gold() == 12);
+  const auto originalOwnerPhase = f.Owner().GetWorldInstance();
+  f.Owner().SetWorldInstance("campaign:" + std::to_string(kOwner) +
+                             ":departed");
+  RequireSameRequest(
+    request,
+    RequireAdmission(f.Jobs().AdmitOccurrence(f.Owner(), captured),
+                     AdmissionStatus::Durable));
+  REQUIRE_THROWS(f.Jobs().Inspect(f.Owner(), request));
+  REQUIRE_THROWS(f.Advance(request));
+  f.Owner().SetWorldInstance(originalOwnerPhase);
+}
+
+TEST_CASE(
+  "Occurrence source pins distinguish a visiting player from the owner",
+  "[Quest][QuestJobs][Occurrences][QuestIngress]")
+{
+  OccurrenceFixture f;
+  f.server.CreateActor(kOwner + 1, { 1, 2, 3 }, 0, 0x3c);
+  auto& guest = f.server.worldState.GetFormAt<MpActor>(kOwner + 1);
+  guest.SetWorldInstance(f.Owner().GetWorldInstance());
+  const auto id = f.Jobs().NextOccurrence(guest);
+  const auto ownerCapture = f.Jobs().CaptureOccurrence(
+    f.Owner(), id, f.Target(), "OnTriggerLeave", f.Owner());
+  const auto guestCapture =
+    f.Jobs().CaptureOccurrence(guest, id, f.Target(), "OnTriggerLeave", guest);
+  REQUIRE(ownerCapture.interaction.source == guestCapture.interaction.source);
+  REQUIRE(ownerCapture.interaction.sourceReference !=
+          guestCapture.interaction.sourceReference);
+  REQUIRE_THROWS(f.Jobs().CaptureOccurrence(f.Owner(), id, f.Target(),
+                                            "OnTriggerLeave", guest));
+  const auto before = QuestJournal::JobState(f.Owner()).Save();
+  REQUIRE_THROWS(f.Admit(guestCapture));
+  REQUIRE(QuestJournal::JobState(f.Owner()).Save() == before);
+  const auto result = f.Jobs().AdmitOccurrence(
+    guest, guestCapture, f.content.Metadata(), f.content.Scripts());
+  const auto request = RequireAdmission(result, AdmissionStatus::Pending);
+  f.AckLatest();
+  RequireSameRequest(request,
+                     RequireAdmission(f.Jobs().InspectOccurrence(guest, id),
+                                      AdmissionStatus::Durable));
+  REQUIRE(QuestJournal::JobState(guest).FindLive(request.sequence)->actor ==
+          guest.GetChangeForm().formDesc.ToString());
+  REQUIRE_THROWS(f.Admit(ownerCapture));
+  REQUIRE(f.Gold() == 10);
+}
+
+TEST_CASE("Occurrence admission refuses capacity and save backpressure "
+          "without consuming identity",
+          "[Quest][QuestJobs][Occurrences][QuestIngress][SaveReceipt]")
+{
+  OccurrenceFixture f;
+  SECTION("No storage")
+  {
+    const auto captured = f.Capture("OnTriggerLeave");
+    const auto before = QuestJournal::JobState(f.Owner()).Save();
+    f.server.worldState.AttachSaveStorage(nullptr);
+    REQUIRE_THROWS(f.Admit(captured));
+    REQUIRE(QuestJournal::JobState(f.Owner()).Save() == before);
+    REQUIRE(f.Gold() == 10);
+    f.server.worldState.AttachSaveStorage(f.storage);
+    RequireAdmission(f.Admit(captured), AdmissionStatus::Pending);
+  }
+  SECTION("Live roots")
+  {
+    std::vector<RequestId> requests;
+    for (size_t index = 0; index < QuestJobState::MaxLive; ++index) {
+      requests.push_back(RequireAdmission(f.Admit(f.Capture("OnTriggerLeave")),
+                                          AdmissionStatus::Pending));
+      f.AckLatest();
+    }
+    const auto captured = f.Capture("OnTriggerLeave");
+    const auto before = QuestJournal::JobState(f.Owner()).Save();
+    REQUIRE_THROWS(f.Admit(captured));
+    REQUIRE(QuestJournal::JobState(f.Owner()).Save() == before);
+    REQUIRE(f.Jobs().NextOccurrence(f.Owner()) == captured.id);
+    REQUIRE(f.Gold() == 10);
+    REQUIRE(f.DrainOccurrence(requests.front()).status == Status::Completed);
+    RequireAdmission(f.Admit(captured), AdmissionStatus::Pending);
+  }
+  SECTION("Immutable save queue")
+  {
+    const auto captured = f.Capture("OnTriggerLeave");
+    for (size_t index = 0; index < 256; ++index)
+      QuestJournal::AtomicDurable(f.Owner(), [] {});
+    const auto before = QuestJournal::JobState(f.Owner()).Save();
+    const auto heap = QuestJournal::ScriptState(f.Owner());
+    REQUIRE_THROWS(f.Admit(captured));
+    REQUIRE(QuestJournal::JobState(f.Owner()).Save() == before);
+    REQUIRE(QuestJournal::ScriptState(f.Owner()) == heap);
+    REQUIRE(f.Jobs().NextOccurrence(f.Owner()) == captured.id);
+    REQUIRE(f.Gold() == 10);
+    REQUIRE(f.storage->submissions.empty());
+    f.AckLatest();
+    RequireAdmission(f.Admit(captured), AdmissionStatus::Pending);
+  }
+}
+
+TEST_CASE(
+  "Native occurrence eligibility waits for the exact initialization receipt",
+  "[Quest][QuestJobs][Occurrences][QuestIngress][ReferenceLoad][SaveReceipt]")
+{
+  LoadFixture f(false, false, true);
+  const auto id = f.Jobs().NextOccurrence(f.Owner());
+  REQUIRE_THROWS(f.Jobs().CaptureOccurrence(f.Owner(), id, f.Target(),
+                                            "OnTriggerEnter", f.Owner()));
+  const auto load = f.Jobs().NextRequest(f.Owner());
+  f.SubmitLoad(load);
+  f.Until(load, [](const auto& job) {
+    return job.loadPhase == LoadPhase::CellLoad;
+  });
+  REQUIRE(QuestJournal::ReferenceInitialized(f.Owner(), kInteractionOriginal));
+  RequirePending(f.InspectLoad(load));
+  const CapturedOccurrence planned{
+    id, f.Owner().GetChangeForm().formDesc.ToString(),
+    f.Owner().GetWorldInstance(),
+    QuestScriptRuntime::CaptureInteraction(f.Owner(), f.Target(),
+                                           "OnTriggerEnter", f.Owner())
+  };
+  const auto before = QuestJournal::JobState(f.Owner()).Save();
+  const auto refuse = [&] {
+    REQUIRE_THROWS(f.Jobs().CaptureOccurrence(f.Owner(), id, f.Target(),
+                                              "OnTriggerEnter", f.Owner()));
+    REQUIRE_THROWS(f.Jobs().AdmitOccurrence(
+      f.Owner(), planned, f.content.Metadata(), f.content.Scripts()));
+    REQUIRE(QuestJournal::JobState(f.Owner()).Save() == before);
+    REQUIRE(f.Jobs().NextOccurrence(f.Owner()) == id);
+  };
+  refuse();
+  f.Tick();
+  const auto failed = f.storage->submissions.size() - 1;
+  f.storage->Complete(
+    failed,
+    std::make_exception_ptr(std::runtime_error("initialization receipt")));
+  f.Tick();
+  refuse();
+  f.storage->Complete(failed);
+  f.Tick();
+  refuse();
+  f.AckLatest();
+  RequireSleeping(f.DrainLoad(load));
+  REQUIRE(f.Live(load).loadPhase == LoadPhase::Load);
+  const auto captured = f.Jobs().CaptureOccurrence(
+    f.Owner(), id, f.Target(), "OnTriggerEnter", f.Owner());
+  const auto event = RequireAdmission(
+    f.Jobs().AdmitOccurrence(f.Owner(), captured, f.content.Metadata(),
+                             f.content.Scripts()),
+    AdmissionStatus::Pending);
+  REQUIRE(Drain(f, event, f.content.Metadata(), f.content.Scripts()).status ==
+          Status::Completed);
+  RequireSleeping(f.InspectLoad(load));
+  RequireAdmission(f.Jobs().InspectOccurrence(f.Owner(), id),
+                   AdmissionStatus::Durable);
+}
+
+namespace {
+void AttachOccurrenceDatabase(PartOne& server, const SqliteFiles& files,
+                              bool ownerFirst)
+{
+  server.AttachEspm(&GetEspmLoader());
+  auto database = std::make_shared<SqliteDatabase>(files.File());
+  std::vector<MpChangeForm> saved;
+  database->Iterate([&](const MpChangeForm& form) { saved.push_back(form); },
+                    std::nullopt);
+  const auto owner = FormDesc::FromFormId(kOwner, server.worldState.espmFiles);
+  std::stable_sort(
+    saved.begin(), saved.end(), [&](const auto& a, const auto& b) {
+      const bool aOwner = a.formDesc == owner, bOwner = b.formDesc == owner;
+      return aOwner != bOwner ? aOwner == ownerFirst
+                              : a.formDesc.ToString() < b.formDesc.ToString();
+    });
+  using Storage =
+    Viet::AsyncSaveStorage<MpChangeForm, FormDesc, std::vector<FormDesc>>;
+  // Read through an independent SQLite connection and replay its real rows
+  // in either order. This intentionally does not force the owner disabled.
+  server.worldState.AttachSaveStorage(std::make_shared<Storage>(
+    database, spdlog::default_logger(), "occurrence-restart", 1));
+  WorldState::RestorationScope restoration(server.worldState);
+  for (const auto& form : saved)
+    server.worldState.LoadChangeForm(form, FormCallbacks::DoNothing());
+}
+
+void FlushOccurrenceSetup(PartOne& server, MpActor& owner)
+{
+  const auto receipt = QuestJournal::AtomicDurable(owner, [] {});
+  const auto deadline =
+    std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (receipt->GetState() == SaveReceipt::State::Pending &&
+         std::chrono::steady_clock::now() < deadline) {
+    server.worldState.Tick();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  REQUIRE(receipt->GetState() == SaveReceipt::State::Durable);
+}
+}
+
+TEST_CASE("SQLite occurrence recovery preserves admission and suspended "
+          "handler effects in either restore order",
+          "[Quest][QuestJobs][Occurrences][QuestIngress][SQLite]")
+{
+  const bool ownerFirst = GENERATE(false, true);
+  SqliteFiles files;
+  OccurrenceProgram content;
+  CapturedOccurrence captured;
+  RequestId request;
+  {
+    PartOne server;
+    AttachDatabase(server, files);
+    Initialize(server);
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    content.Enable(owner);
+    auto& target = BindInteractionTarget(server, owner);
+    QuestScriptRuntime::ExecuteReferenceLoad(owner, kInteractionOriginal,
+                                             content.Scripts());
+    FlushOccurrenceSetup(server, owner);
+    auto& jobs = server.worldState.GetQuestJobs();
+    captured = jobs.CaptureOccurrence(owner, jobs.NextOccurrence(owner),
+                                      target, "OnTriggerEnter", owner);
+    request = RequireAdmission(jobs.AdmitOccurrence(owner, captured,
+                                                    content.Metadata(),
+                                                    content.Scripts()),
+                               AdmissionStatus::Pending);
+    // No Tick: neither the new producer cursor nor its job reached SQLite.
+  }
+  {
+    PartOne server;
+    AttachOccurrenceDatabase(server, files, ownerFirst);
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    auto& jobs = server.worldState.GetQuestJobs();
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 10);
+    REQUIRE(jobs.NextOccurrence(owner) == captured.id);
+    REQUIRE_THROWS(jobs.InspectOccurrence(owner, captured.id));
+    RequireSameRequest(request,
+                       RequireAdmission(jobs.AdmitOccurrence(
+                                          owner, captured, content.Metadata(),
+                                          content.Scripts()),
+                                        AdmissionStatus::Pending));
+    RequireReady(WaitForDurable(server, owner, request));
+    RequireSameRequest(
+      request,
+      RequireAdmission(jobs.InspectOccurrence(owner, captured.id),
+                       AdmissionStatus::Durable));
+  }
+  {
+    PartOne server;
+    AttachOccurrenceDatabase(server, files, !ownerFirst);
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    auto& jobs = server.worldState.GetQuestJobs();
+    jobs.SetClock([] { return QuestJobTime{ 1000000, 5000 }; });
+    // Retained duplicate admission also needs no new content load.
+    RequireSameRequest(request,
+                       RequireAdmission(jobs.AdmitOccurrence(owner, captured),
+                                        AdmissionStatus::Durable));
+    RequireSleeping(DrainStored(server, owner, request, content.Metadata(),
+                                content.Scripts()));
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 13);
+    REQUIRE(InteractionField(owner, "enters") == 1);
+    REQUIRE(QuestJournal::JobState(owner).ingress.next ==
+            captured.id.sequence + 1);
+  }
+  {
+    PartOne server;
+    AttachOccurrenceDatabase(server, files, ownerFirst);
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    auto& jobs = server.worldState.GetQuestJobs();
+    jobs.SetClock([] { return QuestJobTime{ 1003000, 100 }; });
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 13);
+    RequireAdmission(jobs.InspectOccurrence(owner, captured.id),
+                     AdmissionStatus::Durable);
+    RequireSameRequest(request,
+                       RequireAdmission(jobs.AdmitOccurrence(owner, captured),
+                                        AdmissionStatus::Durable));
+    REQUIRE(DrainStored(server, owner, request, content.Metadata(),
+                        content.Scripts())
+              .status == Status::Completed);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 18);
+    REQUIRE(InteractionField(owner, "enters") == 1);
+    REQUIRE(InteractionField(owner, "suffixes") == 1);
+  }
+  {
+    PartOne server;
+    AttachOccurrenceDatabase(server, files, !ownerFirst);
+    auto& owner = server.worldState.GetFormAt<MpActor>(kOwner);
+    auto& jobs = server.worldState.GetQuestJobs();
+    RequireSameRequest(request,
+                       RequireAdmission(jobs.AdmitOccurrence(owner, captured),
+                                        AdmissionStatus::Durable));
+    REQUIRE(jobs.Inspect(owner, request).status == Status::Completed);
+    REQUIRE(owner.GetInventory().GetItemCount(0xf) == 18);
+    REQUIRE(QuestJournal::ScriptState(owner).at("continuations").empty());
+  }
+}
+
+TEST_CASE(
+  "Automatic occurrence execution preserves its durable admission identity",
+  "[Quest][QuestJobs][Occurrences][QuestIngress][Scheduler]")
+{
+  OccurrenceFixture f;
+  f.Jobs().SetSchedulerFixtureContent(f.content.Metadata(),
+                                      f.content.Scripts());
+  const auto captured = f.Capture("OnTriggerLeave");
+  const auto request = RequireAdmission(
+    f.Jobs().AdmitOccurrence(f.Owner(), captured, f.content.Metadata(),
+                             f.content.Scripts(), true),
+    AdmissionStatus::Pending);
+  f.storage->automatic = true;
+  for (size_t pass = 0; pass < 256 &&
+       f.Jobs().Inspect(f.Owner(), request).status != Status::Completed;
+       ++pass)
+    f.Tick();
+  REQUIRE(f.Jobs().Inspect(f.Owner(), request).status == Status::Completed);
+  RequireSameRequest(
+    request,
+    RequireAdmission(f.Admission(captured.id), AdmissionStatus::Durable));
+  RequireSameRequest(
+    request,
+    RequireAdmission(f.Jobs().AdmitOccurrence(f.Owner(), captured),
+                     AdmissionStatus::Durable));
+  REQUIRE(f.Gold() == 12);
+  REQUIRE(InteractionField(f.Owner(), "leaves") == 1);
+}
+
+TEST_CASE("Durable admission survives reentrant observation of later commits",
+          "[Quest][QuestJobs][Occurrences][QuestIngress][SaveReceipt]")
+{
+  struct ObservingStorage : ControlledStorage
+  {
+    std::function<void()> observe;
+    bool SupportsAtomicBatches() const noexcept override
+    {
+      if (observe)
+        observe();
+      return true;
+    }
+  };
+  OccurrenceFixture f;
+  auto storage = std::make_shared<ObservingStorage>();
+  storage->automatic = false;
+  f.server.worldState.AttachSaveStorage(storage);
+  f.storage = storage;
+  const auto first = f.Capture();
+  const auto firstRequest =
+    RequireAdmission(f.Admit(first), AdmissionStatus::Pending);
+  f.AckLatest();
+  f.SelectHandler(firstRequest);
+  std::vector<AdmissionStatus> observed;
+  std::exception_ptr error;
+  // The storage capability callback runs at transaction admission and again
+  // during commit while the runner's owner barrier is busy. It cannot throw.
+  storage->observe = [&] {
+    try {
+      observed.push_back(f.Admission(first.id).status);
+    } catch (...) {
+      error = std::current_exception();
+    }
+  };
+  RequirePending(f.Advance(firstRequest));
+  REQUIRE_FALSE(error);
+  REQUIRE(observed.size() >= 2);
+  REQUIRE(std::all_of(observed.begin(), observed.end(), [](const auto status) {
+    return status == AdmissionStatus::Durable;
+  }));
+  storage->observe = {};
+  f.AckLatest();
+  const auto second = f.Capture("OnTriggerLeave");
+  observed.clear();
+  storage->observe = [&] {
+    try {
+      observed.push_back(f.Admission(first.id).status);
+    } catch (...) {
+      error = std::current_exception();
+    }
+  };
+  RequireAdmission(f.Admit(second), AdmissionStatus::Pending);
+  storage->observe = {};
+  REQUIRE_FALSE(error);
+  REQUIRE(observed.size() >= 2);
+  REQUIRE(std::all_of(observed.begin(), observed.end(), [](const auto status) {
+    return status == AdmissionStatus::Durable;
+  }));
+  RequireAdmission(f.Admission(first.id), AdmissionStatus::Durable);
+  RequireAdmission(f.Admission(second.id), AdmissionStatus::Pending);
+}

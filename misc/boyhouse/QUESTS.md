@@ -963,6 +963,50 @@ its timers. Existing actor-value/respawn restoration behavior is otherwise retai
 Native load ordering, initialization/reentrancy rules, durable ingress, quest
 lifecycle and full multiplayer playthrough/performance validation remain open.
 
+## Durable trusted trigger occurrences
+
+QuestJobRunner exposes NextOccurrence, CaptureOccurrence, AdmitOccurrence and
+InspectOccurrence for trusted OnTriggerEnter/OnTriggerLeave producers. The ID
+contains owner, existing persistent campaign binding identity, journal generation
+and an independent native sequence. NextOccurrence is prospective only. Capture
+pins initiating actor, instance, canonical/physical source and target, and templates
+without consuming a sequence or changing occupancy. Clients cannot submit these
+IDs or choose event names through a packet endpoint.
+
+Schema9 stores one bounded ingress stream per campaign and an optional immutable
+occurrence sequence on each numbered Interaction job. Admission installs that job
+and advances the ingress cursor in the same AtomicJob transaction. A prior target
+initialization marker is required, pending coordinator receipts gate new admission,
+and the durable admission batch includes earlier synchronous initialization changes
+or follows their sealed batches in storage order. Marker visibility alone is not
+an acknowledgement of durable native initialization.
+
+AdmissionStatus is separate from handler status. Only Durable acknowledges
+acceptance; a provisional RequestId may be present while Pending. The exact initial
+admission receipt remains independent of later handler/retirement receipts. Older
+accepted occurrences remain Durable during later work, including reentrant queries.
+The initial host step captures recipients; further handler execution is behind its
+receipt. A waiting Enter handler does not prevent a separately admitted Leave.
+
+Retained retries compare the original actor and exact captured payload before
+loading scripts or resolving current target geometry. They do not replay effects
+or revoke acceptance after the owner's phase changes; execution still validates
+its own current context. Once details retire, an old occurrence reports consumed
+without asserting old payload equivalence or handler success. Retired native
+sequences use bounded canonical sparse intervals, so a low sleeping occurrence can
+retain its job while later completed results compact. Both native and global job
+retirement summaries change atomically. Schemas1-8 migrate with empty ingress and
+no occurrence tags; the original schema5 byte guard is retained.
+
+This API does not persist a movement sample, reserve a prospective ID, or supply a
+native load/reset policy. Production SetPos, Subscribe, inline OnTrigger and packet
+forwarding still use their existing paths. A physical producer must save accepted
+position/occupancy/sequence together and publish packets only after the appropriate
+boundary before this bridge can replace live ingress. Identical saved logical
+references can recover across restart; new durable incarnation/reset semantics are
+not inferred from transient native pointers or phase epochs. No complete quest is
+certified playable by these backend fixtures.
+
 ## Verification commands
 
 ```sh
@@ -1155,3 +1199,22 @@ callback ordering, OnInit call gating, reset generations and per-occurrence
 admission need further audit before production wiring. Skyrim was not launched;
 the installed client and staging were unchanged. Certified playable quests
 remain zero.
+
+The durable-native-ingress batch passed the Linux build and full verification
+on 2026-11-17 UTC: 831 native cases / 506,173 assertions, 368
+JavaScript tests, 47 Python tests, addon and both protocol smokes,
+and SQLite recovery of 32 characters. The focused run passed 107
+cases / 21,347 assertions. The initial full run passed 830 of
+831 cases and found a test expecting an exception where Advance deliberately
+returns Pending without execution; the corrected fixture asserts unchanged
+state and rewards and makes the cross-job barrier scenario actually ready.
+The focused filter now includes all nine new occurrence runner cases through
+their QuestIngress tags. Native ingress fixtures cover
+atomic occurrence/job admission, exact initial receipts, retained conflicts,
+opaque compacted retries, independent waits, sparse retirement and recovery.
+These are backend guarantees for explicitly admitted trusted occurrences;
+physical movement/occupancy/packet acceptance is not yet atomic with admission.
+Production movement and subscription routing remain unchanged. Native load
+eligibility/ordering, quest lifecycle and full multi-client playthrough and
+performance validation remain required. No complete quest is certified playable.
+Skyrim was not launched; the installed client and staging were unchanged.

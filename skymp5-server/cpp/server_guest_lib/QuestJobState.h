@@ -114,6 +114,7 @@ struct QuestJobState
     std::string environmentHash;
     bool automatic = false;
     bool sequenced = false;
+    std::optional<uint64_t> occurrence;
     uint32_t instructions = 0, steps = 0;
     std::vector<Event> events;
     uint32_t eventHead = 0;
@@ -138,7 +139,15 @@ struct QuestJobState
     uint64_t first = 0, last = 0;
     bool operator==(const RetiredRange&) const = default;
   };
+  struct Ingress
+  {
+    std::string identity;
+    uint64_t next = 1, retiredThrough = 0;
+    std::vector<RetiredRange> retiredRanges;
+    bool operator==(const Ingress&) const = default;
+  };
   uint64_t generation = 1, nextJob = 1, retiredThrough = 0;
+  Ingress ingress;
   std::map<uint64_t, Job> live;
   std::vector<RetiredRange> retiredRanges;
   std::vector<Job> completed;
@@ -149,6 +158,8 @@ struct QuestJobState
   static constexpr size_t MaxRecentBytes = 1024 * 1024;
   static constexpr size_t MaxRetiredRanges =
     MaxLive + MaxRecentCompleted + MaxCompleted + 1;
+  static constexpr size_t MaxIngressRetiredRanges =
+    MaxLive + MaxRecentCompleted + 1;
   static constexpr size_t MaxOperations = 256;
   static constexpr size_t MaxEvents = 4096;
   static constexpr size_t MaxDepth = 128;
@@ -168,7 +179,9 @@ struct QuestJobState
   Job* FindLive(uint64_t id);
   const Job* FindLive(uint64_t id) const;
   const Job* FindCompleted(uint64_t id) const;
+  const Job* FindOccurrence(uint64_t occurrence) const;
   bool IsRetired(uint64_t id) const;
+  bool IsOccurrenceRetired(uint64_t occurrence) const;
   bool HasLive() const;
   // Validate canonical heap shape plus one-to-one active job/stack ownership.
   // No object resolution or script execution occurs in this validation.

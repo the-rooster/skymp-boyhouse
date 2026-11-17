@@ -48,6 +48,31 @@ public:
     const std::optional<RequestId> sequence;
   };
   using MetadataOverrides = std::map<uint32_t, espm::QuestScriptData>;
+  struct OccurrenceId
+  {
+    std::string owner, campaignIdentity;
+    uint64_t generation = 0, sequence = 0;
+    bool operator==(const OccurrenceId&) const = default;
+  };
+  struct CapturedOccurrence
+  {
+    OccurrenceId id;
+    std::string actor, instance;
+    QuestJobState::Interaction interaction;
+    bool operator==(const CapturedOccurrence&) const = default;
+  };
+  enum class AdmissionStatus
+  {
+    Pending,
+    Durable,
+    Failed
+  };
+  struct AdmissionResult
+  {
+    AdmissionStatus status = AdmissionStatus::Pending;
+    std::optional<RequestId> request;
+    std::string error;
+  };
   enum class ResultKind
   {
     Stage,
@@ -66,6 +91,23 @@ public:
   };
   // Prospective only: does not reserve, publish or acknowledge an admission.
   RequestId NextRequest(MpActor& actor);
+  // Prospective capture only. Neither call reserves or consumes a sequence.
+  // Native movement/subscription routing does not call this trusted bridge.
+  OccurrenceId NextOccurrence(MpActor& actor);
+  CapturedOccurrence CaptureOccurrence(MpActor& actor, const OccurrenceId& id,
+                                       MpObjectReference& target,
+                                       const std::string& name,
+                                       MpObjectReference& source);
+  AdmissionResult AdmitOccurrence(MpActor& actor,
+                                  const CapturedOccurrence& occurrence);
+  AdmissionResult AdmitOccurrence(MpActor& actor,
+                                  const CapturedOccurrence& occurrence,
+                                  const MetadataOverrides& overrides,
+                                  const std::vector<PexScript::Lazy>& scripts,
+                                  bool automatic = false);
+  // Admission durability is independent of subsequent handler status. A
+  // consumed occurrence whose details were retired has no request result.
+  AdmissionResult InspectOccurrence(MpActor& actor, const OccurrenceId& id);
   Result Submit(MpActor& actor, const Request& command, uint32_t quest,
                 uint16_t stage);
   Result Submit(MpActor& actor, const Request& command, uint32_t quest,
@@ -131,6 +173,9 @@ private:
     std::vector<uint64_t> retiredIds;
     uint64_t retirementGeneration = 0;
     std::shared_ptr<const SaveReceipt> retirementReceipt;
+    uint64_t occurrence = 0, occurrenceGeneration = 0;
+    uint64_t admittingOccurrence = 0, admittingGeneration = 0;
+    std::shared_ptr<const SaveReceipt> admissionReceipt;
   };
   struct Scheduled
   {
@@ -160,6 +205,16 @@ private:
   void RequireContext(MpActor& actor, const QuestJobState::Job& job) const;
   void RequireReady(MpActor& actor);
   void RequireRequest(MpActor&, const Request&, const QuestJobState&) const;
+  void RequireOccurrence(MpActor&, const OccurrenceId&,
+                         const QuestJobState&) const;
+  AdmissionResult InspectOccurrence(MpActor&, const OccurrenceId&,
+                                    const QuestJobState&);
+  std::optional<AdmissionResult> PrepareOccurrence(MpActor&,
+                                                   const CapturedOccurrence&);
+  AdmissionResult AdmitOccurrenceWithContent(
+    MpActor&, const CapturedOccurrence&, const std::vector<PexScript::Lazy>&,
+    const MetadataOverrides&, const std::string&, bool fixtureAwait,
+    bool automatic);
   std::optional<Result> Retired(MpActor&, const Request&,
                                 const QuestJobState&);
   std::optional<Result> Retired(MpActor&, const Request&);
@@ -171,7 +226,8 @@ private:
   Result AdmitWithContent(MpActor&, const Request&, QuestJobState::Job,
                           const std::vector<PexScript::Lazy>&,
                           const MetadataOverrides&, const std::string&,
-                          bool fixtureAwait, bool automatic);
+                          bool fixtureAwait, bool automatic,
+                          const CapturedOccurrence* occurrence = nullptr);
   Result ResumeWithContent(MpActor&, const Request&, const std::string&, bool,
                            const std::vector<PexScript::Lazy>&,
                            const MetadataOverrides&, const std::string&,

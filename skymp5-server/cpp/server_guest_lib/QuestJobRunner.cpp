@@ -1,4 +1,5 @@
 #include "QuestJobRunner.h"
+#include "CampaignReferenceBinding.h"
 #include "MpActor.h"
 #include "QuestJobContent.h"
 #include "QuestJournal.h"
@@ -121,6 +122,190 @@ QuestJobRunner::RequestId QuestJobRunner::NextRequest(MpActor& actor)
   if (id.sequence >= MaxIdentity)
     throw std::overflow_error("Quest request identities exhausted");
   return id;
+}
+
+QuestJobRunner::OccurrenceId QuestJobRunner::NextOccurrence(MpActor& actor)
+{
+  const auto jobs = QuestJournal::JobState(actor);
+  auto& owner = QuestJournal::Owner(actor);
+  OccurrenceId id{ owner.GetChangeForm().formDesc.ToString(),
+                   CampaignReferenceBinding::GetIdentity(owner),
+                   jobs.generation, jobs.ingress.next };
+  RequireOccurrence(actor, id, jobs);
+  if (id.sequence >= MaxIdentity)
+    throw std::overflow_error("Quest occurrence identities exhausted");
+  return id;
+}
+
+void QuestJobRunner::RequireOccurrence(MpActor& actor, const OccurrenceId& id,
+                                       const QuestJobState& jobs) const
+{
+  // An occurrence sequence is not a global job ID. Validate the campaign
+  // using its next job, which cannot accidentally name a legacy command.
+  RequireRequest(actor, RequestId{ id.owner, id.generation, jobs.nextJob },
+                 jobs);
+  auto& owner = QuestJournal::Owner(actor);
+  const auto identity = CampaignReferenceBinding::GetIdentity(owner);
+  if (!id.sequence || id.sequence > MaxIdentity ||
+      id.campaignIdentity != identity ||
+      (!jobs.ingress.identity.empty() && jobs.ingress.identity != identity))
+    throw std::runtime_error(
+      "Quest occurrence belongs to another campaign identity");
+}
+
+QuestJobRunner::CapturedOccurrence QuestJobRunner::CaptureOccurrence(
+  MpActor& actor, const OccurrenceId& id, MpObjectReference& target,
+  const std::string& name, MpObjectReference& source)
+{
+  const auto jobs = QuestJournal::JobState(actor);
+  RequireOccurrence(actor, id, jobs);
+  RequireReady(actor);
+  if (world.IsRestoring())
+    throw std::runtime_error(
+      "Cannot capture quest occurrence during restoration");
+  if (name != "OnTriggerEnter" && name != "OnTriggerLeave")
+    throw std::invalid_argument("Unsupported native quest occurrence");
+  return {
+    id, actor.GetChangeForm().formDesc.ToString(), actor.GetWorldInstance(),
+    QuestScriptRuntime::CaptureInteraction(actor, target, name, source)
+  };
+}
+
+QuestJobRunner::AdmissionResult QuestJobRunner::InspectOccurrence(
+  MpActor& actor, const OccurrenceId& id)
+{
+  return InspectOccurrence(actor, id, QuestJournal::JobState(actor));
+}
+
+QuestJobRunner::AdmissionResult QuestJobRunner::InspectOccurrence(
+  MpActor& actor, const OccurrenceId& id, const QuestJobState& jobs)
+{
+  RequireOccurrence(actor, id, jobs);
+  const auto* job = jobs.FindOccurrence(id.sequence);
+  if (!job && !jobs.IsOccurrenceRetired(id.sequence))
+    throw std::invalid_argument("Unknown quest occurrence");
+  std::optional<RequestId> request;
+  if (job)
+    request = RequestId{ job->owner, job->generation, job->id };
+  const auto& owner = QuestJournal::Owner(actor);
+  if (const auto found = barriers.find(owner.GetFormId());
+      found != barriers.end()) {
+    const auto& barrier = found->second;
+    if (barrier.owner.lock().get() != &owner)
+      throw std::runtime_error("Quest occurrence owner was replaced");
+    // A callback must not acknowledge a transaction-local occurrence before
+    // its exact admission receipt has been published.
+    if (barrier.busy && barrier.admittingOccurrence == id.sequence &&
+        barrier.admittingGeneration == id.generation)
+      return { AdmissionStatus::Pending, std::move(request) };
+    if (barrier.occurrence == id.sequence &&
+        barrier.occurrenceGeneration == id.generation &&
+        barrier.admissionReceipt) {
+      const auto state = barrier.admissionReceipt->GetState();
+      if (state == SaveReceipt::State::Pending)
+        return { AdmissionStatus::Pending, std::move(request) };
+      if (state != SaveReceipt::State::Durable)
+        return {
+          AdmissionStatus::Failed, std::move(request),
+          "Quest occurrence admission was abandoned; recovery is required"
+        };
+    }
+  }
+  // Subsequent handler or retirement receipts cannot revoke an admission.
+  // After recovery, the loaded occurrence ledger is authoritative.
+  return { AdmissionStatus::Durable, std::move(request) };
+}
+
+std::optional<QuestJobRunner::AdmissionResult>
+QuestJobRunner::PrepareOccurrence(MpActor& actor,
+                                  const CapturedOccurrence& occurrence)
+{
+  auto jobs = QuestJournal::JobState(actor);
+  RequireOccurrence(actor, occurrence.id, jobs);
+  if (const auto* prior = jobs.FindOccurrence(occurrence.id.sequence)) {
+    if (prior->actor != actor.GetChangeForm().formDesc.ToString() ||
+        prior->actor != occurrence.actor ||
+        prior->instance != occurrence.instance ||
+        prior->interaction != occurrence.interaction)
+      throw std::runtime_error(
+        "Quest occurrence was reused for different work");
+    return InspectOccurrence(actor, occurrence.id, jobs);
+  }
+  if (jobs.IsOccurrenceRetired(occurrence.id.sequence))
+    return InspectOccurrence(actor, occurrence.id, jobs);
+  if (occurrence.id.sequence != jobs.ingress.next ||
+      occurrence.id.sequence >= MaxIdentity)
+    throw std::runtime_error(
+      "Quest occurrence is not the next admission identity");
+  const auto& owner = QuestJournal::Owner(actor);
+  if (const auto found = barriers.find(owner.GetFormId());
+      found != barriers.end() && found->second.busy) {
+    if (found->second.owner.lock().get() != &owner)
+      throw std::runtime_error("Quest occurrence owner was replaced");
+    return AdmissionResult{ AdmissionStatus::Pending, std::nullopt };
+  }
+  RequireReady(actor);
+  if (world.IsRestoring())
+    throw std::runtime_error(
+      "Cannot admit quest occurrence during restoration");
+  world.RequireDurableSaveStorage();
+  if (occurrence.actor != actor.GetChangeForm().formDesc.ToString() ||
+      occurrence.instance != actor.GetWorldInstance() ||
+      (occurrence.interaction.name != "OnTriggerEnter" &&
+       occurrence.interaction.name != "OnTriggerLeave"))
+    throw std::runtime_error("Quest occurrence capture context changed");
+  if (jobs.live.size() >= QuestJobState::MaxLive ||
+      jobs.nextJob >= MaxIdentity)
+    throw std::runtime_error("Campaign has no native occurrence capacity");
+  // Exercise numbered retention before loading content. This temporary plan
+  // neither consumes a sequence nor publishes retirement.
+  jobs.RetireForAdmission();
+  return std::nullopt;
+}
+
+QuestJobRunner::AdmissionResult QuestJobRunner::AdmitOccurrence(
+  MpActor& actor, const CapturedOccurrence& occurrence)
+{
+  if (const auto existing = PrepareOccurrence(actor, occurrence))
+    return *existing;
+  const auto& pinned = Scripts();
+  return AdmitOccurrenceWithContent(actor, occurrence, pinned, {}, manifest,
+                                    false, true);
+}
+
+QuestJobRunner::AdmissionResult QuestJobRunner::AdmitOccurrence(
+  MpActor& actor, const CapturedOccurrence& occurrence,
+  const MetadataOverrides& overrides,
+  const std::vector<PexScript::Lazy>& sources, bool automatic)
+{
+  if (const auto existing = PrepareOccurrence(actor, occurrence))
+    return *existing;
+  const auto hashManifest = QuestJobContent::WithMetadataOverrides(
+    world, QuestJobContent::ScriptManifest(sources), overrides);
+  return AdmitOccurrenceWithContent(actor, occurrence, sources, overrides,
+                                    hashManifest, true, automatic);
+}
+
+QuestJobRunner::AdmissionResult QuestJobRunner::AdmitOccurrenceWithContent(
+  MpActor& actor, const CapturedOccurrence& occurrence,
+  const std::vector<PexScript::Lazy>& sources,
+  const MetadataOverrides& overrides, const std::string& hashManifest,
+  bool fixtureAwait, bool automatic)
+{
+  // Loading fixture or owned content can invoke host callbacks. Recheck the
+  // immutable capture and prospective sequence immediately before admission.
+  if (const auto existing = PrepareOccurrence(actor, occurrence))
+    return *existing;
+  QuestJobState::Job job;
+  job.kind = QuestJobState::Kind::Interaction;
+  job.cursor = "done";
+  job.interactionDone = false;
+  job.interaction = occurrence.interaction;
+  job.occurrence = occurrence.id.sequence;
+  AdmitWithContent(actor, NextRequest(actor), std::move(job), sources,
+                   overrides, hashManifest, fixtureAwait, automatic,
+                   &occurrence);
+  return InspectOccurrence(actor, occurrence.id);
 }
 
 void QuestJobRunner::RequireRequest(MpActor& actor, const Request& request,
@@ -756,7 +941,7 @@ QuestJobRunner::Result QuestJobRunner::AdmitWithContent(
   MpActor& actor, const Request& command, QuestJobState::Job job,
   const std::vector<PexScript::Lazy>& sources,
   const MetadataOverrides& overrides, const std::string& hashManifest,
-  bool fixtureAwait, bool automatic)
+  bool fixtureAwait, bool automatic, const CapturedOccurrence* occurrence)
 {
   if (command.command.empty() || command.command.size() > 128 ||
       command.command.find('\0') != std::string::npos || stopped ||
@@ -775,10 +960,20 @@ QuestJobRunner::Result QuestJobRunner::AdmitWithContent(
   auto& owner = QuestJournal::Owner(actor);
   auto jobs = QuestJournal::JobState(actor);
   RequireRequest(actor, command, jobs);
+  if (job.occurrence) {
+    if (!occurrence || *job.occurrence != occurrence->id.sequence ||
+        occurrence->actor != actor.GetChangeForm().formDesc.ToString() ||
+        occurrence->instance != actor.GetWorldInstance() ||
+        job.kind != QuestJobState::Kind::Interaction ||
+        job.interaction != occurrence->interaction)
+      throw std::runtime_error("Native occurrence lost its immutable capture");
+    RequireOccurrence(actor, occurrence->id, jobs);
+  }
   if (const auto* prior = Find(jobs, command)) {
     RequireContext(actor, *prior);
     RequireMode(*prior, fixtureAwait);
-    if (prior->kind != job.kind || prior->interaction != job.interaction ||
+    if (prior->kind != job.kind || prior->occurrence != job.occurrence ||
+        prior->interaction != job.interaction ||
         prior->referenceLoad != job.referenceLoad ||
         prior->quest != job.quest || prior->stage != job.stage ||
         prior->contentHash != job.contentHash)
@@ -819,6 +1014,14 @@ QuestJobRunner::Result QuestJobRunner::AdmitWithContent(
         "Concurrent quest jobs require one pinned environment");
   auto retiredIds =
     command.sequence ? jobs.RetireForAdmission() : std::vector<uint64_t>{};
+  if (job.occurrence) {
+    if (!command.sequence || *job.occurrence != jobs.ingress.next ||
+        jobs.ingress.next >= MaxIdentity)
+      throw std::runtime_error(
+        "Native occurrence sequence changed before admission");
+    jobs.ingress.identity = occurrence->id.campaignIdentity;
+    ++jobs.ingress.next;
+  }
   if (job.kind == QuestJobState::Kind::Stage)
     QuestJournal::RequireAdapter(
       actor, FormDesc::FromString(job.quest).ToFormId(world.espmFiles));
@@ -1014,6 +1217,8 @@ QuestJobRunner::Result QuestJobRunner::RunSegment(
 {
   auto& owner = QuestJournal::Owner(actor);
   auto& job = jobs.live.at(jobId);
+  const auto admittedOccurrence = submit ? job.occurrence : std::nullopt;
+  const auto admissionGeneration = job.generation;
   const auto ownerId = owner.GetFormId();
   const auto command = RequestFor(job);
   if (!barriers.contains(ownerId) && barriers.size() >= 4096)
@@ -1028,6 +1233,24 @@ QuestJobRunner::Result QuestJobRunner::RunSegment(
   barrier.owner = world.LookupFormByIdNoLoad(ownerId);
   try {
     BusyGuard guard(barrier.busy);
+    struct AdmissionGuard
+    {
+      Barrier& barrier;
+      AdmissionGuard(Barrier& value, std::optional<uint64_t> occurrence,
+                     uint64_t generation)
+        : barrier(value)
+      {
+        if (occurrence) {
+          barrier.admittingOccurrence = *occurrence;
+          barrier.admittingGeneration = generation;
+        }
+      }
+      ~AdmissionGuard()
+      {
+        barrier.admittingOccurrence = 0;
+        barrier.admittingGeneration = 0;
+      }
+    } admissionGuard(barrier, admittedOccurrence, admissionGeneration);
     std::optional<QuestJobTimerAnchor> timerAnchor;
     const auto receipt = QuestJournal::AtomicJob(actor, jobId, [&] {
       const auto requireAdapter = [&](const QuestJobState::Stage& stage) {
@@ -1072,6 +1295,11 @@ QuestJobRunner::Result QuestJobRunner::RunSegment(
     });
     // All post-commit publication below is nonallocating.
     barrier.receipt = receipt;
+    if (admittedOccurrence) {
+      barrier.occurrence = *admittedOccurrence;
+      barrier.occurrenceGeneration = admissionGeneration;
+      barrier.admissionReceipt = receipt;
+    }
     if (!retiredIds.empty()) {
       barrier.retiredIds = std::move(retiredIds);
       barrier.retirementGeneration = jobs.generation;

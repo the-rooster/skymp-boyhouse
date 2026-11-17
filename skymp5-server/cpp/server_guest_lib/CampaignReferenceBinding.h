@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <string>
 #include <utility>
 
 class MpActor;
@@ -15,6 +16,9 @@ public:
   static constexpr auto kProperty =
     "private.indexed.boyhouse.campaignReference";
   static void Bind(MpActor& owner, uint32_t original, MpObjectReference& copy);
+  // Read the existing persistent binding family without creating it. Native
+  // ingress identities must not become valid for a replacement character.
+  static std::string GetIdentity(MpActor& owner);
   static MpObjectReference& Resolve(MpActor& actor, uint32_t original);
   static std::pair<MpActor*, uint32_t> Context(MpObjectReference& copy);
   // Validate before restoring a saved copy. Its owner may load later.

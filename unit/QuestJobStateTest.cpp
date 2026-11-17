@@ -181,6 +181,8 @@ Json Legacy(const QuestJobState& state, uint64_t version = 1)
 {
   auto saved = state.Save();
   saved["schemaVersion"] = version;
+  if (version < 9)
+    saved.erase("ingress");
   if (version < 6) {
     REQUIRE(saved["live"].size() <= 1);
     saved["active"] = saved["live"].empty() ? Json(nullptr) : saved["live"][0];
@@ -190,8 +192,12 @@ Json Legacy(const QuestJobState& state, uint64_t version = 1)
   if (version < 5)
     saved.erase("retiredThrough");
   auto strip = [version](Json& job) {
-    job.erase("referenceLoad");
-    job.erase("loadPhase");
+    if (version < 9)
+      job.erase("occurrence");
+    if (version < 8) {
+      job.erase("referenceLoad");
+      job.erase("loadPhase");
+    }
     if (version < 7) {
       REQUIRE(job["kind"] == "stage");
       job.erase("kind");
@@ -543,6 +549,31 @@ QuestJobState::Job Numbered(QuestJobState::Job job, uint64_t id,
   return job;
 }
 
+QuestJobState::Job NativeOccurrenceJob(uint64_t id, uint64_t sequence,
+                                       bool completed = false)
+{
+  auto job = Numbered(*Single(InteractionBegin()), id);
+  job.occurrence = sequence;
+  job.interaction->name = sequence % 2 ? "OnTriggerEnter" : "OnTriggerLeave";
+  if (completed) {
+    job.interactionDone = true;
+    HostStep(job, 1);
+  }
+  return job;
+}
+
+QuestJobState NativeOccurrences()
+{
+  QuestJobState state;
+  state.nextJob = 4;
+  state.ingress.identity = std::string(32, 'a');
+  state.ingress.next = 3;
+  state.completed.push_back(CompletedRecord(1, false));
+  state.completed.push_back(NativeOccurrenceJob(2, 1, true));
+  state.live.emplace(3, NativeOccurrenceJob(3, 2));
+  return state;
+}
+
 void CompleteLive(QuestJobState& state, uint64_t id)
 {
   auto job = state.live.at(id);
@@ -687,7 +718,7 @@ TEST_CASE("Quest jobs reject corrupt exact fields identities and cursor state",
   std::vector<std::function<void(Json&)>> corrupt = {
     [](Json& v) { v["unknown"] = 1; },
     [](Json& v) { v.erase("live"); },
-    [](Json& v) { v["schemaVersion"] = 9; },
+    [](Json& v) { v["schemaVersion"] = 10; },
     [](Json& v) { v["generation"] = 0; },
     [](Json& v) { v["nextJob"] = 1; },
     [](Json& v) { v["nextJob"] = UINT64_MAX; },
@@ -1013,7 +1044,7 @@ TEST_CASE(
     const auto legacy = Legacy(state);
     const auto migrated = QuestJobState::Read(legacy);
     REQUIRE(migrated.Save() == MigratedLegacy(state).Save());
-    REQUIRE(migrated.Save()["schemaVersion"] == 8);
+    REQUIRE(migrated.Save()["schemaVersion"] == 9);
   }
   auto external = Waiting();
   Single(external)->awaitKey = "quest-stage";
@@ -1387,7 +1418,7 @@ TEST_CASE("Timer jobs round trip UTC deadlines and typed None completions",
   for (const auto& value : { state, Done(state) })
     REQUIRE(QuestJobState::Read(value.Save()).Save() == value.Save());
   const auto saved = state.Save();
-  REQUIRE(saved["schemaVersion"] == 8);
+  REQUIRE(saved["schemaVersion"] == 9);
   REQUIRE(saved["live"][0]["timer"]["policy"] == "utc-deadline-v1");
   const auto done = Done(state);
   const auto& job = done.completed.front();
@@ -1985,7 +2016,7 @@ TEST_CASE(
     auto migrated = QuestJobState::Read(legacy);
     REQUIRE(migrated.Save() == original.Save());
     REQUIRE(migrated.retiredThrough == 0);
-    REQUIRE(migrated.Save()["schemaVersion"] == 8);
+    REQUIRE(migrated.Save()["schemaVersion"] == 9);
     if (Single(migrated)) {
       REQUIRE_FALSE(Single(migrated)->sequenced);
       REQUIRE(Single(migrated)->Scope() == Single(original)->Scope());
@@ -2700,7 +2731,7 @@ TEST_CASE("Schema six histories migrate as stages without changing stacks or "
                                 SelectedHandler(true), multiple }) {
     const auto migrated = QuestJobState::Read(Legacy(original, 6));
     REQUIRE(migrated.Save() == original.Save());
-    REQUIRE(migrated.Save()["schemaVersion"] == 8);
+    REQUIRE(migrated.Save()["schemaVersion"] == 9);
     for (const auto& [id, job] : migrated.live) {
       REQUIRE(job.kind == QuestJobState::Kind::Stage);
       REQUIRE_FALSE(job.interaction);
@@ -3019,7 +3050,7 @@ TEST_CASE(
          interactionDone }) {
     const auto migrated = QuestJobState::Read(Legacy(original, 7));
     REQUIRE(migrated.Save() == original.Save());
-    REQUIRE(migrated.Save()["schemaVersion"] == 8);
+    REQUIRE(migrated.Save()["schemaVersion"] == 9);
     for (const auto& [id, job] : migrated.live) {
       REQUIRE_FALSE(job.referenceLoad);
       REQUIRE(job.loadPhase == QuestJobState::LoadPhase::Done);
@@ -3348,4 +3379,291 @@ TEST_CASE("Reference-load roots share the twenty live slots while stage slots "
   extra.referenceLoad->target = "200:Skyrim.esm";
   state.live.emplace(extra.id, extra);
   REQUIRE_THROWS(state.Save());
+}
+
+TEST_CASE(
+  "Native ingress associates ordered occurrences with numbered event roots",
+  "[Quest][QuestJob][QuestIngress]")
+{
+  auto state = NativeOccurrences();
+  const auto saved = state.Save();
+  REQUIRE(saved["schemaVersion"] == 9);
+  REQUIRE(saved["completed"][0]["occurrence"].is_null());
+  REQUIRE(saved["completed"][1]["occurrence"] == 1);
+  REQUIRE(saved["live"][0]["occurrence"] == 2);
+  REQUIRE(QuestJobState::Read(saved).Save() == saved);
+  REQUIRE(state.FindOccurrence(1) == &state.completed[1]);
+  REQUIRE(state.FindOccurrence(2) == state.FindLive(3));
+  REQUIRE_FALSE(state.FindOccurrence(0));
+  REQUIRE_FALSE(state.FindOccurrence(3));
+  REQUIRE_FALSE(state.IsOccurrenceRetired(0));
+  REQUIRE_FALSE(state.IsOccurrenceRetired(1));
+  REQUIRE_FALSE(state.IsOccurrenceRetired(2));
+  REQUIRE_FALSE(state.IsOccurrenceRetired(3));
+  REQUIRE(state.FindOccurrence(1)->interaction->name == "OnTriggerEnter");
+  REQUIRE(state.FindOccurrence(2)->interaction->name == "OnTriggerLeave");
+  REQUIRE_NOTHROW(state.ValidateHeap(Json::object()));
+
+  auto waiting = Numbered(*Single(InteractionHandler(true)), 3);
+  waiting.occurrence = 2;
+  waiting.interaction->name = "OnTriggerLeave";
+  waiting.handler->handlerIdentity->function = "OnTriggerLeave";
+  waiting.handler->function = "OnTriggerLeave";
+  state.live.at(3) = waiting;
+  REQUIRE_NOTHROW(state.ValidateHeap(AllLiveHeap(state)));
+  REQUIRE(QuestJobState::Read(state.Save()).Save() == state.Save());
+}
+
+TEST_CASE(
+  "Native ingress rejects malformed identities occurrence tags and coverage",
+  "[Quest][QuestJob][QuestIngress]")
+{
+  const auto original = NativeOccurrences().Save();
+  const std::vector<std::function<void(Json&)>> corrupt = {
+    [](Json& v) { v.erase("ingress"); },
+    [](Json& v) { v["ingress"] = nullptr; },
+    [](Json& v) { v["ingress"]["unknown"] = 1; },
+    [](Json& v) { v["ingress"].erase("retiredRanges"); },
+    [](Json& v) { v["ingress"]["identity"] = ""; },
+    [](Json& v) { v["ingress"]["identity"] = std::string(31, 'a'); },
+    [](Json& v) { v["ingress"]["identity"] = std::string(32, 'A'); },
+    [](Json& v) { v["ingress"]["identity"] = std::string(32, 'g'); },
+    [](Json& v) { v["ingress"]["identity"] = std::string(32, '\0'); },
+    [](Json& v) { v["ingress"]["next"] = 0; },
+    [](Json& v) { v["ingress"]["next"] = 1; },
+    [](Json& v) { v["ingress"]["next"] = 2; },
+    [](Json& v) { v["ingress"]["next"] = 4; },
+    [](Json& v) { v["ingress"]["next"] = 3.0; },
+    [](Json& v) { v["ingress"]["next"] = UINT64_MAX; },
+    [](Json& v) { v["ingress"]["retiredThrough"] = 1; },
+    [](Json& v) { v["ingress"]["retiredThrough"] = -1; },
+    [](Json& v) { v["ingress"]["retiredRanges"] = Json::object(); },
+    [](Json& v) { v["live"][0].erase("occurrence"); },
+    [](Json& v) { v["live"][0]["occurrence"] = nullptr; },
+    [](Json& v) { v["live"][0]["occurrence"] = 0; },
+    [](Json& v) { v["live"][0]["occurrence"] = -1; },
+    [](Json& v) { v["live"][0]["occurrence"] = true; },
+    [](Json& v) { v["live"][0]["occurrence"] = 2.0; },
+    [](Json& v) { v["live"][0]["occurrence"] = 3; },
+    [](Json& v) { v["live"][0]["occurrence"] = 1; },
+    [](Json& v) {
+      v["live"][0]["occurrence"] = 1;
+      v["completed"][1]["occurrence"] = 2;
+    },
+    [](Json& v) { v["live"][0]["sequenced"] = false; },
+    [](Json& v) { v["live"][0]["interaction"]["name"] = "OnTrigger"; },
+    [](Json& v) { v["live"][0]["interaction"]["name"] = "OnActivate"; }
+  };
+  for (size_t index = 0; index < corrupt.size(); ++index) {
+    INFO("Native ingress corruption " << index);
+    auto value = original;
+    corrupt[index](value);
+    REQUIRE_THROWS(QuestJobState::Read(value));
+  }
+  for (const auto& initial : { Begin(), ReferenceLoadBegin() }) {
+    auto state = initial;
+    state.live.at(1) = Numbered(state.live.at(1), 1);
+    state.live.at(1).occurrence = 1;
+    state.ingress.identity = std::string(32, 'a');
+    state.ingress.next = 2;
+    REQUIRE_THROWS(state.Save());
+  }
+  auto empty = QuestJobState{}.Save();
+  empty["ingress"]["identity"] = std::string(32, 'a');
+  REQUIRE_THROWS(QuestJobState::Read(empty));
+}
+
+TEST_CASE("Native sparse retirement preserves an old live occurrence beyond "
+          "300 admissions",
+          "[Quest][QuestJob][QuestIngress]")
+{
+  QuestJobState state;
+  state.completed.push_back(CompletedRecord(1, false));
+  const auto legacy = state.completed.front();
+  state.live.emplace(2, NativeOccurrenceJob(2, 1));
+  state.nextJob = 3;
+  state.ingress.identity = std::string(32, 'a');
+  state.ingress.next = 2;
+  const auto live = state.live.at(2);
+  for (uint64_t sequence = 2; sequence <= 340; ++sequence) {
+    state.RetireForAdmission();
+    const auto id = state.nextJob++;
+    REQUIRE(state.ingress.next == sequence);
+    state.completed.push_back(
+      NativeOccurrenceJob(id, state.ingress.next++, true));
+    REQUIRE_NOTHROW(state.Save());
+  }
+  REQUIRE(state.live.at(2) == live);
+  REQUIRE(state.completed.front() == legacy);
+  REQUIRE(state.retiredThrough == 0);
+  REQUIRE(state.retiredRanges ==
+          std::vector<QuestJobState::RetiredRange>{ { 3, 310 } });
+  REQUIRE(state.ingress.retiredThrough == 0);
+  REQUIRE(state.ingress.retiredRanges ==
+          std::vector<QuestJobState::RetiredRange>{ { 2, 309 } });
+  REQUIRE_FALSE(state.IsOccurrenceRetired(1));
+  REQUIRE(state.IsOccurrenceRetired(2));
+  REQUIRE(state.IsOccurrenceRetired(309));
+  REQUIRE_FALSE(state.IsOccurrenceRetired(310));
+  REQUIRE_FALSE(state.IsOccurrenceRetired(state.ingress.next));
+  REQUIRE_FALSE(state.FindOccurrence(2));
+  REQUIRE(state.FindOccurrence(310)->id == 311);
+  REQUIRE(QuestJobState::Read(state.Save()).Save() == state.Save());
+
+  state.live.at(2).interactionDone = true;
+  HostStep(state.live.at(2), 1);
+  CompleteLive(state, 2);
+  REQUIRE(state.RetireForAdmission() == std::vector<uint64_t>{ 2 });
+  REQUIRE(state.retiredThrough == 310);
+  REQUIRE(state.retiredRanges.empty());
+  REQUIRE(state.ingress.retiredThrough == 309);
+  REQUIRE(state.ingress.retiredRanges.empty());
+  REQUIRE(state.IsOccurrenceRetired(1));
+  REQUIRE(state.completed.front() == legacy);
+  REQUIRE_NOTHROW(state.ValidateHeap(Json::object()));
+}
+
+TEST_CASE("Native byte retirement drops payloads and preserves consumed "
+          "identities atomically",
+          "[Quest][QuestJob][QuestIngress]")
+{
+  auto state = ByteHeavyHistory();
+  state.ingress.identity = std::string(32, 'a');
+  state.ingress.next = 4;
+  uint64_t sequence = 1;
+  for (auto& job : state.completed) {
+    if (job.id != 2 && job.id != 4 && job.id != 5)
+      continue;
+    auto replacement = NativeOccurrenceJob(job.id, sequence++, true);
+    replacement.events = job.events;
+    replacement.eventHead = job.eventHead;
+    job = std::move(replacement);
+  }
+  const auto legacy = state.completed.front();
+  const auto newest = *state.FindOccurrence(3);
+  REQUIRE(state.RetainedSequencedBytes() > QuestJobState::MaxRecentBytes);
+  REQUIRE(state.RetireForAdmission() == std::vector<uint64_t>{ 2, 4 });
+  REQUIRE(state.ingress.retiredThrough == 2);
+  REQUIRE(state.ingress.retiredRanges.empty());
+  REQUIRE(state.IsOccurrenceRetired(1));
+  REQUIRE(state.IsOccurrenceRetired(2));
+  REQUIRE(*state.FindOccurrence(3) == newest);
+  REQUIRE(state.completed.front() == legacy);
+  REQUIRE(state.RetainedSequencedBytes() <= QuestJobState::MaxRecentBytes);
+  REQUIRE_NOTHROW(state.Save());
+  auto malformed = state;
+  malformed.ingress.identity = "invalid";
+  const auto before = malformed;
+  REQUIRE_THROWS(malformed.RetireForAdmission());
+  REQUIRE(malformed.ingress == before.ingress);
+  REQUIRE(malformed.completed == before.completed);
+  REQUIRE(malformed.retiredThrough == before.retiredThrough);
+  REQUIRE(malformed.retiredRanges == before.retiredRanges);
+}
+
+TEST_CASE("Native retirement validates sparse coverage without expanding "
+          "historical IDs",
+          "[Quest][QuestJob][QuestIngress]")
+{
+  constexpr uint64_t max = 9007199254740991ULL;
+  QuestJobState state;
+  state.nextJob = max;
+  state.live.emplace(1, NativeOccurrenceJob(1, 1));
+  state.live.emplace(max - 1, NativeOccurrenceJob(max - 1, max - 1));
+  state.retiredRanges = { { 2, max - 2 } };
+  state.ingress.identity = std::string(32, 'a');
+  state.ingress.next = max;
+  state.ingress.retiredRanges = state.retiredRanges;
+  const auto saved = state.Save();
+  REQUIRE(QuestJobState::Read(saved).Save() == saved);
+  REQUIRE(state.IsOccurrenceRetired(max - 2));
+  REQUIRE_FALSE(state.IsOccurrenceRetired(max - 1));
+  REQUIRE_FALSE(state.IsOccurrenceRetired(max));
+  const std::vector<std::function<void(Json&)>> corrupt = {
+    [](Json& v) { v["ingress"]["retiredRanges"][0]["first"] = 1; },
+    [](Json& v) { v["ingress"]["retiredRanges"][0]["first"] = 3; },
+    [](Json& v) { v["ingress"]["retiredRanges"][0]["last"] = max - 1; },
+    [](Json& v) { v["ingress"]["retiredRanges"][0]["last"] = 0; },
+    [](Json& v) { v["ingress"]["retiredRanges"][0]["extra"] = true; },
+    [](Json& v) { v["ingress"]["retiredRanges"][0].erase("last"); },
+    [](Json& v) {
+      v["ingress"]["retiredRanges"] =
+        Json::array({ { { "first", 2 }, { "last", 3 } },
+                      { { "first", 4 }, { "last", max - 2 } } });
+    },
+    [](Json& v) {
+      v["ingress"]["retiredRanges"] =
+        Json::array({ { { "first", 4 }, { "last", max - 2 } },
+                      { { "first", 2 }, { "last", 3 } } });
+    }
+  };
+  for (size_t index = 0; index < corrupt.size(); ++index) {
+    INFO("Native range corruption " << index);
+    auto changed = saved;
+    corrupt[index](changed);
+    REQUIRE_THROWS(QuestJobState::Read(changed));
+  }
+  auto oversized = state;
+  oversized.ingress.retiredRanges.resize(
+    QuestJobState::MaxIngressRetiredRanges + 1);
+  REQUIRE_THROWS(oversized.Save());
+
+  QuestJobState legacy;
+  legacy.nextJob = 3;
+  legacy.retiredThrough = 2;
+  legacy.completed.push_back(CompletedRecord(1, false));
+  legacy.ingress.identity = std::string(32, 'a');
+  legacy.ingress.next = 3;
+  legacy.ingress.retiredThrough = 2;
+  REQUIRE_THROWS(
+    legacy
+      .Save()); // The retained legacy ID is not a retired native occurrence.
+  legacy.ingress.next = 2;
+  legacy.ingress.retiredThrough = 1;
+  REQUIRE_NOTHROW(legacy.Save());
+  REQUIRE_FALSE(legacy.FindOccurrence(1));
+  REQUIRE(legacy.IsOccurrenceRetired(1));
+
+  QuestJobState adjacent;
+  adjacent.nextJob = 3;
+  adjacent.retiredThrough = 2;
+  adjacent.ingress.identity = std::string(32, 'a');
+  adjacent.ingress.next = 3;
+  adjacent.ingress.retiredRanges = { { 1, 2 } };
+  REQUIRE_THROWS(adjacent.Save());
+  adjacent.ingress.retiredThrough = 1;
+  adjacent.ingress.retiredRanges = { { 2, 2 } };
+  REQUIRE_THROWS(adjacent.Save());
+  adjacent.ingress.retiredThrough = 2;
+  adjacent.ingress.retiredRanges.clear();
+  REQUIRE_NOTHROW(adjacent.Save());
+}
+
+TEST_CASE("Schemas one through eight migrate untouched native ingress and "
+          "reject future fields",
+          "[Quest][QuestJob][QuestIngress]")
+{
+  for (uint64_t version = 1; version <= 8; ++version) {
+    auto original = Waiting();
+    const auto legacy = Legacy(original, version);
+    const auto migrated = QuestJobState::Read(legacy);
+    REQUIRE(migrated.Save()["schemaVersion"] == 9);
+    REQUIRE(migrated.ingress == QuestJobState::Ingress{});
+    REQUIRE_FALSE(migrated.live.at(1).occurrence);
+    auto changed = legacy;
+    changed["ingress"] = QuestJobState{}.Save()["ingress"];
+    REQUIRE_THROWS(QuestJobState::Read(changed));
+    changed = legacy;
+    if (version < 6)
+      changed["active"]["occurrence"] = nullptr;
+    else
+      changed["live"][0]["occurrence"] = nullptr;
+    REQUIRE_THROWS(QuestJobState::Read(changed));
+    REQUIRE_NOTHROW(migrated.ValidateHeap(AllLiveHeap(migrated)));
+  }
+  for (const auto& state :
+       { InteractionBegin(), InteractionHandler(true), ReferenceLoadBegin(),
+         ReferenceLoadHandler(QuestJobState::LoadPhase::Load, true) }) {
+    REQUIRE(QuestJobState::Read(Legacy(state, 8)).Save() == state.Save());
+  }
 }
