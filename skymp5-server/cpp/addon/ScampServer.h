@@ -6,6 +6,7 @@
 #include "PartOne.h"
 #include "ScampServerListener.h"
 #include "libespm/QuestStartSceneIndex.h"
+#include "libespm/StoryEventRouteIndex.h"
 #include "papyrus-vm/PexScript.h"
 
 #include <map>
@@ -136,6 +137,7 @@ private:
   std::optional<std::vector<std::string>> cachedAvailableLanguages;
 
   std::optional<espm::QuestStartSceneIndex> startupScenes;
+  std::optional<espm::StoryEventRouteIndex> startupRoutes;
   std::optional<std::vector<PexScript::Lazy>> startupScripts;
   static Napi::FunctionReference constructor;
 };

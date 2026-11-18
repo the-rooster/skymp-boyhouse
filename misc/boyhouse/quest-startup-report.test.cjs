@@ -91,6 +91,21 @@ test("stage evidence distinguishes active stage execution from stage-free startu
   assert.match(renderStartupMarkdown(report), /\*\*1\*\* executed at least one authored startup stage. \*\*1\*\* completed without executing a stage/);
 });
 
+test("forced controls detect trace or diagnostic changes even when status and first blocker match", () => {
+  const metadata = {sources: [], catalogRecords: 4, excludedDeleted: []};
+  const rows = [quest(1), quest(2), quest(3), quest(4)];
+  const contrast = buildStartupReport(rows, {provenance: {...metadata, mode: "forced-start"}});
+  const report = buildStartupReport([
+    {...rows[0], fixture:"actor-dialogue"},
+    {...rows[1], fixture:"forced-start"},
+    {...rows[2], fixture:"forced-start", stages:[10]},
+    {...rows[3], fixture:"forced-start", detail:"Alias 13"},
+  ], {contrast, provenance:{...metadata, mode:"actor-dialogue"}});
+  assert.deepEqual(report.fixtureContrast.forcedControls,
+    {unchanged:1, changed:2, changedIds:[rows[2].id, rows[3].id]});
+  assert.match(renderStartupMarkdown(report), /\*\*1\*\* had identical evidence and \*\*2\*\* changed/);
+});
+
 test("story event blockers show which event fixture will reach the most quests", () => {
   const rows = ["SCPT", "ADIA", "ADIA"].map((tag, i) => quest(i, "blocked", "story.event",
     {step: "admission", detail: `Quest requires story event ${tag}`}));

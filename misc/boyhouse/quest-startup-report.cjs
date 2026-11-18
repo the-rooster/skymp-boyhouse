@@ -1,5 +1,7 @@
 "use strict";
 
+const {isDeepStrictEqual} = require("node:util");
+
 const statuses = ["started", "blocked", "error"];
 const byText = (left, right) => left < right ? -1 : left > right ? 1 : 0;
 
@@ -57,7 +59,7 @@ function observation(row) {
 function compare(previous, report) {
   if (previous?.kind !== "quest-startup" || previous.schemaVersion !== 1)
     throw new Error("Expected a version 1 quest startup baseline");
-  for (const key of ["mode", "sources"]) {
+  for (const key of ["mode", "sources", "actorDialogue"]) {
     if (JSON.stringify(orderedValue(previous.provenance?.[key])) !==
         JSON.stringify(report.provenance[key]))
       throw new Error(`Cannot compare startup runs with different ${key}`);
@@ -70,6 +72,8 @@ function compare(previous, report) {
   for (const id of [...new Set([...before.keys(), ...after.keys()])].sort(byText)) {
     const old = before.get(id);
     const now = after.get(id);
+    if (old && now && old.fixture !== now.fixture)
+      throw new Error(`Cannot compare different fixtures for ${id}`);
     let kind;
     if (!old) kind = "added";
     else if (!now) kind = "removed";
@@ -89,14 +93,60 @@ function compare(previous, report) {
   return {counts, changes};
 }
 
-function buildStartupReport(rows, {previous = null, provenance = {}} = {}) {
+function contrastFixtures(previous, report) {
+  if (previous?.kind !== "quest-startup" || previous.schemaVersion !== 1 ||
+      previous.provenance?.mode !== "forced-start" || report.provenance.mode !== "actor-dialogue")
+    throw new Error("Fixture contrast requires a forced-start baseline and an actor-dialogue run");
+  for (const key of ["sources", "catalogRecords", "excludedDeleted"]) {
+    if (report.provenance[key] === undefined || JSON.stringify(orderedValue(previous.provenance[key])) !==
+        JSON.stringify(report.provenance[key])) throw new Error(`Fixture contrast differs in ${key}`);
+  }
+  const before = indexRows(previous.quests);
+  const after = report.quests;
+  if (before.size !== after.length || after.length + report.provenance.excludedDeleted.length !== report.provenance.catalogRecords)
+    throw new Error("Fixture contrast requires the same full catalog");
+  const observations = [];
+  const forcedControls = {changed: 0, unchanged: 0, changedIds: []};
+  for (const row of after) {
+    const old = before.get(row.id);
+    if (!old || row.editorId !== old.editorId || row.winningPlugin !== old.winningPlugin)
+      throw new Error(`Fixture contrast differs in winning quest ${row.id}`);
+    if (row.fixture === "actor-dialogue") {
+      observations.push({id: row.id, forced: {...observation(old), detail: old.detail},
+        actorDialogue: {...observation(row), detail: row.detail}});
+    } else {
+      // A mixed run labels its forced rows. Compare all other evidence,
+      // including phase order, stages and exact diagnostics.
+      const {fixture, ...evidence} = row;
+      if (isDeepStrictEqual(old, evidence)) forcedControls.unchanged++;
+      else {
+        forcedControls.changed++;
+        forcedControls.changedIds.push(row.id);
+      }
+    }
+  }
+  return {forcedAddonSha256: previous.provenance.addonSha256, observations, forcedControls};
+}
+
+function buildStartupReport(rows, {previous = null, provenance = {}, contrast = null} = {}) {
   const quests = [...indexRows(rows).values()]
     .sort((a, b) => byText(a.id, b.id)).map(orderedValue);
   const summary = {total: quests.length, started: 0, blocked: 0, error: 0};
   for (const quest of quests) summary[quest.status]++;
   const report = {schemaVersion: 1, kind: "quest-startup", provenance: orderedValue(provenance),
     summary, blockers: groupByCause(quests, "blocked"), errors: groupByCause(quests, "error"), quests};
+  if (provenance.mode === "actor-dialogue") {
+    report.fixtures = {};
+    for (const name of ["actor-dialogue", "forced-start"])
+      report.fixtures[name] = {total: 0, started: 0, blocked: 0, error: 0};
+    for (const row of quests) {
+      if (!Object.hasOwn(report.fixtures, row.fixture)) throw new Error(`Unknown fixture for ${row.id}`);
+      report.fixtures[row.fixture].total++;
+      report.fixtures[row.fixture][row.status]++;
+    }
+  }
   if (previous !== null) report.comparison = compare(previous, report);
+  if (contrast !== null) report.fixtureContrast = contrastFixtures(contrast, report);
   return report;
 }
 
@@ -109,6 +159,36 @@ function renderStartupMarkdown(report) {
     `**${summary.blocked}** reached a reported blocker, and **${summary.error}** returned a test error.`,
     "", "Each attempt requests a first start in a fresh campaign and rolls back its changes. Natural triggers, later quest branches and multiplayer " +
     "playthroughs require separate tests."];
+  if (report.fixtures) {
+    lines.push("", "## Startup fixtures", "",
+      "Every winning QUST with an ADIA event uses Hulda and Mikael as ordered dialogue participants " +
+      "in the campaign owner's private Bannered Mare instance. " +
+      "All other winning quests use the ordinary forced-start probe.", "",
+      "| Fixture | Attempts | Completed startup | Blocked | Error |", "| --- | ---: | ---: | ---: | ---: |");
+    for (const [name, counts] of Object.entries(report.fixtures))
+      lines.push(`| ${name} | ${counts.total} | ${counts.started} | ${counts.blocked} | ${counts.error} |`);
+  }
+  if (report.fixtureContrast) {
+    const {forcedAddonSha256, observations, forcedControls} = report.fixtureContrast;
+    lines.push("", "## Forced startup and explicit actor dialogue", "",
+      `The same **${observations.length}** ADIA quests were attempted under both fixtures. ` +
+      "These observations describe coverage under different inputs. " +
+      "Measuring runtime progress requires rerunning the same fixture.", "");
+    if (forcedControls)
+      lines.push(`Among forced-start controls, **${forcedControls.unchanged}** had identical evidence ` +
+        `and **${forcedControls.changed}** changed.`, "");
+    if (forcedAddonSha256 !== report.provenance.addonSha256)
+      lines.push("The two runs also used different addon builds.", "");
+    const pairs = new Map();
+    const outcome = row => row.code || row.status;
+    for (const {forced, actorDialogue} of observations) {
+      const pair = `| ${tableCell(outcome(forced))} | ${tableCell(outcome(actorDialogue))}`;
+      pairs.set(pair, (pairs.get(pair) ?? 0) + 1);
+    }
+    lines.push("| Forced startup | Actor dialogue | Quests |", "| --- | --- | ---: |");
+    for (const [pair, count] of [...pairs].sort((a, b) => b[1] - a[1] || byText(a[0], b[0])))
+      lines.push(`${pair} | ${count} |`);
+  }
   const completed = report.quests.filter(quest => quest.status === "started");
   if (completed.length && completed.every(quest => Array.isArray(quest.stages))) {
     const withStage = completed.filter(quest => quest.stages.length > 0).length;

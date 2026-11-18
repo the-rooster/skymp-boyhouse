@@ -1944,28 +1944,45 @@ Napi::Value ScampServer::ResumeCampaignActor(const Napi::CallbackInfo& info)
 Napi::Value ScampServer::ProbeQuestStartup(const Napi::CallbackInfo& info)
 {
   try {
-    if (info.Length() != 2)
-      throw std::invalid_argument("Expected disposable actor and quest IDs");
-    const auto actorId = NapiHelper::ExtractUInt32(info[0], "actorId");
-    const auto questId = NapiHelper::ExtractUInt32(info[1], "questId");
-    if (!actorId || !questId ||
-        info[0].As<Napi::Number>().DoubleValue() != actorId ||
-        info[1].As<Napi::Number>().DoubleValue() != questId)
+    if (info.Length() != 2 && info.Length() != 4)
       throw std::invalid_argument(
-        "Startup probe IDs must be positive uint32 integers");
+        "Expected owner and quest IDs, optionally followed by two NPC IDs");
+    const auto id = [&](size_t index) {
+      const auto number = NapiHelper::ExtractUInt32(info[index], "formId");
+      if (!number || info[index].As<Napi::Number>().DoubleValue() != number)
+        throw std::invalid_argument(
+          "Startup probe IDs must be positive uint32 integers");
+      return number;
+    };
+    const auto actorId = id(0);
+    const auto questId = id(1);
     auto& world = partOne->worldState;
-    const auto form = world.LookupFormByIdNoLoad(actorId);
-    auto* actor = form ? form->AsActor() : nullptr;
-    if (!actor ||
-        partOne->serverState.UserByActor(actor) != Networking::InvalidUserId)
-      throw std::invalid_argument(
-        "Startup probes require an unassigned actor");
+    const auto unassigned = [&](uint32_t formId) -> MpActor& {
+      const auto form = world.LookupFormByIdNoLoad(formId);
+      auto* actor = form ? form->AsActor() : nullptr;
+      if (!actor ||
+          partOne->serverState.UserByActor(actor) != Networking::InvalidUserId)
+        throw std::invalid_argument(
+          "Startup probes require registered unassigned actors");
+      return *actor;
+    };
+    auto& owner = unassigned(actorId);
+    std::optional<QuestScriptRuntime::ActorDialogue> dialogue;
+    if (info.Length() == 4) {
+      auto& actor1 = unassigned(id(2));
+      auto& actor2 = unassigned(id(3));
+      if (!startupRoutes)
+        startupRoutes.emplace(world.GetEspm().GetBrowser());
+      dialogue.emplace(QuestScriptRuntime::ActorDialogue{actor1, actor2,
+                                                          *startupRoutes});
+    }
     if (!startupScenes)
       startupScenes.emplace(world.GetEspm().GetBrowser());
     if (!startupScripts)
       startupScripts = QuestScriptRuntime::LoadScripts(world);
     const auto report = QuestScriptRuntime::ProbeStartup(
-      *actor, questId, startupScenes->Find(questId), *startupScripts);
+      owner, questId, startupScenes->Find(questId), *startupScripts,
+      dialogue ? &*dialogue : nullptr);
     return NapiHelper::ParseJson(info.Env(), report.dump());
   } catch (const std::exception& e) {
     throw Napi::Error::New(info.Env(), e.what());

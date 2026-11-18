@@ -61,6 +61,7 @@ function addon(dir, body) {
     const assert = require("node:assert/strict");
     exports.ScampServer = class {
       constructor(settings) {
+        this.actors = new Map();
         this.settings = JSON.parse(settings);
         assert.equal(this.settings.listenHost, "127.0.0.1");
         assert.equal(this.settings.dataDir, process.cwd());
@@ -68,17 +69,41 @@ function addon(dir, body) {
       _setSelf() {}
       getEspmLoadOrder() { return ${JSON.stringify(masters)}; }
       lookupEspmRecordById(id) { return {fileIndex: id === 1 ? 1 : 2,
-        record: {type:"QUST", flags:0, editorId:id === 1 ? "First" : "Second"}}; }
-      createActor(actor) { assert.equal(this.actor, undefined); this.actor = actor; }
+        record: {type:"QUST", flags:0, editorId:id === 1 ? "First" : "Second",
+          fields: [{type:"ENAM",data:Buffer.from(id === 1 ? "ADIA" : "SCPT")}]}}; }
+      createActor(actor, pos, angle, cell) {
+        assert.equal(this.actors.size, 0);
+        if (this.actors.size === 0) this.actor = actor;
+        this.actors.set(actor, {cell});
+      }
       set(actor, key, value) {
-        assert.equal(actor, this.actor);
-        if (key === "worldInstance") assert.equal(value, "campaign:" + actor + ":startup");
-        else if (key === "private.boyhouse.questAdapters") this.adapters = value;
+        const record = this.actors.get(actor);
+        if (key === "worldInstance") {
+          assert.equal(value, "campaign:" + this.actor + ":startup");
+          record.phase = value;
+        } else if (key === "campaignReferences") {
+          assert.equal(actor, this.actor);
+          assert.deepEqual(value, {references:[0x1a66e,0x1a671],encounterLevel:1});
+          this.manifest = {schemaVersion:1,actor,campaignOwner:actor,identity:'a'.repeat(32),
+            instance:record.phase,references:[]};
+          for (const [index, original] of value.references.entries()) {
+            const base = [0x13ba3,0x1a670][index], copy = actor + index + 1;
+            this.actors.set(copy, {base,cell:0x1605e,phase:record.phase});
+            this.manifest.references.unshift({original,baseId:base,kind:"actor",copy,deleted:false,disabled:false});
+          }
+        } else if (key === "private.boyhouse.questAdapters") {
+          assert.equal(actor, this.actor); this.adapters = value;
+        }
         else throw Error("Unexpected runtime write");
       }
       getDescFromId(id) { return String(id); }
-      get() { return null; }
-      destroyActor(actor) { assert.equal(actor, this.actor); this.actor = undefined; }
+      get(id,key) {
+        if (key === "worldInstance") return this.actors.get(id).phase;
+        if (key === "campaignReferences") return structuredClone(this.manifest);
+        return null;
+      }
+      getActorCellOrWorld(id) { return this.actors.get(id).cell; }
+      destroyActor(actor) { assert.ok(this.actors.delete(actor)); if (!this.actors.size) this.actor = undefined; }
       ${body}
     };`);
 }
@@ -126,4 +151,138 @@ test("missing probe support aborts the run before publishing a report", t => {
   assert.equal(result.status, 1);
   assert.match(result.stderr, /Rebuild addon/);
   assert.equal(fs.existsSync(path.join(dir, "out.json")), false);
+});
+
+test("actor-dialogue CLI selects winners by ENAM, validates both actors and contrasts the same catalog", t => {
+  const dir = fixture(t);
+  addon(dir, `probeQuestStartup(actor, id, first, second) {
+    assert.deepEqual(this.adapters, [String(id)]);
+    if (first === undefined) {
+      assert.equal(this.actors.size, 1);
+      assert.equal(this.actors.get(actor).cell, 0x3c);
+      return {status:"blocked",step:"admission",steps:[],stages:[],blocker:{
+        code:"story.event",detail:"Quest requires story event " + (id === 1 ? "ADIA" : "SCPT")}};
+    }
+    assert.equal(id, 1);
+    assert.equal(this.actors.size, 3);
+    assert.equal(new Set([actor, first, second]).size, 3);
+    assert.equal(this.actors.get(actor).cell, 0x1605e);
+    assert.deepEqual(this.actors.get(first), {...this.actors.get(actor),base:0x13ba3});
+    assert.deepEqual(this.actors.get(second), {...this.actors.get(actor),base:0x1a670});
+    return {status:"blocked",step:"aliases",steps:["admission"],stages:[],blocker:{code:"alias.fill",detail:"Alias 2"},
+      storyEvent:{type:"ADIA",actor1:first,actor2:second,location:0x1f86d},
+      storyRoute:{candidateCount:1,nodeIds:[0x123,0x456],questIndex:0}};
+  }`);
+  const forced = run(dir, "--output", "forced.json");
+  assert.equal(forced.status, 0, forced.stderr);
+  const mixed = run(dir, "--scenario", "actor-dialogue", "--contrast", "forced.json");
+  assert.equal(mixed.status, 0, mixed.stderr);
+  const report = JSON.parse(fs.readFileSync(path.join(dir, "out.json")));
+  assert.equal(report.provenance.mode, "actor-dialogue");
+  assert.equal(report.provenance.actorDialogue.winningQuestEvent, "ADIA");
+  assert.deepEqual(report.fixtures, {
+    "actor-dialogue": {total: 1, started: 0, blocked: 1, error: 0},
+    "forced-start": {total: 1, started: 0, blocked: 1, error: 0},
+  });
+  const story = report.quests.find(q => q.fixture === "actor-dialogue");
+  assert.deepEqual(story.storyEvent, {type:"ADIA",actor1Base:0x13ba3,actor2Base:0x1a670,
+    actor1Original:0x1a66e,actor2Original:0x1a671,cell:0x1605e,location:0x1f86d});
+  assert.equal(report.provenance.actorDialogue.placement, "authored");
+  assert.deepEqual(story.storyRoute, {candidateCount:1,nodeIds:[0x123,0x456],questIndex:0});
+  assert.deepEqual(report.fixtureContrast.forcedControls, {unchanged:1,changed:0,changedIds:[]});
+  assert.equal(report.fixtureContrast.observations.length, 1);
+  const pair = report.fixtureContrast.observations[0];
+  assert.equal(pair.id, story.id);
+  assert.equal(pair.forced.code, "story.event");
+  assert.equal(pair.actorDialogue.code, "alias.fill");
+  assert.equal(report.comparison, undefined);
+  assert.match(fs.readFileSync(path.join(dir, "out.md"), "utf8"), /\| story\.event \| alias\.fill \| 1 \|/);
+  const incompatible = run(dir, "--scenario", "actor-dialogue", "--compare", "forced.json");
+  assert.equal(incompatible.status, 1);
+  assert.match(incompatible.stderr, /different mode/);
+  const baseline = JSON.parse(fs.readFileSync(path.join(dir, "forced.json")));
+  baseline.quests.pop();
+  fs.writeFileSync(path.join(dir, "partial.json"), JSON.stringify(baseline));
+  const partial = run(dir, "--scenario", "actor-dialogue", "--contrast", "partial.json");
+  assert.equal(partial.status, 1);
+  assert.match(partial.stderr, /same full catalog/);
+});
+
+test("older addons silently ignoring the event argument cannot publish actor-dialogue evidence", t => {
+  const dir = fixture(t);
+  addon(dir, `probeQuestStartup() {
+    return {status:"blocked",step:"admission",steps:[],stages:[],
+      blocker:{code:"story.event",detail:"Quest requires story event ADIA"}};
+  }`);
+  const result = run(dir, "--scenario", "actor-dialogue");
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Expected native ADIA evidence/);
+  assert.equal(fs.existsSync(path.join(dir, "out.json")), false);
+});
+
+test("forged or changed authored actor receipts abort the report", t => {
+  const dir = fixture(t);
+  for (const [members, diagnostic] of [
+    [`get(id,key) {
+      if (key === "campaignReferences") {
+        const snapshot = structuredClone(this.manifest);
+        snapshot.references[0].original = snapshot.references[1].original;
+        return snapshot;
+      }
+      return key === "worldInstance" ? this.actors.get(id).phase : null;
+    }`, /Invalid dialogue NPC copy receipt/],
+    [`probeQuestStartup() {
+      this.manifest.references[0].disabled = true;
+      throw Error("Native probe failure");
+    }`, /changed dialogue copy receipts/],
+    [`probeQuestStartup(owner, id, first, second) {
+      return {status:"blocked",step:"admission",steps:[],stages:[],blocker:{code:"story.event",detail:"test"},
+        storyEvent:{type:"ADIA",actor1:first,actor2:second,location:0x1f86d,actor1Original:0x1a671,actor2Original:0x1a66e}};
+    }`, /disagrees with the campaign copy receipts/],
+  ]) {
+    addon(dir, "probeQuestStartup() {}\n" + members);
+    const result = run(dir, "--scenario", "actor-dialogue");
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, diagnostic);
+    assert.equal(fs.existsSync(path.join(dir, "out.json")), false);
+  }
+});
+
+test("worker crashes retain their attempted fixture and the mixed run resumes with the next winner", t => {
+  const dir = fixture(t);
+  addon(dir, `probeQuestStartup(actor, id, partner) {
+    if (partner !== undefined) process.exit(42);
+    return {status:"startup-exercised",step:"done",steps:[],stages:[],blocker:null};
+  }`);
+  const result = run(dir, "--scenario", "actor-dialogue");
+  assert.equal(result.status, 1);
+  const report = JSON.parse(fs.readFileSync(path.join(dir, "out.json")));
+  assert.equal(report.fixtures["actor-dialogue"].error, 1);
+  assert.equal(report.fixtures["forced-start"].started, 1);
+  assert.equal(report.quests.find(q => q.code === "probe.crash").storyEvent, undefined);
+});
+
+test("ADIA route evidence with no selected route has only a candidate count", t => {
+  const dir = fixture(t);
+  for (const [route, valid] of [
+    [{candidateCount:0}, true], [{candidateCount:2}, true],
+    [{candidateCount:1}, false], [{candidateCount:0,nodeIds:[1,2]}, false],
+    [{candidateCount:1,nodeIds:[1,-2],questIndex:0}, false],
+  ]) {
+    addon(dir, `probeQuestStartup(actor,id,first,second) {
+      const result = {status:"blocked",step:"story-route",steps:["admission"],stages:[],
+        blocker:{code:"story.route-missing",detail:"No route"}};
+      if (first !== undefined) {
+        result.storyEvent = {type:"ADIA",actor1:first,actor2:second,location:0x1f86d};
+        result.storyRoute = ${JSON.stringify(route)};
+      }
+      return result;
+    }`);
+    const result = run(dir, "--scenario", "actor-dialogue");
+    assert.equal(result.status, valid ? 0 : 1, result.stderr);
+    if (valid) {
+      const report = JSON.parse(fs.readFileSync(path.join(dir, "out.json")));
+      assert.deepEqual(report.quests.find(row => row.fixture === "actor-dialogue").storyRoute, route);
+    } else assert.match(result.stderr, /story route/);
+  }
 });

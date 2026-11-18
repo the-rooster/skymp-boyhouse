@@ -1,4 +1,5 @@
 #include "QuestScriptRuntime.h"
+#include "ActorDialogueConditions.h"
 #include "CampaignCondition.h"
 #include "CampaignFactionApi.h"
 #include "CampaignInventoryApi.h"
@@ -16,6 +17,7 @@
 #include "libespm/QuestAliasData.h"
 #include "libespm/QuestLifecycleData.h"
 #include "libespm/RecordHeaderAccess.h"
+#include "libespm/StoryEventRouteIndex.h"
 #include "papyrus-vm/Reader.h"
 #include "script_classes/PapyrusQuest.h"
 #include "script_compatibility_policies/HeuristicPolicy.h"
@@ -584,9 +586,65 @@ void DiagnoseUnboundMember(VirtualMachine& vm, IGameObject& receiver,
   }
 }
 
-// This first-start diagnostic has no story event, surrounding NPCs, saved
-// alias reservations or preexisting world changes. Only simple PlayerRef and
-// explicit location bindings can be established without inventing inputs.
+constexpr uint32_t kActorDialogueEvent = 0x41494441; // ENAM "ADIA"
+
+uint32_t BindActorDialogue(MpActor& owner,
+                           const QuestScriptRuntime::ActorDialogue& event)
+{
+  auto& world = *owner.GetParent();
+  auto& browser = world.GetEspm().GetBrowser();
+  if (&owner == &event.actor1 || &owner == &event.actor2 ||
+      &event.actor1 == &event.actor2 || owner.GetProfileId() >= 0 ||
+      owner.IsDead() || owner.IsDisabled())
+    throw std::invalid_argument(
+      "Actor dialogue requires a fresh owner and two distinct NPCs");
+
+  for (auto* npc : { &event.actor1, &event.actor2 }) {
+    if (npc->GetParent() != &world ||
+        world.LookupFormByIdNoLoad(npc->GetFormId()).get() != npc ||
+        npc->GetWorldInstance() != owner.GetWorldInstance() ||
+        npc->GetCellOrWorld() != owner.GetCellOrWorld() || npc->IsDeleted() ||
+        npc->IsDisabled() || npc->IsDead() || npc->GetProfileId() >= 0 ||
+        npc->IsCreatedAsPlayer() ||
+        npc->GetDynamicFields().GetValueDump(QuestJournal::kProperty) != "null")
+      throw std::invalid_argument(
+        "Actor dialogue requires live NPCs in the owner's startup cell and phase");
+    const auto base = browser.LookupById(npc->GetBaseId());
+    if (!base.rec || base.rec->IsDeleted() || base.rec->GetType() != "NPC_")
+      throw std::invalid_argument("Actor dialogue NPC has no live base");
+  }
+
+  // A worldspace is insufficient to identify an exterior actor's Location.
+  // This fixture supplies an actual interior CELL with a winning LCTN.
+  const auto cell =
+    browser.LookupById(owner.GetCellOrWorld().ToFormId(world.espmFiles));
+  if (!cell.rec || cell.rec->IsDeleted() || cell.rec->GetType() != "CELL")
+    throw std::invalid_argument("Actor dialogue requires a shared interior cell");
+  std::optional<uint32_t> location;
+  std::optional<bool> interior;
+  espm::RecordHeaderAccess::IterateFields(
+    cell.rec, [&](const char* tag, uint32_t size, const char* bytes) {
+      if (!std::memcmp(tag, "XLCN", 4)) {
+        if (size != 4 || location)
+          throw std::runtime_error("Invalid dialogue cell location field");
+        uint32_t raw;
+        std::memcpy(&raw, bytes, sizeof(raw));
+        location = raw ? cell.ToGlobalId(raw) : 0;
+      } else if (!std::memcmp(tag, "DATA", 4)) {
+        if ((size != 1 && size != 2) || interior.has_value())
+          throw std::runtime_error("Invalid dialogue cell flags");
+        interior = (static_cast<uint8_t>(*bytes) & 1) != 0;
+      }
+    }, world.GetEspmCache());
+  if (!interior.value_or(false) || !location.value_or(0))
+    throw std::invalid_argument("Actor dialogue cell has no interior Location");
+  const auto loc = browser.LookupById(*location);
+  if (!loc.rec || loc.rec->IsDeleted() || loc.rec->GetType() != "LCTN")
+    throw std::invalid_argument("Actor dialogue cell requires a live Location");
+  return *location;
+}
+
+// Only simple PlayerRef and explicit location fills are currently supported.
 void CheckStartupAlias(const espm::QuestAliasDefinition& alias,
                        const espm::LookupResult& quest)
 {
@@ -636,6 +694,7 @@ struct QuestScriptRuntime::StartupProbe
   espm::QuestLifecycleData life;
   espm::QuestAliasData aliases;
   uint32_t scene = 0;
+  Json storyEvent, storyRoute;
   std::vector<uint16_t> selected, stages;
   std::vector<std::string> steps;
   std::string step = "record";
@@ -648,7 +707,7 @@ struct QuestScriptRuntime::StartupProbe
 
   Json Result(const StartupBlocked* blocked) const
   {
-    return { { "status", blocked ? "blocked" : "startup-exercised" },
+    Json result = { { "status", blocked ? "blocked" : "startup-exercised" },
              { "step", step },
              { "steps", steps },
              { "stages", stages },
@@ -656,12 +715,17 @@ struct QuestScriptRuntime::StartupProbe
                blocked ? Json{ { "code", blocked->code },
                                { "detail", blocked->detail } }
                        : Json(nullptr) } };
+    if (!storyEvent.is_null())
+      result["storyEvent"] = storyEvent;
+    if (!storyRoute.is_null())
+      result["storyRoute"] = storyRoute;
+    return result;
   }
 };
 
 Json QuestScriptRuntime::ProbeStartup(
   MpActor& actor, uint32_t questId, uint32_t startScene,
-  const std::vector<PexScript::Lazy>& scripts)
+  const std::vector<PexScript::Lazy>& scripts, const ActorDialogue* dialogue)
 {
   auto* world = actor.GetParent();
   if (!world || actor.IsDeleted() ||
@@ -691,7 +755,58 @@ Json QuestScriptRuntime::ProbeStartup(
   const auto metadata = espm::QuestScriptData::Read(record.rec, cache);
   try {
     probe.Next("admission");
-    if (probe.life.event) {
+    if (dialogue) {
+      if (probe.life.event != kActorDialogueEvent)
+        throw std::invalid_argument("Actor dialogue requires an ADIA quest");
+      probe.Next("story-event");
+      const auto location = BindActorDialogue(actor, *dialogue);
+      probe.storyEvent = { { "type", "ADIA" },
+                           { "location", location },
+                           { "actor1", dialogue->actor1.GetFormId() },
+                           { "actor2", dialogue->actor2.GetFormId() } };
+      probe.Next("story-route");
+      const auto& routes = dialogue->routes.Find(questId, kActorDialogueEvent);
+      probe.storyRoute = { { "candidateCount", routes.size() } };
+      if (routes.empty())
+        throw StartupBlocked{ "story.route-missing",
+                              "No winning ADIA node routes to this quest" };
+      if (routes.size() != 1)
+        throw StartupBlocked{ "story.route-selection",
+                              "Multiple ADIA candidate entries require selection" };
+      const auto& route = routes.front();
+      probe.storyRoute["nodeIds"] = route.nodeIds;
+      probe.storyRoute["questIndex"] = route.questIndex;
+      probe.Next("story-conditions");
+      auto check = [&](const espm::LookupResult& record,
+                       const std::vector<espm::QuestLifecycleData::Condition>& conditions) {
+        const auto result = EvaluateActorDialogueConditions(
+          dialogue->actor1, dialogue->actor2, location, record, conditions);
+        using State = ActorDialogueConditionResult::State;
+        if (result.state == State::Passed)
+          return;
+        const auto id = record.ToGlobalId(record.rec->GetId());
+        throw StartupBlocked{
+          result.state == State::Failed ? "story.conditions-false"
+                                        : "story.condition-unsupported",
+          FormDesc::FromFormId(id, world->espmFiles).ToString() + ": " +
+            result.detail };
+      };
+      // These are necessary conditions for this candidate. Passing them
+      // does not establish which competing node the Story Manager takes.
+      for (auto id : route.nodeIds) {
+        const auto* node = dialogue->routes.GetNode(id);
+        const auto winning = world->GetEspm().GetBrowser().LookupById(id);
+        if (!node || !winning.rec || winning.rec->IsDeleted() ||
+            winning.fileIdx != node->fileIndex)
+          throw std::logic_error("Story route no longer matches its record");
+        check(winning, node->conditions);
+      }
+      check(record, probe.life.storyConditions);
+      probe.Next("story-selection");
+      if (!route.gate.empty())
+        throw StartupBlocked{ "story.route-selection", route.gate };
+      probe.Next("quest-admission");
+    } else if (probe.life.event) {
       // ENAM stores the four-character Story Manager event signature.
       std::string name;
       for (unsigned shift = 0; shift < 32; shift += 8) {
@@ -705,7 +820,7 @@ Json QuestScriptRuntime::ProbeStartup(
       throw StartupBlocked{ "story.event",
                             "Quest requires story event " + name };
     }
-    if (!probe.life.storyConditions.empty())
+    if (!dialogue && !probe.life.storyConditions.empty())
       throw StartupBlocked{
         "story.conditions",
         "No event context for condition " +
@@ -2207,6 +2322,13 @@ bool QuestScriptRuntime::Execute(
         if (std::find(recipients.begin(), recipients.end(), object) ==
             recipients.end())
           recipients.push_back(object);
+      }
+      if (!startup->storyEvent.is_null()) {
+        for (const auto& root : vm.GetEventAttachments(recipients.front())) {
+          if (vm.SelectEventHandler(root, "OnStoryDialogue"))
+            throw StartupBlocked{ "story.on-dialogue",
+                                  "OnStoryDialogue requires event delivery to the quest script" };
+        }
       }
       startup->Next("on-init");
       std::vector<std::shared_ptr<IGameObject>> init;

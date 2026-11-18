@@ -49,6 +49,7 @@ struct Browser::Impl
   std::vector<const RecordHeader*> factions;
   std::vector<const RecordHeader*> quests;
   std::vector<const RecordHeader*> scenes;
+  std::vector<const RecordHeader*> storyEvents, storyBranches, storyQuestNodes;
   std::vector<const RecordHeader*> worlds;
   std::vector<const RecordHeader*> cells;
   std::vector<const RecordHeader*> leveledItems, leveledActors, leveledSpells;
@@ -135,6 +136,12 @@ const std::vector<const RecordHeader*>& Browser::GetRecordsByType(
   if (!std::strcmp(type, espm::QUST::kType)) {
     return pImpl->quests;
   }
+  if (!std::strcmp(type, "SMEN"))
+    return pImpl->storyEvents;
+  if (!std::strcmp(type, "SMBN"))
+    return pImpl->storyBranches;
+  if (!std::strcmp(type, "SMQN"))
+    return pImpl->storyQuestNodes;
   if (!std::strcmp(type, "SCEN"))
     return pImpl->scenes;
   if (!std::strcmp(type, espm::WRLD::kType)) {
@@ -151,7 +158,7 @@ const std::vector<const RecordHeader*>& Browser::GetRecordsByType(
     return pImpl->leveledSpells;
   throw std::runtime_error(
     "GetRecordsByType currently supports only REFR, "
-    "COBJ, KYWD, LCTN, FACT, QUST, SCEN, WRLD, CELL, LVLI, LVLN and LVSP "
+    "COBJ, KYWD, LCTN, FACT, QUST, SCEN, SMEN, SMBN, SMQN, WRLD, CELL, LVLI, LVLN and LVSP "
     "records");
 }
 
@@ -294,6 +301,12 @@ bool Browser::ReadAny(const GroupStack* parentGrStack)
       pImpl->quests.push_back(recHeader);
     }
 
+    if (t == "SMEN")
+      pImpl->storyEvents.push_back(recHeader);
+    if (t == "SMBN")
+      pImpl->storyBranches.push_back(recHeader);
+    if (t == "SMQN")
+      pImpl->storyQuestNodes.push_back(recHeader);
     if (t == "SCEN")
       pImpl->scenes.push_back(recHeader);
 

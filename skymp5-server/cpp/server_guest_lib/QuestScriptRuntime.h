@@ -9,6 +9,9 @@
 class MpActor;
 class MpObjectReference;
 class WorldState;
+namespace espm {
+class StoryEventRouteIndex;
+}
 
 class QuestScriptRuntime
 {
@@ -55,9 +58,16 @@ public:
 
   // Exercise a first start in an isolated, pristine campaign. The return
   // records reached phases; the transaction is discarded even on success.
+  struct ActorDialogue
+  {
+    MpActor& actor1; // Initiating NPC
+    MpActor& actor2; // Addressed NPC
+    const espm::StoryEventRouteIndex& routes;
+  };
   static nlohmann::json ProbeStartup(
     MpActor& actor, uint32_t questId, uint32_t startScene,
-    const std::vector<PexScript::Lazy>& scripts);
+    const std::vector<PexScript::Lazy>& scripts,
+    const ActorDialogue* dialogue = nullptr);
 
   // Explicit dependency injection for deterministic VM fixtures. Production
   // uses owned QUST metadata and PEX storage through the overload above.

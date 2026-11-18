@@ -7,6 +7,7 @@
 #include "TestUtils.hpp"
 #include "papyrus-vm/Reader.h"
 #include "libespm/QuestLifecycleData.h"
+#include "libespm/StoryEventRouteIndex.h"
 #include "save_storages/ISaveStorage.h"
 #include "script_objects/CampaignAliasObject.h"
 #include "script_objects/CampaignFormObject.h"
@@ -3978,6 +3979,78 @@ TEST_CASE(
     actor.SetPropertyValueDump(QuestJournal::kEnabled, "[]", false, false);
     REQUIRE_THROWS(QuestScriptRuntime::ProbeStartup(actor, quest, 0, {}));
   }
+}
+
+TEST_CASE("Explicit actor dialogue binds two NPCs and checks its winning route",
+          "[Quest][QuestStartupProbe][ActorDialogue][espm]")
+{
+  PartOne server;
+  server.AttachEspm(&GetEspmLoader());
+  auto& world = server.worldState;
+  const espm::StoryEventRouteIndex routes(world.GetEspm().GetBrowser());
+  constexpr uint32_t cell = 0x1605e; // Bannered Mare
+  constexpr uint32_t ownerId = 0xff006100;
+  server.CreateActor(ownerId, { 0, 0, 0 }, 0, cell);
+  auto& owner = world.GetFormAt<MpActor>(ownerId);
+  const auto phase = "campaign:" + std::to_string(ownerId) + ":startup";
+  owner.SetWorldInstance(phase);
+  auto place = [&](uint32_t id, uint32_t base) -> MpActor& {
+    world.AddForm(std::make_unique<MpActor>(
+                    LocationalData{ { 0, 0, 0 }, { 0, 0, 0 },
+                                    owner.GetCellOrWorld() },
+                    FormCallbacks::DoNothing(), base),
+                  id);
+    auto& npc = world.GetFormAt<MpActor>(id);
+    npc.SetWorldInstance(phase);
+    return npc;
+  };
+  auto& hulda = place(ownerId + 1, 0x13ba3);
+  auto& mikael = place(ownerId + 2, 0x1a670);
+  const auto probe = [&](uint32_t quest, MpActor& first, MpActor& second) {
+    const auto key = FormDesc::FromFormId(quest, world.espmFiles).ToString();
+    owner.SetPropertyValueDump(QuestJournal::kEnabled,
+                               nlohmann::json::array({ key }).dump(), false, false);
+    const QuestScriptRuntime::ActorDialogue event{ first, second, routes };
+    return QuestScriptRuntime::ProbeStartup(owner, quest, 0, {}, &event);
+  };
+
+  // DA11ConvoHogniLisbet requires a different current location.
+  const uint32_t quest = 0xa71a9;
+  const auto result = probe(quest, hulda, mikael);
+  INFO(result.dump());
+  REQUIRE(result.at("status") == "blocked");
+  REQUIRE(result.at("blocker").at("code") == "story.conditions-false");
+  REQUIRE(result.at("storyEvent").at("actor1") == hulda.GetFormId());
+  REQUIRE(result.at("storyEvent").at("actor2") == mikael.GetFormId());
+  REQUIRE(result.at("storyEvent").at("type") == "ADIA");
+  REQUIRE(result.at("storyEvent").at("location") == 0x1f86d);
+  REQUIRE(result.at("storyRoute").at("nodeIds") ==
+          nlohmann::json::array({ 0x5b, 0x15fce, 0xa71ab }));
+  REQUIRE(probe(quest, hulda, mikael) == result);
+  const auto forced = QuestScriptRuntime::ProbeStartup(owner, quest, 0, {});
+  REQUIRE(forced.at("blocker").at("code") == "story.event");
+  REQUIRE_FALSE(forced.contains("storyEvent"));
+
+  // An NPC spawned from a base has no authentic original editor location.
+  const auto unknown = probe(0x55a6e, mikael, hulda);
+  REQUIRE(unknown.at("blocker").at("code") == "story.condition-unsupported");
+  REQUIRE(unknown.at("storyEvent").at("actor1") == mikael.GetFormId());
+  REQUIRE(unknown.at("storyEvent").at("actor2") == hulda.GetFormId());
+
+  REQUIRE_THROWS_AS(probe(quest, hulda, hulda), std::invalid_argument);
+  REQUIRE_THROWS_AS(probe(quest, owner, hulda), std::invalid_argument);
+  REQUIRE_THROWS_AS(probe(0x4e50d, hulda, mikael), std::invalid_argument);
+  mikael.SetWorldInstance("campaign:333:startup");
+  REQUIRE_THROWS_AS(probe(quest, hulda, mikael), std::invalid_argument);
+  mikael.SetWorldInstance(phase);
+  mikael.SetCellOrWorldObsolete(FormDesc::Tamriel());
+  REQUIRE_THROWS_AS(probe(quest, hulda, mikael), std::invalid_argument);
+  mikael.SetCellOrWorldObsolete(owner.GetCellOrWorld());
+  mikael.Disable();
+  REQUIRE_THROWS_AS(probe(quest, hulda, mikael), std::invalid_argument);
+  for (auto* actor : { &owner, &hulda, &mikael })
+    REQUIRE(actor->GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
+            "null");
 }
 
 TEST_CASE("Startup fragments report only declared operations on their actual "
