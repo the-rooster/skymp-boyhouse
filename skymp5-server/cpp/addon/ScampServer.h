@@ -5,6 +5,8 @@
 #include "NetworkingMock.h"
 #include "PartOne.h"
 #include "ScampServerListener.h"
+#include "libespm/QuestStartSceneIndex.h"
+#include "papyrus-vm/PexScript.h"
 
 #include <map>
 #include <memory>
@@ -57,6 +59,7 @@ public:
   Napi::Value BeginPacketEpoch(const Napi::CallbackInfo& info);
   Napi::Value GetPacketEpoch(const Napi::CallbackInfo& info);
   Napi::Value ResumeCampaignActor(const Napi::CallbackInfo& info);
+  Napi::Value ProbeQuestStartup(const Napi::CallbackInfo& info);
   Napi::Value GetCampaignResume(const Napi::CallbackInfo& info);
   Napi::Value CaptureCampaignResumeProjection(const Napi::CallbackInfo& info);
   Napi::Value CompleteCampaignResume(const Napi::CallbackInfo& info);
@@ -132,5 +135,7 @@ private:
   std::string defaultLanguage;
   std::optional<std::vector<std::string>> cachedAvailableLanguages;
 
+  std::optional<espm::QuestStartSceneIndex> startupScenes;
+  std::optional<std::vector<PexScript::Lazy>> startupScripts;
   static Napi::FunctionReference constructor;
 };

@@ -75,6 +75,21 @@ public:
   VirtualMachine(const std::vector<std::shared_ptr<PexScript>>& loadedScripts);
 
   void SetMissingScriptHandler(const MissingScriptHandler& handler);
+  enum class UnboundMember
+  {
+    Method,
+    PropertyRead,
+    PropertyWrite
+  };
+  // Optional diagnostic hook just before strict dispatch reports an unbound
+  // member. Successful dispatch and its argument/access checks take priority.
+  using UnboundMemberObserver =
+    std::function<void(IGameObject&, const char* receiverType,
+                       const char* name, UnboundMember kind, size_t arity)>;
+  void SetUnboundMemberObserver(UnboundMemberObserver observer)
+  {
+    unboundMemberObserver = std::move(observer);
+  }
   void SetStrictExecution(bool enabled)
   {
     strictExecution = enabled;
@@ -189,6 +204,7 @@ private:
   std::set<std::shared_ptr<IGameObject>> gameObjectsHolder;
 
   MissingScriptHandler missingScriptHandler;
+  UnboundMemberObserver unboundMemberObserver;
 
   std::shared_ptr<MakeID> stackIdMaker;
 };

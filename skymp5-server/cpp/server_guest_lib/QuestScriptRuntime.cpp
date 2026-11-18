@@ -512,6 +512,274 @@ std::vector<PexScript::Lazy> LoadCampaignScripts(WorldState& world)
 }
 }
 
+namespace {
+struct StartupBlocked
+{
+  std::string code, detail;
+};
+struct StartupExercised
+{
+};
+
+// An engine form can have no script instance for its native base class. A
+// miss there is a shared capability only when the actual owned PEX declares
+// the requested operation on the receiver type visible at this call site.
+void DiagnoseUnboundMember(VirtualMachine& vm, IGameObject& receiver,
+                           const char* receiverType, const char* member,
+                           VirtualMachine::UnboundMember kind, size_t arity)
+{
+  using Kind = VirtualMachine::UnboundMember;
+  const std::string actual = receiver.GetParentNativeScript();
+  const auto declared = Lower(receiverType ? receiverType : "");
+  const auto name = Lower(member);
+  bool visible = declared.empty();
+  std::set<std::string> visited;
+  for (std::string cls = Lower(actual); !cls.empty();) {
+    if (!visited.insert(cls).second || visited.size() > 128)
+      throw std::runtime_error("Invalid startup diagnostic PEX inheritance");
+    const auto source = vm.GetPexByName(cls);
+    if (!source.fn)
+      return;
+    const auto pex = source.fn();
+    if (!pex || pex->objectTable.size() != 1 ||
+        Lower(pex->objectTable.front().NameIndex) != cls)
+      throw std::runtime_error("Invalid startup diagnostic PEX class");
+    const auto& def = pex->objectTable.front();
+    visible |= cls == declared;
+    if (visible && kind == Kind::Method) {
+      for (const auto& state : def.states) {
+        if (!state.name.empty())
+          continue;
+        for (const auto& candidate : state.functions) {
+          if (Lower(candidate.name) != name)
+            continue;
+          if (!candidate.function.IsNative() ||
+              candidate.function.IsGlobal() ||
+              candidate.function.params.size() != arity)
+            return;
+          throw StartupBlocked{ "native." + cls + "." + name,
+                                def.NameIndex + "." + candidate.name +
+                                  " is declared native on receiver " +
+                                  actual };
+        }
+      }
+    } else if (visible) {
+      for (const auto& property : def.properties) {
+        if (Lower(property.name) != name)
+          continue;
+        const bool write = kind == Kind::PropertyWrite;
+        const auto access = write ? Object::PropInfo::kFlags_Write
+                                  : Object::PropInfo::kFlags_Read;
+        if (!(property.flags & access))
+          return;
+        const auto operation = write ? "write" : "read";
+        throw StartupBlocked{
+          std::string("property.") + operation + "." + cls + "." + name,
+          std::string(operation) + " " + def.NameIndex + "." + property.name +
+            " lacks an engine-class property binding on receiver " + actual
+        };
+      }
+    }
+    cls = Lower(def.parentClassName);
+  }
+}
+
+// This first-start diagnostic has no story event, surrounding NPCs, saved
+// alias reservations or preexisting world changes. Only simple PlayerRef and
+// explicit location bindings can be established without inventing inputs.
+void CheckStartupAlias(const espm::QuestAliasDefinition& alias,
+                       const espm::LookupResult& quest)
+{
+  const auto block = [&](const char* code) {
+    throw StartupBlocked{
+      code, "Alias " + std::to_string(alias.id) + " (" + alias.name + ")"
+    };
+  };
+  if (!alias.unknownFields.empty())
+    block("alias.unknown-fields");
+  if (alias.Has("ALFE"))
+    block("alias.fill.event");
+  if (alias.Has("ALCO") || alias.creation)
+    block("alias.fill.created-reference");
+  if (alias.Has("ALEQ"))
+    block("alias.fill.external-alias");
+  if (alias.Has("ALFA") || alias.Has("ALFI") || alias.Has("ALNA") ||
+      !alias.conditions.empty())
+    block("alias.fill.world-query");
+  if (alias.Has("ALUA")) {
+    if (quest.ToGlobalId(*alias.Unsigned("ALUA")) != 7)
+      block("alias.fill.unique-actor");
+  } else if (alias.Has("ALFR")) {
+    if (quest.ToGlobalId(*alias.Unsigned("ALFR")) != 0x14)
+      block("alias.fill.forced-reference");
+  } else if (!alias.Has("ALFL"))
+    block("alias.fill.matching-or-script");
+  if (alias.flags & 1)
+    block("alias.reserve");
+  if (alias.flags & ~uint32_t(2))
+    block("alias.flags");
+  for (const auto& [tag, values] : alias.fields) {
+    if (tag == "ALID" || tag == "FNAM" || tag == "ALUA" || tag == "ALFR" ||
+        tag == "ALFL")
+      continue;
+    if ((tag == "COCT" || tag == "KSIZ") && alias.Unsigned(tag) == 0)
+      continue;
+    throw StartupBlocked{ "alias.effect." + tag,
+                          "Alias " + std::to_string(alias.id) + " (" +
+                            alias.name + ") contains " + tag };
+  }
+}
+}
+
+struct QuestScriptRuntime::StartupProbe
+{
+  espm::QuestLifecycleData life;
+  espm::QuestAliasData aliases;
+  uint32_t scene = 0;
+  std::vector<uint16_t> selected, stages;
+  std::vector<std::string> steps;
+  std::string step = "record";
+
+  void Next(const char* next)
+  {
+    steps.push_back(step);
+    step = next;
+  }
+
+  Json Result(const StartupBlocked* blocked) const
+  {
+    return { { "status", blocked ? "blocked" : "startup-exercised" },
+             { "step", step },
+             { "steps", steps },
+             { "stages", stages },
+             { "blocker",
+               blocked ? Json{ { "code", blocked->code },
+                               { "detail", blocked->detail } }
+                       : Json(nullptr) } };
+  }
+};
+
+Json QuestScriptRuntime::ProbeStartup(
+  MpActor& actor, uint32_t questId, uint32_t startScene,
+  const std::vector<PexScript::Lazy>& scripts)
+{
+  auto* world = actor.GetParent();
+  if (!world || actor.IsDeleted() ||
+      world->LookupFormByIdNoLoad(actor.GetFormId()).get() != &actor ||
+      actor.GetWorldInstance() !=
+        "campaign:" + std::to_string(actor.GetFormId()) + ":startup" ||
+      actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty) !=
+        "null" ||
+      QuestJournal::HasActiveTransaction())
+    throw std::invalid_argument(
+      "Startup probe requires a fresh personal campaign");
+  const auto record = world->GetEspm().GetBrowser().LookupById(questId);
+  if (!record.rec || record.rec->IsDeleted() ||
+      record.rec->GetType() != "QUST")
+    throw std::invalid_argument("Startup probe requires a winning live quest");
+  const auto key = FormDesc::FromFormId(questId, world->espmFiles).ToString();
+  if (Json::parse(actor.GetDynamicFields().GetValueDump(
+        QuestJournal::kEnabled)) != Json::array({ key }))
+    throw std::invalid_argument(
+      "Startup probe requires only its quest enabled");
+
+  StartupProbe probe;
+  probe.scene = startScene;
+  auto& cache = world->GetEspmCache();
+  probe.life = espm::QuestLifecycleData::Read(record.rec, cache);
+  probe.aliases = espm::QuestAliasData::Read(record.rec, cache);
+  const auto metadata = espm::QuestScriptData::Read(record.rec, cache);
+  try {
+    probe.Next("admission");
+    if (probe.life.event) {
+      // ENAM stores the four-character Story Manager event signature.
+      std::string name;
+      for (unsigned shift = 0; shift < 32; shift += 8) {
+        const auto byte = (*probe.life.event >> shift) & 0xff;
+        if (byte < 0x20 || byte > 0x7e) {
+          name = std::to_string(*probe.life.event);
+          break;
+        }
+        name.push_back(static_cast<char>(byte));
+      }
+      throw StartupBlocked{ "story.event",
+                            "Quest requires story event " + name };
+    }
+    if (!probe.life.storyConditions.empty())
+      throw StartupBlocked{
+        "story.conditions",
+        "No event context for condition " +
+          std::to_string(probe.life.storyConditions[0].data.functionIndex)
+      };
+    if (!probe.life.unknownFields.empty())
+      throw StartupBlocked{ "quest.unknown-field",
+                            probe.life.unknownFields[0].tag };
+    using Life = espm::QuestLifecycleData;
+    if (probe.life.flags & Life::StartGameEnabled)
+      throw StartupBlocked{ "quest.start-game-enabled",
+                            "Requires new-game startup registration" };
+    constexpr uint16_t supported = Life::RunOnce | Life::AllowRepeatedStages |
+      Life::AddIdleTopicToHello | Life::ExcludeFromDialogueExport |
+      Life::WarnOnAliasFillFailure | Life::HasDialogueData;
+    if (const auto flags = probe.life.flags & ~supported)
+      throw StartupBlocked{
+        "quest.start-flags", "Unhandled startup flags " + std::to_string(flags)
+      };
+    for (const auto& stage : probe.life.stages)
+      if (stage.flags & Life::Stage::StartUp)
+        probe.selected.push_back(stage.index);
+    probe.Next("aliases");
+    // Most quests hit an unsupported first fill. Check it before building an
+    // entire VM, then validate subsequent fills in their actual probe order.
+    if (!probe.aliases.aliases.empty())
+      CheckStartupAlias(probe.aliases.aliases.front(), record);
+    Execute(actor, questId, 0, metadata, scripts, 0, nullptr, 0, nullptr, {},
+            false, {}, {}, {}, nullptr, &probe);
+    throw std::logic_error(
+      "Startup probe returned without discarding its transaction");
+  } catch (const StartupBlocked& blocked) {
+    return probe.Result(&blocked);
+  } catch (const StartupExercised&) {
+    return probe.Result(nullptr);
+  } catch (const std::runtime_error& error) {
+    // Native fragment errors can be prefixed with the owning script/function.
+    // Only recognized capability gates are attributed to the quest. Missing
+    // source files, bad records and unknown failures must escape to the
+    // runner.
+    const std::string message = error.what();
+    const std::string marker = "Unimplemented native: ";
+    std::string code;
+    if (auto at = message.find(marker); at != std::string::npos) {
+      code = "native." + Lower(message.substr(at + marker.size()));
+    } else {
+      for (const auto& [reason, key] :
+           std::initializer_list<std::pair<const char*, const char*>>{
+             { "Nested quest lifecycle change", "quest.nested-lifecycle" },
+             { "adapter is not enabled for this campaign",
+               "quest.cross-quest-adapter" },
+             { "Positive Utility wait requires", "quest.durable-timer" },
+             { "Latent campaign event requires", "quest.latent-event" },
+             { "Latent quest fragment requires", "quest.latent-fragment" },
+             { "Unsupported quest log condition function",
+               "condition.function" },
+             { "Unsupported quest log condition flags", "condition.flags" },
+             { "Unsupported quest condition run-on context",
+               "condition.run-on" },
+             { "Unsupported quest log flags", "quest.log-flags" },
+           }) {
+        if (message.find(reason) != std::string::npos) {
+          code = key;
+          break;
+        }
+      }
+    }
+    if (code.empty())
+      throw;
+    const StartupBlocked blocked{ code, message };
+    return probe.Result(&blocked);
+  }
+}
+
 std::vector<PexScript::Lazy> QuestScriptRuntime::LoadScripts(WorldState& world)
 {
   return LoadCampaignScripts(world);
@@ -724,7 +992,7 @@ bool QuestScriptRuntime::Execute(
   std::optional<QuestJobState::Completion> completion, bool fixtureAwait,
   const std::map<uint32_t, espm::QuestScriptData>& overrides,
   const std::string& contentManifest, const QuestJobClock& clock,
-  std::optional<QuestJobTimerAnchor>* timerAnchor)
+  std::optional<QuestJobTimerAnchor>* timerAnchor, StartupProbe* startup)
 {
   if (!actor.GetParent())
     throw std::runtime_error("Unregistered campaign actor");
@@ -766,6 +1034,12 @@ bool QuestScriptRuntime::Execute(
     }
     VirtualMachine vm(scripts);
     vm.SetStrictExecution(true);
+    if (startup)
+      vm.SetUnboundMemberObserver([&](IGameObject& receiver, const char* type,
+                                      const char* name, auto kind,
+                                      size_t arity) {
+        DiagnoseUnboundMember(vm, receiver, type, name, kind, arity);
+      });
     bool managedFragment = false;
     if (job)
       vm.RestoreExecutionBudget(job->instructions);
@@ -1764,6 +2038,10 @@ bool QuestScriptRuntime::Execute(
               result = execution.value;
             } else
               result = script->StartFunction(function, args, stack);
+          } catch (StartupBlocked& block) {
+            block.detail =
+              fragment.script + "." + fragment.function + ": " + block.detail;
+            throw;
           } catch (const std::exception& error) {
             throw std::runtime_error(fragment.script + "." +
                                      fragment.function + ": " + error.what());
@@ -1907,7 +2185,72 @@ bool QuestScriptRuntime::Execute(
     if (job && job->handler && !job->children.empty())
       roster(*job->dispatch, false);
     bool executedWork = false;
-    if (job && job->cursor == "done" && job->children.empty()) {
+    if (startup) {
+      QuestJournal::Apply(actor, { { "quest", questId }, { "op", "start" } });
+      std::set<uint32_t> filled;
+      for (const auto& def : startup->aliases.aliases) {
+        CheckStartupAlias(def, record);
+        auto alias = std::dynamic_pointer_cast<CampaignAliasObject>(
+          resolveAlias(questId, def.id));
+        const auto value = aliasTarget(*alias);
+        if (static_cast<IGameObject*>(value) &&
+            !filled.insert(formId(value)).second)
+          throw StartupBlocked{ "alias.reuse",
+                                "Multiple aliases select the same target" };
+      }
+      startup->Next("scripts");
+      std::vector<std::shared_ptr<IGameObject>> recipients{ resolve(questId) };
+      for (const auto& binding : metadata.aliases) {
+        if (!definitions(questId).Find(binding.object.alias))
+          throw std::runtime_error("Startup script names an undefined alias");
+        auto object = resolveAlias(questId, binding.object.alias);
+        if (std::find(recipients.begin(), recipients.end(), object) ==
+            recipients.end())
+          recipients.push_back(object);
+      }
+      startup->Next("on-init");
+      std::vector<std::shared_ptr<IGameObject>> init;
+      for (const auto& recipient : recipients)
+        for (const auto& root : vm.GetEventAttachments(recipient))
+          if (vm.SelectEventHandler(root, "OnInit"))
+            init.push_back(recipient);
+      if (!init.empty()) {
+        if (!(startup->life.flags & espm::QuestLifecycleData::RunOnce) ||
+            !startup->selected.empty() || init.size() != 1)
+          throw StartupBlocked{
+            "quest.on-init-order",
+            "Quest reset, stage or multiple OnInit handlers require ordering"
+          };
+        vm.SendEventSynchronous(init.front(), "OnInit", {}, stack);
+      }
+      startup->Next("startup-stages");
+      if (startup->selected.empty() && !startup->life.stages.empty())
+        throw StartupBlocked{
+          "quest.implicit-startup-stage",
+          "Quest has stages but no explicit startup stage"
+        };
+      if (startup->selected.size() > 1)
+        throw StartupBlocked{ "quest.startup-stage-order",
+                              "Multiple stages are marked for startup" };
+      for (auto index : startup->selected) {
+        const auto& stages = startup->life.stages;
+        if (std::count_if(
+              stages.begin(), stages.end(),
+              [&](const auto& stage) { return stage.index == index; }) != 1)
+          throw StartupBlocked{ "quest.duplicate-startup-stage",
+                                std::to_string(index) };
+        const auto entry =
+          std::find_if(stages.begin(), stages.end(), [&](const auto& stage) {
+            return stage.index == index;
+          });
+        if (entry->flags != espm::QuestLifecycleData::Stage::StartUp)
+          throw StartupBlocked{ "quest.startup-stage-flags",
+                                std::to_string(entry->flags) };
+        execute(questId, index, false);
+        startup->stages.push_back(index);
+      }
+      changed = true;
+    } else if (job && job->cursor == "done" && job->children.empty()) {
       if (++job->steps > QuestJobState::MaxSteps)
         throw std::runtime_error("Quest job work limit exceeded");
       if (job->handler) {
@@ -2090,7 +2433,21 @@ bool QuestScriptRuntime::Execute(
       }
     }
   };
-  if (job)
+  if (startup) {
+    QuestJournal::Atomic(actor, [&] {
+      run();
+      startup->Next("scenes");
+      if (startup->scene)
+        throw StartupBlocked{
+          "scene.begin-on-quest-start",
+          FormDesc::FromFormId(startup->scene, world.espmFiles).ToString()
+        };
+      startup->steps.push_back(startup->step);
+      // A successful diagnostic must leave the campaign exactly as fresh as
+      // a rejected diagnostic. Unwind before the journal can publish anything.
+      throw StartupExercised{};
+    });
+  } else if (job)
     run();
   else
     QuestJournal::Atomic(actor, run);

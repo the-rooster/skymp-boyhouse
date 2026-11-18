@@ -552,8 +552,12 @@ VarValue VirtualMachine::CallMethod(
   e += base;
   e += (base[0] ? "." : "") + std::string(methodName) + "'";
 
-  if (strictExecution)
+  if (strictExecution) {
+    if (unboundMemberObserver && !activePexInstancesOverride)
+      unboundMemberObserver(*selfObj, receiverType, methodName,
+                            UnboundMember::Method, arguments.size());
     throw std::runtime_error(e);
+  }
   spdlog::error("VirtualMachine::CallMethod - {}", e);
 
   return VarValue::None();

@@ -53,6 +53,12 @@ public:
   // this API.
   static bool ExecuteStage(MpActor& actor, uint32_t questId, uint16_t stage);
 
+  // Exercise a first start in an isolated, pristine campaign. The return
+  // records reached phases; the transaction is discarded even on success.
+  static nlohmann::json ProbeStartup(
+    MpActor& actor, uint32_t questId, uint32_t startScene,
+    const std::vector<PexScript::Lazy>& scripts);
+
   // Explicit dependency injection for deterministic VM fixtures. Production
   // uses owned QUST metadata and PEX storage through the overload above.
   static bool ExecuteStage(MpActor& actor, uint32_t questId, uint16_t stage,
@@ -78,6 +84,7 @@ public:
     const std::vector<PexScript::Lazy>& scripts);
 
 private:
+  struct StartupProbe;
   static bool Execute(
     MpActor& actor, uint32_t questId, uint16_t stage,
     const espm::QuestScriptData& metadata,
@@ -88,5 +95,6 @@ private:
     bool fixtureAwait = false,
     const std::map<uint32_t, espm::QuestScriptData>& overrides = {},
     const std::string& contentManifest = {}, const QuestJobClock& clock = {},
-    std::optional<QuestJobTimerAnchor>* timerAnchor = nullptr);
+    std::optional<QuestJobTimerAnchor>* timerAnchor = nullptr,
+    StartupProbe* startup = nullptr);
 };

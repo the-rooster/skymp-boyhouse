@@ -3935,3 +3935,129 @@ TEST_CASE("Completion log flags apply before fragment queries and roll back "
                 .at("value") == true);
   }
 }
+
+TEST_CASE(
+  "Quest startup probes exercise a fresh journal and always discard it",
+  "[Quest][QuestStartupProbe][espm]")
+{
+  PartOne server;
+  server.AttachEspm(&GetEspmLoader());
+  const uint32_t actorId = 0xff006100;
+  server.CreateActor(actorId, { 1, 2, 3 }, 0, 0x3c);
+  auto& actor = server.worldState.GetFormAt<MpActor>(actorId);
+  actor.SetWorldInstance("campaign:" + std::to_string(actorId) + ":startup");
+  // Dragonborn's actual DLC2MH02PostQuest record marks stage zero for startup.
+  const auto quest = FormDesc::FromString("208da:Dragonborn.esm")
+                       .ToFormId(server.worldState.espmFiles);
+  actor.SetPropertyValueDump(QuestJournal::kEnabled,
+                             "[\"208da:Dragonborn.esm\"]", false, false);
+  const auto pristine = QuestJournal::Snapshot(actor);
+  SECTION("original empty fragment stage is recorded inside both dry runs")
+  {
+    const auto first = QuestScriptRuntime::ProbeStartup(actor, quest, 0, {});
+    REQUIRE(first.at("status") == "startup-exercised");
+    REQUIRE(first.at("stages") == nlohmann::json::array({ 0 }));
+    REQUIRE(first.at("blocker").is_null());
+    REQUIRE(QuestJournal::Snapshot(actor) == pristine);
+    REQUIRE(QuestScriptRuntime::ProbeStartup(actor, quest, 0, {}) == first);
+  }
+  SECTION("a scene reached after the stage still rolls the stage back")
+  {
+    const auto report = QuestScriptRuntime::ProbeStartup(actor, quest, 42, {});
+    REQUIRE(report.at("status") == "blocked");
+    REQUIRE(report.at("step") == "scenes");
+    REQUIRE(report.at("blocker").at("code") == "scene.begin-on-quest-start");
+    REQUIRE(report.at("stages") == nlohmann::json::array({ 0 }));
+    REQUIRE(QuestJournal::Snapshot(actor) == pristine);
+  }
+  SECTION("an invalid actor or absent opt-in is a test setup failure")
+  {
+    actor.SetWorldInstance("");
+    REQUIRE_THROWS(QuestScriptRuntime::ProbeStartup(actor, quest, 0, {}));
+    actor.SetWorldInstance("campaign:" + std::to_string(actorId) + ":startup");
+    actor.SetPropertyValueDump(QuestJournal::kEnabled, "[]", false, false);
+    REQUIRE_THROWS(QuestScriptRuntime::ProbeStartup(actor, quest, 0, {}));
+  }
+}
+
+TEST_CASE("Startup fragments report only declared operations on their actual "
+          "engine receiver",
+          "[Quest][QuestStartupProbe][espm]")
+{
+  struct Sample
+  {
+    const char *key, *blocker;
+  };
+  const Sample samples[] = {
+    { "2b01:Dawnguard.esm", "native.objectreference.placeatme" },
+    { "3332b:Dragonborn.esm", "native.cell.reset" },
+    { "3bc0:Dawnguard.esm", "property.read.objectreference.x" },
+    { "fff50:Skyrim.esm", "property.write.globalvariable.value" },
+  };
+  const auto sample = samples[GENERATE(0, 1, 2, 3)];
+  PartOne server;
+  server.AttachEspm(&GetEspmLoader());
+  auto& world = server.worldState;
+  const auto quest =
+    FormDesc::FromString(sample.key).ToFormId(world.espmFiles);
+  server.CreateActor(0xff006100, { 1, 2, 3 }, 0, 0x3c);
+  auto& actor = world.GetFormAt<MpActor>(0xff006100);
+  actor.SetWorldInstance("campaign:" + std::to_string(actor.GetFormId()) +
+                         ":startup");
+  actor.SetPropertyValueDump(QuestJournal::kEnabled,
+                             nlohmann::json::array({ sample.key }).dump(),
+                             false, false);
+  world.AttachScriptStorage(std::make_shared<BsaArchiveScriptStorage>(
+    (std::filesystem::path(GetDataDir()) / "Skyrim - Misc.bsa")
+      .string()
+      .c_str()));
+  const auto scripts = QuestScriptRuntime::LoadScripts(world);
+  const auto before = QuestJournal::Snapshot(actor);
+  const auto probe = [&] {
+    return QuestScriptRuntime::ProbeStartup(actor, quest, 0, scripts);
+  };
+  INFO(sample.key);
+  const auto result = probe();
+  INFO(result.dump());
+  REQUIRE(result.at("status") == "blocked");
+  REQUIRE(result.at("step") == "startup-stages");
+  REQUIRE(result.at("blocker").at("code") == sample.blocker);
+  REQUIRE(QuestJournal::Snapshot(actor) == before);
+
+  // Corrupt only the in-memory PEX declaration used for the diagnostic. A
+  // name/arity/access mismatch must stay an execution error, even when the
+  // same original fragment previously reached a supported blocker category.
+  if (std::string(sample.key) == "fff50:Skyrim.esm") {
+    bool changed = false;
+    for (const auto& lazy : scripts) {
+      if (CIString(lazy.source.c_str()) != CIString("globalvariable"))
+        continue;
+      for (auto& prop : lazy.fn()->objectTable.at(0).properties) {
+        if (CIString(prop.name.c_str()) == CIString("value")) {
+          prop.flags &= ~Object::PropInfo::kFlags_Write;
+          changed = true;
+        }
+      }
+    }
+    REQUIRE(changed);
+    REQUIRE_THROWS_WITH(
+      probe(),
+      Catch::Matchers::ContainsSubstring("Unavailable Papyrus property"));
+  } else if (std::string(sample.key) == "2b01:Dawnguard.esm") {
+    bool changed = false;
+    for (const auto& lazy : scripts) {
+      if (CIString(lazy.source.c_str()) != CIString("objectreference"))
+        continue;
+      for (auto& state : lazy.fn()->objectTable.at(0).states)
+        for (auto& fn : state.functions)
+          if (CIString(fn.name.c_str()) == CIString("placeatme")) {
+            fn.function.params.clear();
+            changed = true;
+          }
+    }
+    REQUIRE(changed);
+    REQUIRE_THROWS_WITH(
+      probe(), Catch::Matchers::ContainsSubstring("Method not found"));
+  }
+  REQUIRE(QuestJournal::Snapshot(actor) == before);
+}

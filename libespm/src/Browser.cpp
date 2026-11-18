@@ -48,6 +48,7 @@ struct Browser::Impl
   std::vector<const RecordHeader*> locations;
   std::vector<const RecordHeader*> factions;
   std::vector<const RecordHeader*> quests;
+  std::vector<const RecordHeader*> scenes;
   std::vector<const RecordHeader*> worlds;
   std::vector<const RecordHeader*> cells;
   std::vector<const RecordHeader*> leveledItems, leveledActors, leveledSpells;
@@ -134,6 +135,8 @@ const std::vector<const RecordHeader*>& Browser::GetRecordsByType(
   if (!std::strcmp(type, espm::QUST::kType)) {
     return pImpl->quests;
   }
+  if (!std::strcmp(type, "SCEN"))
+    return pImpl->scenes;
   if (!std::strcmp(type, espm::WRLD::kType)) {
     return pImpl->worlds;
   }
@@ -148,7 +151,7 @@ const std::vector<const RecordHeader*>& Browser::GetRecordsByType(
     return pImpl->leveledSpells;
   throw std::runtime_error(
     "GetRecordsByType currently supports only REFR, "
-    "COBJ, KYWD, LCTN, FACT, QUST, WRLD, CELL, LVLI, LVLN and LVSP "
+    "COBJ, KYWD, LCTN, FACT, QUST, SCEN, WRLD, CELL, LVLI, LVLN and LVSP "
     "records");
 }
 
@@ -290,6 +293,9 @@ bool Browser::ReadAny(const GroupStack* parentGrStack)
     if (utils::Is<espm::QUST>(t)) {
       pImpl->quests.push_back(recHeader);
     }
+
+    if (t == "SCEN")
+      pImpl->scenes.push_back(recHeader);
 
     if (utils::Is<espm::WRLD>(t)) {
       pImpl->worlds.push_back(recHeader);

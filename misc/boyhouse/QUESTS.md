@@ -2,6 +2,40 @@
 
 This fork targets separate personal campaigns in a shared world, with invited guests using the owner's history inside altered locations. Full coverage means playable quests, scripts, dialogue, rewards, and world changes for the five owned masters. It is **not implemented yet**. The catalog still has **zero certified quests** out of 2,274 QUST records (including internal helpers).
 
+## Bulk quest startup test
+
+The server verification suite builds the dependency catalog from the owned game
+files, then attempts an explicit first start for each winning, non-deleted quest
+in its own disposable campaign. Internal quests are included. Each attempt uses
+the original quest record and the server's supported Papyrus operations. The
+probe rolls back its campaign changes. Ordinary servers keep their configured
+quest adapters.
+
+To run it independently after building the server and generating
+`build/quest-dependencies.json`, use the same game data and disposable state
+directories as the server verification suite.
+
+```sh
+docker compose -p skymp-quest-startup -f misc/boyhouse/compose.yaml run --rm --no-deps verify \
+  node misc/boyhouse/quest-startup-runner.cjs --catalog build/quest-dependencies.json \
+  --output build/quest-startup.json --markdown build/quest-startup.md
+```
+
+The [five-master baseline](QUEST_STARTUP_BASELINE.md) lists the measured startup outcomes
+and the most common missing story events. The Markdown groups first blockers by cause. The JSON keeps the per-quest trace.
+Keep a copy of the JSON from the first run and pass `--compare <previous.json>`
+on the next run. Use separate output paths for the new report. The comparison
+counts an advance when the new trace completes a phase that previously blocked
+the quest. A change of blocker within the same phase is recorded separately.
+
+A successful row covers this explicit startup probe. Natural triggers,
+subsequent player choices, party visibility, save recovery and completion need
+their own tests. An unsupported operation ends that quest's attempt, so the
+counts describe the first observed dependency and can shift after a fix. Child
+scenes marked to begin on quest start are detected from the winning SCEN record.
+Scene action flags and package references are read separately from the scene's
+own flags and parent quest. [TES5Edit SCEN definition](https://github.com/TES5Edit/TES5Edit/blob/dev-4.1.5/Core/wbDefinitionsTES5.pas#L9221-L9347)
+
 ## Implemented journal foundation
 
 - The owning character's existing change form persists a private, versioned quest journal. Keys use native `FormDesc` format, for example `4e50d:Skyrim.esm`; the inventory scanner uses a different display format.

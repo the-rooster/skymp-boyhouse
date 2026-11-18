@@ -285,6 +285,12 @@ void ActivePexInstance::ExecuteStrictProperty(
   }
   const auto access =
     write ? Object::PropInfo::kFlags_Write : Object::PropInfo::kFlags_Read;
+  if (!self && !selected && parentVM->unboundMemberObserver)
+    parentVM->unboundMemberObserver(
+      *object, target.objectType.c_str(), name,
+      write ? VirtualMachine::UnboundMember::PropertyWrite
+            : VirtualMachine::UnboundMember::PropertyRead,
+      write ? 1 : 0);
   if (!selected || !(property->flags & access))
     throw std::runtime_error(std::string("Unavailable Papyrus property: ") +
                              name);

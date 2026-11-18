@@ -11,6 +11,7 @@
 #include "NetworkingCombined.h"
 #include "PacketHistoryWrapper.h"
 #include "PapyrusUtils.h"
+#include "QuestScriptRuntime.h"
 #include "ScampServerListener.h"
 #include "condition_functions/ConditionFunctionFactory.h"
 #include "formulas/DamageMultConditionalFormula.h"
@@ -134,6 +135,7 @@ Napi::Object ScampServer::Init(Napi::Env env, Napi::Object exports)
       InstanceMethod("beginPacketEpoch", &ScampServer::BeginPacketEpoch),
       InstanceMethod("getPacketEpoch", &ScampServer::GetPacketEpoch),
       InstanceMethod("resumeCampaignActor", &ScampServer::ResumeCampaignActor),
+      InstanceMethod("probeQuestStartup", &ScampServer::ProbeQuestStartup),
       InstanceMethod("getCampaignResume", &ScampServer::GetCampaignResume),
       InstanceMethod("captureCampaignResumeProjection",
                      &ScampServer::CaptureCampaignResumeProjection),
@@ -1934,6 +1936,37 @@ Napi::Value ScampServer::ResumeCampaignActor(const Napi::CallbackInfo& info)
         ->ResumeCampaignActor(id, NapiHelper::ExtractUInt32(info[1], "actor"),
                               info[2].As<Napi::String>().Utf8Value(), area)
         .dump());
+  } catch (const std::exception& e) {
+    throw Napi::Error::New(info.Env(), e.what());
+  }
+}
+
+Napi::Value ScampServer::ProbeQuestStartup(const Napi::CallbackInfo& info)
+{
+  try {
+    if (info.Length() != 2)
+      throw std::invalid_argument("Expected disposable actor and quest IDs");
+    const auto actorId = NapiHelper::ExtractUInt32(info[0], "actorId");
+    const auto questId = NapiHelper::ExtractUInt32(info[1], "questId");
+    if (!actorId || !questId ||
+        info[0].As<Napi::Number>().DoubleValue() != actorId ||
+        info[1].As<Napi::Number>().DoubleValue() != questId)
+      throw std::invalid_argument(
+        "Startup probe IDs must be positive uint32 integers");
+    auto& world = partOne->worldState;
+    const auto form = world.LookupFormByIdNoLoad(actorId);
+    auto* actor = form ? form->AsActor() : nullptr;
+    if (!actor ||
+        partOne->serverState.UserByActor(actor) != Networking::InvalidUserId)
+      throw std::invalid_argument(
+        "Startup probes require an unassigned actor");
+    if (!startupScenes)
+      startupScenes.emplace(world.GetEspm().GetBrowser());
+    if (!startupScripts)
+      startupScripts = QuestScriptRuntime::LoadScripts(world);
+    const auto report = QuestScriptRuntime::ProbeStartup(
+      *actor, questId, startupScenes->Find(questId), *startupScripts);
+    return NapiHelper::ParseJson(info.Env(), report.dump());
   } catch (const std::exception& e) {
     throw Napi::Error::New(info.Env(), e.what());
   }

@@ -1,4 +1,5 @@
 #include "libespm/QuestLifecycleData.h"
+#include "libespm/QuestStartSceneIndex.h"
 #include "libespm/RecordHeaderAccess.h"
 #include "TestUtils.hpp"
 #include <cstring>
@@ -273,4 +274,15 @@ TEST_CASE("Every owned quest lifecycle keeps exact DNAM and ordered stage metada
   REQUIRE_THROWS(Data::Read(nullptr, browser.GetCache()));
   REQUIRE_THROWS(
     Data::Read(browser.LookupById(0xf).rec, browser.GetCache()));
+}
+
+TEST_CASE("Startup checks include auto-starting scenes from winning records",
+          "[Quest][QuestLifecycleData][QuestStartupProbe]")
+{
+  espm::QuestStartSceneIndex scenes(GetEspmLoader().GetBrowser());
+  REQUIRE(scenes.Find(0x15fcc) == 0x19712);       // DialogueRiverwoodSceneA
+  REQUIRE(scenes.Find(0x4e667) == 0x91443);       // five auto-start scenes
+  REQUIRE(scenes.Find(0x0201a1c1) == 0x02010f2b); // Dawnguard
+  REQUIRE(scenes.Find(0x0403854c) == 0x0403854d); // Dragonborn
+  REQUIRE(scenes.Find(0x4e50d) == 0);             // MQ102
 }

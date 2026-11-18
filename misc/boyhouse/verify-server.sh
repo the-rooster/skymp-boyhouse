@@ -15,3 +15,6 @@ node misc/boyhouse/protocol-smoke.cjs
 node misc/boyhouse/protocol-smoke.cjs --projection
 node misc/boyhouse/storage-smoke.cjs
 node misc/boyhouse/guest-restart-smoke.cjs
+# Exercise every non-deleted winning QUST against original records and scripts.
+node misc/boyhouse/quest-startup-runner.cjs --catalog build/quest-dependencies.json \
+  --output build/quest-startup.json --markdown build/quest-startup.md
