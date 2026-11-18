@@ -171,6 +171,7 @@ test("actor-dialogue CLI selects winners by ENAM, validates both actors and cont
     assert.deepEqual(this.actors.get(second), {...this.actors.get(actor),base:0x1a670});
     return {status:"blocked",step:"aliases",steps:["admission"],stages:[],blocker:{code:"alias.fill",detail:"Alias 2"},
       storyEvent:{type:"ADIA",actor1:first,actor2:second,location:0x1f86d},
+      scenePlan:{questId:id,sceneId:0x100,lines:[{index:1,phase:0,speakerAliasId:3,speakerFormId:0x1a66e,speakerCopyId:first,topicId:0x200}]},
       storyRoute:{candidateCount:1,nodeIds:[0x123,0x456],questIndex:0},
         storySelection:{outcome:"attempt",nodeIds:[0x123,0x456],nodeId:0x456,questId:id,questIndex:0,detail:""},
         storyAliasBindings:[{id:3,member:"R1",formId:0x1a66e}],
@@ -192,6 +193,9 @@ test("actor-dialogue CLI selects winners by ENAM, validates both actors and cont
     actor1Original:0x1a66e,actor2Original:0x1a671,cell:0x1605e,location:0x1f86d});
   assert.equal(report.provenance.actorDialogue.placement, "authored");
   assert.deepEqual(story.storyRoute, {candidateCount:1,nodeIds:[0x123,0x456],questIndex:0});
+  assert.deepEqual(story.scenePlan, {questId:1,sceneId:0x100,lines:[
+    {index:1,phase:0,speakerAliasId:3,speakerFormId:0x1a66e,topicId:0x200}
+  ]});
   assert.deepEqual(story.storyAliasBindings, [{id:3,member:"R1",formId:0x1a66e}]);
   assert.deepEqual(story.storyUniqueActorBindings, [{id:4,baseId:0x13ba3,formId:0x1a66e,reused:true}]);
   assert.deepEqual(story.storySelection, {outcome:"attempt",nodeIds:[0x123,0x456],nodeId:0x456,

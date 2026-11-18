@@ -4,6 +4,7 @@ Format references: libespm/QuestScriptData.cpp, papyrus-vm/Reader.cpp,
 TES5Edit/Core/wbDefinitionsTES5.pas, Ryan-rsm-McKenzie/bsa/src/bsa/tes4.cpp.
 Unknown formats fail explicitly; these readers are analysis tools, not a VM.
 """
+import mmap
 import struct
 import zlib
 
@@ -311,7 +312,17 @@ def bsa_scripts(path):
     Skyrim BSA 104/105 with filename tables. SSE compressed entries require the
     optional lz4 package; unsupported compression fails rather than omitting files.
     """
-    data = path.read_bytes()
+    for _, filename, payload in bsa_members(path, lambda folder, name: folder == "scripts" and name.endswith(".pex")):
+        yield filename[:-4], payload
+
+
+def bsa_members(path, select):
+    """Read selected members without loading a multi-gigabyte voice archive into memory."""
+    with path.open("rb") as stream, mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as data:
+        yield from _bsa_members(data, select)
+
+
+def _bsa_members(data, select):
     if len(data) < 36:
         raise ValueError("Truncated BSA header")
     magic, version, offset, flags, folders, files, dir_bytes, name_bytes, _ = (
@@ -353,17 +364,17 @@ def bsa_scripts(path):
             pos += 16
             filename = names[name_index].decode("utf-8").lower()
             name_index += 1
-            if folder != "scripts" or not filename.endswith(".pex"):
+            if not select(folder, filename):
                 continue
             if "/" in filename or "\\" in filename:
-                raise ValueError("Unexpected nested script filename")
-            script = filename[:-4]
-            if script in seen:
-                raise ValueError("Duplicate BSA script name")
-            seen.add(script)
+                raise ValueError("Unexpected nested BSA filename")
+            member = (folder, filename)
+            if member in seen:
+                raise ValueError("Duplicate BSA member name")
+            seen.add(member)
             size = size_flags & 0x3fffffff
             if start & 0x80000000 or start < names_end or start + size > len(data):
-                raise ValueError("BSA script data outside archive")
+                raise ValueError("BSA member data outside archive")
             payload = data[start:start + size]
             if flags & 0x100:
                 if not payload or 1 + payload[0] > len(payload):
@@ -374,7 +385,7 @@ def bsa_scripts(path):
                     raise ValueError("Truncated compressed BSA entry")
                 expected = struct.unpack_from("<I", payload)[0]
                 if expected > MAX_BLOB:
-                    raise ValueError("BSA script exceeds 64 MiB")
+                    raise ValueError("BSA member exceeds 64 MiB")
                 if version == 104:
                     payload = inflate(payload[4:], expected)
                 else:
@@ -388,7 +399,7 @@ def bsa_scripts(path):
                     if not decoder.eof or decoder.unused_data or len(payload) != expected:
                         raise ValueError("Invalid compressed SSE BSA entry")
             if len(payload) > MAX_BLOB:
-                raise ValueError("BSA script exceeds 64 MiB")
-            yield script, payload
+                raise ValueError("BSA member exceeds 64 MiB")
+            yield folder, filename, payload
     if pos != names_start:
         raise ValueError("BSA directory table length mismatch")

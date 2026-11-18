@@ -73,6 +73,11 @@ public:
   // This read-only event probe has no requested quest and does not start one.
   static nlohmann::json ProbeActorDialogueSelection(
     MpActor& owner, const ActorDialogue& dialogue);
+  // Read authored topics and the running quest's saved private speaker roles.
+  // The trusted caller authorizes and drives playback separately.
+  static nlohmann::json GetCampaignSceneDialoguePlan(MpActor& owner,
+                                                     uint32_t questId,
+                                                     uint32_t sceneId);
   static nlohmann::json ProbeStartup(
     MpActor& actor, uint32_t questId, uint32_t startScene,
     const std::vector<PexScript::Lazy>& scripts,

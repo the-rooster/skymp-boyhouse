@@ -154,10 +154,14 @@ function probe(mode) {
         {id:2, baseId:0x1a670, formId:mikael, reused:true}
       ]);
       assert.equal(result.status, "blocked");
-      assert.equal(result.blocker.code, "scene.begin-on-quest-start");
+      assert.equal(result.blocker.code, "scene.dialogue-playback");
+      const topics = [0x17f2b, 0x17f2a, 0x17f29, 0x17f28, 0x17f27, 0x17f1f];
+      assert.deepEqual(result.scenePlan, { questId: banneredMareQuest, sceneId: 0x17f33,
+        lines: topics.map((topicId, phase) => ({ index: phase + 1, phase, speakerAliasId: phase % 2 + 1,
+          speakerFormId: [hulda, mikael][phase % 2], speakerCopyId: ordered[phase % 2], topicId })) });
       assert.equal(result.blocker.detail, "17f33:Skyrim.esm");
       startup = {quest:record.editorId, status:result.status, step:result.step, blocker:result.blocker,
-        stages:result.stages, eventAliases:result.storyAliasBindings, uniqueAliases:result.storyUniqueActorBindings};
+        stages:result.stages, eventAliases:result.storyAliasBindings, uniqueAliases:result.storyUniqueActorBindings, scenePlan:result.scenePlan};
       server.set(owner, "private.boyhouse.questAdapters", []);
     } else {
       const expected = i === 1 && mode !== "alias-fallback-fixture" ? firstQuest : fallbackQuest;

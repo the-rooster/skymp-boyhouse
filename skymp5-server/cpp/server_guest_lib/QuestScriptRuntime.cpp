@@ -19,6 +19,7 @@
 #include "libespm/QuestAliasData.h"
 #include "libespm/QuestLifecycleData.h"
 #include "libespm/RecordHeaderAccess.h"
+#include "libespm/SceneActionData.h"
 #include "libespm/StoryEventRouteIndex.h"
 #include "papyrus-vm/Reader.h"
 #include "script_classes/PapyrusQuest.h"
@@ -949,6 +950,180 @@ StoryIndex::Selection SelectActorDialogue(
   };
   return dialogue.routes.Select(kActorDialogueEvent, checkNode, checkQuest);
 }
+// A dialogue action references a topic, not a selected INFO or voice file.
+// Validate that the winning topic still belongs to this quest.
+bool IsSceneTopic(WorldState& world, uint32_t id, uint32_t questId)
+{
+  const auto topic = world.GetEspm().GetBrowser().LookupById(id);
+  if (!topic.rec || topic.rec->GetType() != "DIAL" || topic.rec->IsDeleted())
+    return false;
+  std::optional<uint32_t> quest;
+  espm::RecordHeaderAccess::IterateFields(
+    topic.rec,
+    [&](const char* tag, uint32_t size, const char* data) {
+      if (std::memcmp(tag, "QNAM", 4))
+        return;
+      if (quest || size != 4)
+        throw std::runtime_error("Malformed dialogue topic quest");
+      uint32_t raw;
+      std::memcpy(&raw, data, sizeof(raw));
+      quest = raw ? topic.ToGlobalId(raw) : 0;
+    },
+    world.GetEspmCache());
+  return quest == questId;
+}
+
+Json BuildSceneDialoguePlan(MpActor& owner, uint32_t questId, uint32_t sceneId)
+{
+  auto* world = owner.GetParent();
+  const auto prefix = "campaign:" + std::to_string(owner.GetFormId()) + ":";
+  if (!world ||
+      world->LookupFormByIdNoLoad(owner.GetFormId()).get() != &owner ||
+      owner.IsDeleted() || !owner.GetWorldInstance().starts_with(prefix) ||
+      &QuestJournal::Owner(owner) != &owner)
+    throw std::invalid_argument(
+      "Scene planning requires a registered private campaign owner");
+  const auto& browser = world->GetEspm().GetBrowser();
+  const auto quest = browser.LookupById(questId);
+  const auto record = browser.LookupById(sceneId);
+  if (!quest.rec || quest.rec->IsDeleted() || quest.rec->GetType() != "QUST" ||
+      !record.rec || record.rec->IsDeleted() ||
+      record.rec->GetType() != "SCEN")
+    throw std::invalid_argument(
+      "Scene planning requires a live quest and scene");
+  const auto scene = espm::SceneActionData::Read(browser, sceneId);
+  if (scene.questId != questId)
+    throw StartupBlocked{ "scene.quest-owner",
+                          "Scene belongs to a different quest" };
+  if (QuestJournal::Get(owner, questId).at("running") != true)
+    throw StartupBlocked{ "scene.quest-not-running",
+                          "The owning quest is not running" };
+  try {
+    QuestJournal::RequireAdapter(owner, questId);
+  } catch (const std::runtime_error& error) {
+    throw StartupBlocked{ "scene.quest-adapter", error.what() };
+  }
+  if (scene.unknownFields || (scene.flags & ~uint32_t{ 7 }))
+    throw StartupBlocked{ "scene.fields",
+                          "Unsupported scene metadata or flags" };
+  if (scene.hasScripts || scene.conditionCount)
+    throw StartupBlocked{ "scene.conditions-or-scripts",
+                          "Scene has scripts or conditions" };
+  if (scene.duplicateActionIndices)
+    throw StartupBlocked{ "scene.action-index",
+                          "Scene action indices are not unique" };
+  if (scene.actions.empty() || scene.actions.size() != scene.phases.size())
+    throw StartupBlocked{ "scene.phase-layout",
+                          "Scene requires one dialogue action per phase" };
+  for (size_t i = 0; i < scene.phases.size(); ++i) {
+    const auto& phase = scene.phases[i];
+    if (phase.unknownFields || phase.startConditionCount ||
+        phase.completionConditionCount)
+      throw StartupBlocked{ "scene.phase-conditions",
+                            "Phase " + std::to_string(i) +
+                              " has unsupported conditions or fields" };
+  }
+
+  const auto aliases =
+    espm::QuestAliasData::Read(quest.rec, world->GetEspmCache());
+  const auto questKey =
+    FormDesc::FromFormId(questId, world->espmFiles).ToString();
+  const QuestVmState state(QuestJournal::ScriptState(owner), {}, {});
+  std::map<uint32_t, std::pair<uint32_t, uint32_t>> speakers;
+  for (const auto& role : scene.actors) {
+    const auto label = "Scene actor alias " + std::to_string(role.aliasId);
+    if (role.flags || (role.behaviorFlags & ~uint32_t{ 0x1a }))
+      throw StartupBlocked{ "scene.actor-flags",
+                            label + " has unsupported actor flags" };
+    const auto* definition = aliases.Find(role.aliasId);
+    if (!definition ||
+        definition->kind != espm::QuestAliasDefinition::Kind::Reference)
+      throw StartupBlocked{ "scene.speaker-role",
+                            label + " lacks a reference alias" };
+    const auto bound = state.GetAliasBinding(
+      questKey + "/alias:" + std::to_string(role.aliasId));
+    if (!bound || !bound->is_string())
+      throw StartupBlocked{ "scene.speaker-binding",
+                            label + " has no saved reference binding" };
+    const auto saved = bound->get<std::string>();
+    const auto original =
+      FormDesc::FromString(saved).ToFormId(world->espmFiles);
+    if (!original || original >= 0xff000000 || original == 0x14 ||
+        FormDesc::FromFormId(original, world->espmFiles).ToString() != saved)
+      throw StartupBlocked{ "scene.speaker-binding",
+                            label + " is not a canonical NPC original" };
+    MpActor* copy;
+    try {
+      copy = CampaignReferenceBinding::Resolve(owner, original).AsActor();
+    } catch (const std::runtime_error& e) {
+      throw StartupBlocked{ "scene.speaker-copy", label + ": " + e.what() };
+    }
+    if (!copy || copy->IsDisabled() || copy->IsDead() ||
+        copy->IsCreatedAsPlayer())
+      throw StartupBlocked{ "scene.speaker-copy",
+                            label + " has no active private NPC" };
+    const auto unique = definition->Unsigned("ALUA");
+    const auto forced = definition->Unsigned("ALFR");
+    if ((unique && copy->GetBaseId() != quest.ToGlobalId(*unique)) ||
+        (forced && original != quest.ToGlobalId(*forced)))
+      throw StartupBlocked{ "scene.speaker-binding",
+                            label + " conflicts with its authored actor" };
+    if (!speakers
+           .emplace(role.aliasId, std::make_pair(original, copy->GetFormId()))
+           .second)
+      throw StartupBlocked{ "scene.speaker-role", label + " is duplicated" };
+  }
+
+  Json lines = Json::array();
+  for (const auto& action : scene.actions) {
+    const auto label = "Scene action " + std::to_string(action.index);
+    if (action.type != 0)
+      throw StartupBlocked{
+        "scene.action-type", label + " has type " + std::to_string(action.type)
+      };
+    if (action.startPhase != lines.size() ||
+        action.endPhase != action.startPhase)
+      throw StartupBlocked{ "scene.phase-layout",
+                            label +
+                              " is not a successive single-phase action" };
+    if (action.unknownFields || action.flags || !action.packageIds.empty() ||
+        action.timerSeconds || action.headtrackActorAlias != -1 ||
+        action.emotionType.value_or(0) || action.emotionValue.value_or(0))
+      throw StartupBlocked{ "scene.action-fields",
+                            label + " has unrepresented dialogue behavior" };
+    const auto speaker =
+      speakers.find(static_cast<uint32_t>(action.actorAlias));
+    if (action.actorAlias < 0 || speaker == speakers.end())
+      throw StartupBlocked{ "scene.speaker-role",
+                            label + " refers to an unbound scene role" };
+    if (!IsSceneTopic(*world, action.topicId, questId))
+      throw StartupBlocked{ "scene.dialogue-topic",
+                            label + " lacks a live topic owned by the quest" };
+    lines.push_back({ { "index", action.index },
+                      { "phase", action.startPhase },
+                      { "speakerAliasId", action.actorAlias },
+                      { "speakerFormId", speaker->second.first },
+                      { "speakerCopyId", speaker->second.second },
+                      { "topicId", action.topicId } });
+  }
+  return { { "sceneId", sceneId },
+           { "questId", questId },
+           { "lines", std::move(lines) } };
+}
+}
+
+Json QuestScriptRuntime::GetCampaignSceneDialoguePlan(MpActor& owner,
+                                                      uint32_t questId,
+                                                      uint32_t sceneId)
+{
+  try {
+    return { { "scenePlan", BuildSceneDialoguePlan(owner, questId, sceneId) },
+             { "blocker", nullptr } };
+  } catch (const StartupBlocked& block) {
+    return { { "scenePlan", nullptr },
+             { "blocker",
+               { { "code", block.code }, { "detail", block.detail } } } };
+  }
 }
 
 std::optional<uint32_t> QuestScriptRuntime::ActorDialogue::UniqueActorOriginal(
@@ -988,7 +1163,7 @@ struct QuestScriptRuntime::StartupProbe
   const ActorDialogue* dialogue = nullptr;
   uint32_t dialogueLocation = 0;
   Json storyEvent, storyRoute, storySelection, storyAliasBindings,
-    storyUniqueActorBindings;
+    storyUniqueActorBindings, scenePlan;
   std::vector<uint16_t> selected, stages;
   std::vector<std::string> steps;
   std::string step = "record";
@@ -1009,6 +1184,8 @@ struct QuestScriptRuntime::StartupProbe
                blocked ? Json{ { "code", blocked->code },
                                { "detail", blocked->detail } }
                        : Json(nullptr) } };
+    if (!scenePlan.is_null())
+      result["scenePlan"] = scenePlan;
     if (!storyEvent.is_null())
       result["storyEvent"] = storyEvent;
     if (!storyRoute.is_null())
@@ -2931,6 +3108,14 @@ bool QuestScriptRuntime::Execute(
     QuestJournal::Atomic(actor, [&] {
       run();
       startup->Next("scenes");
+      if (startup->scene && startup->dialogue) {
+        startup->scenePlan =
+          BuildSceneDialoguePlan(actor, questId, startup->scene);
+        throw StartupBlocked{
+          "scene.dialogue-playback",
+          FormDesc::FromFormId(startup->scene, world.espmFiles).ToString()
+        };
+      }
       if (startup->scene)
         throw StartupBlocked{
           "scene.begin-on-quest-start",

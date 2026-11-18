@@ -86,6 +86,11 @@ async function finishCreation(p) {
     });
     process.exit(0);
   }
+  if (process.env.BOYHOUSE_PROTOCOL_DIALOGUE === "1") {
+    await require("./dialogue-smoke-gamemode.cjs")({ server, sleep, packet, prepared, acknowledge,
+      login, command, finishCreation, scope, community });
+    process.exit(0);
+  }
   if (community) {
     await require("./community-smoke-gamemode.cjs")({ server, sleep, packet, scope,
       prepared, acknowledge, login, command, finishCreation });

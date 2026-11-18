@@ -1,6 +1,9 @@
 import { Settings } from "../settings";
 import { System, SystemContext, Content } from "./system";
 import { PartyInstances } from "../campaign/partyInstances";
+import { loadSceneTimingIndex } from "../campaign/sceneTimingIndex";
+import { playTimedScene } from "../campaign/sceneDialogueClock";
+import { CampaignSceneDialogue } from "../campaign/sceneDialogue";
 import { ProjectionFeed } from "../campaign/projectionFeed";
 
 export class CampaignInstances implements System {
@@ -12,7 +15,7 @@ export class CampaignInstances implements System {
   async initAsync(ctx: SystemContext): Promise<void> {
     const settings = await Settings.get();
     const config = settings.allSettings?.boyhouseInstances as
-      { experimental?: boolean; projection?: boolean; areas?: unknown[] } | undefined;
+      { experimental?: boolean; projection?: boolean; dialogueTimingFile?: string; areas?: unknown[] } | undefined;
     if (config?.experimental !== true) return;
     const api = ctx.svr as any;
     this.authority = new PartyInstances({
@@ -80,6 +83,7 @@ export class CampaignInstances implements System {
         if (accepted) this.authority!.confirmPersonalResume(resume.actor, resume.phase);
         return accepted;
       },
+      blocked: (user: number) => ctx.svr.getGameplayBlocked(user),
       block: (user: number, blocked: boolean) => ctx.svr.setGameplayBlocked(user, blocked),
       send: (user: number, packet: unknown) => ctx.svr.sendCustomPacket(user, JSON.stringify(packet)),
       close: (user: number, error: unknown) => {
@@ -93,6 +97,19 @@ export class CampaignInstances implements System {
     });
     if (this.projection) {
       const projection = this.projection;
+      const dialogue = new CampaignSceneDialogue(projection, this.authority, {
+        user: (actor: number) => ctx.svr.getUserByActor(actor),
+        plan: (owner: number, quest: number, scene: number) => ctx.svr.getCampaignSceneDialoguePlan(owner, quest, scene),
+      });
+      api.beginCampaignSceneDialogue = (owner: number, quest: number, scene: number) =>
+        dialogue.begin(owner, quest, scene);
+      if (config.dialogueTimingFile !== undefined) {
+        const timings = await loadSceneTimingIndex(config.dialogueTimingFile, settings.allSettings,
+          api.getEspmLoadOrder());
+        api.playCampaignSceneDialogue = (owner: number, quest: number, scene: number) =>
+          playTimedScene(dialogue.begin(owner, quest, scene, true), timings,
+            (topic: number) => api.getDescFromId(topic));
+      }
       ctx.svr.setCampaignVisibilityCallbacks(
         (_owner, users) => projection.prepareVisibility(users),
         (_owner, users, synchronized) => projection.completeVisibility(users, synchronized)

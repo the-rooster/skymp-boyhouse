@@ -135,6 +135,8 @@ Napi::Object ScampServer::Init(Napi::Env env, Napi::Object exports)
       InstanceMethod("beginPacketEpoch", &ScampServer::BeginPacketEpoch),
       InstanceMethod("getPacketEpoch", &ScampServer::GetPacketEpoch),
       InstanceMethod("resumeCampaignActor", &ScampServer::ResumeCampaignActor),
+      InstanceMethod("getCampaignSceneDialoguePlan",
+                     &ScampServer::GetCampaignSceneDialoguePlan),
       InstanceMethod("probeQuestStartup", &ScampServer::ProbeQuestStartup),
       InstanceMethod("probeActorDialogueSelection",
                      &ScampServer::ProbeActorDialogueSelection),
@@ -1988,6 +1990,27 @@ Napi::Value ScampServer::ProbeActorDialogueSelection(
     const auto result =
       QuestScriptRuntime::ProbeActorDialogueSelection(owner, dialogue);
     return NapiHelper::ParseJson(info.Env(), result.dump());
+  } catch (const std::exception& e) {
+    throw Napi::Error::New(info.Env(), e.what());
+  }
+}
+
+Napi::Value ScampServer::GetCampaignSceneDialoguePlan(
+  const Napi::CallbackInfo& info)
+{
+  try {
+    if (info.Length() != 3)
+      throw std::invalid_argument(
+        "Expected a campaign owner, quest and scene");
+    const auto ownerForm =
+      partOne->worldState.LookupFormByIdNoLoad(ProbeFormId(info[0]));
+    auto* owner = ownerForm ? ownerForm->AsActor() : nullptr;
+    if (!owner)
+      throw std::invalid_argument(
+        "Scene planning requires a loaded campaign owner");
+    const auto plan = QuestScriptRuntime::GetCampaignSceneDialoguePlan(
+      *owner, ProbeFormId(info[1]), ProbeFormId(info[2]));
+    return NapiHelper::ParseJson(info.Env(), plan.dump());
   } catch (const std::exception& e) {
     throw Napi::Error::New(info.Env(), e.what());
   }

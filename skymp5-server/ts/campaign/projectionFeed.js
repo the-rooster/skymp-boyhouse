@@ -99,6 +99,7 @@ class ProjectionFeed {
     if (state.sequence >= Number.MAX_SAFE_INTEGER) throw Error("Projection sequence exhausted");
     ++state.sequence;
     const pending = { token, actor, encoded, attempt: captured?.attempt, proof: captured?.proof };
+    state.released = null;
     state.pending = pending;
     state.context = this.context(user);
     state.dirty = false;
@@ -118,6 +119,32 @@ class ProjectionFeed {
     }
   }
 
+  // A cue can reference only NPC copies in the exact manifest this socket applied.
+  isReleased(user, release) {
+    const state = this.users.get(user);
+    return !!release && state?.released === release && !state.pending && !state.dirty &&
+      !state.deadline && !state.visibilityHeld && this.adapter.connected(user) && !this.adapter.blocked(user) &&
+      this.adapter.actor(user) === release.actor && this.adapter.epoch(user) === release.token &&
+      this.context(user) === state.context;
+  }
+
+  releasedProjection(user) {
+    const release = this.users.get(user)?.released;
+    if (!this.isReleased(user, release)) return null;
+    const manifest = this.adapter.read(release.actor);
+    if (JSON.stringify(manifest) !== release.encoded) return null;
+    return { release, manifest };
+  }
+
+  sendSceneLine(user, release, sceneId, line, slotMs) {
+    const sequence = (release.dialogueSequence ?? 0) + 1;
+    if (!Number.isSafeInteger(sequence)) throw Error("Dialogue sequence exhausted");
+    release.dialogueSequence = sequence;
+    this.adapter.send(user, { customPacketType: "boyhouse.sceneDialogue", protocolVersion: 1,
+      packetEpoch: release.token, sequence, sceneId, actionIndex: line.index,
+      speaker: line.speakerCopyId, topicId: line.topicId, ...(slotMs === undefined ? {} : { slotMs }) });
+  }
+
   pauseUser(user, state) {
     const actor = this.adapter.actor(user);
     try {
@@ -125,6 +152,7 @@ class ProjectionFeed {
       this.adapter.beginEpoch(user);
       if (state.sequence >= Number.MAX_SAFE_INTEGER) throw Error("Projection sequence exhausted");
       ++state.sequence;
+      state.released = null;
       state.pending = null;
       state.dirty = true;
       state.deadline = this.now() + 30000;
@@ -267,7 +295,7 @@ class ProjectionFeed {
           if (!current()) return;
           state.pending = null;
           state.dirty = !accepted;
-          if (accepted) { state.deadline = 0; state.resumeAttempt = null; }
+          if (accepted) { state.deadline = 0; state.resumeAttempt = null; state.released = pending; }
           else this.publish(user, state);
           return;
         }
@@ -286,6 +314,7 @@ class ProjectionFeed {
         this.send(user, state, { kind: "ready", token: pending.token });
         this.adapter.block(user, false);
         state.pending = null;
+        state.released = pending;
         state.deadline = 0;
       }
     } catch (error) { this.fail(user, error, state); }

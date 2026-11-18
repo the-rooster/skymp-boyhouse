@@ -4095,6 +4095,89 @@ TEST_CASE("Explicit actor dialogue binds two NPCs and checks its winning route",
             "null");
 }
 
+TEST_CASE(
+  "Scene dialogue resolves restored roles in the running private campaign",
+  "[Quest][QuestStartupProbe][CampaignSceneDialogue][espm]")
+{
+  Fixture f;
+  auto& world = f.server.worldState;
+  constexpr uint32_t ownerId = 0xff006200, quest = 0x17f32, scene = 0x17f33;
+  auto& owner = f.Add(ownerId);
+  const auto phase = "campaign:" + std::to_string(ownerId) + ":scene";
+  owner.SetWorldInstance(phase);
+  EnableRuntimeQuest(owner, quest);
+  const auto plan = [&] {
+    return QuestScriptRuntime::GetCampaignSceneDialoguePlan(owner, quest,
+                                                            scene);
+  };
+  REQUIRE(plan().at("blocker").at("code") == "scene.quest-not-running");
+  REQUIRE(
+    QuestScriptRuntime::GetCampaignSceneDialoguePlan(owner, kQuest, scene)
+      .at("blocker")
+      .at("code") == "scene.quest-owner");
+  QuestJournal::Apply(owner, { { "quest", quest }, { "op", "start" } });
+  REQUIRE(plan().at("blocker").at("code") == "scene.speaker-binding");
+  EnableRuntimeQuest(owner, kQuest);
+  REQUIRE(plan().at("blocker").at("code") == "scene.quest-adapter");
+  EnableRuntimeQuest(owner, quest);
+
+  const auto saveRole = [&](uint32_t id, uint32_t original) {
+    QuestJournal::Atomic(owner, [&] {
+      QuestVmState state(QuestJournal::ScriptState(owner), {}, {});
+      state.SetAliasBinding(
+        "17f32:Skyrim.esm/alias:" + std::to_string(id),
+        FormDesc::FromFormId(original, world.espmFiles).ToString());
+      QuestJournal::SetScriptState(owner, state.Save());
+    });
+  };
+  saveRole(1, 0x1a66e);
+  saveRole(2, 0x1a671);
+  REQUIRE(plan().at("blocker").at("code") == "scene.speaker-copy");
+  auto place = [&](uint32_t id, uint32_t base, uint32_t original) {
+    world.AddForm(std::make_unique<MpActor>(
+                    LocationalData{ {}, {}, owner.GetCellOrWorld() },
+                    FormCallbacks::DoNothing(), base),
+                  id);
+    auto& copy = world.GetFormAt<MpActor>(id);
+    copy.SetWorldInstance(phase);
+    CampaignReferenceBinding::Bind(owner, original, copy);
+  };
+  place(ownerId + 1, 0x13ba3, 0x1a66e);
+  place(ownerId + 2, 0x1a670, 0x1a671);
+  const auto journal =
+    owner.GetDynamicFields().GetValueDump(QuestJournal::kProperty);
+  const auto report = plan();
+  INFO(report.dump());
+  REQUIRE(report.at("blocker").is_null());
+  const auto& lines = report.at("scenePlan").at("lines");
+  REQUIRE(lines.size() == 6);
+  const uint32_t topics[] = { 0x17f2b, 0x17f2a, 0x17f29,
+                              0x17f28, 0x17f27, 0x17f1f };
+  for (size_t i = 0; i < lines.size(); ++i) {
+    const uint32_t role = 1 + i % 2;
+    const nlohmann::json expected = { { "index", i + 1 },
+                                      { "phase", i },
+                                      { "speakerAliasId", role },
+                                      { "speakerFormId",
+                                        role == 1 ? 0x1a66e : 0x1a671 },
+                                      { "speakerCopyId", ownerId + role },
+                                      { "topicId", topics[i] } };
+    REQUIRE(lines[i] == expected);
+  }
+  REQUIRE(owner.GetDynamicFields().GetValueDump(QuestJournal::kProperty) ==
+          journal);
+  REQUIRE_FALSE(world.LookupFormByIdNoLoad(0x1a66e));
+  REQUIRE_FALSE(world.LookupFormByIdNoLoad(0x1a671));
+  saveRole(
+    1, 0x1a671); // Wrong existing private NPC for this authored unique role.
+  REQUIRE(plan().at("blocker").at("code") == "scene.speaker-binding");
+  saveRole(1, 0x1a66e);
+  world.GetFormAt<MpActor>(ownerId + 1).SetWorldInstance("");
+  const auto absent = plan();
+  REQUIRE(absent.at("scenePlan").is_null());
+  REQUIRE(absent.at("blocker").at("code") == "scene.speaker-copy");
+}
+
 TEST_CASE("Startup fragments report only declared operations on their actual "
           "engine receiver",
           "[Quest][QuestStartupProbe][espm]")

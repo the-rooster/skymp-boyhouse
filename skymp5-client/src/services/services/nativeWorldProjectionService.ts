@@ -1,5 +1,6 @@
 import { ProjectionEngine, ProjectionProgress } from '../../campaign/worldProjectionCoordinator';
 import { ProjectedReference, WorldBaseline, WorldProjection } from '../../campaign/worldProjection';
+import type { SceneDialogueCue } from './campaignProjectionService';
 import { WorldView } from '../../view/worldView';
 import { logError } from '../../logging';
 import { ClientListener, CombinedController, Sp } from './clientListener';
@@ -19,6 +20,7 @@ interface ControlLease { version: 1; enabled?: boolean[]; }
 // only retire/reset models or dispatch baselines; native work runs on update.
 export class NativeWorldProjectionService extends ClientListener implements ProjectionEngine {
     private target?: WorldProjection;
+    private packetEpoch = '';
     private references: ProjectedReference[] = [];
     private spawnGeneration = 0;
     private acquired = 0;
@@ -51,7 +53,7 @@ export class NativeWorldProjectionService extends ClientListener implements Proj
     private get factions() { return this.controller.lookupListener(ActorFactionsService); }
 
     cancel(): void {
-        this.blocked = true; this.target = undefined; this.references = []; this.acquired = 0; this.installed = false;
+        this.blocked = true; this.target = undefined; this.packetEpoch = ''; this.references = []; this.acquired = 0; this.installed = false;
         this.error = undefined;
         this.view.setFormViewUpdateAllowed(false);
         this.controller.lookupListener(RemoteServer).resetWorldModel();
@@ -91,6 +93,7 @@ export class NativeWorldProjectionService extends ClientListener implements Proj
                 kind: 'actor', disabled: false, deleted: false,
             });
         }
+        this.packetEpoch = baseline.packetEpoch;
         this.target = projection; this.acquired = 0; this.installed = false;
         this.references = references;
         if (!this.controller.lookupListener(NetworkingService).applyCampaignBaseline(baseline))
@@ -129,6 +132,29 @@ export class NativeWorldProjectionService extends ClientListener implements Proj
         if (!this.observe().ready) throw Error('Projection is no longer ready for gameplay');
         this.blocked = false;
         this.reconcileControls();
+    }
+
+    presentSceneDialogue(cue: SceneDialogueCue): 'submitted' | 'missing' | 'unloaded' | 'ineligible' {
+        const target = this.target;
+        if (this.blocked || !this.installed || !target?.instance || !target.identity ||
+            cue.packetEpoch !== this.packetEpoch) return 'ineligible';
+        const mapping = target.references.find(ref => ref.copy === cue.speaker);
+        if (!mapping || mapping.kind !== 'actor' || mapping.deleted || mapping.disabled) return 'ineligible';
+        if (this.loading) return 'unloaded';
+        const view = this.view;
+        const local = view.getProjectedLocalRefrId(mapping.original);
+        if (!local || local < 0xff000000 || view.getRemoteRefrId(local) !== cue.speaker) return 'missing';
+        const actor = this.sp.Actor.from(this.sp.Game.getFormEx(local));
+        if (!actor) return 'missing';
+        if (actor.isDeleted() || actor.isDisabled() || actor.isDead()) return 'ineligible';
+        if (!actor.is3DLoaded()) return 'unloaded';
+        const scene = this.sp.Scene.from(this.sp.Game.getFormEx(cue.sceneId));
+        const topic = this.sp.Topic.from(this.sp.Game.getFormEx(cue.topicId));
+        if (!scene || !topic) return 'ineligible';
+        // Say uses the speaker's voice and the local game's eligible topic INFO.
+        // It returns void and supplies no acknowledgement of audible playback.
+        actor.say(topic, null, false);
+        return 'submitted';
     }
 
     disconnect(): void {

@@ -60,6 +60,7 @@ public:
   Napi::Value BeginPacketEpoch(const Napi::CallbackInfo& info);
   Napi::Value GetPacketEpoch(const Napi::CallbackInfo& info);
   Napi::Value ResumeCampaignActor(const Napi::CallbackInfo& info);
+  Napi::Value GetCampaignSceneDialoguePlan(const Napi::CallbackInfo& info);
   Napi::Value ProbeQuestStartup(const Napi::CallbackInfo& info);
   Napi::Value ProbeActorDialogueSelection(const Napi::CallbackInfo& info);
   Napi::Value GetCampaignResume(const Napi::CallbackInfo& info);

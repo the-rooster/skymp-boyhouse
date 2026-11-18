@@ -57,6 +57,14 @@ class PartyInstances {
       (!requireReady || !this.adapter.isReady || this.adapter.isReady(owner));
   }
 
+  canObserveScene(actor, owner) {
+    const visit = this.visits.get(actor);
+    return !!visit && visit.owner === owner && this.hostAvailable(owner, visit.area, true) &&
+      (actor === owner || this.sameParty(actor, owner)) &&
+      this.adapter.getInstance(actor) === this.key(owner, visit.area) &&
+      this.adapter.isInside(actor, this.areas.get(visit.area));
+  }
+
   transition(actor, owner, areaId) {
     // Preparation is synchronous and never changes a player's current phase.
     // Do not publish a visit until every destination reference is available.

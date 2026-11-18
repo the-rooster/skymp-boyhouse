@@ -29,6 +29,19 @@ export interface CampaignResumeArea {
   encounterLevel?: number;
 }
 
+export interface CampaignSceneDialoguePlan {
+  sceneId: number;
+  questId: number;
+  lines: {
+    index: number;
+    phase: number;
+    speakerAliasId: number;
+    speakerFormId: number;
+    speakerCopyId: number;
+    topicId: number;
+  }[];
+}
+
 export interface WorldBaseline {
   schemaVersion: 1;
   actor: number;
@@ -77,6 +90,9 @@ export interface ScampServer {
   getWorldBaseline(userId: number, packetEpoch: string): WorldBaseline;
   resumeCampaignActor(userId: number, actorId: number, expectedPhase: string,
     area: CampaignResumeArea): CampaignResumeState | null;
+  getCampaignSceneDialoguePlan(ownerId: number, questId: number, sceneId: number):
+    | { scenePlan: CampaignSceneDialoguePlan; blocker: null }
+    | { scenePlan: null; blocker: { code: string; detail: string } };
   getCampaignResume(userId: number): CampaignResumeState | null;
   captureCampaignResumeProjection(userId: number, packetEpoch: string): {
     attempt: string; proof: string; manifest: Record<string, unknown>; baseline: WorldBaseline;

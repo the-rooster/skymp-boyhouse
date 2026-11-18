@@ -14,6 +14,7 @@ node misc/boyhouse/native-smoke.cjs
 node misc/boyhouse/story-selection-smoke.cjs
 node misc/boyhouse/protocol-smoke.cjs
 node misc/boyhouse/protocol-smoke.cjs --projection
+node misc/boyhouse/protocol-smoke.cjs --projection --dialogue
 node misc/boyhouse/storage-smoke.cjs
 node misc/boyhouse/guest-restart-smoke.cjs
 # Exercise every non-deleted winning QUST against original records and scripts.

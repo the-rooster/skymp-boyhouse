@@ -11,12 +11,12 @@ const { ReferenceSuppression } = require('../../skymp5-client/src/campaign/refer
 const { QuestJournalReplica } = require('../../skymp5-client/src/campaign/questJournalReplica.ts');
 const root = path.resolve(__dirname, '../../skymp5-client');
 const ts = require(require.resolve('typescript', { paths: [root, path.resolve(root, '../skymp5-server')] }));
-function load(file, dependencies) {
+function load(file, dependencies, globals = {}) {
   const source = ts.transpileModule(fs.readFileSync(path.join(root, 'src', file), 'utf8'), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
   }).outputText;
   const module = { exports: {} };
-  vm.runInNewContext(source, { module, exports: module.exports, require: id => {
+  vm.runInNewContext(source, { ...globals, module, exports: module.exports, require: id => {
     assert.ok(id in dependencies, `Unexpected import ${id}`); return dependencies[id];
   } }, { filename: file });
   return module.exports;
@@ -35,6 +35,7 @@ const baseline = epoch => ({ schemaVersion: 1, actor, packetEpoch: epoch, messag
 function bindingFixture(enabled = true, initiallyConnected = false) {
   const emitter = new EventEmitter(), events = new EventEmitter(), channel = new CampaignPacketChannel();
   const packets = [], sent = [], calls = [], storage = {};
+  let now = Date.now();
   let connected = initiallyConnected, nonce = 0, epoch = '', data = manifest(), engineError;
   const feed = new ProjectionFeed({ connected: () => connected, actor: () => actor,
     instance: () => data.instance, read: () => structuredClone(data), block() {},
@@ -54,6 +55,7 @@ function bindingFixture(enabled = true, initiallyConnected = false) {
   const controller = { emitter, on: (...args) => events.on(...args), once: (...args) => events.once(...args),
     lookupListener: type => { assert.equal(type, NetworkingService); return network; } };
   const engine = { cancel() {}, disconnect() {}, apply() { calls.push('apply'); }, release() { calls.push('release'); },
+    presentSceneDialogue(cue) { calls.push(['say', cue.sequence]); return 'submitted'; },
     drained: () => ({ ready: true }), observe: () => ({ ready: !engineError, error: engineError }) };
   emitter.on('sendMessage', e => {
     const packet = channel.outgoing(e.message);
@@ -68,7 +70,7 @@ function bindingFixture(enabled = true, initiallyConnected = false) {
     '../../messages': { MsgType: { CustomPacket: 1 } }, '../../logging': { logError() {} },
     './clientListener': { ClientListener: class {} }, './networkingService': { NetworkingService },
   };
-  const { CampaignProjectionService } = load('services/services/campaignProjectionService.ts', dependencies);
+  const { CampaignProjectionService } = load('services/services/campaignProjectionService.ts', dependencies, { Date: { now: () => now } });
   const { CampaignQuestService } = load('services/services/campaignQuestService.ts', dependencies);
   const sp = { storage, settings: { 'skymp5-client': { 'campaign-projection': enabled } } };
   const projection = new CampaignProjectionService(sp, controller, engine);
@@ -76,7 +78,7 @@ function bindingFixture(enabled = true, initiallyConnected = false) {
   function deliver() {
     while (packets.length) emitter.emit('customPacketMessage', { message: { contentJsonDump: JSON.stringify(packets.shift()) } });
   }
-  return { emitter, events, sent, calls, channel, projection, journal, storage,
+  return { emitter, events, sent, calls, channel, projection, journal, storage, engine, elapse(ms) { now += ms; },
     connect() { connected = true; feed.connect(0); emitter.emit('connectionAccepted', {}); },
     deliver, error(value) { engineError = value; },
     release() { deliver(); events.emit('tick'); events.emit('update'); deliver(); events.emit('update'); },
@@ -104,6 +106,103 @@ test('service bindings subscribe the journal only after real coordinator release
   assert.equal(second.action, 'subscribe'); assert.notEqual(second.subscriptionId, first.subscriptionId);
   assert.equal(f.storage.boyhouseProjectionCoordinator, f.projection.coordinator);
   assert.equal(f.calls.filter(c => c === 'release').length, 2);
+});
+
+const sceneCue = (epoch, sequence) => ({ customPacketType: 'boyhouse.sceneDialogue', protocolVersion: 1,
+  packetEpoch: epoch, sequence, sceneId: 0x900, actionIndex: 0, speaker: 0xff001000, topicId: 0x901 });
+
+test('scene dialogue waits for engine release, ignores duplicates, and discards pending lines on replacement', () => {
+  const f = bindingFixture(), send = p => f.emitter.emit('customPacketMessage', { message: { contentJsonDump: JSON.stringify(p) } });
+  const say = () => f.calls.filter(Array.isArray).map(c => c[1]);
+  f.events.emit('tick'); f.connect(); f.deliver(); f.events.emit('tick'); f.events.emit('update');
+  const epoch = f.projection.coordinator.replica.packetEpoch;
+  send(sceneCue(epoch, 1)); // no server ready yet
+  f.deliver(); assert.equal(f.projection.coordinator.status.phase, 'releasing');
+  send(sceneCue(epoch, 2)); send(sceneCue(epoch, 2)); send(sceneCue(epoch, 1));
+  send({ ...sceneCue(epoch, 3), speaker: 0x100 });
+  send({ ...sceneCue(epoch, 3), sceneId: -1 }); send({ ...sceneCue(epoch, 3), protocolVersion: 5 });
+  send({ ...sceneCue(epoch, 3), actionIndex: 0.5 }); send(sceneCue(epoch, Number.MAX_SAFE_INTEGER + 1));
+  send({ ...sceneCue(epoch, 3), topicId: null }); send(sceneCue('f'.repeat(32), 3));
+  f.events.emit('tick'); assert.deepEqual(say(), []);
+  f.events.emit('update'); f.events.emit('update'); assert.deepEqual(say(), [2]);
+  send(sceneCue(epoch, 3)); f.replace(); f.release();
+  const replacement = f.projection.coordinator.replica.packetEpoch; assert.notEqual(replacement, epoch);
+  send(sceneCue(epoch, 4)); send(sceneCue(replacement, 1)); f.events.emit('update');
+  assert.deepEqual(say(), [2, 1]);
+  for (let n = 2; n <= 40; ++n) send(sceneCue(replacement, n));
+  for (let n = 0; n < 42; ++n) f.events.emit('update');
+  assert.deepEqual(say().slice(2), Array.from({ length: 32 }, (_, i) => i + 9));
+  send(sceneCue(replacement, 41)); f.emitter.emit('connectionDisconnect', {}); f.events.emit('update');
+  assert.equal(say().at(-1), 40);
+});
+
+test('a reply waits for the preceding speaker to load and dialogue is submitted in authored order', () => {
+  const f = bindingFixture(); f.events.emit('tick'); f.connect(); f.release();
+  const epoch = f.projection.coordinator.replica.packetEpoch, attempts = [], submitted = [];
+  let readiness = 'missing';
+  f.engine.presentSceneDialogue = cue => {
+    attempts.push(cue.sequence);
+    if (cue.sequence === 1 && readiness !== 'loaded') return readiness;
+    submitted.push(cue.sequence); return 'submitted';
+  };
+  const send = (n, speaker) => f.emitter.emit('customPacketMessage', { message: { contentJsonDump:
+    JSON.stringify({ ...sceneCue(epoch, n), speaker }) } });
+  send(1, 0xff001000); send(2, 0xff001001);
+  f.events.emit('update'); readiness = 'unloaded'; f.events.emit('update');
+  assert.deepEqual(attempts, [1, 1]); assert.deepEqual(submitted, []);
+  readiness = 'loaded'; f.events.emit('update'); assert.deepEqual(submitted, [1]);
+  f.events.emit('update'); assert.deepEqual(submitted, [1, 2]);
+  assert.deepEqual(attempts, [1, 1, 1, 2]);
+});
+
+test('an expired first speaker is skipped and cannot speak over the later reply', () => {
+  const f = bindingFixture(); f.events.emit('tick'); f.connect(); f.release();
+  const epoch = f.projection.coordinator.replica.packetEpoch, submitted = [], attempts = [];
+  let loaded = false;
+  f.engine.presentSceneDialogue = cue => {
+    attempts.push(cue.sequence);
+    if (cue.sequence === 1 && !loaded) return 'missing';
+    submitted.push(cue.sequence); return 'submitted';
+  };
+  const send = (n, speaker) => f.emitter.emit('customPacketMessage', { message: { contentJsonDump:
+    JSON.stringify({ ...sceneCue(epoch, n), speaker }) } });
+  send(1, 0xff001000); f.events.emit('update'); f.elapse(4000); send(2, 0xff001001);
+  f.events.emit('update'); assert.deepEqual(submitted, []);
+  f.elapse(1001); loaded = true; f.events.emit('update'); assert.deepEqual(submitted, [2]);
+  send(1, 0xff001000); f.events.emit('update'); assert.deepEqual(submitted, [2]);
+  assert.deepEqual(attempts, [1, 1, 2]);
+});
+
+test('a newer timed slot replaces a waiting line before the next update and preserves manual FIFO', () => {
+  const f = bindingFixture(); f.events.emit('tick'); f.connect(); f.release();
+  const epoch = f.projection.coordinator.replica.packetEpoch, attempts = [], submitted = [];
+  let loaded = false;
+  f.engine.presentSceneDialogue = cue => {
+    attempts.push(cue.sequence);
+    if (!loaded) return 'missing';
+    submitted.push(cue.sequence); return 'submitted';
+  };
+  const send = (n, slotMs) => f.emitter.emit('customPacketMessage', { message: { contentJsonDump:
+    JSON.stringify({ ...sceneCue(epoch, n), slotMs }) } });
+  send(1, 1000); f.events.emit('update');
+  send(2); send(3); send(4, 1000);
+  send(4, 1); // A duplicate must not shorten the active slot.
+  for (const slot of [null, 0, -1, 0.5, '1000', Number.MAX_SAFE_INTEGER + 1]) send(5, slot);
+  f.elapse(100); loaded = true;
+  for (let i = 0; i < 4; ++i) f.events.emit('update');
+  assert.deepEqual(attempts, [1, 2, 3, 4]); assert.deepEqual(submitted, [2, 3, 4]);
+  send(5, 250); f.events.emit('update'); assert.deepEqual(submitted, [2, 3, 4, 5]);
+});
+
+test('an unpresented timed cue expires at its slot boundary or five seconds, whichever arrives first', () => {
+  const f = bindingFixture(); f.events.emit('tick'); f.connect(); f.release();
+  const epoch = f.projection.coordinator.replica.packetEpoch;
+  const send = (n, slotMs) => f.emitter.emit('customPacketMessage', { message: { contentJsonDump:
+    JSON.stringify({ ...sceneCue(epoch, n), slotMs }) } });
+  send(1, 250); f.elapse(250); f.events.emit('update');
+  send(2, 6000); f.elapse(5000); f.events.emit('update');
+  send(3, 250); f.elapse(249); f.events.emit('update');
+  assert.deepEqual(f.calls.filter(Array.isArray), [['say', 3]]);
 });
 
 test('a deferred projection failure cannot close a newer connection', () => {
@@ -261,14 +360,18 @@ function engineFixture(options = {}) {
     return { getFormID() { valid(); return id; }, getBaseObject() { valid(); return { getFormID: () => state.base }; },
       isDeleted() { valid(); return !!state.deleted; }, isDisabled() { valid(); return state.disabled; },
       isActivationBlocked() { valid(); return state.blocked; }, blockActivation(value) { valid(); state.blocked = value; },
-      isInDialogueWithPlayer: () => false, getDialogueTarget: () => null, actor: state.actor,
+      isInDialogueWithPlayer: () => false, getDialogueTarget: () => null, actor: state.actor, kind: state.kind,
+      isDead() { valid(); return !!state.dead; }, is3DLoaded() { valid(); return !!state.loaded; },
+      say(topic, speakAs, inHead) { valid(); calls.push(['say', id, topic.getFormID(), speakAs, inHead]); },
       disable: () => job('disable', () => { state.disabled = true; }),
       enable: () => job('enable', () => { state.disabled = false; }),
       delete: () => job('delete', () => { state.deleted = true; }),
     };
   };
   const sp = { storage: options.storage || {}, ObjectReference: { from: value => value },
-    Actor: { from: value => value?.actor ? value : null }, getReferenceHandle: id => forms.get(id)?.deleted ? 0 : forms.get(id)?.handle || 0,
+    Actor: { from: value => value?.actor ? value : null },
+    Scene: { from: value => value?.kind === 'SCEN' ? value : null }, Topic: { from: value => value?.kind === 'DIAL' ? value : null },
+    getReferenceHandle: id => forms.get(id)?.deleted ? 0 : forms.get(id)?.handle || 0,
     TESModPlatform: { setWeaponDrawnMode() {} }, Game: { getPlayer: () => reference(0x14), getFormEx: reference,
       disablePlayerControls(...mask) { if (!nativeNoOp) mask.slice(0, 8).forEach((change, i) => { if (change) flags[i] = false; }); },
       enablePlayerControls(...mask) { if (!nativeNoOp) mask.slice(0, 8).forEach((change, i) => { if (change) flags[i] = true; }); },
@@ -358,6 +461,27 @@ test('native engine waits for self, suppression, original work, and copies while
   assert.equal(f.engine.observe().ready, false); f.viewsReady(); f.originalsReady(false);
   assert.equal(f.engine.observe().ready, false); f.originalsReady(true); assert.equal(f.engine.observe().ready, true);
   f.engine.release(); assert.deepEqual(f.flags, before); assert.equal(f.errors.length, 0);
+});
+
+test('native scene dialogue speaks the installed topic on the current loaded campaign copy only', async () => {
+  const f = engineFixture(), mapping = f.projection.references[0], cue = sceneCue('a'.repeat(32), 1);
+  const local = 0xff009999, speak = (change = {}) => f.engine.presentSceneDialogue({ ...cue, ...change });
+  f.view.getProjectedLocalRefrId = original => original === mapping.original ? local : 0;
+  f.view.getRemoteRefrId = id => id === local ? mapping.copy : 0;
+  f.forms.set(cue.sceneId, { kind: 'SCEN' }); f.forms.set(cue.topicId, { kind: 'DIAL' });
+  f.begin(); f.playerReady(); f.viewsReady(); await f.drain();
+  assert.equal(speak(), 'ineligible'); f.engine.release();
+  assert.equal(speak(), 'missing');
+  const copy = { actor: true, loaded: false }; f.forms.set(local, copy);
+  assert.equal(speak(), 'unloaded'); copy.loaded = true;
+  assert.equal(speak({ topicId: cue.sceneId }), 'ineligible'); assert.equal(speak({ sceneId: cue.topicId }), 'ineligible');
+  assert.equal(speak({ speaker: mapping.original }), 'ineligible'); assert.equal(speak({ packetEpoch: 'b'.repeat(32) }), 'ineligible');
+  copy.disabled = true; assert.equal(speak(), 'ineligible'); copy.disabled = false;
+  copy.dead = true; assert.equal(speak(), 'ineligible'); copy.dead = false;
+  assert.equal(speak(), 'submitted');
+  f.view.getRemoteRefrId = () => 0xff001999; assert.equal(speak(), 'missing');
+  f.engine.disconnect(); assert.equal(speak(), 'ineligible');
+  assert.deepEqual(f.calls.filter(c => c[0] === 'say'), [['say', local, cue.topicId, null, false]]);
 });
 
 test('native projection controls stay held for deferred or failed actor-value catch-up', async () => {

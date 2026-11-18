@@ -196,6 +196,9 @@ async function systemsFixture(resumeResult = { attempt: "attempt-1", actor, phas
   const settings = { allSettings: { boyhouseInstances: { experimental: true, projection: true, areas: [area] } },
     startPoints: [{ pos: [0, 0, 0], angleZ: 0, worldOrCell: 60 }] };
   const dependencies = { "../settings": { Settings: { get: async () => settings } },
+    "../campaign/sceneTimingIndex": require("../../skymp5-server/ts/campaign/sceneTimingIndex"),
+    "../campaign/sceneDialogueClock": require("../../skymp5-server/ts/campaign/sceneDialogueClock"),
+    "../campaign/sceneDialogue": require("../../skymp5-server/ts/campaign/sceneDialogue"),
     "../campaign/partyInstances": { PartyInstances }, "../campaign/projectionFeed": { ProjectionFeed } };
   const { CampaignInstances } = loadSystem("campaignInstances.ts", dependencies);
   const { Spawn } = loadSystem("spawn.ts", dependencies);

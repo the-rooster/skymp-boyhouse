@@ -131,6 +131,22 @@ function normalizeUniqueActorAliases(bindings) {
   });
 }
 
+function normalizeScenePlan(plan, questId, manifest) {
+  assert.ok(plan?.questId === questId && uint32(plan.sceneId) && plan.sceneId > 0 &&
+    Array.isArray(plan.lines) && plan.lines.length, "Invalid dialogue scene plan");
+  const indices = new Set();
+  const lines = plan.lines.map(({index, phase, speakerAliasId, speakerFormId, speakerCopyId, topicId}, ordinal) => {
+    const ref = manifest?.references.find(r => r.original === speakerFormId && r.copy === speakerCopyId);
+    assert.ok(phase === ordinal && uint32(index) && !indices.has(index) && uint32(speakerAliasId) &&
+      uint32(topicId) && topicId > 0 && ref?.kind === "actor" && !ref.disabled && !ref.deleted,
+      "Invalid dialogue scene action or speaker");
+    indices.add(index);
+    // The campaign's allocated copy ID is verified above and varies between probes.
+    return {index, phase, speakerAliasId, speakerFormId, topicId};
+  });
+  return {questId, sceneId:plan.sceneId, lines};
+}
+
 function normalizeStoryRoute(route) {
   assert.ok(route && uint32(route.candidateCount), "Invalid story route candidate count");
   const {candidateCount, nodeIds, questIndex} = route;
@@ -215,6 +231,7 @@ function probe(server, quest, actor, fixture) {
         cell: banneredMareCell, location: result.storyEvent.location } } : {}),
       ...(dialogue && result.storyRoute !== undefined ? {storyRoute: normalizeStoryRoute(result.storyRoute)} : {}),
       ...(selection ? {storySelection: selection} : {}),
+      ...(result.scenePlan ? {scenePlan:normalizeScenePlan(result.scenePlan, quest.formId, manifest)} : {}),
       ...(dialogue && result.storyAliasBindings !== undefined ? {storyAliasBindings: normalizeStoryAliases(result.storyAliasBindings)} : {}),
       ...(dialogue && result.storyUniqueActorBindings !== undefined
         ? {storyUniqueActorBindings: normalizeUniqueActorAliases(result.storyUniqueActorBindings)} : {}),
