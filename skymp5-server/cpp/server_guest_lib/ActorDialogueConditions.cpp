@@ -2,6 +2,7 @@
 #include "ActorDialogueEditorLocation.h"
 #include "CampaignFactionApi.h"
 #include "MpActor.h"
+#include "QuestJournal.h"
 #include "WorldState.h"
 #include "libespm/CELL.h"
 #include "libespm/RecordHeaderAccess.h"
@@ -75,23 +76,44 @@ bool Matches(bool value, const espm::CTDA& data)
   throw std::runtime_error("unknown comparison operator");
 }
 
-bool EvaluateClause(MpActor& actor1, MpActor& actor2, uint32_t location,
-                    const espm::LookupResult& record, const Clause& clause)
+bool InCell(MpActor& subject, uint32_t expected)
+{
+  auto& world = *subject.GetParent();
+  const auto current = subject.GetCellOrWorld().ToFormId(world.espmFiles);
+  // An exterior WRLD alone cannot identify the actor's parent CELL.
+  RequireRecord(world, current, "CELL");
+  RequireRecord(world, expected, "CELL");
+  return current == expected;
+}
+
+bool EvaluateClause(MpActor& actor1, MpActor& actor2, MpActor* campaignOwner,
+                    uint32_t location, const espm::LookupResult& record,
+                    const Clause& clause)
 {
   const auto& data = clause.data;
   if ((data.operatorFlag & 0x1e) || !std::isfinite(data.comparisonValue) ||
       clause.parameter1String || clause.parameter2String)
     throw std::runtime_error(
       "unsupported flags, comparison or string operand");
+  uint32_t raw;
+  std::memcpy(&raw, data.functionData, sizeof(raw));
+  const auto id = raw ? record.ToGlobalId(raw) : 0;
+  if (data.functionIndex == 67 &&
+      data.runOnType == espm::CTDA::RunOnTypeFlags::Reference &&
+      record.ToGlobalId(static_cast<uint32_t>(data.reference)) == 0x14) {
+    if (!campaignOwner)
+      throw std::runtime_error(
+        "GetInCell on PlayerRef requires the campaign owner");
+    return Matches(InCell(*campaignOwner, id), data);
+  }
   if (data.runOnType != espm::CTDA::RunOnTypeFlags::EventData ||
       (data.unknown2 != 0x3152 && data.unknown2 != 0x3252))
     throw std::runtime_error("requires event member R1 or R2");
   MpActor& subject = data.unknown2 == 0x3152 ? actor1 : actor2;
   auto& world = *subject.GetParent();
-  uint32_t raw;
-  std::memcpy(&raw, data.functionData, sizeof(raw));
-  const auto id = raw ? record.ToGlobalId(raw) : 0;
   switch (data.functionIndex) {
+    case 67: // GetInCell compares the reference's parent CELL by identity.
+      return Matches(InCell(subject, id), data);
     case 71: { // GetInFaction on the selected NPC's campaign snapshot
       RequireRecord(world, id, "FACT");
       const auto effective =
@@ -127,30 +149,52 @@ bool EvaluateClause(MpActor& actor1, MpActor& actor2, uint32_t location,
 
 ActorDialogueConditionResult EvaluateActorDialogueConditions(
   MpActor& actor1, MpActor& actor2, uint32_t locationId,
-  const espm::LookupResult& record, const std::vector<Clause>& conditions)
+  const espm::LookupResult& record, const std::vector<Clause>& conditions,
+  MpActor* campaignOwner)
 {
   if (!record.rec || !actor1.GetParent() ||
       actor1.GetParent() != actor2.GetParent() ||
       record.parent != &actor1.GetParent()->GetEspm().GetBrowser())
     return { State::Unsupported, "missing actor-dialogue condition context" };
-  std::string firstFailure;
+  if (campaignOwner) {
+    const auto& phase = campaignOwner->GetWorldInstance();
+    try {
+      if (campaignOwner == &actor1 || campaignOwner == &actor2 ||
+          campaignOwner->GetParent() != actor1.GetParent() ||
+          actor1.GetWorldInstance() != phase ||
+          actor2.GetWorldInstance() != phase ||
+          QuestJournal::ParseCampaignOwnerId(phase, true) !=
+            campaignOwner->GetFormId() ||
+          actor1.GetParent()
+              ->LookupFormByIdNoLoad(campaignOwner->GetFormId())
+              .get() != campaignOwner)
+        return { State::Unsupported, "invalid actor-dialogue campaign owner" };
+    } catch (const std::runtime_error& e) {
+      return { State::Unsupported, e.what() };
+    }
+  }
+  std::string firstFailure, firstUnsupported;
   size_t groupStart = 0;
-  bool group = false;
+  bool group = false, groupUnknown = false;
   for (size_t i = 0; i < conditions.size(); ++i) {
     const auto& clause = conditions[i];
     try {
       // Evaluate every clause so an unsupported predicate in an OR group
       // never grants eligibility. These predicates only read world data.
-      const bool match =
-        EvaluateClause(actor1, actor2, locationId, record, clause);
+      const bool match = EvaluateClause(actor1, actor2, campaignOwner,
+                                        locationId, record, clause);
       group = group || match;
     } catch (const std::runtime_error& e) {
-      return { State::Unsupported,
-               "CTDA " + std::to_string(clause.data.functionIndex) +
-                 " at index " + std::to_string(i) + ": " + e.what() };
+      groupUnknown = true;
+      if (firstUnsupported.empty())
+        firstUnsupported = "CTDA " +
+          std::to_string(clause.data.functionIndex) + " at index " +
+          std::to_string(i) + ": " + e.what();
     }
     if (!(clause.data.operatorFlag & 1) || i + 1 == conditions.size()) {
-      if (!group && firstFailure.empty()) {
+      // A failed AND term rules out the entire list, even when another
+      // term is unknown. Every alternative in this OR group must be false.
+      if (!group && !groupUnknown && firstFailure.empty()) {
         firstFailure = "CTDA " +
           std::to_string(conditions[groupStart].data.functionIndex) +
           " at index " + std::to_string(groupStart);
@@ -160,8 +204,12 @@ ActorDialogueConditionResult EvaluateActorDialogueConditions(
       }
       groupStart = i + 1;
       group = false;
+      groupUnknown = false;
     }
   }
-  return { firstFailure.empty() ? State::Passed : State::Failed,
-           firstFailure };
+  if (!firstFailure.empty())
+    return { State::Failed, firstFailure };
+  if (!firstUnsupported.empty())
+    return { State::Unsupported, firstUnsupported };
+  return { State::Passed, {} };
 }

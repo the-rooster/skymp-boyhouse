@@ -4037,10 +4037,52 @@ TEST_CASE("Explicit actor dialogue binds two NPCs and checks its winning route",
   REQUIRE(unknown.at("storyEvent").at("actor1") == mikael.GetFormId());
   REQUIRE(unknown.at("storyEvent").at("actor2") == hulda.GetFormId());
 
+  // The same occurrence can be submitted without requesting or enabling a
+  // quest. A target-specific probe must observe the very same ordered
+  // traversal.
+  const QuestScriptRuntime::ActorDialogue event{ hulda, mikael, routes };
+  REQUIRE_FALSE(event.UniqueActorOriginal(owner, 0x13ba3, { 0x1a66e }));
+  CampaignReferenceBinding::Bind(owner, 0x1a66e, hulda);
+  CampaignReferenceBinding::Bind(owner, 0x1a671, mikael);
+  REQUIRE(event.UniqueActorOriginal(owner, 0x13ba3, { 0x1a66e }) == 0x1a66e);
+  REQUIRE(event.UniqueActorOriginal(owner, 0x1a670, { 0x1a671 }) == 0x1a671);
+  REQUIRE_FALSE(event.UniqueActorOriginal(owner, 0x13ba3, {}));
+  REQUIRE_FALSE(event.UniqueActorOriginal(owner, 0x13ba3, { 0x1a671 }));
+  REQUIRE_FALSE(
+    event.UniqueActorOriginal(owner, 0x13ba3, { 0x1a66e, 0x1a671 }));
+  REQUIRE_FALSE(event.UniqueActorOriginal(mikael, 0x13ba3, { 0x1a66e }));
+  REQUIRE_FALSE(event.UniqueActorOriginal(owner, 0x5eab5, { 0x5ea70 }));
+  auto& duplicate = place(ownerId + 3, 0x13ba3);
+  const QuestScriptRuntime::ActorDialogue ambiguous{ duplicate, hulda,
+                                                     routes };
+  REQUIRE_FALSE(ambiguous.UniqueActorOriginal(owner, 0x13ba3, { 0x1a66e }));
+  REQUIRE_FALSE(world.LookupFormByIdNoLoad(0x1a66e));
+  REQUIRE_FALSE(world.LookupFormByIdNoLoad(0x1a671));
+  owner.SetPropertyValueDump(QuestJournal::kEnabled, "[]", false, false);
+  const auto natural =
+    QuestScriptRuntime::ProbeActorDialogueSelection(owner, event);
+  const auto target = probe(0xa2bca, hulda, mikael); // Whiterun conversation
+  INFO(natural.dump());
+  INFO(target.dump());
+  REQUIRE(target.at("storyEvent") == natural.at("storyEvent"));
+  REQUIRE(target.at("storySelection") == natural.at("storySelection"));
+  REQUIRE_FALSE(natural.at("storySelection").at("nodeIds").empty());
+  REQUIRE(QuestScriptRuntime::ProbeActorDialogueSelection(owner, event) ==
+          natural);
+
+  const auto multi = probe(0x25eef, hulda, mikael); // Two Markarth inn entries
+  INFO(multi.dump());
+  REQUIRE(multi.at("storyRoute").at("candidateCount") == 2);
+  REQUIRE(multi.at("blocker").at("code") == "story.conditions-false");
+  REQUIRE_FALSE(multi.contains("storySelection"));
+
   REQUIRE_THROWS_AS(probe(quest, hulda, hulda), std::invalid_argument);
   REQUIRE_THROWS_AS(probe(quest, owner, hulda), std::invalid_argument);
   REQUIRE_THROWS_AS(probe(0x4e50d, hulda, mikael), std::invalid_argument);
   mikael.SetWorldInstance("campaign:333:startup");
+  REQUIRE_THROWS_AS(
+    QuestScriptRuntime::ProbeActorDialogueSelection(owner, event),
+    std::invalid_argument);
   REQUIRE_THROWS_AS(probe(quest, hulda, mikael), std::invalid_argument);
   mikael.SetWorldInstance(phase);
   mikael.SetCellOrWorldObsolete(FormDesc::Tamriel());

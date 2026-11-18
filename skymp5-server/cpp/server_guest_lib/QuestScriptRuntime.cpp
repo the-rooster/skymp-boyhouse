@@ -13,7 +13,9 @@
 #include "QuestVmState.h"
 #include "WorldState.h"
 #include "libespm/CTDA.h"
+#include "libespm/Convert.h"
 #include "libespm/GroupHeader.h"
+#include "libespm/NPC_.h"
 #include "libespm/QuestAliasData.h"
 #include "libespm/QuestLifecycleData.h"
 #include "libespm/RecordHeaderAccess.h"
@@ -644,10 +646,103 @@ uint32_t BindActorDialogue(MpActor& owner,
   return *location;
 }
 
-// Only simple PlayerRef and explicit location fills are currently supported.
-void CheckStartupAlias(const espm::QuestAliasDefinition& alias,
-                       const espm::LookupResult& quest)
+using StoryIndex = espm::StoryEventRouteIndex;
+
+StoryIndex::Check CheckStoryConditions(
+  MpActor& owner, const QuestScriptRuntime::ActorDialogue& dialogue,
+  uint32_t location, const espm::LookupResult& record,
+  const std::vector<espm::QuestLifecycleData::Condition>& conditions)
 {
+  const auto result = EvaluateActorDialogueConditions(
+    dialogue.actor1, dialogue.actor2, location, record, conditions, &owner);
+  using State = ActorDialogueConditionResult::State;
+  if (result.state == State::Passed)
+    return { StoryIndex::Verdict::Pass, {} };
+  const auto& files = dialogue.actor1.GetParent()->espmFiles;
+  const auto key =
+    FormDesc::FromFormId(record.ToGlobalId(record.rec->GetId()), files);
+  return { result.state == State::Failed ? StoryIndex::Verdict::Reject
+                                         : StoryIndex::Verdict::Unsupported,
+           key.ToString() + ": " + result.detail };
+}
+
+StoryIndex::Check CheckStoryNode(
+  MpActor& owner, const QuestScriptRuntime::ActorDialogue& dialogue,
+  uint32_t location, const StoryIndex::Node& node)
+{
+  auto& browser = dialogue.actor1.GetParent()->GetEspm().GetBrowser();
+  const auto record = browser.LookupById(node.id);
+  if (!record.rec || record.rec->IsDeleted() ||
+      record.fileIdx != node.fileIndex)
+    throw std::logic_error("Story route no longer matches its record");
+  return CheckStoryConditions(owner, dialogue, location, record,
+                              node.conditions);
+}
+
+Json ActorDialogueEventJson(const QuestScriptRuntime::ActorDialogue& dialogue,
+                            uint32_t location)
+{
+  return { { "type", "ADIA" },
+           { "location", location },
+           { "actor1", dialogue.actor1.GetFormId() },
+           { "actor2", dialogue.actor2.GetFormId() } };
+}
+
+Json StorySelectionJson(const StoryIndex::Selection& selection)
+{
+  const char* outcome = "blocked";
+  if (selection.verdict == StoryIndex::Verdict::Pass)
+    outcome = "attempt";
+  else if (selection.verdict == StoryIndex::Verdict::Reject)
+    outcome = "none";
+  return { { "outcome", outcome },
+           { "nodeIds", selection.nodeIds },
+           { "nodeId", selection.nodeId },
+           { "questId", selection.questId },
+           { "questIndex", selection.questIndex },
+           { "detail", selection.detail } };
+}
+
+void CheckFreshStartupCampaign(MpActor& actor)
+{
+  auto* world = actor.GetParent();
+  if (!world || actor.IsDeleted() ||
+      world->LookupFormByIdNoLoad(actor.GetFormId()).get() != &actor ||
+      actor.GetWorldInstance() !=
+        "campaign:" + std::to_string(actor.GetFormId()) + ":startup" ||
+      actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty) !=
+        "null" ||
+      QuestJournal::HasActiveTransaction())
+    throw std::invalid_argument(
+      "Startup probe requires a fresh personal campaign");
+}
+
+enum class DialogueMember : uint32_t
+{
+  Actor1 = 0x3152,  // "R1" in ALFD
+  Actor2 = 0x3252,  // "R2"
+  Location = 0x314c // "L1"
+};
+
+std::optional<uint32_t> DialogueUniqueBase(
+  const espm::QuestAliasDefinition& alias, const espm::LookupResult& quest,
+  bool actorDialogue)
+{
+  if (actorDialogue) {
+    if (const auto unique = alias.Unsigned("ALUA")) {
+      const auto base = quest.ToGlobalId(*unique);
+      if (base != 7)
+        return base;
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<DialogueMember> CheckStartupAlias(
+  const espm::QuestAliasDefinition& alias, const espm::LookupResult& quest,
+  bool actorDialogue)
+{
+  std::optional<DialogueMember> member;
   const auto block = [&](const char* code) {
     throw StartupBlocked{
       code, "Alias " + std::to_string(alias.id) + " (" + alias.name + ")"
@@ -655,38 +750,234 @@ void CheckStartupAlias(const espm::QuestAliasDefinition& alias,
   };
   if (!alias.unknownFields.empty())
     block("alias.unknown-fields");
-  if (alias.Has("ALFE"))
-    block("alias.fill.event");
+  if (alias.Has("ALFE")) {
+    if (!actorDialogue)
+      block("alias.fill.event");
+    if (alias.Unsigned("ALFE") != kActorDialogueEvent || !alias.Has("ALFD"))
+      block("alias.fill.event-member");
+    member = static_cast<DialogueMember>(*alias.Unsigned("ALFD"));
+    using Kind = espm::QuestAliasDefinition::Kind;
+    if ((alias.kind == Kind::Reference && member != DialogueMember::Actor1 &&
+         member != DialogueMember::Actor2) ||
+        (alias.kind == Kind::Location && member != DialogueMember::Location))
+      block("alias.fill.event-member");
+    if (alias.Has("ALFR") || alias.Has("ALUA") || alias.Has("ALFL"))
+      block("alias.fill.conflicting-selectors");
+  }
   if (alias.Has("ALCO") || alias.creation)
     block("alias.fill.created-reference");
   if (alias.Has("ALEQ"))
     block("alias.fill.external-alias");
   if (alias.Has("ALFA") || alias.Has("ALFI") || alias.Has("ALNA") ||
-      !alias.conditions.empty())
+      (!alias.conditions.empty() && !member))
     block("alias.fill.world-query");
+  const auto unique = DialogueUniqueBase(alias, quest, actorDialogue);
+  if (unique &&
+      (alias.kind != espm::QuestAliasDefinition::Kind::Reference ||
+       alias.Has("ALFR") || alias.Has("ALFL") || alias.Has("ALFD")))
+    block("alias.fill.conflicting-selectors");
   if (alias.Has("ALUA")) {
-    if (quest.ToGlobalId(*alias.Unsigned("ALUA")) != 7)
+    if (!unique && quest.ToGlobalId(*alias.Unsigned("ALUA")) != 7)
       block("alias.fill.unique-actor");
   } else if (alias.Has("ALFR")) {
     if (quest.ToGlobalId(*alias.Unsigned("ALFR")) != 0x14)
       block("alias.fill.forced-reference");
-  } else if (!alias.Has("ALFL"))
+  } else if (!alias.Has("ALFL") && !member)
     block("alias.fill.matching-or-script");
   if (alias.flags & 1)
     block("alias.reserve");
-  if (alias.flags & ~uint32_t(2))
+  // Allow Reserved does not acquire a reservation. This fresh campaign has
+  // no existing quests and these event members are explicitly supplied.
+  uint32_t allowedFlags = 2;
+  if (member || unique)
+    allowedFlags |= 0x200;
+  if (unique)
+    allowedFlags |= 8; // Allow Reuse in Quest.
+  if (alias.flags & ~allowedFlags)
     block("alias.flags");
   for (const auto& [tag, values] : alias.fields) {
     if (tag == "ALID" || tag == "FNAM" || tag == "ALUA" || tag == "ALFR" ||
-        tag == "ALFL")
+        tag == "ALFL" || (member && (tag == "ALFE" || tag == "ALFD")))
       continue;
+    if (member && tag == "CTDA")
+      continue;
+    if ((member || unique) && tag == "VTCK" && alias.Unsigned(tag) == 0)
+      continue; // No voice-type restriction on the candidate.
     if ((tag == "COCT" || tag == "KSIZ") && alias.Unsigned(tag) == 0)
       continue;
     throw StartupBlocked{ "alias.effect." + tag,
                           "Alias " + std::to_string(alias.id) + " (" +
                             alias.name + ") contains " + tag };
   }
+  return member;
 }
+
+bool DialogueAliasMatches(MpActor& owner,
+                          const QuestScriptRuntime::ActorDialogue& dialogue,
+                          uint32_t location, const espm::LookupResult& quest,
+                          const espm::QuestAliasDefinition& alias,
+                          DialogueMember member)
+{
+  if (alias.conditions.empty())
+    return true;
+  if (member == DialogueMember::Location)
+    throw StartupBlocked{
+      "alias.event-condition-unsupported",
+      "Location alias conditions require a location subject"
+    };
+  std::vector<espm::QuestLifecycleData::Condition> conditions;
+  conditions.reserve(alias.conditions.size());
+  for (auto data : alias.conditions) {
+    // On a matching reference alias, Subject is this candidate reference.
+    // Express it through the authenticated event member for the shared
+    // evaluator.
+    using RunOn = espm::CTDA::RunOnTypeFlags;
+    if (data.runOnType != RunOn::Subject)
+      throw StartupBlocked{
+        "alias.event-condition-unsupported",
+        "Event alias predicate requires another run-on context"
+      };
+    data.runOnType = RunOn::EventData;
+    data.unknown2 = static_cast<int32_t>(member);
+    conditions.push_back({ data, {}, {} });
+  }
+  const auto result =
+    CheckStoryConditions(owner, dialogue, location, quest, conditions);
+  if (result.verdict == StoryIndex::Verdict::Unsupported)
+    throw StartupBlocked{ "alias.event-condition-unsupported", result.detail };
+  if (result.verdict == StoryIndex::Verdict::Reject) {
+    if (!(alias.flags & 2))
+      throw StartupBlocked{ "alias.event-condition-false", result.detail };
+    return false;
+  }
+  return true;
+}
+
+uint32_t DialogueActorOriginal(MpActor& owner, MpActor& participant)
+{
+  if (participant.GetDynamicFields().GetValueDump(
+        CampaignReferenceBinding::kProperty) == "null")
+    throw StartupBlocked{ "alias.fill.event-reference",
+                          "Event NPC has no campaign original" };
+  const auto [boundOwner, original] =
+    CampaignReferenceBinding::Context(participant);
+  if (boundOwner != &owner)
+    throw StartupBlocked{ "alias.fill.event-reference",
+                          "Event NPC belongs to a different campaign" };
+  return original;
+}
+
+std::optional<uint32_t> ResolveDialogueAliasMember(
+  MpActor& owner, const QuestScriptRuntime::ActorDialogue& event,
+  uint32_t location, const espm::LookupResult& record,
+  const espm::QuestAliasDefinition& alias, DialogueMember member)
+{
+  const auto target = member == DialogueMember::Location
+    ? location
+    : DialogueActorOriginal(
+        owner, member == DialogueMember::Actor1 ? event.actor1 : event.actor2);
+  if (DialogueAliasMatches(owner, event, location, record, alias, member))
+    return target;
+  return std::nullopt; // Proven empty optional binding.
+}
+
+std::optional<std::string> RequiredEventAliasFailure(
+  MpActor& owner, const QuestScriptRuntime::ActorDialogue& dialogue,
+  uint32_t location, const espm::LookupResult& record,
+  const espm::QuestAliasData& aliases)
+{
+  std::set<uint32_t> filled;
+  try {
+    for (const auto& alias : aliases.aliases) {
+      const auto member = CheckStartupAlias(alias, record, true);
+      if (!member)
+        break; // Other fill modes must run through the full startup
+               // transaction.
+      const auto target = ResolveDialogueAliasMember(owner, dialogue, location,
+                                                     record, alias, *member);
+      if (target && !filled.insert(*target).second)
+        break; // Reuse would block before any later alias.
+    }
+  } catch (const StartupBlocked& e) {
+    if (e.code == "alias.event-condition-false")
+      return e.detail;
+    // An unsupported fill has not been shown to fail in Skyrim.
+  }
+  return std::nullopt;
+}
+
+using QuestLife = espm::QuestLifecycleData;
+constexpr uint16_t kStartupFlags = QuestLife::RunOnce |
+  QuestLife::AllowRepeatedStages | QuestLife::AddIdleTopicToHello |
+  QuestLife::ExcludeFromDialogueExport | QuestLife::WarnOnAliasFillFailure |
+  QuestLife::HasDialogueData;
+
+StoryIndex::Selection SelectActorDialogue(
+  MpActor& owner, const QuestScriptRuntime::ActorDialogue& dialogue,
+  uint32_t location)
+{
+  auto& world = *dialogue.actor1.GetParent();
+  auto checkNode = [&](const StoryIndex::Node& node) {
+    return CheckStoryNode(owner, dialogue, location, node);
+  };
+  auto checkQuest = [&](const StoryIndex::Node& node,
+                        uint32_t entryIndex) -> StoryIndex::Check {
+    const auto id = node.quests.at(entryIndex).questId;
+    const auto record = world.GetEspm().GetBrowser().LookupById(id);
+    if (!record.rec || record.rec->IsDeleted() ||
+        record.rec->GetType() != "QUST")
+      return { StoryIndex::Verdict::Unsupported,
+               "Story entry has no winning live quest" };
+    const auto life =
+      espm::QuestLifecycleData::Read(record.rec, world.GetEspmCache());
+    if (life.event != kActorDialogueEvent)
+      return { StoryIndex::Verdict::Unsupported,
+               "Quest has a different event definition" };
+    const auto conditions = CheckStoryConditions(owner, dialogue, location,
+                                                 record, life.storyConditions);
+    if (conditions.verdict != StoryIndex::Verdict::Pass ||
+        !life.unknownFields.empty() || (life.flags & ~kStartupFlags))
+      return conditions;
+    const auto aliases =
+      espm::QuestAliasData::Read(record.rec, world.GetEspmCache());
+    // A proven false required member prevents startup. An unresolved fill
+    // still owns the next attempt and must never admit a lower-priority quest.
+    if (auto failure = RequiredEventAliasFailure(owner, dialogue, location,
+                                                 record, aliases))
+      return { StoryIndex::Verdict::Reject, *failure };
+    return conditions;
+  };
+  return dialogue.routes.Select(kActorDialogueEvent, checkNode, checkQuest);
+}
+}
+
+std::optional<uint32_t> QuestScriptRuntime::ActorDialogue::UniqueActorOriginal(
+  MpActor& owner, uint32_t base, const std::vector<uint32_t>& placements) const
+{
+  if (placements.size() != 1 || !owner.GetParent())
+    return std::nullopt;
+  auto& world = *owner.GetParent();
+  const auto record = world.GetEspm().GetBrowser().LookupById(base);
+  if (!record.rec || record.rec->IsDeleted() ||
+      record.rec->GetType() != "NPC_")
+    return std::nullopt;
+  const auto data =
+    espm::Convert<espm::NPC_>(record.rec)->GetData(world.GetEspmCache());
+  if (!data.isUnique || data.baseTemplate)
+    return std::nullopt;
+  const bool first = actor1.GetBaseId() == base;
+  const bool second = actor2.GetBaseId() == base;
+  if (first == second)
+    return std::nullopt;
+  auto& participant = first ? actor1 : actor2;
+  if (participant.GetDynamicFields().GetValueDump(
+        CampaignReferenceBinding::kProperty) == "null")
+    return std::nullopt;
+  const auto [boundOwner, original] =
+    CampaignReferenceBinding::Context(participant);
+  if (boundOwner != &owner || original != placements.front())
+    return std::nullopt;
+  return original;
 }
 
 struct QuestScriptRuntime::StartupProbe
@@ -694,7 +985,10 @@ struct QuestScriptRuntime::StartupProbe
   espm::QuestLifecycleData life;
   espm::QuestAliasData aliases;
   uint32_t scene = 0;
-  Json storyEvent, storyRoute;
+  const ActorDialogue* dialogue = nullptr;
+  uint32_t dialogueLocation = 0;
+  Json storyEvent, storyRoute, storySelection, storyAliasBindings,
+    storyUniqueActorBindings;
   std::vector<uint16_t> selected, stages;
   std::vector<std::string> steps;
   std::string step = "record";
@@ -719,24 +1013,33 @@ struct QuestScriptRuntime::StartupProbe
       result["storyEvent"] = storyEvent;
     if (!storyRoute.is_null())
       result["storyRoute"] = storyRoute;
+    if (!storySelection.is_null())
+      result["storySelection"] = storySelection;
+    if (!storyAliasBindings.empty())
+      result["storyAliasBindings"] = storyAliasBindings;
+    if (!storyUniqueActorBindings.empty())
+      result["storyUniqueActorBindings"] = storyUniqueActorBindings;
     return result;
   }
 };
+
+Json QuestScriptRuntime::ProbeActorDialogueSelection(
+  MpActor& owner, const ActorDialogue& dialogue)
+{
+  CheckFreshStartupCampaign(owner);
+  const auto location = BindActorDialogue(owner, dialogue);
+  return { { "storyEvent", ActorDialogueEventJson(dialogue, location) },
+           { "storySelection",
+             StorySelectionJson(
+               SelectActorDialogue(owner, dialogue, location)) } };
+}
 
 Json QuestScriptRuntime::ProbeStartup(
   MpActor& actor, uint32_t questId, uint32_t startScene,
   const std::vector<PexScript::Lazy>& scripts, const ActorDialogue* dialogue)
 {
+  CheckFreshStartupCampaign(actor);
   auto* world = actor.GetParent();
-  if (!world || actor.IsDeleted() ||
-      world->LookupFormByIdNoLoad(actor.GetFormId()).get() != &actor ||
-      actor.GetWorldInstance() !=
-        "campaign:" + std::to_string(actor.GetFormId()) + ":startup" ||
-      actor.GetDynamicFields().GetValueDump(QuestJournal::kProperty) !=
-        "null" ||
-      QuestJournal::HasActiveTransaction())
-    throw std::invalid_argument(
-      "Startup probe requires a fresh personal campaign");
   const auto record = world->GetEspm().GetBrowser().LookupById(questId);
   if (!record.rec || record.rec->IsDeleted() ||
       record.rec->GetType() != "QUST")
@@ -760,51 +1063,72 @@ Json QuestScriptRuntime::ProbeStartup(
         throw std::invalid_argument("Actor dialogue requires an ADIA quest");
       probe.Next("story-event");
       const auto location = BindActorDialogue(actor, *dialogue);
-      probe.storyEvent = { { "type", "ADIA" },
-                           { "location", location },
-                           { "actor1", dialogue->actor1.GetFormId() },
-                           { "actor2", dialogue->actor2.GetFormId() } };
+      probe.dialogue = dialogue;
+      probe.dialogueLocation = location;
+      probe.storyEvent = ActorDialogueEventJson(*dialogue, location);
       probe.Next("story-route");
       const auto& routes = dialogue->routes.Find(questId, kActorDialogueEvent);
       probe.storyRoute = { { "candidateCount", routes.size() } };
       if (routes.empty())
         throw StartupBlocked{ "story.route-missing",
                               "No winning ADIA node routes to this quest" };
-      if (routes.size() != 1)
-        throw StartupBlocked{ "story.route-selection",
-                              "Multiple ADIA candidate entries require selection" };
-      const auto& route = routes.front();
-      probe.storyRoute["nodeIds"] = route.nodeIds;
-      probe.storyRoute["questIndex"] = route.questIndex;
-      probe.Next("story-conditions");
-      auto check = [&](const espm::LookupResult& record,
-                       const std::vector<espm::QuestLifecycleData::Condition>& conditions) {
-        const auto result = EvaluateActorDialogueConditions(
-          dialogue->actor1, dialogue->actor2, location, record, conditions);
-        using State = ActorDialogueConditionResult::State;
-        if (result.state == State::Passed)
-          return;
-        const auto id = record.ToGlobalId(record.rec->GetId());
-        throw StartupBlocked{
-          result.state == State::Failed ? "story.conditions-false"
-                                        : "story.condition-unsupported",
-          FormDesc::FromFormId(id, world->espmFiles).ToString() + ": " +
-            result.detail };
-      };
-      // These are necessary conditions for this candidate. Passing them
-      // does not establish which competing node the Story Manager takes.
-      for (auto id : route.nodeIds) {
-        const auto* node = dialogue->routes.GetNode(id);
-        const auto winning = world->GetEspm().GetBrowser().LookupById(id);
-        if (!node || !winning.rec || winning.rec->IsDeleted() ||
-            winning.fileIdx != node->fileIndex)
-          throw std::logic_error("Story route no longer matches its record");
-        check(winning, node->conditions);
+      if (routes.size() == 1) {
+        probe.storyRoute["nodeIds"] = routes.front().nodeIds;
+        probe.storyRoute["questIndex"] = routes.front().questIndex;
       }
-      check(record, probe.life.storyConditions);
+
+      probe.Next("story-conditions");
+      using Verdict = StoryIndex::Verdict;
+      // Every route into this quest has its own necessary node conditions.
+      // A failed route excludes the quest only if all its other routes fail.
+      StoryIndex::Check candidacy{ Verdict::Reject, {} };
+      for (const auto& route : routes) {
+        StoryIndex::Check path{ Verdict::Pass, {} };
+        for (const auto id : route.nodeIds) {
+          const auto* node = dialogue->routes.GetNode(id);
+          if (!node)
+            throw std::logic_error("Missing node from indexed story route");
+          path = CheckStoryNode(actor, *dialogue, location, *node);
+          if (path.verdict != Verdict::Pass)
+            break;
+        }
+        if (candidacy.verdict == Verdict::Reject ||
+            path.verdict == Verdict::Pass)
+          candidacy = path;
+        if (candidacy.verdict == Verdict::Pass)
+          break;
+      }
+      if (candidacy.verdict == Verdict::Pass)
+        candidacy = CheckStoryConditions(actor, *dialogue, location, record,
+                                         probe.life.storyConditions);
+      if (candidacy.verdict != Verdict::Pass)
+        throw StartupBlocked{ candidacy.verdict == Verdict::Reject
+                                ? "story.conditions-false"
+                                : "story.condition-unsupported",
+                              candidacy.detail };
+
       probe.Next("story-selection");
-      if (!route.gate.empty())
-        throw StartupBlocked{ "story.route-selection", route.gate };
+      const auto selection = SelectActorDialogue(actor, *dialogue, location);
+      probe.storySelection = StorySelectionJson(selection);
+      // Required event-member filters can exclude this target even if the
+      // ordered traversal stopped at an unrelated earlier quest.
+      if (probe.life.unknownFields.empty() &&
+          !(probe.life.flags & ~kStartupFlags)) {
+        if (auto failure = RequiredEventAliasFailure(
+              actor, *dialogue, location, record, probe.aliases))
+          throw StartupBlocked{ "alias.event-condition-false", *failure };
+      }
+      if (selection.verdict != Verdict::Pass)
+        throw StartupBlocked{ selection.verdict == Verdict::Reject
+                                ? "story.no-candidate"
+                                : "story.route-selection",
+                              selection.detail.empty()
+                                ? "No quest admitted by this event"
+                                : selection.detail };
+      if (selection.questId != questId)
+        throw StartupBlocked{ "story.preceding-quest",
+                              "A preceding eligible quest requires a startup "
+                              "attempt before this entry" };
       probe.Next("quest-admission");
     } else if (probe.life.event) {
       // ENAM stores the four-character Story Manager event signature.
@@ -833,10 +1157,7 @@ Json QuestScriptRuntime::ProbeStartup(
     if (probe.life.flags & Life::StartGameEnabled)
       throw StartupBlocked{ "quest.start-game-enabled",
                             "Requires new-game startup registration" };
-    constexpr uint16_t supported = Life::RunOnce | Life::AllowRepeatedStages |
-      Life::AddIdleTopicToHello | Life::ExcludeFromDialogueExport |
-      Life::WarnOnAliasFillFailure | Life::HasDialogueData;
-    if (const auto flags = probe.life.flags & ~supported)
+    if (const auto flags = probe.life.flags & ~kStartupFlags)
       throw StartupBlocked{
         "quest.start-flags", "Unhandled startup flags " + std::to_string(flags)
       };
@@ -847,7 +1168,8 @@ Json QuestScriptRuntime::ProbeStartup(
     // Most quests hit an unsupported first fill. Check it before building an
     // entire VM, then validate subsequent fills in their actual probe order.
     if (!probe.aliases.aliases.empty())
-      CheckStartupAlias(probe.aliases.aliases.front(), record);
+      CheckStartupAlias(probe.aliases.aliases.front(), record,
+                        dialogue != nullptr);
     Execute(actor, questId, 0, metadata, scripts, 0, nullptr, 0, nullptr, {},
             false, {}, {}, {}, nullptr, &probe);
     throw std::logic_error(
@@ -1591,6 +1913,24 @@ bool QuestScriptRuntime::Execute(
     }
 
     std::optional<std::map<uint32_t, std::vector<uint32_t>>> actorReferences;
+    const auto placedActors =
+      [&](uint32_t base) -> const std::vector<uint32_t>& {
+      if (!actorReferences) {
+        actorReferences.emplace();
+        const auto& browser = world.GetEspm().GetBrowser();
+        // The REFR index contains both placed objects and placed actors.
+        for (const auto& candidate :
+             browser.GetDistinctRecordsByType("REFR")) {
+          if (candidate.rec->GetType() != "ACHR" || candidate.rec->IsDeleted())
+            continue;
+          const auto original = candidate.ToGlobalId(candidate.rec->GetId());
+          if (browser.LookupById(original).rec == candidate.rec)
+            (*actorReferences)[ReferenceBase(candidate, world)].push_back(
+              original);
+        }
+      }
+      return (*actorReferences)[base];
+    };
     std::set<std::pair<uint32_t, uint32_t>> resolvingAliases;
     std::function<VarValue(CampaignAliasObject&, bool)> readAliasTarget;
     readAliasTarget = [&](CampaignAliasObject& object,
@@ -1670,24 +2010,12 @@ bool QuestScriptRuntime::Execute(
         if (base == 0x7) {
           target = 0x14;
         } else {
-          if (!actorReferences) {
-            actorReferences.emplace();
-            for (const auto& candidate :
-                 world.GetEspm().GetBrowser().GetDistinctRecordsByType(
-                   "REFR")) {
-              // The browser stores ACHR and REFR in its REFR index.
-              if (candidate.rec->GetType() == "ACHR" &&
-                  !candidate.rec->IsDeleted())
-                (*actorReferences)[ReferenceBase(candidate, world)].push_back(
-                  candidate.ToGlobalId(candidate.rec->GetId()));
-            }
-          }
-          const auto it = actorReferences->find(base);
-          if (it != actorReferences->end()) {
-            if (it->second.size() != 1)
+          const auto& placements = placedActors(base);
+          if (!placements.empty()) {
+            if (placements.size() != 1)
               throw std::runtime_error(
                 "Unique actor alias has multiple reference candidates");
-            target = it->second.front();
+            target = placements.front();
           }
         }
       } else {
@@ -2304,14 +2632,58 @@ bool QuestScriptRuntime::Execute(
       QuestJournal::Apply(actor, { { "quest", questId }, { "op", "start" } });
       std::set<uint32_t> filled;
       for (const auto& def : startup->aliases.aliases) {
-        CheckStartupAlias(def, record);
+        const auto member =
+          CheckStartupAlias(def, record, startup->dialogue != nullptr);
+        const auto unique =
+          DialogueUniqueBase(def, record, startup->dialogue != nullptr);
+        if (member || unique) {
+          const auto& event = *startup->dialogue;
+          std::optional<uint32_t> target;
+          if (member)
+            target = ResolveDialogueAliasMember(
+              actor, event, startup->dialogueLocation, record, def, *member);
+          else {
+            target =
+              event.UniqueActorOriginal(actor, *unique, placedActors(*unique));
+            if (!target)
+              throw StartupBlocked{ "alias.fill.unique-actor",
+                                    "Alias " + std::to_string(def.id) + " (" +
+                                      def.name +
+                                      ") has no unique placed actor matching "
+                                      "a bound dialogue participant" };
+          }
+          const auto key =
+            questKey(questId) + "/alias:" + std::to_string(def.id);
+          if (state.GetAliasBinding(key))
+            throw std::logic_error("Fresh event alias already has a binding");
+          if (target)
+            state.SetAliasBinding(key, questKey(*target));
+          else
+            state.SetAliasBinding(key, nullptr);
+        }
         auto alias = std::dynamic_pointer_cast<CampaignAliasObject>(
           resolveAlias(questId, def.id));
         const auto value = aliasTarget(*alias);
-        if (static_cast<IGameObject*>(value) &&
-            !filled.insert(formId(value)).second)
+        const bool reused = static_cast<IGameObject*>(value) &&
+          !filled.insert(formId(value)).second;
+        if (reused && !(unique && (def.flags & 8)))
           throw StartupBlocked{ "alias.reuse",
                                 "Multiple aliases select the same target" };
+        if (unique)
+          startup->storyUniqueActorBindings.push_back(
+            { { "id", def.id },
+              { "baseId", *unique },
+              { "formId", formId(value) },
+              { "reused", reused } });
+        if (member && static_cast<IGameObject*>(value)) {
+          const char* name = *member == DialogueMember::Location ? "L1"
+            : *member == DialogueMember::Actor1                  ? "R1"
+                                                                 : "R2";
+          startup->storyAliasBindings.push_back(
+            { { "id", def.id },
+              { "member", name },
+              { "formId", formId(value) } });
+        }
       }
       startup->Next("scripts");
       std::vector<std::shared_ptr<IGameObject>> recipients{ resolve(questId) };

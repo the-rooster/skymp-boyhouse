@@ -132,18 +132,47 @@ std::string NodeGate(const Node& n)
 
 StoryEventRouteIndex::StoryEventRouteIndex(const CombineBrowser& browser)
 {
-  std::unordered_map<uint32_t, size_t> childCount, eventCount;
+  std::unordered_map<uint32_t, std::vector<uint32_t>> byParent;
   for (auto type : { "SMEN", "SMBN", "SMQN" }) {
     for (const auto& record : browser.GetDistinctRecordsByType(type)) {
       const auto id = record.ToGlobalId(record.rec->GetId());
       if (record.rec->IsDeleted() || browser.LookupById(id).rec != record.rec)
         continue;
       auto node = ReadNode(record, browser.GetCache());
-      ++childCount[node.parent];
+      byParent[node.parent].push_back(id);
       if (node.eventType)
-        ++eventCount[*node.eventType];
+        events[*node.eventType].push_back(id);
+      for (auto& entry : node.quests) {
+        const auto quest = browser.LookupById(entry.questId);
+        entry.liveQuest = quest.rec && !quest.rec->IsDeleted() &&
+          quest.rec->GetType() == "QUST";
+      }
       nodes.emplace(id, std::move(node));
     }
+  }
+
+  // Only an unambiguous SNAM chain starting at the head establishes order.
+  // Keep detached cycles, missing predecessors and forked tails separately.
+  for (const auto& [parent, ids] : byParent) {
+    auto& group = children[parent];
+    std::unordered_map<uint32_t, std::vector<uint32_t>> next;
+    for (const auto id : ids)
+      next[nodes.at(id).previousSibling].push_back(id);
+    std::unordered_set<uint32_t> ordered;
+    uint32_t previous = 0;
+    for (;;) {
+      const auto found = next.find(previous);
+      if (found == next.end() || found->second.size() != 1)
+        break;
+      previous = found->second.front();
+      if (!ordered.insert(previous).second)
+        break;
+      group.ordered.push_back(previous);
+    }
+    for (const auto id : ids)
+      if (!ordered.count(id))
+        group.unresolved.push_back(id);
+    std::sort(group.unresolved.begin(), group.unresolved.end());
   }
 
   // SNAM is a previous sibling, not an ancestor. An absent or cyclic
@@ -187,7 +216,7 @@ StoryEventRouteIndex::StoryEventRouteIndex(const CombineBrowser& browser)
       continue; // Deleted/missing parent, broken chain, or no event ancestor.
 
     std::reverse(base.nodeIds.begin(), base.nodeIds.end());
-    if (eventCount.at(*event->eventType) != 1)
+    if (events.at(*event->eventType).size() != 1)
       base.gate = "Multiple Story Manager nodes handle this event";
     bool belowEvent = false;
     for (const auto nodeId : base.nodeIds) {
@@ -196,7 +225,7 @@ StoryEventRouteIndex::StoryEventRouteIndex(const CombineBrowser& browser)
         base.gate = "Invalid Story Manager previous sibling chain";
       if (base.gate.empty())
         base.gate = NodeGate(n);
-      if (belowEvent && base.gate.empty() && childCount.at(n.parent) > 1)
+      if (belowEvent && base.gate.empty() && byParent.at(n.parent).size() > 1)
         base.gate = "Story Manager must select among sibling nodes";
       belowEvent |= nodeId == event->id;
     }
@@ -205,9 +234,7 @@ StoryEventRouteIndex::StoryEventRouteIndex(const CombineBrowser& browser)
 
     for (size_t i = 0; i < leaf.quests.size(); ++i) {
       const auto& entry = leaf.quests[i];
-      const auto quest = browser.LookupById(entry.questId);
-      if (!quest.rec || quest.rec->IsDeleted() ||
-          quest.rec->GetType() != "QUST")
+      if (!entry.liveQuest)
         continue;
       auto route = base;
       route.questIndex = static_cast<uint32_t>(i);
@@ -226,6 +253,142 @@ StoryEventRouteIndex::StoryEventRouteIndex(const CombineBrowser& browser)
                   std::tie(b.questNodeId, b.questIndex);
               });
   }
+}
+
+StoryEventRouteIndex::Selection StoryEventRouteIndex::Select(
+  uint32_t eventType, const std::function<Check(const Node&)>& evaluateNode,
+  const std::function<Check(const Node&, uint32_t)>& evaluateQuest) const
+{
+  const auto root = events.find(eventType);
+  if (root == events.end())
+    return { Verdict::Reject, 0, 0, 0, {}, "No Story Manager event node" };
+  if (root->second.size() != 1)
+    return { Verdict::Unsupported,
+             0,
+             0,
+             0,
+             {},
+             "Multiple Story Manager nodes handle this event" };
+
+  const auto eventId = root->second.front();
+  std::vector<uint32_t> path;
+  std::unordered_set<uint32_t> ancestors;
+  const Node* ancestor = GetNode(eventId);
+  while (ancestor->parent) {
+    ancestor = GetNode(ancestor->parent);
+    if (!ancestor || ancestor->kind != Kind::Branch ||
+        !ancestors.insert(ancestor->id).second)
+      return { Verdict::Unsupported,
+               eventId,
+               0,
+               0,
+               {},
+               "Invalid Story Manager event ancestry" };
+    path.push_back(ancestor->id);
+  }
+  std::reverse(path.begin(), path.end());
+
+  const auto nodeCheck = [&](const Node& node) -> Check {
+    if (node.unknownFields)
+      return { Verdict::Unsupported,
+               "Story Manager node contains unknown fields" };
+    return evaluateNode(node);
+  };
+  // Other SMENs below the structural root handle different event types.
+  // Its branch ancestors can still impose conditions and scheduler rules.
+  for (size_t i = 0; i < path.size(); ++i) {
+    const auto& node = nodes.at(path[i]);
+    auto check = nodeCheck(node);
+    if (check.verdict == Verdict::Pass) {
+      auto gate = NodeGate(node);
+      if (gate.empty())
+        continue;
+      check = { Verdict::Unsupported, std::move(gate) };
+    }
+    path.resize(i + 1);
+    return { check.verdict, node.id, 0, 0, path, check.detail };
+  }
+
+  enum class VisitMode
+  {
+    Ordered,
+    ExcludeUnordered,
+    ExcludeRandom
+  };
+  const auto visit = [&](auto&& self, const Node& node,
+                         VisitMode mode) -> Selection {
+    const auto result = [&](Verdict verdict, std::string detail = {},
+                            uint32_t questId = 0, uint32_t index = 0) {
+      return Selection{ verdict, node.id, questId,
+                        index,   path,    std::move(detail) };
+    };
+    if (path.size() > 256 || (node.kind == Kind::Event && node.id != eventId))
+      return result(Verdict::Unsupported, "Invalid nested Story Manager tree");
+    const auto check = nodeCheck(node);
+    if (check.verdict != Verdict::Pass)
+      return result(check.verdict, check.detail);
+    const auto gate = NodeGate(node);
+    if (!gate.empty()) {
+      // A draw is immaterial to exclusion if every possible choice fails.
+      // Limits, event sharing, cooldowns and unknown metadata still block.
+      const bool randomOnly = (node.flags & 1) &&
+        !(node.flags & ~uint32_t(3)) && !node.unknownFields &&
+        !node.maxConcurrent && !node.questsToRun.value_or(0);
+      if (mode == VisitMode::Ordered || !randomOnly)
+        return result(Verdict::Unsupported, gate);
+      mode = VisitMode::ExcludeRandom;
+    }
+
+    const auto group = children.find(node.id);
+    if (node.kind == Kind::Quest) {
+      if (group != children.end())
+        return result(Verdict::Unsupported,
+                      "Invalid child of Story Manager quest node");
+      for (size_t i = 0; i < node.quests.size(); ++i) {
+        const auto& entry = node.quests[i];
+        if (!entry.liveQuest)
+          return result(Verdict::Unsupported,
+                        "Missing winning Story Manager quest", entry.questId,
+                        i);
+        if (entry.flags.value_or(0) || entry.resetHours.value_or(0) != 0)
+          return result(Verdict::Unsupported,
+                        "Story Manager quest entry requires selection state",
+                        entry.questId, i);
+        const auto quest = evaluateQuest(node, i);
+        if (mode != VisitMode::Ordered && quest.verdict == Verdict::Pass) {
+          const auto* reason = mode == VisitMode::ExcludeRandom
+            ? "Story Manager random selection requires a draw"
+            : "Unresolved Story Manager sibling order";
+          return result(Verdict::Unsupported, reason, entry.questId, i);
+        }
+        if (quest.verdict != Verdict::Reject)
+          return result(quest.verdict, quest.detail, entry.questId, i);
+      }
+    } else if (group != children.end()) {
+      // Subtrees without a provable sibling position may only be excluded.
+      // Every possible descendant must fail its own necessary predicate.
+      // An eligible or unknown entry in such a subtree stops the traversal.
+      for (auto id : group->second.unresolved) {
+        path.push_back(id);
+        auto child = self(
+          self, nodes.at(id),
+          mode == VisitMode::Ordered ? VisitMode::ExcludeUnordered : mode);
+        path.pop_back();
+        if (child.verdict != Verdict::Reject)
+          return child;
+      }
+      for (auto id : group->second.ordered) {
+        path.push_back(id);
+        auto child = self(self, nodes.at(id), mode);
+        path.pop_back();
+        if (child.verdict != Verdict::Reject)
+          return child;
+      }
+    }
+    return result(Verdict::Reject, "No eligible Story Manager quest in node");
+  };
+  path.push_back(eventId);
+  return visit(visit, nodes.at(eventId), VisitMode::Ordered);
 }
 
 const StoryEventRouteIndex::Node* StoryEventRouteIndex::GetNode(

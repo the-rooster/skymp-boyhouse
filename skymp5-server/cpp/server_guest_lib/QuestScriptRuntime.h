@@ -63,7 +63,16 @@ public:
     MpActor& actor1; // Initiating NPC
     MpActor& actor2; // Addressed NPC
     const espm::StoryEventRouteIndex& routes;
+    // Match a winning NPC_ base and its indexed live ACHR placements to
+    // exactly one authenticated participant in this campaign.
+    std::optional<uint32_t> UniqueActorOriginal(
+      MpActor& owner, uint32_t base,
+      const std::vector<uint32_t>& placements) const;
   };
+  // Select the first candidate due a startup attempt in a fresh campaign.
+  // This read-only event probe has no requested quest and does not start one.
+  static nlohmann::json ProbeActorDialogueSelection(
+    MpActor& owner, const ActorDialogue& dialogue);
   static nlohmann::json ProbeStartup(
     MpActor& actor, uint32_t questId, uint32_t startScene,
     const std::vector<PexScript::Lazy>& scripts,

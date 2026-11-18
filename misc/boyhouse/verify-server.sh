@@ -11,6 +11,7 @@ python3 misc/boyhouse/quest_dependencies.py --data-dir /game-data \
 # Run the complete native suite, including archive and visibility-barrier cases.
 ./build/unit/unit
 node misc/boyhouse/native-smoke.cjs
+node misc/boyhouse/story-selection-smoke.cjs
 node misc/boyhouse/protocol-smoke.cjs
 node misc/boyhouse/protocol-smoke.cjs --projection
 node misc/boyhouse/storage-smoke.cjs

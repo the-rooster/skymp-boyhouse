@@ -171,7 +171,10 @@ test("actor-dialogue CLI selects winners by ENAM, validates both actors and cont
     assert.deepEqual(this.actors.get(second), {...this.actors.get(actor),base:0x1a670});
     return {status:"blocked",step:"aliases",steps:["admission"],stages:[],blocker:{code:"alias.fill",detail:"Alias 2"},
       storyEvent:{type:"ADIA",actor1:first,actor2:second,location:0x1f86d},
-      storyRoute:{candidateCount:1,nodeIds:[0x123,0x456],questIndex:0}};
+      storyRoute:{candidateCount:1,nodeIds:[0x123,0x456],questIndex:0},
+        storySelection:{outcome:"attempt",nodeIds:[0x123,0x456],nodeId:0x456,questId:id,questIndex:0,detail:""},
+        storyAliasBindings:[{id:3,member:"R1",formId:0x1a66e}],
+        storyUniqueActorBindings:[{id:4,baseId:0x13ba3,formId:0x1a66e,reused:true}]};
   }`);
   const forced = run(dir, "--output", "forced.json");
   assert.equal(forced.status, 0, forced.stderr);
@@ -189,6 +192,10 @@ test("actor-dialogue CLI selects winners by ENAM, validates both actors and cont
     actor1Original:0x1a66e,actor2Original:0x1a671,cell:0x1605e,location:0x1f86d});
   assert.equal(report.provenance.actorDialogue.placement, "authored");
   assert.deepEqual(story.storyRoute, {candidateCount:1,nodeIds:[0x123,0x456],questIndex:0});
+  assert.deepEqual(story.storyAliasBindings, [{id:3,member:"R1",formId:0x1a66e}]);
+  assert.deepEqual(story.storyUniqueActorBindings, [{id:4,baseId:0x13ba3,formId:0x1a66e,reused:true}]);
+  assert.deepEqual(story.storySelection, {outcome:"attempt",nodeIds:[0x123,0x456],nodeId:0x456,
+    questId:1,questIndex:0,detail:""});
   assert.deepEqual(report.fixtureContrast.forcedControls, {unchanged:1,changed:0,changedIds:[]});
   assert.equal(report.fixtureContrast.observations.length, 1);
   const pair = report.fixtureContrast.observations[0];
@@ -246,6 +253,21 @@ test("forged or changed authored actor receipts abort the report", t => {
     assert.match(result.stderr, diagnostic);
     assert.equal(fs.existsSync(path.join(dir, "out.json")), false);
   }
+});
+
+test("successful dialogue startup must match the candidate chosen by the event", t => {
+  const dir = fixture(t);
+  addon(dir, `probeQuestStartup(owner, id, first, second) {
+    const result = {status:"startup-exercised",step:"done",steps:["quest-admission"],stages:[],blocker:null};
+    if (first !== undefined) {
+      result.storyEvent = {type:"ADIA",actor1:first,actor2:second,location:0x1f86d};
+      result.storySelection = {outcome:"attempt",nodeIds:[5],nodeId:5,questIndex:0,questId:id + 1,detail:""};
+    }
+    return result;
+  }`);
+  const result = run(dir, "--scenario", "actor-dialogue");
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /ordered selection of the requested quest/);
 });
 
 test("worker crashes retain their attempted fixture and the mixed run resumes with the next winner", t => {

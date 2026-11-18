@@ -1,6 +1,7 @@
 #pragma once
 #include "QuestLifecycleData.h"
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
@@ -25,6 +26,7 @@ public:
     uint32_t questId = 0;
     std::optional<uint32_t> flags;
     std::optional<float> resetHours;
+    bool liveQuest = false;
   };
   struct Node
   {
@@ -46,13 +48,45 @@ public:
     std::string gate;
   };
 
+  enum class Verdict
+  {
+    Pass,
+    Reject,
+    Unsupported
+  };
+  struct Check
+  {
+    Verdict verdict;
+    std::string detail;
+  };
+  struct Selection
+  {
+    Verdict verdict;
+    uint32_t nodeId = 0, questId = 0, questIndex = 0;
+    std::vector<uint32_t> nodeIds;
+    std::string detail;
+  };
+
+  // Read-only predicates. Reject permits fallback, Unsupported stops it.
+  // A passing quest receives the first startup attempt; only the caller
+  // can establish whether its aliases filled and its scripts started.
+  Selection Select(
+    uint32_t eventType, const std::function<Check(const Node&)>& evaluateNode,
+    const std::function<Check(const Node&, uint32_t)>& evaluateQuest) const;
+
   explicit StoryEventRouteIndex(const CombineBrowser& browser);
   const std::vector<Route>& Find(uint32_t questId,
                                  uint32_t eventType) const noexcept;
   const Node* GetNode(uint32_t id) const noexcept;
 
 private:
+  struct Children
+  {
+    std::vector<uint32_t> ordered, unresolved;
+  };
   std::unordered_map<uint32_t, Node> nodes;
+  std::unordered_map<uint32_t, std::vector<uint32_t>> events;
+  std::unordered_map<uint32_t, Children> children;
   std::map<std::pair<uint32_t, uint32_t>, std::vector<Route>> routes;
 };
 }

@@ -19,8 +19,10 @@ struct ActorDialogueConditionResult
 };
 
 // The caller supplies the two validated event actors and their shared current
-// location. Each CTDA operand belongs to the plugin containing the condition.
+// location. PlayerRef requires the explicit owner of their private campaign.
+// Each CTDA operand belongs to the plugin containing the condition.
 ActorDialogueConditionResult EvaluateActorDialogueConditions(
   MpActor& actor1, MpActor& actor2, uint32_t locationId,
   const espm::LookupResult& record,
-  const std::vector<espm::QuestLifecycleData::Condition>& conditions);
+  const std::vector<espm::QuestLifecycleData::Condition>& conditions,
+  MpActor* campaignOwner = nullptr);

@@ -136,6 +136,8 @@ Napi::Object ScampServer::Init(Napi::Env env, Napi::Object exports)
       InstanceMethod("getPacketEpoch", &ScampServer::GetPacketEpoch),
       InstanceMethod("resumeCampaignActor", &ScampServer::ResumeCampaignActor),
       InstanceMethod("probeQuestStartup", &ScampServer::ProbeQuestStartup),
+      InstanceMethod("probeActorDialogueSelection",
+                     &ScampServer::ProbeActorDialogueSelection),
       InstanceMethod("getCampaignResume", &ScampServer::GetCampaignResume),
       InstanceMethod("captureCampaignResumeProjection",
                      &ScampServer::CaptureCampaignResumeProjection),
@@ -1941,41 +1943,69 @@ Napi::Value ScampServer::ResumeCampaignActor(const Napi::CallbackInfo& info)
   }
 }
 
+namespace {
+uint32_t ProbeFormId(const Napi::Value& value)
+{
+  const auto id = NapiHelper::ExtractUInt32(value, "formId");
+  if (!id || value.As<Napi::Number>().DoubleValue() != id)
+    throw std::invalid_argument(
+      "Startup probe IDs must be positive uint32 integers");
+  return id;
+}
+
+MpActor& UnassignedProbeActor(PartOne& server, const Napi::Value& value)
+{
+  const auto form = server.worldState.LookupFormByIdNoLoad(ProbeFormId(value));
+  auto* actor = form ? form->AsActor() : nullptr;
+  if (!actor ||
+      server.serverState.UserByActor(actor) != Networking::InvalidUserId)
+    throw std::invalid_argument(
+      "Startup probes require registered unassigned actors");
+  return *actor;
+}
+
+QuestScriptRuntime::ActorDialogue ProbeDialogue(
+  PartOne& server, std::optional<espm::StoryEventRouteIndex>& routes,
+  const Napi::Value& first, const Napi::Value& second)
+{
+  auto& actor1 = UnassignedProbeActor(server, first);
+  auto& actor2 = UnassignedProbeActor(server, second);
+  if (!routes)
+    routes.emplace(server.worldState.GetEspm().GetBrowser());
+  return { actor1, actor2, *routes };
+}
+}
+
+Napi::Value ScampServer::ProbeActorDialogueSelection(
+  const Napi::CallbackInfo& info)
+{
+  try {
+    if (info.Length() != 3)
+      throw std::invalid_argument("Expected a campaign owner and two NPC IDs");
+    auto& owner = UnassignedProbeActor(*partOne, info[0]);
+    const auto dialogue =
+      ProbeDialogue(*partOne, startupRoutes, info[1], info[2]);
+    const auto result =
+      QuestScriptRuntime::ProbeActorDialogueSelection(owner, dialogue);
+    return NapiHelper::ParseJson(info.Env(), result.dump());
+  } catch (const std::exception& e) {
+    throw Napi::Error::New(info.Env(), e.what());
+  }
+}
+
 Napi::Value ScampServer::ProbeQuestStartup(const Napi::CallbackInfo& info)
 {
   try {
     if (info.Length() != 2 && info.Length() != 4)
       throw std::invalid_argument(
         "Expected owner and quest IDs, optionally followed by two NPC IDs");
-    const auto id = [&](size_t index) {
-      const auto number = NapiHelper::ExtractUInt32(info[index], "formId");
-      if (!number || info[index].As<Napi::Number>().DoubleValue() != number)
-        throw std::invalid_argument(
-          "Startup probe IDs must be positive uint32 integers");
-      return number;
-    };
-    const auto actorId = id(0);
-    const auto questId = id(1);
+    auto& owner = UnassignedProbeActor(*partOne, info[0]);
+    const auto questId = ProbeFormId(info[1]);
     auto& world = partOne->worldState;
-    const auto unassigned = [&](uint32_t formId) -> MpActor& {
-      const auto form = world.LookupFormByIdNoLoad(formId);
-      auto* actor = form ? form->AsActor() : nullptr;
-      if (!actor ||
-          partOne->serverState.UserByActor(actor) != Networking::InvalidUserId)
-        throw std::invalid_argument(
-          "Startup probes require registered unassigned actors");
-      return *actor;
-    };
-    auto& owner = unassigned(actorId);
     std::optional<QuestScriptRuntime::ActorDialogue> dialogue;
-    if (info.Length() == 4) {
-      auto& actor1 = unassigned(id(2));
-      auto& actor2 = unassigned(id(3));
-      if (!startupRoutes)
-        startupRoutes.emplace(world.GetEspm().GetBrowser());
-      dialogue.emplace(QuestScriptRuntime::ActorDialogue{actor1, actor2,
-                                                          *startupRoutes});
-    }
+    if (info.Length() == 4)
+      dialogue.emplace(
+        ProbeDialogue(*partOne, startupRoutes, info[2], info[3]));
     if (!startupScenes)
       startupScenes.emplace(world.GetEspm().GetBrowser());
     if (!startupScripts)

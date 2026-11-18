@@ -1,5 +1,29 @@
 # Actor dialogue in the Bannered Mare
 
+## Ordered Story Manager selection
+
+The headless server tested Hulda speaking to Mikael in the Bannered Mare against all 900 actor-dialogue quest records. The original story tree did not start a conversation for this encounter. Of the 900, **891** can now be ruled out for this pair. Six need a condition the server cannot yet evaluate. Three remain possible at the first unresolved Story Manager decision.
+
+| First observation | Previous run | Ordered selection and alias checks |
+| --- | ---: | ---: |
+| Story conditions excluded the encounter | 772 | 871 |
+| A required quest alias excluded the participants | 0 | 20 |
+| Condition or run-on context still unsupported | 94 | 6 |
+| Story Manager selection still pending | 34 | 3 |
+| Test errors | 0 | 0 |
+
+Of the 94 previously blocked on conditions, 82 now fail a story condition, five fail a required alias filter, one reaches selection and six still need condition support. Those six involve `GetStage` (three), `GetInCurrentLoc` with an unsupported run-on context (two) and `GetIsVoiceType` (one). Of the 34 previously waiting on selection, 17 now have every candidate route ruled out, 15 fail a required alias filter and two still reach selection.
+
+Starting from the NPC pair alone, in either speaking order, the original tree reaches `GenericScenesSpecial` (Skyrim 0x016FA1). Its quest entry for `DialogueGenericSceneSpecial01` (Skyrim 0x016FA6) has flags whose selection behavior is unresolved. This same decision gates three candidates when Hulda speaks first, namely `DialogueGenericSceneSpecial01`, `DialogueWhiterunBanneredMareScene1` and `DialogueGenericScene04`.
+
+**An original quest reached its first scene in an isolated route test.** A temporary plugin pointed the event directly at `DialogueWhiterunBanneredMareScene1` (Skyrim 0x017F32). Skyrim.esm supplied the original quest and scene. In both speaking orders the quest filled Actor1 and Actor2 from the event, reused those campaign identities for its named Hulda and Mikael aliases, then requested scene 0x017F33. Playback of its six dialogue actions is the next observable step. The route override is required to reach this result today.
+
+Across the 900 dialogue quests, 793 have an automatically starting scene. Of those 793 scenes, 787 contain only dialogue actions. The five masters specify 3,856 dialogue actions across these auto-start scenes. This count identifies how many original records share the playback requirement. Each scene still has its own conditions, topics, participants and callbacks to verify.
+
+Separate temporary two-quest fixtures verified sibling priority, fallback when a required actor filter rejects, and rejection when a quest forbids reuse of the same actor. The probes verify that journals and private NPC copies survive the attempts intact. Reversing the catalog input reproduced all 2,274 per-quest observations. All 1,374 forced-start controls matched. Across the full forced-start catalog 27 records completed startup and three executed an authored stage. Zero quests have a verified complete multiplayer playthrough.
+
+## Previous editor-location and faction run
+
 The headless server attempted all 2,274 winning quest records from Skyrim, Update, Dawnguard, HearthFires and Dragonborn. Exactly 900 requested the Story Manager's actor-dialogue event (`ADIA`). The scenario used Hulda as actor 1 and Mikael as actor 2. Each attempt used a fresh personal campaign and private copies of their original placed references, at their authored positions. No dialogue quest started in this encounter.
 
 | First observation for the 900 dialogue quests | Before editor-location and faction support | After |

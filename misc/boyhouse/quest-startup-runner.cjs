@@ -94,8 +94,44 @@ function selectFixture(server, quest, scenario) {
   return Buffer.from(events[0].data).equals(Buffer.from("ADIA")) ? "actor-dialogue" : "forced-start";
 }
 
+const uint32 = value => Number.isInteger(value) && value >= 0 && value <= 0xffffffff;
+
+function normalizeStorySelection(selection) {
+  assert.ok(selection && ["attempt", "blocked", "none"].includes(selection.outcome), "Invalid story selection outcome");
+  const {outcome, nodeIds, nodeId, questId, questIndex, detail} = selection;
+  assert.ok(Array.isArray(nodeIds) && nodeIds.every(id => uint32(id) && id > 0) &&
+    new Set(nodeIds).size === nodeIds.length && uint32(nodeId) && uint32(questId) &&
+    uint32(questIndex) && typeof detail === "string", "Invalid story selection evidence");
+  if (outcome === "attempt")
+    assert.ok(nodeId > 0 && questId > 0 && nodeIds.at(-1) === nodeId, "Invalid story selection candidate");
+  return {outcome, nodeIds, nodeId, questId, questIndex, detail};
+}
+
+function normalizeStoryAliases(bindings) {
+  assert.ok(Array.isArray(bindings), "Invalid story alias bindings");
+  const ids = new Set();
+  const members = {R1:dialogueIdentities.actor1Original, R2:dialogueIdentities.actor2Original, L1:banneredMareLocation};
+  return bindings.map(({id, member, formId}) => {
+    assert.ok(uint32(id) && !ids.has(id) && Object.hasOwn(members, member) && members[member] === formId,
+      "Invalid story alias member or original form");
+    ids.add(id);
+    return {id, member, formId};
+  });
+}
+
+function normalizeUniqueActorAliases(bindings) {
+  assert.ok(Array.isArray(bindings), "Invalid unique actor alias bindings");
+  const ids = new Set();
+  return bindings.map(({id, baseId, formId, reused}) => {
+    assert.ok(uint32(id) && !ids.has(id) && typeof reused === "boolean" &&
+      dialogueNpcs.some(npc => npc.base === baseId && npc.original === formId),
+      "Invalid unique actor alias identity");
+    ids.add(id);
+    return {id, baseId, formId, reused};
+  });
+}
+
 function normalizeStoryRoute(route) {
-  const uint32 = value => Number.isInteger(value) && value >= 0 && value <= 0xffffffff;
   assert.ok(route && uint32(route.candidateCount), "Invalid story route candidate count");
   const {candidateCount, nodeIds, questIndex} = route;
   if (candidateCount !== 1) {
@@ -167,11 +203,21 @@ function probe(server, quest, actor, fixture) {
         !Array.isArray(result.stages) || !result.stages.every(Number.isInteger) ||
         (blocked ? !result.blocker?.code || typeof result.blocker.detail !== "string" : result.blocker !== null))
       throw new Error(`Invalid native startup result for ${quest.id}`);
+    const selection = dialogue && result.storySelection !== undefined
+      ? normalizeStorySelection(result.storySelection) : null;
+    if (dialogue && (!blocked || result.steps.includes("quest-admission"))) {
+      assert.ok(selection?.outcome === "attempt" && selection.questId === quest.formId,
+        "Dialogue startup requires ordered selection of the requested quest");
+    }
     return { id: quest.id, editorId: quest.editorId, winningPlugin: quest.winningPlugin,
       status: blocked ? "blocked" : "started", step: result.step, steps: result.steps, stages: result.stages,
       ...(dialogue ? { storyEvent: { type: "ADIA", ...dialogueIdentities,
         cell: banneredMareCell, location: result.storyEvent.location } } : {}),
       ...(dialogue && result.storyRoute !== undefined ? {storyRoute: normalizeStoryRoute(result.storyRoute)} : {}),
+      ...(selection ? {storySelection: selection} : {}),
+      ...(dialogue && result.storyAliasBindings !== undefined ? {storyAliasBindings: normalizeStoryAliases(result.storyAliasBindings)} : {}),
+      ...(dialogue && result.storyUniqueActorBindings !== undefined
+        ? {storyUniqueActorBindings: normalizeUniqueActorAliases(result.storyUniqueActorBindings)} : {}),
       code: result.blocker?.code ?? "", detail: result.blocker?.detail ?? "" };
   } finally {
     for (const id of actors.reverse()) server.destroyActor(id);
